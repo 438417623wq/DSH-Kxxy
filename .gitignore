@@ -1,0 +1,23 @@
+# DSH Kxxy — 忽略规则
+
+# ---- Android 构建产物 ----
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ---- 运行时装配产物 ----
+# runtime.zip 是 tools/build-runtime.mjs 的产物（98.7 MiB / 15104 条目），
+# 由本机 DSH 桌面版的 app.asar + Termux .deb 装配而成，不属于源码。
+# 需要它的人请按 README「三、构建」自行生成。
+android/app/src/main/assets/runtime.zip
+
+# ---- 装配中间缓存 ----
+# .cache/debs（下载的 .deb）与 .cache/stage（解包后的 Termux 前缀树），
+# 可由 tools/fetch-runtime.mjs 重新拉取，体积约 226 MiB。
+.cache/

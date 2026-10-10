@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DSH Kxxy</string>
+
+    <!-- 引擎状态通知 -->
+    <string name="notif_channel">引擎状态</string>
+    <string name="notif_title">DSH Kxxy 引擎</string>
+    <string name="notif_action_exit">退出</string>
+
+    <string name="status_idle">空闲</string>
+    <string name="status_installing">正在安装运行时 %1$d%%</string>
+    <string name="status_starting">正在启动引擎…</string>
+    <string name="status_healthy">引擎已就绪</string>
+    <string name="status_backoff">启动失败，%1$d 秒后重试（第 %2$d 次）</string>
+    <string name="status_exiting">正在退出…</string>
+
+    <!-- 引导页 -->
+    <string name="boot_title">DSH Kxxy</string>
+    <string name="boot_checking">正在检查运行环境…</string>
+    <string name="boot_installing">正在安装运行时…</string>
+    <string name="boot_starting">正在启动引擎…</string>
+    <string name="boot_waiting">正在等待引擎就绪…</string>
+    <string name="boot_failed">启动失败</string>
+    <string name="boot_retry">重试</string>
+    <string name="boot_webview_too_old">系统 WebView 版本过低（需 Chrome 85 以上），请更新「Android System WebView」后重试。</string>
+    <string name="boot_hint">首次启动需要解压约 480 MB 运行时，请保持屏幕常亮。</string>
+
+    <!-- 主界面 -->
+    <string name="main_loading">正在加载界面…</string>
+    <string name="main_error">界面加载失败，请重启引擎后重试。</string>
+</resources>

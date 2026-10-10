@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0B0D13">
+  <title>DSH Kxxy 控制台</title>
+  <!-- 必须用绝对路径：页面 URL 是 /kxxy（无尾斜杠），相对路径会被浏览器解析成
+       /host.css 而落到官方前端的 fallback 上 → 404，页面将完全无样式无交互。 -->
+  <link rel="stylesheet" href="/kxxy/assets/host.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- 顶部固定 Header -->
+    <header class="app-header">
+      <div class="header-inner">
+        <div class="header-branding">
+          <div class="brand-logo" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+              <path d="M12 2L3 7V17L12 22L21 17V7L12 2Z" stroke="#00C0FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M12 22V12" stroke="#00C0FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M21 7L12 12L3 7" stroke="#00C0FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <circle cx="12" cy="12" r="3" fill="#2F80ED" />
+            </svg>
+          </div>
+          <div class="brand-text">
+            <h1 class="header-title">DSH Kxxy 控制台</h1>
+            <span class="header-version">v1.4.2-android</span>
+          </div>
+        </div>
+
+        <div class="header-status">
+          <!-- 回到官方对话界面。管理页由 WebView 加载，history 里没有上一页
+               （首次进入就是 /kxxy），所以必须是真链接而不是 history.back()。 -->
+          <a class="header-back" href="/" title="返回 DSH 对话界面">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M15 5L8 12L15 19" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span>对话</span>
+          </a>
+          <div class="status-pill" id="global-status-pill">
+            <span class="pulse-dot dot-green" id="header-pulse-dot"></span>
+            <span class="status-label" id="header-status-label">引擎正常</span>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- 浮动通知条 (Toast) -->
+    <div class="toast-container" id="toast-container" aria-live="polite"></div>
+
+    <!-- 主体视口容器 -->
+    <main class="app-main">
+      <!-- 1. 概览视图 -->
+      <section class="view-pane active" data-view="overview" id="view-overview">
+        <!-- 引擎状态主卡 -->
+        <div class="card hero-status-card">
+          <div class="hero-header">
+            <div class="hero-indicator">
+              <span class="pulse-dot-large dot-green" id="hero-pulse-dot"></span>
+              <div class="hero-titles">
+                <h2 class="hero-status-text" id="engine-status-text">引擎运行中</h2>
+                <div class="hero-meta-row">
+                  <span class="badge badge-accent" id="engine-pid-badge">PID: 28419</span>
+                  <span class="badge badge-subtle" id="engine-arch-badge">aarch64</span>
+                  <span class="badge badge-subtle" id="engine-node-badge">Node.js v20.11.1</span>
+                </div>
+              </div>
+            </div>
+            <div class="hero-action-slot">
+              <button class="icon-button" id="btn-quick-refresh" title="刷新状态" aria-label="刷新状态">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3 指标小卡横排 -->
+        <div class="metric-grid">
+          <div class="card metric-card">
+            <div class="metric-icon memory-icon" aria-hidden="true">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="2" y="4" width="20" height="16" rx="2"/>
+                <path d="M6 8v8M10 8v8M14 8v8M18 8v8"/>
+              </svg>
+            </div>
+            <span class="metric-label">内存占用</span>
+            <div class="metric-value-wrap">
+              <span class="metric-value" id="metric-memory">142</span>
+              <span class="metric-unit">MB</span>
+            </div>
+            <span class="metric-foot">RSS 物理常驻</span>
+          </div>
+
+          <div class="card metric-card">
+            <div class="metric-icon uptime-icon" aria-hidden="true">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/>
+                <polyline points="12 6 12 12 16 14"/>
+              </svg>
+            </div>
+            <span class="metric-label">运行时长</span>
+            <div class="metric-value-wrap">
+              <span class="metric-value" id="metric-uptime">03:42:19</span>
+            </div>
+            <span class="metric-foot">持续运行状态</span>
+          </div>
+
+          <div class="card metric-card">
+            <div class="metric-icon port-icon" aria-hidden="true">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </div>
+            <span class="metric-label">监听端口</span>
+            <div class="metric-value-wrap">
+              <span class="metric-value" id="metric-port">3080</span>
+            </div>
+            <span class="metric-foot">127.0.0.1:3080</span>
+          </div>
+        </div>
+
+        <!-- 运行时完整性检查列表 (7 项) -->
+        <div class="card block-card">
+          <div class="card-title-row">
+            <div class="card-title-group">
+              <h3 class="card-title">运行时完整性检查</h3>
+              <span class="card-subtitle">系统基础设施与 IPC 状态</span>
+            </div>
+            <span class="badge badge-success" id="runtime-all-status">7 / 7 通过</span>
+          </div>
+          <div class="check-list" id="runtime-checks-container">
+            <div class="check-item">
+              <div class="check-status-icon success" aria-hidden="true">✓</div>
+              <div class="check-content">
+                <div class="check-main">
+                  <span class="check-name">Node.js 运行时执行体</span>
+                  <span class="check-badge">ELF aarch64</span>
+                </div>
+                <div class="check-detail">/data/data/app.kxxy/files/engine/bin/node · 正常可执行</div>
+              </div>
+            </div>
+
+            <div class="check-item">
+              <div class="check-status-icon success" aria-hidden="true">✓</div>
+              <div class="check-content">
+                <div class="check-main">
+                  <span class="check-name">Harness Core 核心包</span>
+                  <span class="check-badge">v2.1.0-prod</span>
+                </div>
+                <div class="check-detail">/files/engine/lib/node_modules/@deepseek-ai/dsh · SHA-256 签名一致</div>
+              </div>
+            </div>
+
+            <div class="check-item">
+              <div class="check-status-icon success" aria-hidden="true">✓</div>
+              <div class="check-content">
+                <div class="check-main">
+                  <span class="check-name">Android Bionic Linker 适配</span>
+                  <span class="check-badge">Linker64</span>
+                </div>
+                <div class="check-detail">系统级 /system/bin/linker64 动态库重定向已挂载</div>
+              </div>
+            </div>
+
+            <div class="check-item">
+              <div class="check-status-icon success" aria-hidden="true">✓</div>
+              <div class="check-content">
+                <div class="check-main">
+                  <span class="check-name">UNIX IPC 命名通道</span>
+                  <span class="check-badge">Domain Socket</span>
+                </div>
+                <div class="check-detail">files/engine/kxxy-state.json 处于可写入监听态</div>
+              </div>
+            </div>
+
+            <div class="check-item">
+              <div class="check-status-icon success" aria-hidden="true">✓</div>
+              <div class="check-content">
+                <div class="check-main">
+                  <span class="check-name">SQLite3 原生驱动组件</span>
+                  <span class="check-badge">WAL 模式</span>
+                </div>
+                <div class="check-detail">better-sqlite3 模块 binding 载入无符号冲突</div>
+              </div>
+            </div>
+
+            <div class="check-item">
+              <div class="check-status-icon success" aria-hidden="true">✓</div>
+              <div class="check-content">
+                <div class="check-main">
+                  <span class="check-name">用户 Workspace 隔离沙箱</span>
+                  <span class="check-badge">POSIX Perms</span>
+                </div>
+                <div class="check-detail">/sdcard/Android/data/app.kxxy/files 权限可读写 (0755)</div>
+              </div>
+            </div>
+
+            <div class="check-item">
+              <div class="check-status-icon success" aria-hidden="true">✓</div>
+              <div class="check-content">
+                <div class="check-main">
+                  <span class="check-name">Localhost 回环网络策略</span>
+                  <span class="check-badge">IPv4 Loopback</span>
+                </div>
+                <div class="check-detail">TCP 3080 端口无外网暴露风险，仅限本地 WebView</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 13 项补丁状态折叠列表 -->
+        <div class="card block-card patch-card">
+          <details class="patch-accordion" id="patch-details-wrapper">
+            <summary class="patch-summary">
+              <div class="patch-summary-left">
+                <span class="accordion-title">已载入 Android 宿主补丁</span>
+                <span class="badge badge-accent">13 项全部生效</span>
+              </div>
+              <div class="patch-summary-right">
+                <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </div>
+            </summary>
+            <div class="patch-content-body">
+              <div class="patch-grid">
+                <div class="patch-item">
+                  <div class="patch-id">P01</div>
+                  <div class="patch-info">
+                    <span class="patch-name">process.binding 兼容模拟层</span>
+                    <span class="patch-desc">为 Android 上被裁切的底层 Node 绑定提供兼容垫片</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P02</div>
+                  <div class="patch-info">
+                    <span class="patch-name">child_process.spawn POSIX 适配</span>
+                    <span class="patch-desc">强制重定向 /bin/sh 到宿主内嵌的 Toybox Shell 环境</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P03</div>
+                  <div class="patch-info">
+                    <span class="patch-name">DNS 绕过 Android Netd 守护</span>
+                    <span class="patch-desc">使用纯 JS c-ares 逻辑直连公共 DNS，避免 getaddrinfo 权限阻断</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P04</div>
+                  <div class="patch-info">
+                    <span class="patch-name">os.cpus() 核心热插拔模拟</span>
+                    <span class="patch-desc">规避 Android 内核在低功耗时隐藏脱机 CPU 核心导致的越界</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P05</div>
+                  <div class="patch-info">
+                    <span class="patch-name">fs.stat 沙箱权限抹平</span>
+                    <span class="patch-desc">将 Android 特有虚拟 uid/gid 映射至标准 POSIX 模拟用户</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P06</div>
+                  <div class="patch-info">
+                    <span class="patch-name">pthread 亲和性隔离规避</span>
+                    <span class="patch-desc">拦截 thread-affinity 调用，防止部分定制 ROM 下被 SELinux 杀进程</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P07</div>
+                  <div class="patch-info">
+                    <span class="patch-name">Terminfo 无色彩终端降级</span>
+                    <span class="patch-desc">为内嵌 WebView 提供安全的 xterm-256color 终端转义支持</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P08</div>
+                  <div class="patch-info">
+                    <span class="patch-name">WorkerThreads 内存限额优化</span>
+                    <span class="patch-desc">对 Android LMK (低内存杀手) 适配的堆内存阈值动态裁剪</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P09</div>
+                  <div class="patch-info">
+                    <span class="patch-name">OpenSSL CA 证书重定向</span>
+                    <span class="patch-desc">将 Node TLS 证书链指向 Android 系统 /system/etc/security/cacerts</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P10</div>
+                  <div class="patch-info">
+                    <span class="patch-name">WebSocket 心跳防打盹 (Doze Mode)</span>
+                    <span class="patch-desc">高频自适应 ping 保持套接字活性，防止进入系统浅睡眠</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P11</div>
+                  <div class="patch-info">
+                    <span class="patch-name">V8 JIT W^X 内存重映射</span>
+                    <span class="patch-desc">规避 Android 高版本内核对可执行堆内存的写保护强制崩溃</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P12</div>
+                  <div class="patch-info">
+                    <span class="patch-name">本地路由 /kxxy 独立反代挂载</span>
+                    <span class="patch-desc">在同一个 HTTP 服务内部无感分流宿主管理接口与官方 React 视图</span>
+                  </div>
+                </div>
+                <div class="patch-item">
+                  <div class="patch-id">P13</div>
+                  <div class="patch-info">
+                    <span class="patch-name">SIGINT / SIGTERM 优雅退出捕获</span>
+                    <span class="patch-desc">接收 Android Activity 销毁信号并安全刷写 SQLite 日志与配置缓存</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <!-- 2. 扩展视图 -->
+      <section class="view-pane" data-view="extensions" id="view-extensions">
+        <!-- 镜像源状态栏 -->
+        <div class="card mirror-card">
+          <div class="mirror-left">
+            <span class="mirror-icon" aria-hidden="true">🌐</span>
+            <div class="mirror-info">
+              <span class="mirror-title">镜像源加速：<strong class="mirror-active-source" id="current-mirror-name">清华源 TUNA (Android 镜像包)</strong></span>
+              <span class="mirror-sub">平均延迟 38ms · 自动同步官方构建</span>
+            </div>
+          </div>
+          <button class="button button-subtle button-sm" id="btn-switch-mirror">测速</button>
+        </div>
+
+        <!-- 扩展分类标签栏 -->
+        <div class="tab-category-bar">
+          <button class="category-chip active" data-category="all">全部</button>
+          <button class="category-chip" data-category="toolchain">语言与编译链</button>
+          <button class="category-chip" data-category="system">系统与媒体</button>
+          <button class="category-chip" data-category="devtools">开发工具</button>
+        </div>
+
+        <!-- 扩展卡片列表容器 -->
+        <div class="extensions-container" id="extensions-list">
+          <!-- 卡片 1 -->
+          <div class="card ext-card" data-category="toolchain">
+            <div class="ext-card-inner">
+              <div class="ext-icon-box python-color">Py</div>
+              <div class="ext-body">
+                <div class="ext-header">
+                  <h4 class="ext-name">Python 3.11 独立环境</h4>
+                  <span class="ext-version">v3.11.8</span>
+                </div>
+                <p class="ext-desc">内嵌精简版 Python 运行时，预置 pip、wheel 及基础科学计算桥接。</p>
+                <div class="ext-tags">
+                  <span class="tag-item">python3</span>
+                  <span class="tag-item">pip</span>
+                </div>
+              </div>
+              <div class="ext-action">
+                <button class="button button-installed button-sm" disabled>已激活</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 卡片 2 -->
+          <div class="card ext-card" data-category="devtools">
+            <div class="ext-card-inner">
+              <div class="ext-icon-box git-color">Git</div>
+              <div class="ext-body">
+                <div class="ext-header">
+                  <h4 class="ext-name">Git &amp; OpenSSH 工具集</h4>
+                  <span class="ext-version">v2.43.0</span>
+                </div>
+                <p class="ext-desc">完整 Git 命令行版本控制，支持 SSH Key 认证与远程代码拉取提交。</p>
+                <div class="ext-tags">
+                  <span class="tag-item">git</span>
+                  <span class="tag-item">ssh</span>
+                </div>
+              </div>
+              <div class="ext-action">
+                <button class="button button-installed button-sm" disabled>已激活</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 卡片 3 -->
+          <div class="card ext-card" data-category="toolchain">
+            <div class="ext-card-inner">
+              <div class="ext-icon-box clang-color">C++</div>
+              <div class="ext-body">
+                <div class="ext-header">
+                  <h4 class="ext-name">Clang / LLVM 编译套件</h4>
+                  <span class="ext-version">v17.0.6</span>
+                </div>
+                <p class="ext-desc">用于在 Android 端编译 Node C++ 原生 Native Addon 模块与 C 依赖库。</p>
+                <div class="ext-tags">
+                  <span class="tag-item">clang</span>
+                  <span class="tag-item">make</span>
+                </div>
+              </div>
+              <div class="ext-action">
+                <button class="button button-primary button-sm" data-action="install-ext" data-ext-id="llvm-toolchain">获取</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 卡片 4 -->
+          <div class="card ext-card" data-category="system">
+            <div class="ext-card-inner">
+              <div class="ext-icon-box media-color">FF</div>
+              <div class="ext-body">
+                <div class="ext-header">
+                  <h4 class="ext-name">FFmpeg 极简多媒体编解码</h4>
+                  <span class="ext-version">v6.1</span>
+                </div>
+                <p class="ext-desc">音频格式转换、元数据抽取与语音识别切片处理工具。</p>
+                <div class="ext-tags">
+                  <span class="tag-item">ffmpeg</span>
+                  <span class="tag-item">ffprobe</span>
+                </div>
+              </div>
+              <div class="ext-action">
+                <button class="button button-primary button-sm" data-action="install-ext" data-ext-id="ffmpeg-mini">获取</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 卡片 5 -->
+          <div class="card ext-card" data-category="devtools">
+            <div class="ext-card-inner">
+              <div class="ext-icon-box rg-color">Rg</div>
+              <div class="ext-body">
+                <div class="ext-header">
+                  <h4 class="ext-name">Ripgrep &amp; Fd 搜索加速</h4>
+                  <span class="ext-version">v14.1.0</span>
+                </div>
+                <p class="ext-desc">Rust 编写的代码树文本检索与文件名模糊匹配器，提速 10 倍以上。</p>
+                <div class="ext-tags">
+                  <span class="tag-item">rg</span>
+                  <span class="tag-item">fd</span>
+                </div>
+              </div>
+              <div class="ext-action">
+                <button class="button button-installed button-sm" disabled>已激活</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 卡片 6 -->
+          <div class="card ext-card" data-category="devtools">
+            <div class="ext-card-inner">
+              <div class="ext-icon-box rust-color">Rs</div>
+              <div class="ext-body">
+                <div class="ext-header">
+                  <h4 class="ext-name">Rust 编译器与 Cargo</h4>
+                  <span class="ext-version">v1.75.0</span>
+                </div>
+                <p class="ext-desc">支持在本地直接编译带有 rust 代码的 Agent 依赖扩展工具。</p>
+                <div class="ext-tags">
+                  <span class="tag-item">rustc</span>
+                  <span class="tag-item">cargo</span>
+                </div>
+              </div>
+              <div class="ext-action">
+                <button class="button button-primary button-sm" data-action="install-ext" data-ext-id="rust-toolchain">获取</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. 终端视图 -->
+      <section class="view-pane" data-view="terminal" id="view-terminal">
+        <div class="terminal-container">
+          <!-- 终端标题栏 -->
+          <div class="terminal-bar">
+            <div class="terminal-bar-left">
+              <span class="terminal-traffic red"></span>
+              <span class="terminal-traffic yellow"></span>
+              <span class="terminal-traffic green"></span>
+              <span class="terminal-title">dsh-engine.log (tty0)</span>
+            </div>
+            <div class="terminal-bar-right">
+              <button class="term-tool-btn" id="btn-term-clear" title="清空界面">清屏</button>
+              <button class="term-tool-btn" id="btn-term-refresh" title="重新获取日志">刷新</button>
+            </div>
+          </div>
+
+          <!-- 终端显示区域 -->
+          <div class="terminal-viewport" id="terminal-viewport">
+            <pre class="terminal-code" id="terminal-code-stream">
+<span class="ansi-cyan">[dsh-init]</span> Android Bionic environment initialized.
+<span class="ansi-cyan">[dsh-init]</span> Platform: android (aarch64), Kernel: 5.15.78-android13
+<span class="ansi-cyan">[dsh-init]</span> Loading core binaries...
+$ node -v
+<span class="ansi-green">v20.11.1</span>
+$ pnpm -v
+<span class="ansi-green">8.15.4</span>
+$ dsh --profile desktop --workspace /data/user/0/app.kxxy/files/kxxy-home/workspaces
+<span class="ansi-yellow">[boot]</span> Loading configuration from /data/user/0/app.kxxy/files/kxxy-home/profiles/desktop/package.json
+<span class="ansi-yellow">[boot]</span> Applying Android runtime compatibility layers (13 patches active)
+<span class="ansi-yellow">[boot]</span> SQLite storage connected: state.db (WAL enabled)
+<span class="ansi-green">[http]</span> Server listening at http://127.0.0.1:3080/
+<span class="ansi-green">[http]</span> Route /kxxy mounted for Host Management Dashboard
+<span class="ansi-green">[http]</span> Route / connected to Official React Web Client
+<span class="ansi-cyan">[agent]</span> Engine core ready. Waiting for user tasks...</pre>
+          </div>
+
+          <!-- 终端底部快捷键操作栏 -->
+          <div class="terminal-shortcuts">
+            <button class="term-key" data-key="ctrl-c">Ctrl+C</button>
+            <button class="term-key" data-key="tab">Tab</button>
+            <button class="term-key" data-key="up">↑</button>
+            <button class="term-key" data-key="down">↓</button>
+            <button class="term-key" data-key="esc">Esc</button>
+            <button class="term-key" data-key="clear">Clear</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. 设置视图 -->
+      <section class="view-pane" data-view="settings" id="view-settings">
+        <!-- 权限等级分段选择 -->
+        <div class="card block-card">
+          <div class="card-title-group">
+            <h3 class="card-title">宿主运行权限等级</h3>
+            <span class="card-subtitle">控制 Agent 进程获取宿主 Android API 及系统执行边界</span>
+          </div>
+
+          <div class="segmented-control" id="priv-mode-segment" role="radiogroup" aria-label="权限模式">
+            <button class="segment-btn active" data-mode="normal" role="radio" aria-checked="true">
+              <span class="seg-title">沙箱 Normal</span>
+              <span class="seg-sub">应用专属目录隔离</span>
+            </button>
+            <button class="segment-btn" data-mode="shizuku" role="radio" aria-checked="false">
+              <span class="seg-title">Shizuku ADB</span>
+              <span class="seg-sub">系统 ADB 调试权限</span>
+            </button>
+            <button class="segment-btn" data-mode="root" role="radio" aria-checked="false">
+              <span class="seg-title">Root 最高</span>
+              <span class="seg-sub">su 无限制系统调用</span>
+            </button>
+          </div>
+          <div class="segment-hint" id="priv-mode-description">
+            当前处于标准应用沙箱环境，保护隐私同时满足绝大多数 Harness Agent 代码任务。
+          </div>
+        </div>
+
+        <!-- 功能开关组 -->
+        <div class="card block-card">
+          <div class="card-title-group">
+            <h3 class="card-title">系统级守护设置</h3>
+            <span class="card-subtitle">保障后台任务运行与网络通信</span>
+          </div>
+
+          <div class="setting-list">
+            <div class="setting-row">
+              <div class="setting-info">
+                <span class="setting-title">前台保活服务</span>
+                <span class="setting-desc">常驻通知栏通知，防止进程被系统 LMK 策略中止</span>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-foreground" checked>
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <span class="setting-title">无障碍看门狗</span>
+                <span class="setting-desc">当引擎遇到未捕获异常退出时自动尝试拉起守护</span>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-watchdog" checked>
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <span class="setting-title">局域网反代服务</span>
+                <span class="setting-desc">将 127.0.0.1:3080 广播开放至 WLAN 局域网调试访问</span>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-lan">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- 宿主信息卡片 -->
+        <div class="card block-card">
+          <div class="card-title-group">
+            <h3 class="card-title">宿主环境参数</h3>
+            <span class="card-subtitle">编译构建与系统运行库信息</span>
+          </div>
+
+          <div class="info-table">
+            <div class="info-row">
+              <span class="info-key">Target SDK</span>
+              <span class="info-val">28 (Android 9.0 · W^X 保护兼容)</span>
+            </div>
+            <div class="info-row">
+              <span class="info-key">Min SDK</span>
+              <span class="info-val">26 (Android 8.0 Oreo)</span>
+            </div>
+            <div class="info-row">
+              <span class="info-key">Node.js 版本</span>
+              <span class="info-val" id="info-node-ver">v20.11.1 (LTS/Iron)</span>
+            </div>
+            <div class="info-row">
+              <span class="info-key">pnpm 版本</span>
+              <span class="info-val" id="info-pnpm-ver">v8.15.4</span>
+            </div>
+            <div class="info-row">
+              <span class="info-key">应用包名</span>
+              <span class="info-val">app.kxxy</span>
+            </div>
+            <div class="info-row">
+              <span class="info-key">执行目录</span>
+              <span class="info-val code-font">/data/user/0/app.kxxy/files</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 危险操作区 -->
+        <div class="card block-card danger-zone-card">
+          <div class="card-title-group">
+            <h3 class="card-title danger-title">服务管理与维护</h3>
+            <span class="card-subtitle">进程控制与运行排错日志</span>
+          </div>
+
+          <div class="danger-actions-grid">
+            <button class="button button-warning button-block" id="btn-restart-engine">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+              </svg>
+              <span>重启引擎进程</span>
+            </button>
+
+            <button class="button button-subtle button-block" id="btn-export-logs">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              <span>导出诊断日志</span>
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 底部固定 Tab 导航 -->
+    <nav class="app-tabbar" aria-label="底栏导航">
+      <div class="tabbar-inner">
+        <button class="tab-item active" data-target="overview">
+          <div class="tab-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="7" height="7"/>
+              <rect x="14" y="3" width="7" height="7"/>
+              <rect x="14" y="14" width="7" height="7"/>
+              <rect x="3" y="14" width="7" height="7"/>
+            </svg>
+          </div>
+          <span class="tab-label">概览</span>
+        </button>
+
+        <button class="tab-item" data-target="extensions">
+          <div class="tab-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+              <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+              <line x1="12" y1="22.08" x2="12" y2="12"/>
+            </svg>
+          </div>
+          <span class="tab-label">扩展</span>
+        </button>
+
+        <button class="tab-item" data-target="terminal">
+          <div class="tab-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="4 17 10 11 4 5"/>
+              <line x1="12" y1="19" x2="20" y2="19"/>
+            </svg>
+          </div>
+          <span class="tab-label">终端</span>
+        </button>
+
+        <button class="tab-item" data-target="settings">
+          <div class="tab-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </div>
+          <span class="tab-label">设置</span>
+        </button>
+      </div>
+    </nav>
+  </div>
+
+  <script src="/kxxy/assets/host.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- DSH Kxxy 主题：深色、无 ActionBar，WebView 全屏铺底 -->
+    <style name="Theme.Kxxy" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0B0D13</item>
+        <item name="android:statusBarColor">#0E1017</item>
+        <item name="android:navigationBarColor">#0E1017</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

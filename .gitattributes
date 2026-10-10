@@ -1,0 +1,10 @@
+# 统一换行符为 LF：Kotlin / C / JS / Gradle 脚本都在跨平台工具链里编译，
+# 混入 CRLF 会在 Linux CI 上产生整文件 diff。
+* text=auto eol=lf
+
+# 二进制资源不做换行转换
+*.png binary
+*.jpg binary
+*.zip binary
+*.jar binary
+*.so binary

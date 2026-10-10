@@ -1,0 +1,25 @@
+# DSH Kxxy 宿主管理页插件
+#
+# 这是方案 T 的核心：宿主管理界面不做成 Android UI，而是作为一个 Cordis 插件，
+# 由官方 webServer 在 127.0.0.1:3080 上提供 HTML。
+#
+# 之所以可行：官方 `dsh-host-webserver` 的 WebServer 服务是**公开可注入**的
+# （官方自己就有 8 个包在用它的 register / registerFallback / registerUpgrade）。
+#
+# 挂载方式（三条路由）：
+#   · /kxxy  与 /kxxy/  —— 完整宿主管理页（exact 路由，尾斜杠变体也要挂，
+#                          因为地址栏手输时很容易带上，exact 是精确匹配）
+#   · /kxxy/assets      —— 管理页静态资源（prefix 路由）
+#   · /kxxy/api         —— 管理 API（prefix 路由）
+#
+# ⚠️ prefix 路由的 path **不能带尾斜杠**：官方 WebServer.match() 的判据是
+#    `pathname === prefix || pathname.startsWith(`${prefix}/`)`，带尾斜杠会拼出
+#    双斜杠而永不命中（实测症状：/kxxy 返回 200 但 /kxxy/api/* 全 404）。
+#
+# 关于插槽：**不用插槽**。`ctx.slots`（@deepseek-ai/dsh-client-ui-slots）是
+# **浏览器侧**概念 —— 它是 client bundle 里跑的 SlotCore，host 侧没有任何
+# 名为 slots 的服务可 inject。管理页要融入官方 UI，只能靠 Android 原生层
+# 在 WebView 里注入入口（见 AdaptLayer.kt），或直接访问 /kxxy。
+- insert:
+    - id: kxxy-host
+      name: kxxy-host

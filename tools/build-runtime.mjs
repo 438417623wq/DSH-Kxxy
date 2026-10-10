@@ -1,0 +1,597 @@
+/**
+ * 装配 `assets/runtime.zip`：Termux stage（bionic 系统层）+ asar（dsh JS 依赖树）
+ * → 一份可直接解压到 `filesDir/engine/` 的运行时。
+ *
+ * 用法：
+ *   node tools/build-runtime.mjs [--stage <dir>] [--asar <app.asar>] [--out <zip>]
+ *
+ * 管线（顺序有约束，逐条注明理由）：
+ *   loadStage → collectStage        符号链接解析成 link 条目
+ *   → dedupeByContent               同内容只留一个本体，其余降级为 LINK
+ *   → normaliseStageFiles           把 Termux 绝对前缀换成占位符（必须在去重之后：
+ *                                   去重按 sha256，归一化会改内容）
+ *   → resolveClosure → readClosureInto
+ *   → applyAllPatches               10 个补丁作用在 lib/node_modules 上
+ *   → corepackWrappers              生成 bin/{pnpm,npm,npx}
+ *   → mergeEntries + collectDirs
+ *   → ZipWriter                     写出
+ *
+ * 为什么 shebang 用占位符而不是写死设备路径：构建期不知道 APK 的
+ * `filesDir` 绝对路径（`/data/data/<pkg>/files`，pkg 可变、用户可改）。
+ * 所以构建期只做「Termux 前缀 → @DSH_ROOT@」这步**变短**的替换，
+ * App 侧解压后统一替换成真实路径（见 RuntimeInstaller.rewriteRootPlaceholder）。
+ */
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
+import { dirname, join, posix, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import {
+  collectStage,
+  collectDirs,
+  dedupeByContent,
+  mergeEntries,
+  readClosureInto,
+  readPluginFiles,
+  resolveClosure,
+} from "./lib/assemble.mjs";
+import { applyAllPatches, assertEngineFlags } from "./lib/patches.mjs";
+import { openAsar } from "./lib/registry.mjs";
+import { TERMUX_PREFIX, isPruned } from "./lib/stage.mjs";
+import { ZipWriter } from "./lib/zipwrite.mjs";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PROJECT = resolve(HERE, "..");
+
+const ROOT_PLACEHOLDER = "@DSH_ROOT@";
+const HOME_PLACEHOLDER = "@DSH_HOME@";
+const TMP_PLACEHOLDER = "@DSH_TMP@";
+
+/**
+ * 路径替换表，**按 needle 长度降序应用**（长前缀必须先替换，否则
+ * `/usr/` 被 `/usr` 先吃掉会留下一个多余的斜杠）。
+ *
+ * 为什么是四条而不是一条：Termux 的脚本里这三种写法都真实存在 ——
+ *   `prefix=/data/data/com.termux/files/usr`      （*-config 系列，无尾斜杠）
+ *   `DIR=/data/data/com.termux/files/usr/share/et`（有尾斜杠）
+ *   `HOME=/data/data/com.termux/files/home`       （termux-backup 等）
+ *   `cache_dir=/data/data/com.termux/cache/apt`   （bin/pkg）
+ * 只替换带尾斜杠的那条，实测会漏掉 23 个文件（见 verify-runtime.mjs 的残留扫描）。
+ *
+ * 替换后字符串一律**变短**（`/data/data/com.termux/files/usr` 32 字节 →
+ * `@DSH_ROOT@` 10 字节），因此不会撑破脚本里任何内嵌缓冲。
+ */
+const PATH_REWRITES = [
+  [`${TERMUX_PREFIX}`, `${ROOT_PLACEHOLDER}/`],
+  ["/data/data/com.termux/files/usr", ROOT_PLACEHOLDER],
+  ["/data/data/com.termux/files/home", HOME_PLACEHOLDER],
+  ["/data/data/com.termux/cache", TMP_PLACEHOLDER],
+].sort((a, b) => b[0].length - a[0].length);
+
+/**
+ * 剔除清单：依赖 Termux 这个 Android 应用本体、在 DSH Kxxy 里必然失败的脚本。
+ *
+ * 全部是**脚本**（非 ELF），判据是它们都通过 `com.termux.termuxam.Am` /
+ * `app_process` / `am broadcast` 去驱动 Termux 自己的 Activity 与 Service。
+ * Kxxy 不是 Termux，这些 Intent 的接收者不存在，跑起来只会报
+ * `Error: Activity not started, unable to resolve Intent`。
+ *
+ * 依据：`F:\KF\DSKX\_recon\termux-refs.mjs` 实测这些脚本在保留集合内
+ * **没有被任何非 Termux 脚本引用**。（`bin/am` 报出的 250 处、`bin/pkg` 的
+ * 93 处是子串误报 —— "am" 命中 "program"，"pkg" 命中 "pkg-config"。）
+ *
+ * 刻意**不删** `bin/login`、`bin/passwd`、`bin/chsh`、`bin/su`：
+ * 它们是 ELF，`libtermux-auth.so` 在闭包里所以能正常加载，删 ELF 的风险
+ * 远大于收益（`su` 还是 Shizuku/root 提权路径的一环）。
+ */
+const TERMUX_APP_SCRIPTS = new Set([
+  "bin/am",
+  "bin/termux-am",
+  "bin/termux-am-socket",
+  "bin/termux-backup",
+  "bin/termux-restore",
+  "bin/termux-change-repo",
+  "bin/termux-info",
+  "bin/termux-open",
+  "bin/termux-open-url",
+  "bin/termux-reload-settings",
+  "bin/termux-reset",
+  "bin/termux-setup-package-manager",
+  "bin/termux-setup-storage",
+  "bin/termux-wake-lock",
+  "bin/termux-wake-unlock",
+  "bin/termux-apps-info-app-version-name",
+  "bin/termux-apps-info-app-version-name.bash",
+  "bin/termux-apps-info-app-version-name.sh",
+  "bin/termux-apps-info-env-variable",
+  "bin/termux-apps-info-env-variable.bash",
+  "bin/termux-apps-info-env-variable.sh",
+  "bin/termux-scoped-env-variable",
+  "bin/termux-scoped-env-variable.bash",
+  "bin/termux-scoped-env-variable.sh",
+  "bin/termux-exec-ld-preload-lib",
+  "bin/termux-exec-system-linker-exec",
+  "bin/termux-fix-shebang",
+  "bin/dalvikvm",
+  "bin/pkg",
+  "etc/motd",
+  "etc/motd.sh",
+  "etc/motd-playstore",
+  "etc/profile.d/init-termux-properties.sh",
+]);
+
+/** `dsh web` profile 的依赖根：CLI 本体 + 两个 bundle。 */
+const CLOSURE_ROOTS = [
+  "@deepseek-ai/dsh",
+  "@deepseek-ai/dsh-base",
+  "@deepseek-ai/dsh-web-app",
+];
+
+/**
+ * 必须剔除的脚本：shebang 指向 `bin/perl` / `bin/python`，而这两个解释器
+ * 不在 Termux 闭包里（没装 perl / python 包）。留着只会在设备上报
+ * `bad interpreter: No such file or directory`。
+ *
+ * 六个都是 CVS / Perforce 桥接，Agent 场景不会触碰。
+ */
+const DEAD_INTERPRETER_SCRIPTS = new Set([
+  "bin/git-cvsserver",
+  "libexec/git-core/git-archimport",
+  "libexec/git-core/git-cvsexportcommit",
+  "libexec/git-core/git-cvsimport",
+  "libexec/git-core/git-send-email",
+  "libexec/git-core/git-p4",
+]);
+
+/**
+ * 需要归一化 shebang / 正文路径的顶层目录。
+ *
+ * 只处理这几棵树，是因为它们才可能出现 `#!` 或 shell 路径引用；
+ * `lib/*.so`、`bin/*`（ELF）靠 ELF 魔数二次过滤挡掉。
+ */
+const SCRIPT_TOP_DIRS = ["bin/", "libexec/", "lib/", "share/", "etc/", "var/"];
+
+/** 超过这个大小的一律当二进制，不做文本替换（避免误伤大 ELF）。 */
+const MAX_SCRIPT_BYTES = 1 << 20;
+
+/**
+ * 目录型符号链接。
+ *
+ * `resolveSymlinks` 只把 `file`/`hardlink` 放进可解析集合，目标是 `dir` 的
+ * 符号链接永远解析不到，会被记成「目标不是实体文件」丢弃。实测有两条这样的
+ * 链接，且都真实影响运行时：
+ *
+ *   lib/terminfo   → share/terminfo   （40 文件，ncurses 应用查 TERMINFO 用）
+ *   lib/icu/current → lib/icu/78.3    （2 个 .inc 开发文件，实际用不到）
+ *
+ * 还有两条经由 `lib/icu/current` 中转的二级链接（`lib/icu/Makefile.inc`、
+ * `lib/icu/pkgdata.inc`），所以这里必须**迭代到不动点**：先把目录链接解析成
+ * 真实目录，再让指向它的链接也能解析。
+ */
+function collectDirLinks(stage) {
+  const dirs = new Set(stage.entries.filter((e) => e.type === "dir").map((e) => e.path));
+  const pending = stage.entries.filter((e) => e.type === "symlink" && !isPruned(e.path));
+  const out = [];
+
+  // 别名 → 真实目录；先填目录型链接本身，再处理指向别名的链接。
+  const aliasTo = new Map();
+  for (const e of pending) {
+    const target = posix.normalize(posix.join(posix.dirname(e.path), e.target));
+    if (dirs.has(target)) aliasTo.set(e.path, target);
+  }
+
+  for (let round = 0; round < 8; round += 1) {
+    let grew = false;
+    for (const e of pending) {
+      if (aliasTo.has(e.path)) continue;
+      const target = posix.normalize(posix.join(posix.dirname(e.path), e.target));
+      const real = aliasTo.get(target);
+      if (real !== undefined) {
+        aliasTo.set(e.path, real);
+        grew = true;
+      }
+    }
+    if (!grew) break;
+  }
+
+  for (const [path, target] of aliasTo) out.push({ path, target });
+  return out;
+}
+
+function parseArgs(argv) {
+  const opts = {
+    stage: join(PROJECT, ".cache", "stage"),
+    asar: "F:/dsh-desktop/resources/app.asar",
+    out: join(PROJECT, "android", "app", "src", "main", "assets", "runtime.zip"),
+    manifest: null,
+    plugins: join(PROJECT, "plugins"),
+  };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === "--stage") opts.stage = resolve(argv[++i]);
+    else if (a === "--asar") opts.asar = resolve(argv[++i]);
+    else if (a === "--out") opts.out = resolve(argv[++i]);
+    else if (a === "--manifest") opts.manifest = resolve(argv[++i]);
+    else if (a === "--plugins") opts.plugins = resolve(argv[++i]);
+    else if (a === "--help" || a === "-h") {
+      console.log("用法：node tools/build-runtime.mjs [--stage <dir>] [--asar <app.asar>] [--out <zip>]");
+      process.exit(0);
+    } else throw new Error(`未知参数：${a}`);
+  }
+  return opts;
+}
+
+function human(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MiB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+}
+
+/** 前 4 字节是 ELF 魔数即视为二进制，绝不改内容。 */
+function isElf(buf) {
+  return buf.length >= 4 && buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46;
+}
+
+/**
+ * 归一化 stage 侧文本文件：把 Termux 的绝对路径换成占位符。
+ *
+ * 三条规则，顺序重要：
+ *   ① 剔除清单（Termux 应用专属脚本）先删 —— 它们含大量 `com.termux`
+ *      Intent 字符串，替换也救不了，留着只会误导后续排查。
+ *   ② ELF 一律跳过：320 个二进制的 RUNPATH 里就写着 Termux prefix，
+ *      那是预期内的（Android linker 先读 `LD_LIBRARY_PATH`，
+ *      `EngineConfig.buildEnv` 已把 `<root>/lib` 放首位），改它反而危险。
+ *   ③ 只处理 `SCRIPT_TOP_DIRS` 下的文本文件，且按 `PATH_REWRITES` 逐条替换。
+ *
+ * 返回统计；被改写的条目就地升级成内存条目（带 data，丢掉 blob 引用）。
+ */
+function normaliseStageFiles(files, blobRoot) {
+  let touched = 0;
+  let dropped = 0;
+  const droppedPaths = [];
+  const placeholderPaths = [];
+
+  for (let i = files.length - 1; i >= 0; i -= 1) {
+    const f = files[i];
+
+    if (DEAD_INTERPRETER_SCRIPTS.has(f.path) || TERMUX_APP_SCRIPTS.has(f.path)) {
+      files.splice(i, 1);
+      dropped += 1;
+      droppedPaths.push(f.path);
+      continue;
+    }
+
+    if (!SCRIPT_TOP_DIRS.some((d) => f.path.startsWith(d))) continue;
+    if ((f.size ?? 0) > MAX_SCRIPT_BYTES) continue;
+
+    const buf = readFileSync(join(blobRoot, f.blob.slice(0, 2), f.blob));
+    if (isElf(buf)) continue;
+
+    let text = buf.toString("latin1");
+    if (!text.includes("com.termux")) continue;
+
+    for (const [needle, repl] of PATH_REWRITES) {
+      if (text.includes(needle)) text = text.split(needle).join(repl);
+    }
+
+    const out = Buffer.from(text, "latin1");
+    files[i] = { path: f.path, type: "file", data: out, mode: f.mode, size: out.length };
+    touched += 1;
+    placeholderPaths.push(f.path);
+  }
+
+  return { touched, dropped, droppedPaths, placeholderPaths };
+}
+
+/**
+ * 生成 corepack 包装器 `bin/{pnpm,npm,npx}`。
+ *
+ * 为什么需要：Termux 的 nodejs-lts 只装 corepack 本体，不提供这三个 shim
+ * （实测 `bin/{pnpm,npm,npx}` 全部不存在，只有 `lib/node_modules/corepack/shims/*`）。
+ * 而 shims 目录里的脚本 shebang 指向 Termux 路径且依赖 `termux-exec`，
+ * 与其修补不如重写三个 8 行的 wrapper。
+ *
+ * shebang 固定 `/system/bin/sh`：Android 必然存在，且是 app 私有路径之外的
+ * 唯一稳定解释器，因此**不需要**参与 `@DSH_ROOT@` 占位符替换。
+ */
+function corepackWrappers() {
+  const mk = (target) =>
+    Buffer.from(
+      [
+        "#!/system/bin/sh",
+        "# generated by dsh-kxxy build-runtime.mjs — do not edit",
+        'd=${0%/*}',
+        `exec "$d/node" "$d/../lib/node_modules/corepack/dist/${target}" "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+  return [
+    { path: "bin/pnpm", data: mk("pnpm.js"), mode: 0o755 },
+    { path: "bin/npm", data: mk("npm.js"), mode: 0o755 },
+    { path: "bin/npx", data: mk("npx.js"), mode: 0o755 },
+  ];
+}
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+
+  if (!existsSync(join(opts.stage, "entries.json"))) {
+    throw new Error(`stage 不存在或不完整：${opts.stage}（缺 entries.json）`);
+  }
+  if (!existsSync(opts.asar)) {
+    throw new Error(`asar 不存在：${opts.asar}`);
+  }
+
+  // ---------------------------------------------------------------- stage 侧
+  console.log(`[1/8] 读 stage ${opts.stage}`);
+  const part = collectStage(opts.stage);
+  console.log(
+    `      stage：实体 ${part.files.length}，符号链接 ${part.links.length}，` +
+      `丢弃 ${part.dropped.length}`,
+  );
+
+  const deduped = dedupeByContent(part.files, part.links);
+  console.log(
+    `[2/8] 内容去重：${part.files.length} → ${deduped.files.length} 本体，` +
+      `新增 ${deduped.links.length - part.links.length} 个 LINK，省 ${human(deduped.savedBytes)}`,
+  );
+
+  const norm = normaliseStageFiles(deduped.files, part.stage.blobRoot);
+  console.log(
+    `[3/8] 路径归一化：改写 ${norm.touched} 个脚本 → ${ROOT_PLACEHOLDER}，` +
+      `剔除 ${norm.dropped} 个死解释器脚本`,
+  );
+  for (const p of norm.droppedPaths) console.log(`      - ${p}`);
+
+  /**
+   * 目录型符号链接展开：`lib/terminfo → share/terminfo` 这类链接无法用单条
+   * LINK 表达（LINK 的目标必须是实体文件），所以把它**逐个成员**展开成
+   * `lib/terminfo/<rel>` → LINK → `share/terminfo/<rel>`。
+   *
+   * 展开必须在去重与归一化之后：此时 `deduped.files` 已是最终本体集合，
+   * 且归一化可能把某个成员升级成内存条目（本任务里 terminfo 是二进制，
+   * 不会被改，但规则上仍以后者为准）。
+   */
+  const dirLinks = collectDirLinks(part.stage);
+  const dirLinkEntries = [];
+  const memberPaths = new Set(deduped.files.map((f) => f.path));
+  for (const dl of dirLinks) {
+    const prefix = `${dl.target}/`;
+    const members = [...memberPaths].filter((p) => p.startsWith(prefix));
+    for (const m of members) {
+      dirLinkEntries.push({ path: dl.path + m.slice(dl.target.length), type: "link", target: m, mode: 0o644 });
+    }
+    console.log(`      目录链接 ${dl.path} → ${dl.target}：展开 ${members.length} 条 LINK`);
+  }
+  deduped.links.push(...dirLinkEntries);
+
+  // ---------------------------------------------------------------- asar 侧
+  console.log(`[4/8] 打开 asar ${opts.asar}`);
+  const asar = openAsar(opts.asar);
+  const closure = resolveClosure(asar, CLOSURE_ROOTS);
+  console.log(`      闭包 ${closure.seen.size} 个包；平台跳过 ${closure.platformSkipped.size}，缺失 ${closure.missing.size}`);
+  if (closure.missing.size) {
+    const list = [...closure.missing].slice(0, 10).map(([d, by]) => `${d} (by ${by})`);
+    throw new Error(`非 optional 依赖缺失，asar 不完整：${list.join(", ")}`);
+  }
+  // 接缝包体检：peerDependencies 是 DSH 的抽象层接缝机制（实现包 peer 抽象层，
+  // 抽象层自身无人以 dependencies 声明）。这些包一旦漏出闭包，设备上引擎会在
+  // 启动阶段抛 `Cannot find package '@deepseek-ai/dsh-fs'` 之类，且错误离构建期很远。
+  // 这里只做**存在性**断言（闭包里的包数），不做完整性断言 —— 官方安装是扁平提升的，
+  // 我们复刻的是「按闭包裁剪」，两者集合不一定相等。
+  const SEAM_PROBES = [
+    "@deepseek-ai/cordis-plugin-group",
+    "@deepseek-ai/dsh-fs",
+    "@deepseek-ai/dsh-sandbox",
+    "@deepseek-ai/dsh-shell",
+    "@deepseek-ai/dsh-compaction",
+    "@deepseek-ai/dsh-workflow",
+    "@deepseek-ai/dsh-session-persistence",
+    "@deepseek-ai/dsh-attachment",
+    "@deepseek-ai/dsh-spill",
+    "@deepseek-ai/dsh-ptc-runtime",
+    "@deepseek-ai/dsh-session-query",
+    "@deepseek-ai/dsh-output-retention",
+  ];
+  const absentSeams = SEAM_PROBES.filter((n) => !closure.seen.has(n));
+  if (absentSeams.length) {
+    throw new Error(`接缝包漏出闭包（peerDependencies 未跟随？）：${absentSeams.join(", ")}`);
+  }
+  console.log(`      ✓ 接缝包 ${SEAM_PROBES.length} 个全在闭包内`);
+
+  const asarFiles = new Map();
+  readClosureInto(asar, closure, asarFiles);
+  let asarBytes = 0;
+  for (const v of asarFiles.values()) asarBytes += v.data.length;
+  console.log(`      asar 侧 ${asarFiles.size} 文件 / ${human(asarBytes)}`);
+
+  // ---------------------------------------------------------------- 补丁
+  /**
+   * `termuxRead`：补丁需要从 Termux stage 取文件（`patchRipgrep` 要 `bin/rg`）。
+   * 走归一化**之前**的原始 blob —— rg 是 ELF，归一化不会碰它，
+   * 但用原始 blob 更稳（不依赖归一化的过滤规则）。
+   */
+  const originalByPath = new Map(part.files.map((f) => [f.path, f]));
+  const termuxRead = (rel) => {
+    const e = originalByPath.get(rel);
+    if (!e || !e.blob) return null;
+    return readFileSync(join(part.stage.blobRoot, e.blob.slice(0, 2), e.blob));
+  };
+
+  console.log("[5/8] 应用补丁");
+  /*
+   * 先断言原生层与补丁的契约：patchRequireBuiltin 把
+   * node-addon-require-builtin 换成纯 JS shim，shim 靠 `--expose-internals`
+   * 才能 require `internal/*`。EngineProcess.kt 一旦去掉这个 flag，
+   * 引擎会在启动阶段抛 "profile resolution: unsupported Node module loader"，
+   * 而那个错误离构建期很远 —— 在这里提前失败。
+   */
+  const engineProcessKt = join(PROJECT, "android", "app", "src", "main", "java", "app", "kxxy", "engine", "EngineProcess.kt");
+  assertEngineFlags(readFileSync(engineProcessKt, "utf8"));
+  console.log("      ✓ EngineProcess.kt 传了 --expose-internals");
+
+  const patchLog = applyAllPatches(asarFiles, termuxRead);
+  for (const line of patchLog) console.log(`      ${line}`);
+
+  // ---------------------------------------------------------------- 组装
+  console.log("[6/8] 生成 corepack 包装器");
+  // 包装器落在 bin/ 而非 lib/node_modules/ 下，因此不能塞进 asarFiles
+  // （那个 Map 的键全部以 lib/node_modules/ 开头）；单独一份 Map。
+  const asarPart = new Map(asarFiles);
+  for (const w of corepackWrappers()) {
+    if (asarPart.has(w.path)) throw new Error(`corepack 包装器与既有条目冲突：${w.path}`);
+    asarPart.set(w.path, { data: w.data, mode: w.mode });
+    console.log(`      + ${w.path}`);
+  }
+
+  /*
+   * 自有插件（plugins/<name>/）。
+   *
+   * 它们落进 asarPart 的 lib/node_modules/ 前缀区，因此自动被下面的
+   * collectDirs 推导与 [8/8] 的写出循环覆盖，不需要动其它任何地方。
+   *
+   * 与上游包的区别只在于「谁声明了它」：上游包由 @deepseek-ai/dsh 的
+   * dependencies 拉进 installation scope；kxxy-host 是 dsh-app-boot 补丁
+   * （patches.mjs 的 patchDshManifest）临时写进那份 manifest 的，效果相同。
+   */
+  if (existsSync(opts.plugins)) {
+    const pluginDirs = readdirSync(opts.plugins).filter((name) =>
+      statSync(join(opts.plugins, name)).isDirectory(),
+    );
+    for (const name of pluginDirs) {
+      const count = readPluginFiles(join(opts.plugins, name), asarPart, `lib/node_modules/${name}/`);
+      console.log(`      + lib/node_modules/${name}/ （${count} 文件）`);
+    }
+  }
+
+  const merged = mergeEntries(
+    { files: deduped.files, links: deduped.links },
+    asarPart,
+  );
+
+  /*
+   * 悬空 LINK 清扫。
+   *
+   * 剔除了 Termux 应用脚本与死解释器脚本之后，指向它们的符号链接会变成
+   * 悬空别名 —— 例如 `bin/xdg-open → bin/termux-open`（termux-open 在
+   * TERMUX_APP_SCRIPTS 里）、`bin/termux-apps-info-*.bash → bin/termux-apps-info-*`
+   * （`.bash` 变体没进剔除清单，本体进了）。这些别名若写进 zip，
+   * RuntimeInstaller.materialiseLinks 会在设备上**静默跳过**它们
+   * （目标不存在），结果是安装目录里少几个文件却没有任何日志 ——
+   * 与其如此，不如在构建期就一致地剔除，并把它计入 removedPaths。
+   *
+   * 迭代到不动点：别名也可能指向另一个别名（stage 里 `bin/sh → bin/dash`
+   * 这种两级链），目标被剔除后需要级联清理。
+   */
+  const present = new Set(merged.filter((e) => e.type === "file").map((e) => e.path));
+  for (const key of asarPart.keys()) present.add(key);
+  const dangling = [];
+  for (let round = 0; round < 8; round += 1) {
+    const bad = merged.filter((e) => e.type === "link" && !present.has(e.target));
+    if (bad.length === 0) break;
+    for (const e of bad) {
+      dangling.push(`${e.path} → ${e.target}`);
+      const i = merged.indexOf(e);
+      if (i >= 0) merged.splice(i, 1);
+    }
+  }
+  if (dangling.length) {
+    console.log(`      悬空 LINK 清扫：剔除 ${dangling.length} 条（目标已被剔除）`);
+    for (const d of dangling) console.log(`      - ${d}`);
+    norm.droppedPaths.push(...dangling.map((d) => d.split(" → ")[0]));
+  }
+
+  // mergeEntries 只回 stage 侧条目（asar 侧由本脚本单独写出），所以目录集合
+  // 必须两侧合并推导，否则 asar 的 bin/ 目录不会被显式建出来。
+  const dirs = collectDirs([...merged, ...[...asarPart.keys()].map((path) => ({ path }))]);
+
+  let totalBytes = 0;
+  for (const e of deduped.files) totalBytes += e.size ?? (e.data ? e.data.length : 0);
+  for (const v of asarPart.values()) totalBytes += v.data.length;
+
+  console.log(
+    `[7/8] 合并：目录 ${dirs.length}，文件 ${deduped.files.length + asarPart.size}，` +
+      `LINK ${merged.filter((e) => e.type === "link").length}，未压缩合计 ${human(totalBytes)}`,
+  );
+
+  // ---------------------------------------------------------------- 写出
+  mkdirSync(dirname(opts.out), { recursive: true });
+  // 用同步 fd 而非 createWriteStream：ZipWriter 的 sink 是同步回调，
+  // 且 259 MiB 的产物若先攒在用户态再 end()，statSync 会抢在 flush 之前跑。
+  const fd = openSync(opts.out, "w");
+  const zip = new ZipWriter((buf) => writeSync(fd, buf));
+
+  for (const d of dirs) zip.add(`${d}/`, Buffer.alloc(0), { mode: 0o755 });
+
+  // 目录条目也要计入：中央目录里它们是真实条目（`method=store`、size 0），
+  // 漏掉会让日志与 verify-runtime.mjs 的 EOCD 计数对不上（12413 vs 14800）。
+  let written = dirs.length;
+  const emitFile = (path, data, mode) => {
+    zip.add(path, data, { mode, level: 6 });
+    written += 1;
+  };
+
+  for (const e of deduped.files) {
+    const data = e.data ?? readFileSync(join(part.stage.blobRoot, e.blob.slice(0, 2), e.blob));
+    emitFile(e.path, data, e.mode ?? 0o644);
+  }
+  for (const e of merged) {
+    if (e.type !== "link") continue;
+    // 别名条目：数据区留空，中央目录注释记下本体路径。
+    zip.add(e.path, Buffer.alloc(0), { mode: e.mode ?? 0o755, comment: `LINK:${e.target}` });
+    written += 1;
+  }
+  for (const [path, v] of asarPart) emitFile(path, v.data, v.mode ?? 0o644);
+
+  // 运行时自述，App 侧据此做版本与占位符校验。
+  //
+  // `placeholderPaths` 是**必须**做替换的文件清单：App 侧若用 ZipInputStream
+  // 流式解压，无法在解压时就知道该文件要不要改；给出清单后可以只对这些
+  // 路径做一次定点重写（161 个文件，远少于全量 12,412 条）。
+  // `entries` 是 zip 中央目录的**总条目数**（目录 + 文件 + LINK + 本 manifest），
+  // 与 verify-runtime.mjs 读 EOCD 得到的数字应当一致 —— 这是校验脚本
+  // 判断「产物是否被截断」的依据。`written` 此刻还没算上 manifest 自己，
+  // 所以 +1。
+  const manifest = {
+    schemaVersion: 1,
+    runtimeVersion: "v0.1.0-arm64",
+    rootPlaceholder: ROOT_PLACEHOLDER,
+    termuxPrefix: TERMUX_PREFIX,
+    arch: "aarch64",
+    node: "24.18.0",
+    entries: written + 1,
+    directories: dirs.length,
+    linkEntries: merged.filter((e) => e.type === "link").length,
+    placeholderPaths: norm.placeholderPaths,
+    removedPaths: norm.droppedPaths,
+    builtAt: new Date().toISOString(),
+  };
+  zip.add("kxxy-runtime.json", Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8"), { mode: 0o644 });
+  written += 1;
+
+  zip.finish();
+  closeSync(fd);
+
+  const stats = statSync(opts.out);
+  console.log(`[8/8] 写出 ${opts.out}`);
+  console.log(`      条目 ${written}，zip ${human(stats.size)}（未压缩 ${human(totalBytes)}）`);
+
+  if (opts.manifest) {
+    writeFileSync(opts.manifest, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    console.log(`      manifest → ${opts.manifest}`);
+  }
+}
+
+main();

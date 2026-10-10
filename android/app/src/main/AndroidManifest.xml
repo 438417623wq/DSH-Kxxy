@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DSH Kxxy — Android 清单
+  方案 T：Web-First 宿主。UI 全部由 WebView 承载（官方 React 前端 + 自研宿主管理页），
+  原生只保留引擎监管、前台服务、PTY、权限桥所必需的声明。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14+ 要求前台服务声明类型。specialUse 不被系统限时强杀；
+         对照：dataSync 类型有 6 小时上限，长任务会被中断。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 13+ 通知为运行时权限；引擎状态通知需要 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 外置工作区读写（sessions/workspaces 外置到公开目录，卸载不丢） -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:name=".KxxyApp"
+        android:label="DSH Kxxy"
+        android:icon="@android:drawable/ic_menu_manage"
+        android:theme="@style/Theme.Kxxy"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="true"
+        android:hardwareAccelerated="true">
+
+        <!-- 引导页：引擎未就绪时的唯一原生界面（WebView 无处加载） -->
+        <activity
+            android:name=".BootstrapActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 主界面：纯 WebView 容器，加载 127.0.0.1:3080 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 引擎前台服务：保活第一层 -->
+        <service
+            android:name=".service.EngineService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="local_ai_agent_engine" />
+        </service>
+
+    </application>
+</manifest>

@@ -1,0 +1,17 @@
+{
+  "name": "kxxy-host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH Kxxy 宿主管理页：由官方 webServer 提供 /kxxy 路由，承载引擎状态、扩展中心、权限切换与终端。",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
