@@ -7,38 +7,76 @@
 import https from "node:https";
 import http from "node:http";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync } from "node:fs";
+import {
+  readFileSync, writeFileSync, appendFileSync, renameSync, mkdirSync,
+  existsSync, statSync, openSync, closeSync, writeSync, rmSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 const UA = "dsh-kxxy-runtime-builder/1.0";
 
-/** 带重试的 GET，返回 Buffer。npmmirror/Termux 偶发 TLS 断连，必须重试。 */
-export async function fetchBuffer(url, { retries = 4, timeoutMs = 180_000 } = {}) {
+/**
+ * 带重试的 GET，返回 Buffer。npmmirror/Termux 偶发 TLS 断连，必须重试。
+ *
+ * ⚠️ 除了 socket 空闲超时（req.setTimeout，对端慢滴滴几字节就会复位），
+ * 还必须有**墙钟硬超时**：实测 libllvm（29 MB）会在「每几秒来几个字节」的
+ * 连接上无限挂起 —— socket 永不空闲、重试永不触发。墙钟到点直接 destroy，
+ * 走重试重新建连（慢连接通常是服务端/中间盒的问题，重连就好）。
+ */
+export async function fetchBuffer(url, { retries = 4, timeoutMs = 180_000, hardTimeoutMs = 150_000 } = {}) {
   let lastErr;
   for (let attempt = 1; attempt <= retries; attempt += 1) {
     try {
       return await new Promise((resolve, reject) => {
+        let settled = false;
         const mod = url.startsWith("https:") ? https : http;
         const req = mod.get(url, { headers: { "user-agent": UA } }, (res) => {
           if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
             res.resume();
-            resolve(fetchBuffer(new URL(res.headers.location, url).toString(), { retries, timeoutMs }));
+            settled = true;
+            clearTimeout(hardTimer);
+            resolve(fetchBuffer(new URL(res.headers.location, url).toString(), { retries, timeoutMs, hardTimeoutMs }));
             return;
           }
           if (res.statusCode !== 200) {
             res.resume();
+            settled = true;
+            clearTimeout(hardTimer);
             reject(new Error(`HTTP ${res.statusCode} ${url}`));
             return;
           }
           const chunks = [];
           res.on("data", (c) => chunks.push(c));
-          res.on("end", () => resolve(Buffer.concat(chunks)));
-          res.on("error", reject);
+          res.on("end", () => {
+            settled = true;
+            clearTimeout(hardTimer);
+            resolve(Buffer.concat(chunks));
+          });
+          res.on("error", (e) => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(hardTimer);
+              reject(e);
+            }
+          });
         });
-        req.on("error", reject);
+        req.on("error", (e) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(hardTimer);
+            reject(e);
+          }
+        });
         req.setTimeout(timeoutMs, () => {
           req.destroy(new Error(`timeout after ${timeoutMs}ms: ${url}`));
         });
+        const hardTimer = setTimeout(() => {
+          if (!settled) {
+            req.destroy(new Error(`hard timeout after ${hardTimeoutMs}ms: ${url}`));
+            settled = true;
+            reject(new Error(`hard timeout after ${hardTimeoutMs}ms: ${url}`));
+          }
+        }, hardTimeoutMs);
       });
     } catch (err) {
       lastErr = err;
@@ -51,16 +89,184 @@ export async function fetchBuffer(url, { retries = 4, timeoutMs = 180_000 } = {}
   throw lastErr;
 }
 
-/** 下载到文件，已存在且非空则跳过（构建可续跑）。 */
-export async function downloadTo(url, dest) {
+/** 下载到文件，已存在且非空则跳过（构建可续跑）。
+ *
+ * 两层抗慢策略（都来自对 packages.termux.dev 的实测）：
+ *
+ * 1. **限速是每连接的**（单流 ~30 KB/s，6 并行 ~6 倍聚合），大文件走
+ *    并行分段：探测总长 → 切 4 MiB 段 → N 个 worker 各用独立连接拉自己的段
+ *    （段内按 512 KiB 块请求，块级重试；段完成才落盘）→ 顺序拼装 → 原子改名。
+ * 2. 服务器不认 Range（回 200 全量）时退回单流断点续传（.part 追加）。
+ *
+ * 两种路径最后都做「大小 == Content-Length」校验，杜绝半截文件冒充缓存。
+ */
+export async function downloadTo(url, dest, {
+  concurrency = 4,
+  spanBytes = 4 * 1024 * 1024,
+  chunkBytes = 512 * 1024,
+  chunkTimeoutMs = 60_000,
+} = {}) {
   if (existsSync(dest) && statSync(dest).size > 0) return "cached";
   mkdirSync(dirname(dest), { recursive: true });
-  const buf = await fetchBuffer(url);
-  // 先写 .part 再原子改名：避免半截文件被下次运行当作缓存命中
-  const tmp = `${dest}.part`;
-  writeFileSync(tmp, buf);
-  renameSync(tmp, dest);
+  const part = `${dest}.part`;
+
+  // ── 探测总长（Range: bytes=0-0）──────────────────────────────────
+  let total = null;
+  try {
+    const probe = await fetchChunk(url, 0, 0, chunkTimeoutMs);
+    if (probe.status === 206 && probe.total) total = probe.total;
+  } catch {
+    // 探测失败按不支持 Range 处理，走单流
+  }
+
+  if (total === null) {
+    return singleStreamResume(url, dest, part, chunkTimeoutMs);
+  }
+
+  // 上一次运行已经拿全但没来得及改名 → 直接采用
+  if (existsSync(part) && statSync(part).size === total) {
+    renameSync(part, dest);
+    return "ok";
+  }
+
+  // ── 并行分段 ─────────────────────────────────────────────────────
+  const spans = [];
+  for (let start = 0; start < total; start += spanBytes) {
+    spans.push([start, Math.min(start + spanBytes, total) - 1]);
+  }
+  const tmpDir = `${dest}.parts`;
+  rmSync(tmpDir, { recursive: true, force: true });
+  mkdirSync(tmpDir, { recursive: true });
+
+  try {
+    let next = 0;
+    const worker = async () => {
+      for (;;) {
+        const i = next += 1;
+        if (i > spans.length) return;
+        const [s, e] = spans[i - 1];
+        await downloadSpan(url, s, e, join(tmpDir, String(i - 1)), chunkBytes, chunkTimeoutMs);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, spans.length) }, () => worker()),
+    );
+
+    const fd = openSync(part, "w");
+    try {
+      for (let i = 0; i < spans.length; i += 1) {
+        const buf = readFileSync(join(tmpDir, String(i)));
+        writeSync(fd, buf);
+      }
+    } finally {
+      closeSync(fd);
+    }
+    if (statSync(part).size !== total) {
+      throw new Error(`size mismatch after assembly: ${statSync(part).size}/${total}: ${url}`);
+    }
+    renameSync(part, dest);
+    return "ok";
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+/** 单个 worker 拉一段 [start, end]：按块请求、块级重试（带退避），段成功才写 tmp。 */
+async function downloadSpan(url, start, end, tmp, chunkBytes, chunkTimeoutMs) {
+  const parts = [];
+  let pos = start;
+  while (pos <= end) {
+    const stop = Math.min(pos + chunkBytes - 1, end);
+    let buf = null;
+    for (let retry = 0; retry < 5 && !buf; retry += 1) {
+      try {
+        const res = await fetchChunk(url, pos, stop, chunkTimeoutMs);
+        if (res.status !== 206) throw new Error(`expected 206, got ${res.status}`);
+        if (!res.buf || res.buf.length === 0) throw new Error("empty chunk body");
+        buf = res.buf;
+      } catch {
+        // 块失败退避重试（连接被掐断是常态；连续失败说明服务端在限流，
+        // 拉长间隔给对端冷却窗口）
+        await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+      }
+    }
+    if (!buf) throw new Error(`span ${start}-${end} failed at ${pos}: ${url}`);
+    parts.push(buf);
+    pos += buf.length;
+  }
+  writeFileSync(tmp, Buffer.concat(parts));
+}
+
+/** 服务器不支持 Range 时的兜底：单流 + .part 断点续传。 */
+async function singleStreamResume(url, dest, part, chunkTimeoutMs) {
+  for (let round = 0; round < 60; round += 1) {
+    const have = existsSync(part) ? statSync(part).size : 0;
+    let res;
+    try {
+      res = await fetchChunk(url, have, null, chunkTimeoutMs);
+    } catch {
+      await new Promise((r) => setTimeout(r, 2_000)); // 别用瞬时重试打服务器
+      continue;
+    }
+    if (res.done) break;
+    if (res.buf && res.buf.length > 0) {
+      if (res.status === 200 && have > 0) writeFileSync(part, res.buf);
+      else appendFileSync(part, res.buf);
+    }
+    if (res.total === null && (!res.buf || res.buf.length === 0)) break;
+  }
+  if (!existsSync(part)) throw new Error(`download failed: ${url}`);
+  const size = statSync(part).size;
+  if (size === 0) throw new Error(`incomplete download 0 bytes: ${url}`);
+  renameSync(part, dest);
   return "ok";
+}
+
+/**
+ * 拉一个 Range 块 [from, to]（to=null 表示到文件尾）。
+ * 返回 {status, buf, total, done}。
+ */
+function fetchChunk(url, from, to, hardTimeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimer);
+      fn(val);
+    };
+    const range = to === null ? (from > 0 ? `bytes=${from}-` : undefined) : `bytes=${from}-${to}`;
+    const mod = url.startsWith("https:") ? https : http;
+    const req = mod.get(
+      url,
+      { headers: { "user-agent": UA, ...(range ? { range } : {}) } },
+      (res) => {
+        if (res.statusCode === 416) {
+          res.resume();
+          finish(resolve, { status: 416, buf: null, total: null, done: true });
+          return;
+        }
+        const total = res.statusCode === 206
+          ? Number(String(res.headers["content-range"] ?? "").split("/")[1]) || null
+          : Number(res.headers["content-length"]) || null;
+        if (res.statusCode !== 200 && res.statusCode !== 206) {
+          res.resume();
+          finish(reject, new Error(`HTTP ${res.statusCode} ${url}`));
+          return;
+        }
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => finish(resolve, { status: res.statusCode, buf: Buffer.concat(chunks), total, done: false }));
+        res.on("error", (e) => finish(reject, e));
+      },
+    );
+    req.on("error", (e) => finish(reject, e));
+    req.setTimeout(60_000, () => req.destroy());
+    const hardTimer = setTimeout(() => {
+      req.destroy();
+      finish(reject, new Error(`chunk hard timeout after ${hardTimeoutMs}ms: ${url}`));
+    }, hardTimeoutMs);
+  });
 }
 
 // ---------------------------------------------------------------- Termux apt

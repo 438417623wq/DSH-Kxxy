@@ -58,7 +58,7 @@ class RuntimeInstaller(private val ctx: Context) {
     /**
      * 幂等安装。已安装且完整时立即返回。
      *
-     * 完整性判定用**五锚点探针**而非单一版本戳 —— 参考项目 m1.13 事故：
+     * 完整性判定用**七锚点探针**而非单一版本戳 —— 参考项目 m1.13 事故：
      * 覆盖升级后 `@deepseek-ai` 目录只剩空壳（JS 文件未落地）但版本戳已写成功，
      * 于是「引擎存在 + 版本匹配」直接跳装，导致 MODULE_NOT_FOUND 反复重启。
      */
@@ -68,6 +68,7 @@ class RuntimeInstaller(private val ctx: Context) {
         if (isComplete(root)) {
             Log.i(TAG, "runtime already installed and complete")
             onProgress.onProgress(1f)
+            ensureExtensionPool(root)
             return
         }
 
@@ -90,12 +91,67 @@ class RuntimeInstaller(private val ctx: Context) {
         restoreExecBits(root)
         writeStamp(root)
 
+        // bin/ 与 lib/ 被整体替换，扩展中心装进 engine/{bin,lib} 的链接/副本
+        // 全部丢失。extensions/ 在扩展侧留有 .links.json，这里立一个标记，
+        // kxxy-host 插件启动时据此重建（五项改进方案 §2.4「升级后的自愈」）。
+        runCatching {
+            val relink = File(EngineConfig.extensionsRoot(ctx), RELINK_MARKER)
+            relink.parentFile?.mkdirs()
+            relink.writeText(System.currentTimeMillis().toString())
+        }.onFailure { Log.w(TAG, "relink marker failed: ${it.message}") }
+
         Log.i(TAG, "runtime install complete")
         onProgress.onProgress(1f)
+        ensureExtensionPool(root)
     }
 
     /**
-     * 五锚点完整性探针。
+     * 把 APK `assets/ext-pool/` 里的扩展包池拷到 `<engineRoot>/ext-pool/`。
+     *
+     * 引擎（Node 进程）读不到 APK asset 流，而扩展中心的「获取」是纯本地解包
+     * （五项改进方案 §4.3 第二层）—— 所以原生层先把包池落盘。幂等：按
+     * 「文件存在且大小一致」跳过，APK 升级带新包时会自动补齐。
+     *
+     * 全程 runCatching：包池缺失（旧 APK / 未跑 fetch-extensions）不是致命错误，
+     * 扩展中心会把对应条目标成「不可用」而不是崩掉引擎。
+     */
+    private fun ensureExtensionPool(root: File) {
+        runCatching {
+            val names = ctx.assets.list(POOL_ASSET_DIR) ?: return
+            if (names.isEmpty()) return
+            val poolDir = File(root, "ext-pool")
+            poolDir.mkdirs()
+            var copied = 0
+            for (name in names) {
+                val dest = File(poolDir, name)
+                val assetSize = try {
+                    ctx.assets.openFd("$POOL_ASSET_DIR/$name").use { it.length }
+                } catch (_: Exception) {
+                    // openFd 对压缩存储的 asset 会抛 FileNotFoundException。
+                    // 无法做大小校验时退化为「存在即跳过」—— 压缩 asset 的逐字节
+                    // 对拷每次启动都要重来，对 1 GiB 级包池不可接受。
+                    // build.gradle.kts 已对 .gz 配 noCompress，正常不会走到这。
+                    if (dest.isFile && dest.length() > 0) continue
+                    -1L
+                }
+                if (dest.isFile && assetSize >= 0 && dest.length() == assetSize) continue
+                ctx.assets.open("$POOL_ASSET_DIR/$name").use { input ->
+                    val tmp = File(poolDir, "$name.part")
+                    FileOutputStream(tmp).use { out -> input.copyTo(out) }
+                    if (dest.exists()) dest.delete()
+                    if (!tmp.renameTo(dest)) {
+                        tmp.copyTo(dest, overwrite = true)
+                        tmp.delete()
+                    }
+                }
+                copied++
+            }
+            if (copied > 0) Log.i(TAG, "ext-pool: $copied file(s) extracted to ${poolDir.absolutePath}")
+        }.onFailure { Log.w(TAG, "ensureExtensionPool failed: ${it.message}") }
+    }
+
+    /**
+     * 七锚点完整性探针。
      *
      * 任一锚点缺失即认为需要重装。刻意不只看版本戳 —— 见方法注释上方的 m1.13 事故。
      */
@@ -130,7 +186,75 @@ class RuntimeInstaller(private val ctx: Context) {
             return false
         }
 
+        // 锚点 6：WebView 兼容层在位且为当前版本。
+        // 真机事故：ROM 自带的 WebView 可能停留在 Chrome 116 之前（如
+        // com.google.android.webview 104.0.5112.97），而官方前端插件 bundle
+        // 用了 AbortSignal.any 等新 API，缺失时连接层抛错被静默吞掉，表现为
+        // 设置面板「权限」显示英文 key、模型页 provider 列表整块空白；后续又
+        // 发现同一 WebView 不支持 dvh 单位，导致目录选择对话框列表整片空白。
+        // kxxy-host 靠这个脚本给页面打补丁；它若缺失，症状会静默复现。
+        //
+        // 只判「文件存在」不够：老设备上已有旧版兼容层，升级 APK 后文件仍在，
+        // 会带着不含新补丁的旧脚本跳过重装。因此按版本标记判定，标记写在
+        // compat.js 首行（`kxxy-webview-compat@N`），改动该文件时必须同步递增。
+        if (!File(root, COMPAT_LAYER_FILE).isFile) {
+            Log.w(TAG, "runtime probe: webview compat layer missing, forcing reinstall")
+            return false
+        }
+        if (!compatLayerIsCurrent(root)) {
+            Log.w(TAG, "runtime probe: webview compat layer outdated, forcing reinstall")
+            return false
+        }
+
+        // 锚点 7：Android 原生 PTY 绑定在位且为当前版本。
+        // 真机事故：「新建终端」报
+        // `subprocess-local: terminal inspection is unsupported on platform android`。
+        // 两处原因：① 上游 createProcessInspector 只认 linux/darwin/win32，而
+        // Android 上 process.platform == "android"；② node-pty 在 Android 上没有
+        // 官方预编译产物，早期构建注入的是抛错空壳。两者都由构建期补丁修掉，
+        // 但老设备的 runtime 不会因此重装（版本戳不变），必须参与完整性判定。
+        //
+        // 与锚点 6 同理，只判存在不够：老设备上可能有旧的抛错空壳，按版本标记判定。
+        if (!File(root, PTY_NODE_BINDING).isFile) {
+            Log.w(TAG, "runtime probe: android pty binding missing, forcing reinstall")
+            return false
+        }
+        if (!markerIsCurrent(root, PTY_NODE_WRAPPER, PTY_NODE_MARKER)) {
+            Log.w(TAG, "runtime probe: android pty binding outdated, forcing reinstall")
+            return false
+        }
+
         return true
+    }
+
+    /**
+     * 校验兼容层脚本的版本标记是否与当前构建一致。
+     *
+     * 读不到文件、读不到标记、标记不匹配都视为过期。这里刻意不做「宽松放行」
+     * —— 判错的代价是一次重装（几百 MB，一次性），而漏判的代价是老设备上
+     * 静默复现已经修过的显示缺陷，用户无从察觉。
+     */
+    private fun compatLayerIsCurrent(root: File): Boolean =
+        markerIsCurrent(root, COMPAT_LAYER_FILE, COMPAT_LAYER_MARKER)
+
+    /**
+     * 通用版本标记探针：读文件头部，看是否含指定标记。
+     *
+     * 标记约定写在文件首行，所以只读前若干字节，避免为一个大文件整体读入。
+     */
+    private fun markerIsCurrent(root: File, relativePath: String, marker: String): Boolean {
+        val file = File(root, relativePath)
+        return try {
+            val head = file.inputStream().use { input ->
+                val buffer = ByteArray(COMPAT_MARKER_PROBE_BYTES)
+                val read = input.read(buffer)
+                if (read <= 0) "" else String(buffer, 0, read, Charsets.UTF_8)
+            }
+            head.contains(marker)
+        } catch (e: Exception) {
+            Log.w(TAG, "runtime probe: cannot read marker of $relativePath: ${e.message}")
+            false
+        }
     }
 
     /**
@@ -433,6 +557,20 @@ class RuntimeInstaller(private val ctx: Context) {
                 .forEach { if (it.setExecutable(true, false)) changed++ }
         }
 
+        // openjdk-21 装在 lib/jvm/java-21-openjdk/bin/（Termux 布局），不在
+        // bin/ 与 usr/bin/ 的扫描范围内 —— 漏掉的表现是 d8/apksigner/gradle
+        // 调 java 时报 Permission denied（与缺陷 B 的 git-remote-http 同型）。
+        // 只对 /bin/ 路径段且确为 ELF/脚本的动作，避免把 javadoc HTML 一并 chmod。
+        val jvm = File(root, "lib/jvm")
+        if (jvm.isDirectory) {
+            jvm.walkTopDown()
+                .maxDepth(MAX_SCAN_DEPTH)
+                .filter { it.isFile }
+                .filter { f -> f.path.replace('\\', '/').contains("/bin/") }
+                .filter { isElfOrScript(it) }
+                .forEach { if (it.setExecutable(true, false)) changed++ }
+        }
+
         Log.i(TAG, "restoreExecBits: $changed file(s) made executable")
     }
 
@@ -472,15 +610,49 @@ class RuntimeInstaller(private val ctx: Context) {
         /** @deepseek-ai 下文件数下限，用于识破「只剩空壳」。 */
         private const val MIN_DSH_AI_FILES = 100
 
+        /**
+         * WebView 兼容层的版本标记，写在 kxxy-host/web/compat.js 首行。
+         *
+         * 老设备升级 APK 时 runtime 版本戳不变（仍为 [RUNTIME_VERSION]），
+         * 光判「文件存在」会让它们带着不含新补丁的旧兼容层跳过重装，症状
+         * 静默复现。改动 compat.js 时必须同步递增此处的编号。
+         */
+        private const val COMPAT_LAYER_MARKER = "kxxy-webview-compat@2"
+
+        /** 兼容层脚本路径，锚点 6 与 [compatLayerIsCurrent] 共用。 */
+        private const val COMPAT_LAYER_FILE = "lib/node_modules/kxxy-host/web/compat.js"
+
+        /**
+         * Android 原生 PTY 绑定（锚点 7）。
+         *
+         * 前者是自研 N-API 模块（arm64 共享库），后者是 JS 包装层；
+         * 标记写在包装层首行，改动 tools/prebuilt/node-pty-android/ 下任何
+         * 文件后都必须递增编号，并同步 [PTY_NODE_MARKER]。
+         */
+        private const val PTY_NODE_BINDING =
+            "lib/node_modules/node-pty/prebuilds/android-arm64/dsh_pty_node.node"
+        private const val PTY_NODE_WRAPPER = "lib/node_modules/node-pty/lib/index.js"
+        private const val PTY_NODE_MARKER = "kxxy-pty-node@1"
+
+        /** 读版本标记时探测的头部字节数；标记都写在首行，取小值即可。 */
+        private const val COMPAT_MARKER_PROBE_BYTES = 256
+
         private const val MAX_SCAN_DEPTH = 6
 
         /**
          * 预估未压缩总量（字节），仅用于进度条分母。
          *
-         * 实测值 259.45 MiB（stage 812 本体 + asar 11,322 文件 + 421 别名），
-         * 取 260 MiB 略高一点，让进度条到 95% 就被 clamp，不会溢出。
+         * 实测值随内置档位变化：基线 22 种子时是 259.45 MiB；④ 全能精选档
+         * （220 包，含 openjdk-21 / clang / llvm 闭包）约 1.37 GiB。取 1.4 GiB
+         * 略高一点，让进度条到 95% 就被 clamp，不会溢出。
          */
-        private const val TOTAL_UNCOMPRESSED_BYTES = 260L * 1024 * 1024
+        private const val TOTAL_UNCOMPRESSED_BYTES = 1_400L * 1024 * 1024
+
+        /** APK 内扩展包池的 asset 目录名。 */
+        private const val POOL_ASSET_DIR = "ext-pool"
+
+        /** 升级后重建扩展链接的标记文件名（位于 extensions/ 下）。 */
+        private const val RELINK_MARKER = ".relink"
 
         private val EXECUTABLE_NAMES = setOf(
             "rg", "esbuild", "node", "sharp", "swc", "dprint", "biome",

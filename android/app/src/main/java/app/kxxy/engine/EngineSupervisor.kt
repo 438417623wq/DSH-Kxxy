@@ -87,6 +87,9 @@ class EngineSupervisor(private val ctx: Context) {
     @Volatile
     private var heartbeatJob: Job? = null
 
+    @Volatile
+    private var requestJob: Job? = null
+
     /** 用户显式退出标记：置位后所有自动启动路径都必须跳过。 */
     private val userStopped = AtomicBoolean(false)
 
@@ -122,6 +125,43 @@ class EngineSupervisor(private val ctx: Context) {
             }
         }
         startHeartbeat()
+        startRequestWatcher()
+    }
+
+    /**
+     * 引擎请求文件的轮询消费者（五项改进方案 §7-2 方案 A）。
+     *
+     * 挂在 start() 的生命周期里，与心跳同一条机制：文件交换是引擎插件
+     * （kxxy-host，跑在引擎进程内）调用原生层能力的唯一通道 —— 进程没法
+     * 重启自己，而宿主管理页的「重启引擎」「终端快捷键」都需要原生层配合。
+     *
+     * 消费顺序刻意是「先删文件、再执行动作」：动作执行途中被再次轮询
+     * 命中会重复触发；先删顶多丢一次请求（下一次点按钮重发即可）。
+     */
+    private fun startRequestWatcher() {
+        if (requestJob?.isActive == true) return
+        requestJob = scope.launch {
+            while (true) {
+                delay(REQUEST_POLL_MS)
+
+                val restartReq = EngineConfig.restartRequestFile(ctx)
+                if (restartReq.isFile) {
+                    runCatching { restartReq.delete() }
+                    Log.i(TAG, "restart.request consumed -> restarting engine")
+                    restart()
+                    continue
+                }
+
+                val stdinReq = EngineConfig.stdinRequestFile(ctx)
+                if (stdinReq.isFile) {
+                    val bytes = runCatching { stdinReq.readBytes() }.getOrNull()
+                    runCatching { stdinReq.delete() }
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        process?.write(bytes)
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -150,6 +190,8 @@ class EngineSupervisor(private val ctx: Context) {
     suspend fun stop(graceMs: Long = 3_500L) {
         heartbeatJob?.cancel()
         heartbeatJob = null
+        requestJob?.cancel()
+        requestJob = null
         supervisionJob?.cancel()
         supervisionJob = null
         withContext(Dispatchers.IO) {
@@ -305,7 +347,8 @@ class EngineSupervisor(private val ctx: Context) {
      *
      * 字段名与 `plugins/kxxy-host/lib/index.js` 的 `collectEngineState` 对齐：
      * 插件用 `Object.assign(state, JSON.parse(...))` 覆盖，所以这里给的键
-     * （`supervisor` / `pid` / `uptimeSec` / `memoryMB` / `installProgress`）
+     * （`supervisor` / `pid` / `uptimeSec` / `memoryMB` / `installProgress` /
+     * `effectivePrivMode` / `permissions` / `privAvailable`）
      * 会直接出现在 `/kxxy/api/state` 的响应里。
      *
      * 全程 runCatching：状态发布绝不能让监管循环因磁盘问题中断。
@@ -323,6 +366,9 @@ class EngineSupervisor(private val ctx: Context) {
                 append("  \"memoryMB\": $memoryMB,\n")
                 append("  \"installProgress\": ${_installProgress.value},\n")
                 append("  \"port\": ${EngineConfig.DEFAULT_PORT},\n")
+                append("  \"effectivePrivMode\": \"$effectivePrivMode\",\n")
+                append("  \"permissions\": ${permissionSnapshot()},\n")
+                append("  \"privAvailable\": ${privAvailability()},\n")
                 append("  \"updatedAt\": ${System.currentTimeMillis()}\n")
                 append("}\n")
             }
@@ -337,6 +383,51 @@ class EngineSupervisor(private val ctx: Context) {
                 tmp.delete()
             }
         }.onFailure { Log.w(TAG, "publishState failed: ${it.message}") }
+    }
+
+    /**
+     * Android 能力开关快照（设置页「系统权限」卡片的数据源）。
+     * 全部是即时查询，绕开「权限在设置里被收回但 UI 还显示已授」的陈旧态。
+     */
+    private fun permissionSnapshot(): String {
+        val notifications = runCatching {
+            val nm = ctx.getSystemService(android.app.NotificationManager::class.java)
+            nm?.areNotificationsEnabled() ?: false
+        }.getOrDefault(false)
+        val allFiles = runCatching {
+            android.os.Build.VERSION.SDK_INT >= 30 && android.os.Environment.isExternalStorageManager()
+        }.getOrDefault(false)
+        val battery = runCatching {
+            val pm = ctx.getSystemService(android.os.PowerManager::class.java)
+            pm?.isIgnoringBatteryOptimizations(ctx.packageName) ?: false
+        }.getOrDefault(false)
+        // Android 10 及以下走 legacy storage 的运行时权限；11+ 由「所有文件访问」
+        // 接管，此字段报告 null 让前端隐藏该行。
+        val legacyStorage: Boolean? = if (android.os.Build.VERSION.SDK_INT > 29) {
+            null
+        } else {
+            android.content.pm.PackageManager.PERMISSION_GRANTED ==
+                ctx.checkPermission(
+                    android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                    android.os.Process.myPid(),
+                    android.os.Process.myUid(),
+                )
+        }
+        return buildString {
+            append("{\n")
+            append("    \"notifications\": $notifications,\n")
+            append("    \"allFiles\": $allFiles,\n")
+            append("    \"battery\": $battery,\n")
+            append("    \"legacyStorage\": ${legacyStorage ?: "null"}\n")
+            append("  }")
+        }
+    }
+
+    /** root/shizuku 可用性（segmented 控件灰化依据，均只 stat 不弹框）。 */
+    private fun privAvailability(): String {
+        val root = Privilege.rootAvailableMinimal()
+        val shizuku = Privilege.shizukuInstalled(ctx)
+        return "{\"root\": $root, \"shizuku\": $shizuku}"
     }
 
     /** 读 /proc/<pid>/status 的 VmRSS（KB）。读不到返回 0。 */
@@ -356,19 +447,50 @@ class EngineSupervisor(private val ctx: Context) {
     @Volatile
     private var startedAtMs: Long = 0L
 
+    /** 本次 spawn 实际生效的权限等级（root 探测失败会回落 normal，要与请求值区分）。 */
+    @Volatile
+    private var effectivePrivMode: String = "normal"
+
     private suspend fun spawnEngine(): EngineProcess {
         val logOffset = EngineConfig.logFile(ctx).let { if (it.isFile) it.length() else 0L }
+
+        // 权限等级：前端写 kxxy-prefs.json + 一键重启 → 这里消费（此前硬编码 normal，
+        // 管理页的权限等级开关是死的）。root 需要真提权，见下；shizuku 本期只改
+        // 引擎可感知的环境变量，不改变进程 uid（Shizuku 的 binder 能力给不了子进程）。
+        val requestedMode = EngineConfig.readPrivMode(ctx)
+        var effectiveMode = requestedMode
+        var rootPrefix: List<String>? = null
+
+        if (requestedMode == "root") {
+            val prefix = Privilege.usableSuPrefix()
+            if (prefix == null) {
+                Log.w(TAG, "privMode=root requested but no usable su; falling back to normal")
+                effectiveMode = "normal"
+            } else {
+                // 参考项目 m1.26 事故链的两道防护：root 启动会把 dsh-home 写成
+                // root 属主（之后非 root 启动全 EACCES），先修属主再备份。
+                if (Privilege.dshHomeNeedsOwnershipFix(ctx)) {
+                    Log.w(TAG, "dsh-home ownership broken (previous root run?), fixing")
+                    Privilege.fixHomeOwnership(ctx)
+                }
+                Privilege.backupHome(ctx)
+                rootPrefix = prefix
+            }
+        }
+
         val proc = EngineProcess.spawn(
             nodeBin = EngineConfig.nodeBin(ctx),
             entryJs = EngineConfig.dshEntry(ctx),
             cwd = EngineConfig.workspaces(ctx),
-            env = EngineConfig.buildEnv(ctx, EngineConfig.DEFAULT_PORT, "normal"),
+            env = EngineConfig.buildEnv(ctx, EngineConfig.DEFAULT_PORT, effectiveMode),
             logFile = EngineConfig.logFile(ctx),
             patchPath = EngineConfig.overlayFile(ctx).absolutePath,
+            rootPrefix = rootPrefix,
         )
         // 记录日志基线，供 token 提取使用
         logBaseline = logOffset
         startedAtMs = System.currentTimeMillis()
+        effectivePrivMode = effectiveMode
         return proc
     }
 
@@ -462,5 +584,13 @@ class EngineSupervisor(private val ctx: Context) {
          * 时长会以肉眼可见的步长跳变。写一个几百字节的文件本身极廉价。
          */
         private const val HEARTBEAT_INTERVAL_MS = 5_000L
+
+        /**
+         * 引擎请求文件的轮询间隔。
+         *
+         * 方案 §7-2 原定 2 秒；实际取 1 秒 —— 终端快捷键走同一通道，2 秒的
+         * Ctrl+C 延迟已到肉眼可感的程度。stat 一次几百字节的文件开销可忽略。
+         */
+        private const val REQUEST_POLL_MS = 1_000L
     }
 }

@@ -1,0 +1,13 @@
+{
+  "name": "node-pty",
+  "version": "1.0.0-android-kxxy",
+  "description": "Android PTY binding for dsh-kxxy (self-built, N-API, arm64)",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "os": [
+    "android"
+  ],
+  "cpu": [
+    "arm64"
+  ]
+}

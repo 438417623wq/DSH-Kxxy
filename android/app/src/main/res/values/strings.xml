@@ -28,4 +28,7 @@
     <!-- 主界面 -->
     <string name="main_loading">正在加载界面…</string>
     <string name="main_error">界面加载失败，请重启引擎后重试。</string>
+
+    <!-- 下载通知 -->
+    <string name="download_notification_description">正在下载到 Download/kxxy/</string>
 </resources>

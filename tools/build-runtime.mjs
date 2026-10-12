@@ -121,6 +121,12 @@ const TERMUX_APP_SCRIPTS = new Set([
   "bin/termux-exec-ld-preload-lib",
   "bin/termux-exec-system-linker-exec",
   "bin/termux-fix-shebang",
+  // ④ 档新增的伴生脚本：功能全部依赖 Termux 本体/Termux:API 应用，
+  // 在 Kxxy 里必然失败（Kxxy 的 su 路径由原生层 Privilege.kt +
+  // engine/bin/su 闸门承担，termux-api 的硬件通道后续由原生层实现）。
+  "bin/termux-api-start",
+  "bin/termux-api-stop",
+  "bin/tsu",
   "bin/dalvikvm",
   "bin/pkg",
   "etc/motd",
@@ -280,9 +286,19 @@ function normaliseStageFiles(files, blobRoot) {
     let text = buf.toString("latin1");
     if (!text.includes("com.termux")) continue;
 
+    let changed = false;
     for (const [needle, repl] of PATH_REWRITES) {
-      if (text.includes(needle)) text = text.split(needle).join(repl);
+      if (text.includes(needle)) {
+        text = text.split(needle).join(repl);
+        changed = true;
+      }
     }
+
+    // 只有真的发生了替换才升级为内存条目并声明进 placeholderPaths。
+    // ④ 档新增的 python 包里有一批只把 com.termux 写在注释/PyPI URL 里的
+    // 文件（proot_distro/constants.py、*.dist-info/METADATA）—— 它们改不动
+    // 也无需改，声明出去只会让设备端「声明了却没有占位符」对不上账。
+    if (!changed) continue;
 
     const out = Buffer.from(text, "latin1");
     files[i] = { path: f.path, type: "file", data: out, mode: f.mode, size: out.length };
@@ -322,6 +338,67 @@ function corepackWrappers() {
     { path: "bin/npm", data: mk("npm.js"), mode: 0o755 },
     { path: "bin/npx", data: mk("npx.js"), mode: 0o755 },
   ];
+}
+
+/**
+ * 从官方主题模块抽取全部 token 定义块，生成 `plugins/kxxy-host/web/theme.css`。
+ *
+ * 为什么这么做（二轮问题 ② 的 B 方案）：宿主管理页过去用一套手造色板，和官方
+ * 对话界面（dsh-client-ui-theme 的 neutral-bluish + deepseek 色板）肉眼可见不一致。
+ * 让 host.css 直接消费官方的 `--dsw-alias-*` / `--dsw-static-*` 变量、把定义块
+ * 原样搬过来 —— 官方以后调色，重跑构建自动跟齐，管理页永远和对话页同源。
+ *
+ * 抽取分两步（该模块把 CSS 存成 JS 双引号字符串常量，直接按花括号扫会把 JS
+ * 代码块也抓进来）：
+ *   1. 收集所有含 `--dsw-` 的双引号字符串字面量 → 得到纯 CSS 片段；
+ *   2. 解析 selector{block}，只保留**定义了** token 的块（`--dsw-x:` 形态）。
+ *      组件样式块（如 `.v01cdW_group{color:var(--dsw-alias-…)}`）只引用不定义，
+ *      会被 var() 后无冒号这条判据自然剔除。重复块去重。
+ */
+function extractOfficialTheme(asarFiles) {
+  const entry = asarFiles.get(
+    "lib/node_modules/@deepseek-ai/dsh-client-ui-theme/lib/client.js",
+  );
+  if (!entry) {
+    console.log("      ⚠️ dsh-client-theme 不在闭包内，跳过 theme.css 生成");
+    return;
+  }
+  const js = entry.data.toString("utf8");
+
+  const fragments = [];
+  for (const m of js.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+    const s = m[1];
+    if (s.includes("--dsw-alias-") || s.includes("--dsw-static-")) fragments.push(s);
+  }
+  if (fragments.length === 0) {
+    console.log("      ⚠️ 主题模块里没有 --dsw token 字符串，跳过 theme.css 生成");
+    return;
+  }
+
+  const cssAll = fragments.join("\n");
+  const blocks = [];
+  const seen = new Set();
+  for (const m of cssAll.matchAll(/([^{}]{1,300})\{([^{}]*)\}/g)) {
+    const selector = m[1].trim();
+    const body = m[2];
+    if (!/--dsw-(?:alias|static)-[\w-]+\s*:/.test(body)) continue;
+    const block = `${selector}{${body}}`;
+    if (seen.has(block)) continue;
+    seen.add(block);
+    blocks.push(block);
+  }
+  if (blocks.length === 0) {
+    console.log("      ⚠️ 未解析出 token 定义块，跳过 theme.css 生成");
+    return;
+  }
+  const header =
+    "/*\n" +
+    " * 官方主题 token（构建期从 @deepseek-ai/dsh-client-ui-theme/lib/client.js 自动抽取）。\n" +
+    " * 请勿手改 —— 改了也会被下次构建覆盖；要调样式请改 host.css 里对变量的引用。\n" +
+    " */\n";
+  const css = header + blocks.join("\n") + "\n";
+  writeFileSync(join(PROJECT, "plugins", "kxxy-host", "web", "theme.css"), css, "utf8");
+  console.log(`      ✓ theme.css：抽取 ${blocks.length} 个 token 块（${css.length} 字节）`);
 }
 
 function main() {
@@ -447,6 +524,8 @@ function main() {
 
   // ---------------------------------------------------------------- 组装
   console.log("[6/8] 生成 corepack 包装器");
+  // 官方主题 token 抽取（必须在 readPluginFiles 之前：产物随插件打包）
+  extractOfficialTheme(asarFiles);
   // 包装器落在 bin/ 而非 lib/node_modules/ 下，因此不能塞进 asarFiles
   // （那个 Map 的键全部以 lib/node_modules/ 开头）；单独一份 Map。
   const asarPart = new Map(asarFiles);

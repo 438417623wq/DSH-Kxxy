@@ -12,10 +12,18 @@ captures/
 .cxx/
 
 # ---- 运行时装配产物 ----
-# runtime.zip 是 tools/build-runtime.mjs 的产物（98.7 MiB / 15104 条目），
+# runtime.zip 是 tools/build-runtime.mjs 的产物（④ 全能精选档 497 MiB / 35250 条目），
 # 由本机 DSH 桌面版的 app.asar + Termux .deb 装配而成，不属于源码。
 # 需要它的人请按 README「三、构建」自行生成。
 android/app/src/main/assets/runtime.zip
+
+# 扩展包池（tools/fetch-extensions.mjs 产物，约 1.0 GiB / 20 项），与 runtime.zip
+# 同理是构建产物；目录清单随包生成于 plugins/kxxy-host/extensions.json。
+android/app/src/main/assets/ext-pool/
+plugins/kxxy-host/extensions.json
+
+# 官方主题 token（构建期抽取产物，见 tools/build-runtime.mjs extractOfficialTheme）
+plugins/kxxy-host/web/theme.css
 
 # ---- 装配中间缓存 ----
 # .cache/debs（下载的 .deb）与 .cache/stage（解包后的 Termux 前缀树），

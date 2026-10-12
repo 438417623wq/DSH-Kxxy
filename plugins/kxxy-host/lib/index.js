@@ -1,7 +1,7 @@
 /**
  * kxxy-host — DSH Kxxy 宿主管理页插件。
  *
- * 设计要点（方案 T）：
+ * 设计要点（方案 T + 五项改进方案 v2）：
  *
  * 1. **复用官方 webServer 的公开扩展点**
  *    官方 `dsh-host-webserver` 的 `WebServer` 类公开四个注册点：
@@ -17,16 +17,26 @@
  *    cookie/token 鉴权。管理 API 直接用官方 authorization 服务判定浏览器信任，
  *    避免自造鉴权带来的绕过风险。
  *
- * 3. **只读优先，写操作走显式 API**
- *    状态查询是 GET，动作（重启引擎、切换权限、装扩展）是 POST，
- *    便于审计与限流。
+ * 3. **动作真做，做不到就明确失败**
+ *    旧版 /kxxy/api/action 恒返回 202（什么都没做），前端却弹「成功」toast。
+ *    现在的动作是分派表：
+ *      restart-engine → 写 restart.request，原生层轮询消费（§7-2 方案 A）
+ *      export-logs    → 真打包 tar.gz，A+B 双写落盘（§7-3）
+ *      set-priv-mode / set-toggle → 写 kxxy-prefs.json
+ *      term-key       → 写 stdin.request，原生层写进引擎 PTY
+ *      install-ext / switch-mirror → 已迁往专用端点，此处明确 400
+ *      未知动作       → 501，让前端抛错回滚按钮而不是假成功
  *
  * @module kxxy-host
  */
 
-import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, existsSync, readdirSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+import * as extinstall from './extinstall.mjs'
+import * as mirror from './mirror.mjs'
+import { tarGzSync } from './tar.mjs'
 
 /** 插件名。 */
 export const name = 'kxxy-host'
@@ -46,6 +56,19 @@ const WEB_DIR = join(HERE, '..', 'web')
 let cachedIndexHtml = null
 
 /**
+ * 主题偏好缓存（三轮优化 ①）。
+ *
+ * 官方对话页的主题偏好存在引擎 `dsh-settings` 服务的 `ui-theme` 命名空间
+ * （字段 `preference` = light/dark/system，默认 system）。这里缓存最近一次
+ * 读到的值供 /kxxy/api/state 轮询带出；POST 主题时同步更新。
+ * `source: 'unavailable'` 表示 settings 服务不可达（前端退回跟随系统）。
+ */
+let themeCache = { preference: 'system', source: 'unavailable' }
+
+/** 主题偏好合法值（与 dsh-client-ui-theme 的 THEME_PREFERENCES 一致）。 */
+const THEME_PREFERENCES = ['light', 'dark', 'system']
+
+/**
  * 读取 web 目录下的静态资源。
  *
  * 刻意不做目录遍历防护的复杂实现 —— 资源名来自固定白名单，
@@ -57,7 +80,6 @@ function readWebAsset(relative) {
   return readFileSync(full)
 }
 
-/** 官方前端的 index.html 路径（用于注入管理页入口）。 */
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -71,6 +93,47 @@ function contentTypeFor(path) {
   const dot = path.lastIndexOf('.')
   if (dot < 0) return 'application/octet-stream'
   return CONTENT_TYPES[path.slice(dot)] ?? 'application/octet-stream'
+}
+
+/**
+ * WebView 兼容层（polyfill）的 inline 脚本，惰性读取后常驻。
+ *
+ * 见 web/compat.js 头部说明。核心事实：ROM 自带的 WebView 版本由系统决定，
+ * 应用无法自带；官方前端插件 bundle 用了 `AbortSignal.any`（Chrome 116+），
+ * 在旧 WebView 上抛 TypeError 并被连接层静默吞掉，表现为设置面板权限区
+ * 渲染英文 key、模型区列表空白。
+ */
+let cachedCompatScript = null
+
+function compatScript() {
+  if (cachedCompatScript === null) {
+    try {
+      const raw = readFileSync(join(WEB_DIR, 'compat.js'), 'utf8')
+      // inline script 内不得出现 `</script`，否则会提前闭合标签
+      cachedCompatScript = raw.replace(/<\/script/gi, '<\\/script')
+    } catch {
+      cachedCompatScript = ''
+    }
+  }
+  return cachedCompatScript
+}
+
+/**
+ * 把兼容层插到 `<head>` 开标签之后（早于一切 module/classic script）。
+ *
+ * 时序是硬约束：官方前端入口是 `<head>` 内的 `<script type="module">`，
+ * 兼容层必须排在它前面才能在其求值前装好 API。官方 `renderIndex` 的
+ * 结构化注入行也插在同一位置、且在 tapIndex **之前**，因此本函数用
+ * 相同的锚点即可，无需关心行顺序。
+ */
+function injectCompat(html) {
+  const script = compatScript()
+  if (script === '') return html
+  const markup = `<script data-kxxy-compat>${script}</script>`
+  const open = /<head(?:\s[^>]*)?>/i.exec(html)
+  if (open === null) return `${markup}${html}`
+  const at = open.index + open[0].length
+  return `${html.slice(0, at)}${markup}${html.slice(at)}`
 }
 
 /**
@@ -122,6 +185,48 @@ function readBody(req, limitBytes = 64 * 1024) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// 状态采集
+// ---------------------------------------------------------------------------
+
+/**
+ * 从引擎 `dsh-settings` 服务读官方主题偏好。
+ *
+ * settings 服务按名注入（与 dsh-api-settings-controller 的用法一致），
+ * 运行时获取而非 inject 硬依赖 —— 缺失时前端退回跟随系统。
+ * `describe()` 返回各 profile 条目的 {id, ns, revision, value}；
+ * ui-theme 条目的 value 是 `{ preference, fontSize }`。
+ */
+function readThemePreference(settings) {
+  if (!settings) return { preference: 'system', source: 'unavailable' }
+  try {
+    const descriptors = settings.describe()
+    const entry = descriptors.find(
+      (d) => (d.ns === 'ui-theme' || String(d.id).includes('ui-theme')) &&
+        d.value && typeof d.value.preference === 'string',
+    )
+    if (!entry) return { preference: 'system', source: 'unavailable' }
+    const preference = THEME_PREFERENCES.includes(entry.value.preference)
+      ? entry.value.preference
+      : 'system'
+    return { preference, source: 'settings' }
+  } catch {
+    return { preference: 'system', source: 'unavailable' }
+  }
+}
+
+/** 把主题偏好写回官方设置文档（控制台与对话页同源生效）。 */
+async function writeThemePreference(settings, preference) {
+  if (!settings) throw new Error('settings service unavailable')
+  const descriptors = settings.describe()
+  const entry = descriptors.find(
+    (d) => (d.ns === 'ui-theme' || String(d.id).includes('ui-theme')) &&
+      d.value && typeof d.value.preference === 'string',
+  )
+  if (!entry) throw new Error('ui-theme settings entry not found')
+  await settings.update('ui-theme', { preference }, entry.revision)
+}
+
 /**
  * 采集引擎状态。
  *
@@ -144,6 +249,18 @@ function collectEngineState(ctx) {
     port: Number(process.env.PORT ?? 3080),
     privMode: process.env.DSH_ANDROID_PRIV_MODE ?? 'normal',
     permissionMode: process.env.DSH_PERMISSION_MODE ?? 'unknown',
+    themePreference: themeCache.preference,
+  }
+
+  // 用户保存但尚未生效的权限等级（前端显示「已保存 · 重启引擎后生效」徽章）
+  const engineRoot = extinstall.engineRoot()
+  if (engineRoot) {
+    try {
+      const prefs = readPrefs(engineRoot)
+      if (prefs.privMode) state.requestedPrivMode = String(prefs.privMode)
+    } catch {
+      // 偏好文件读不到就跳过该字段
+    }
   }
 
   // 原生层写入的补充状态（可选）
@@ -175,7 +292,7 @@ function collectEngineState(ctx) {
  * tools/verify_runtime.py 完成，结果随 runtime.zip 一起分发。
  */
 function collectRuntimeState() {
-  const engineRoot = process.env.KXXY_ENGINE_ROOT ?? process.env.PREFIX ?? ''
+  const engineRoot = extinstall.engineRoot()
   const result = {
     engineRoot,
     checks: [],
@@ -185,6 +302,8 @@ function collectRuntimeState() {
     ['bin/node', 'Node 可执行文件'],
     ['bin/bash', 'bash 可执行文件'],
     ['bin/rg', 'ripgrep 可执行文件'],
+    ['bin/python3', 'Python 解释器（④ 档内置）'],
+    ['bin/clang', 'C/C++ 编译器（④ 档内置）'],
     ['lib/libreadline.so.8', 'SONAME 别名'],
     ['lib/node_modules/@deepseek-ai/dsh/lib/bin.js', 'DSH 引擎入口'],
     ['etc/tls/cert.pem', 'CA 证书'],
@@ -219,45 +338,305 @@ function collectRuntimeState() {
   return result
 }
 
-/** 列出已安装扩展。 */
+// ---------------------------------------------------------------------------
+// 扩展中心
+// ---------------------------------------------------------------------------
+
+/** 正在进行的安装任务索引（extId → job 快照）。 */
+function activeJobFor(extId) {
+  for (const job of [...extinstall.jobsSnapshot()]) {
+    if (job.extId === extId && (job.phase === 'queued' || job.phase === 'extract' || job.phase === 'link')) {
+      return { jobId: job.id, phase: job.phase, percent: job.percent, message: job.message }
+    }
+  }
+  return null
+}
+
 function collectExtensions() {
-  const engineRoot = process.env.KXXY_ENGINE_ROOT ?? process.env.PREFIX ?? ''
-  const extRoot = join(engineRoot, 'extensions')
-  if (!existsSync(extRoot)) return { items: [] }
+  const engineRoot = extinstall.engineRoot()
+  const catalog = extinstall.readCatalog()
+  const pool = extinstall.listPool(engineRoot)
 
-  const items = []
+  /** 已安装版本表。 */
+  const installed = new Map()
   try {
-    for (const entry of readdirSync(extRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue
-      if (entry.name.endsWith('.tmp-install')) continue
-
-      const dir = join(extRoot, entry.name)
-      const versionFile = join(dir, '.ext-version')
-      let version = null
-      try {
-        if (existsSync(versionFile)) version = readFileSync(versionFile, 'utf8').trim()
-      } catch {
-        // 版本文件不可读时仍列出扩展，只是没有版本号
-      }
-
-      let bins = []
-      try {
-        const binDir = join(dir, 'bin')
-        if (existsSync(binDir)) {
-          bins = readdirSync(binDir).slice(0, 20)
+    const extRoot = extinstall.extensionsDir(engineRoot)
+    if (engineRoot && existsSync(extRoot)) {
+      for (const entry of readdirSync(extRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.name.endsWith('.tmp-install')) continue
+        const vf = join(extRoot, entry.name, '.ext-version')
+        try {
+          installed.set(entry.name, existsSync(vf) ? readFileSync(vf, 'utf8').trim() : 'unknown')
+        } catch {
+          installed.set(entry.name, 'unknown')
         }
-      } catch {
-        // 忽略
       }
-
-      items.push({ id: entry.name, version, bins })
     }
   } catch {
-    // 目录不可读时返回空列表
+    // 目录不可读时按全未安装处理
   }
 
-  return { items }
+  const items = (catalog?.items ?? []).map((item) => {
+    const installedVersion = installed.get(item.id) ?? null
+    if (installedVersion !== null) installed.delete(item.id)
+    return {
+      id: item.id,
+      name: item.name,
+      version: item.version,
+      category: item.category ?? 'devtools',
+      description: item.description ?? '',
+      bins: item.bins ?? [],
+      sizeBytes: item.sizeBytes ?? 0,
+      // bundled = 包池里确实带着这个 tar.gz（APK 内置、点了就本地展开，零联网）
+      bundled: pool.has(item.id),
+      installed: installedVersion !== null,
+      installedVersion,
+      installing: activeJobFor(item.id),
+    }
+  })
+
+  // 装过但目录里多出来的（目录清单没有的条目）也列出来，免得「装了却看不见」
+  for (const [id, version] of installed) {
+    items.push({
+      id,
+      name: id,
+      version,
+      category: 'devtools',
+      description: '',
+      bins: [],
+      sizeBytes: 0,
+      bundled: false,
+      installed: true,
+      installedVersion: version,
+      installing: null,
+    })
+  }
+
+  return {
+    items,
+    builtin: catalog?.builtin ?? null,
+    poolCount: pool.size,
+    engineRoot,
+  }
 }
+
+// ---------------------------------------------------------------------------
+// 动作分派表
+// ---------------------------------------------------------------------------
+
+/** 用户偏好文件（权限模式与三个开关的真值来源）。 */
+function prefsFile(root) {
+  return join(root, 'kxxy-prefs.json')
+}
+
+function readPrefs(root) {
+  try {
+    return JSON.parse(readFileSync(prefsFile(root), 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+function writePrefs(root, patch) {
+  if (!root) return { ok: false, error: 'engine root unknown (KXXY_ENGINE_ROOT not set)' }
+  try {
+    const prefs = { ...readPrefs(root), ...patch, updatedAt: Date.now() }
+    writeFileSync(prefsFile(root), `${JSON.stringify(prefs, null, 2)}\n`)
+    return { ok: true, prefs }
+  } catch (e) {
+    return { ok: false, error: String(e?.message ?? e) }
+  }
+}
+
+/** 终端快捷键 → 注入引擎 PTY 的字节序列。 */
+const TERM_KEY_BYTES = {
+  'ctrl-c': '\x03',
+  tab: '\t',
+  up: '\x1b[A',
+  down: '\x1b[B',
+  esc: '\x1b',
+  enter: '\r',
+}
+
+function writeStdinRequest(root, bytes) {
+  if (!root) return { ok: false, error: 'engine root unknown' }
+  try {
+    writeFileSync(extinstall.stdinRequestPath(root), Buffer.from(bytes, 'utf8'))
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: String(e?.message ?? e) }
+  }
+}
+
+/**
+ * 导出诊断日志（§7-3 方案 A + B 双写，默认公共下载目录，失败退回私有目录）。
+ *
+ * 内容：engine.log（环形上限 2 MiB，天然有界）+ 原生层状态快照 +
+ * 一份 diag.json（进程/扩展/镜像摘要，不含任何凭证 —— mirror/npmrc 都只存 registry）。
+ */
+function exportLogs(root) {
+  if (!root) return { status: 500, body: { error: 'engine root unknown' } }
+
+  const files = []
+  try {
+    const logFile = join(root, 'engine.log')
+    if (existsSync(logFile)) {
+      const buf = readFileSync(logFile)
+      files.push({ name: 'engine.log', data: buf.subarray(-2 * 1024 * 1024) })
+    }
+  } catch { /* 日志读不到就跳过，导出不因此失败 */ }
+  try {
+    const stateFile = process.env.KXXY_STATE_FILE || join(root, 'kxxy-state.json')
+    if (existsSync(stateFile)) {
+      files.push({ name: 'kxxy-state.json', data: readFileSync(stateFile) })
+    }
+  } catch { /* 同上 */ }
+
+  const diag = {
+    exportedAt: new Date().toISOString(),
+    node: process.version,
+    platform: process.platform,
+    arch: process.arch,
+    uptimeSec: Math.round(process.uptime()),
+    engineRoot: root,
+    extensions: collectExtensions().items
+      .filter((i) => i.installed)
+      .map((i) => ({ id: i.id, version: i.installedVersion })),
+    mirror: mirror.describe(root),
+  }
+  files.push({ name: 'diag.json', data: Buffer.from(`${JSON.stringify(diag, null, 2)}\n`, 'utf8') })
+
+  const d = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  const stamp =
+    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+    `-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+  const name = `kxxy-logs-${stamp}.tar.gz`
+  const tar = tarGzSync(files)
+
+  // 方案 B：公共下载目录（文件管理器直接可见，微信/QQ 可直接发送）。
+  // ⚠️ 先判存在再 mkdir —— Windows 上 Node 会把 /sdcard 解析成「当前盘根下的
+  // \sdcard」，mkdirSync(recursive) 真会给你在 F:\ 建出一棵目录树来。
+  // Android 上 /sdcard 恒存在，这个守卫只过滤非 Android 宿主。
+  const PUBLIC_DIRS = ['/sdcard/Download/kxxy', '/storage/emulated/0/Download/kxxy']
+  for (const dir of PUBLIC_DIRS) {
+    try {
+      if (!existsSync(dirname(dir))) continue
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, name), tar)
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          location: 'download',
+          path: join(dir, name),
+          note: '已保存到下载目录',
+        },
+      }
+    } catch {
+      // 权限未开（MANAGE_EXTERNAL_STORAGE / WRITE_EXTERNAL_STORAGE 未授）→ 下一个
+    }
+  }
+
+  // 方案 A：应用私有目录 —— 一定能写成功，但文件管理器里看不到
+  try {
+    const priv = join(root, 'export')
+    mkdirSync(priv, { recursive: true })
+    writeFileSync(join(priv, name), tar)
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        location: 'private',
+        path: join(priv, name),
+        downloadUrl: `/kxxy/api/export/${name}`,
+        note: '已保存到应用私有目录（可在系统设置里开启「所有文件访问」后重试，即可保存到下载目录）',
+      },
+    }
+  } catch (e) {
+    return { status: 500, body: { error: `导出失败：${e?.message ?? e}` } }
+  }
+}
+
+/** 分派表。返回 {status, body}。 */
+function dispatchAction(payload) {
+  const root = extinstall.engineRoot()
+  const action = payload?.action
+
+  switch (action) {
+    case 'restart-engine': {
+      // 进程没法重启自己（本插件跑在引擎进程里）：写请求文件，
+      // 由原生层 EngineSupervisor 的轮询消费（§7-2 方案 A）。
+      if (!root) return { status: 503, body: { error: 'engine root unknown' } }
+      try {
+        writeFileSync(extinstall.restartRequestPath(root), `${Date.now()}\n`)
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            requested: true,
+            note: '重启请求已写入，原生层将在 1~2 秒内重启引擎进程',
+          },
+        }
+      } catch (e) {
+        return { status: 500, body: { error: String(e?.message ?? e) } }
+      }
+    }
+
+    case 'export-logs':
+      return exportLogs(root)
+
+    case 'set-priv-mode': {
+      const value = String(payload.value ?? payload.mode ?? '')
+      if (!['normal', 'shizuku', 'root'].includes(value)) {
+        return { status: 400, body: { error: `invalid priv mode: ${value}` } }
+      }
+      const res = writePrefs(root, { privMode: value })
+      if (!res.ok) return { status: 500, body: { error: res.error } }
+      // 权限模式在引擎启动时注入（buildEnv 的 DSH_ANDROID_PRIV_MODE），
+      // 改完必须重启引擎才生效 —— 明说，不给「假成功」。
+      return { status: 200, body: { ok: true, requiresRestart: true, note: '权限模式已保存；重启引擎后生效' } }
+    }
+
+    case 'set-toggle': {
+      const key = String(payload.key ?? '')
+      if (!['foreground', 'watchdog', 'lan'].includes(key)) {
+        return { status: 400, body: { error: `unknown toggle key: ${key}` } }
+      }
+      const res = writePrefs(root, { toggles: { ...(readPrefs(root).toggles ?? {}), [key]: Boolean(payload.value) } })
+      if (!res.ok) return { status: 500, body: { error: res.error } }
+      return { status: 200, body: { ok: true } }
+    }
+
+    case 'term-key': {
+      const key = String(payload.key ?? '')
+      const bytes = TERM_KEY_BYTES[key]
+      if (!bytes) return { status: 400, body: { error: `unknown term key: ${key}` } }
+      const res = writeStdinRequest(root, bytes)
+      if (!res.ok) return { status: 500, body: { error: res.error } }
+      return { status: 200, body: { ok: true } }
+    }
+
+    // ── 已迁往专用端点的旧动作：明确报错并指引，绝不假成功 ──────────
+    case 'install-ext':
+      return {
+        status: 400,
+        body: { error: 'install-ext 已迁往 POST /kxxy/api/extensions/install {id}' },
+      }
+    case 'switch-mirror':
+      return {
+        status: 400,
+        body: { error: 'switch-mirror 已迁往 POST /kxxy/api/mirror/test 与 /kxxy/api/mirror/apply {id}' },
+      }
+
+    default:
+      return { status: 501, body: { error: 'not implemented', action: action ?? null } }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 插件主体
+// ---------------------------------------------------------------------------
 
 /**
  * 插件主体。
@@ -266,6 +645,31 @@ function collectExtensions() {
  */
 export function apply(ctx) {
   ctx.effect(() => {
+    // ── 引擎 settings 服务（官方主题偏好的真值来源）──────────────────
+    // 运行时获取而非 inject 硬依赖：服务缺失时主题端点降级为「跟随系统」，
+    // 不拖垮整个插件。
+    const getSettings = () => {
+      try {
+        return ctx.get('settings') ?? null
+      } catch {
+        return null
+      }
+    }
+
+    // ── 升级自愈：runtime 升级后按 .links.json 重建扩展接入点 ──────────
+    const root0 = extinstall.engineRoot()
+    const rebuilt = extinstall.relinkAll(root0)
+    if (rebuilt > 0) {
+      ctx.logger?.info?.(`[kxxy-host] relinkAll: ${rebuilt} extension(s) relinked after runtime upgrade`)
+    }
+
+    // ── WebView 兼容层：注入到官方前端 index.html 的 <head> ────────────
+    // 必须走 tapIndex（官方公开扩展点）而不是在 onPageFinished 里
+    // evaluateJavascript —— 后者晚于入口 module 求值，连接代际循环已经
+    // 以失败态启动，补回 API 也不会让重试计数归零（实测：补回后 body 从
+    // 31 恢复到 292，但 retry 仍继续）。
+    const disposeCompat = ctx.webServer.tapIndex(injectCompat)
+
     // ── 静态资源：/kxxy/assets/* ─────────────────────────────────────
     // ⚠️ path 不能带尾斜杠：WebServer.match() 的判据是
     //     `pathname === prefix || pathname.startsWith(`${prefix}/`)`
@@ -314,6 +718,8 @@ export function apply(ctx) {
 
         try {
           if (path === '/kxxy/api/state' && req.method === 'GET') {
+            // 主题偏好随轮询刷新：官方设置页改了主题，控制台几秒内跟随
+            themeCache = readThemePreference(getSettings())
             sendJson(res, 200, {
               engine: collectEngineState(ctx),
               runtime: collectRuntimeState(),
@@ -321,13 +727,118 @@ export function apply(ctx) {
             return
           }
 
+          // ── 主题（读写官方 ui-theme 偏好，控制台与对话页同源生效）────
+          if (path === '/kxxy/api/theme' && req.method === 'GET') {
+            themeCache = readThemePreference(getSettings())
+            sendJson(res, 200, themeCache)
+            return
+          }
+
+          if (path === '/kxxy/api/theme' && req.method === 'POST') {
+            const payload = JSON.parse((await readBody(req)) || '{}')
+            const preference = String(payload.preference ?? '')
+            if (!THEME_PREFERENCES.includes(preference)) {
+              sendJson(res, 400, { error: `invalid preference: ${preference}` })
+              return
+            }
+            try {
+              await writeThemePreference(getSettings(), preference)
+              themeCache = { preference, source: 'settings' }
+              sendJson(res, 200, {
+                ok: true,
+                preference,
+                note: '已写入官方外观偏好，对话界面同步生效',
+              })
+            } catch (e) {
+              sendJson(res, 409, { error: String(e?.message ?? e) })
+            }
+            return
+          }
+
+          // ── 扩展中心 ────────────────────────────────────────────────
           if (path === '/kxxy/api/extensions' && req.method === 'GET') {
             sendJson(res, 200, collectExtensions())
             return
           }
 
+          if (path === '/kxxy/api/extensions/install' && req.method === 'POST') {
+            const payload = JSON.parse((await readBody(req)) || '{}')
+            const root = extinstall.engineRoot()
+            const catalog = extinstall.readCatalog()
+            const item = catalog?.items?.find((i) => i.id === payload.id) ?? {}
+            const started = extinstall.startInstall(root, String(payload.id ?? ''), item)
+            if (started.error) {
+              sendJson(res, 409, { error: started.error, jobId: started.jobId ?? null })
+              return
+            }
+            // 202：异步安装，前端拿 jobId 轮询 /extensions/job
+            sendJson(res, 202, { accepted: true, jobId: started.jobId })
+            return
+          }
+
+          if (path === '/kxxy/api/extensions/job' && req.method === 'GET') {
+            const jobId = new URL(req.url, 'http://127.0.0.1').searchParams.get('id') ?? ''
+            const job = extinstall.getJob(jobId)
+            if (!job) {
+              sendJson(res, 404, { error: 'unknown job' })
+              return
+            }
+            sendJson(res, 200, job)
+            return
+          }
+
+          if (path === '/kxxy/api/extensions/remove' && req.method === 'POST') {
+            const payload = JSON.parse((await readBody(req)) || '{}')
+            const result = extinstall.removeExtension(extinstall.engineRoot(), String(payload.id ?? ''))
+            if (result.error) {
+              sendJson(res, 400, { error: result.error })
+              return
+            }
+            sendJson(res, 200, result)
+            return
+          }
+
+          // ── 镜像源 ──────────────────────────────────────────────────
+          if (path === '/kxxy/api/mirror' && req.method === 'GET') {
+            sendJson(res, 200, mirror.readCurrent(extinstall.engineRoot()))
+            return
+          }
+
+          if (path === '/kxxy/api/mirror/test' && req.method === 'POST') {
+            const results = await mirror.testMirrors()
+            sendJson(res, 200, { results })
+            return
+          }
+
+          if (path === '/kxxy/api/mirror/apply' && req.method === 'POST') {
+            const payload = JSON.parse((await readBody(req)) || '{}')
+            const result = mirror.applyMirror(extinstall.engineRoot(), String(payload.id ?? ''))
+            sendJson(res, result.ok ? 200 : 400, result)
+            return
+          }
+
+          // ── 导出的日志下载（私有目录场景的兜底取出通道）────────────
+          const exportMatch = path.match(/^\/kxxy\/api\/export\/([A-Za-z0-9._-]+\.tar\.gz)$/)
+          if (exportMatch && req.method === 'GET') {
+            const root = extinstall.engineRoot()
+            const file = join(root, 'export', exportMatch[1])
+            if (!root || !existsSync(file)) {
+              sendJson(res, 404, { error: 'export not found' })
+              return
+            }
+            const buf = readFileSync(file)
+            res.writeHead(200, {
+              'content-type': 'application/gzip',
+              'content-length': buf.length,
+              'content-disposition': `attachment; filename="${exportMatch[1]}"`,
+              'cache-control': 'no-store',
+            })
+            res.end(buf)
+            return
+          }
+
           if (path === '/kxxy/api/log' && req.method === 'GET') {
-            const engineRoot = process.env.KXXY_ENGINE_ROOT ?? process.env.PREFIX ?? ''
+            const engineRoot = extinstall.engineRoot()
             const logFile = join(engineRoot, 'engine.log')
             let tail = ''
             try {
@@ -351,14 +862,11 @@ export function apply(ctx) {
               sendJson(res, 400, { error: 'invalid json' })
               return
             }
-            // 动作执行需要原生层配合，这里只做登记与回执。
-            // 真正的动作通道走 AgentBridge（127.0.0.1:3083）或原生层文件交换。
-            ctx.logger?.info?.(`[kxxy-host] action requested: ${payload.action}`)
-            sendJson(res, 202, {
-              accepted: true,
-              action: payload.action ?? null,
-              note: 'action recorded; native layer applies it on next poll',
-            })
+            const result = dispatchAction(payload)
+            ctx.logger?.info?.(
+              `[kxxy-host] action=${payload.action ?? '?'} -> ${result.status}`,
+            )
+            sendJson(res, result.status, result.body)
             return
           }
 
@@ -399,13 +907,14 @@ export function apply(ctx) {
       handler: renderPage,
     })
 
-    ctx.logger?.info?.('[kxxy-host] mounted: /kxxy (page), /kxxy/assets (prefix), /kxxy/api (prefix)')
+    ctx.logger?.info?.('[kxxy-host] mounted: /kxxy (page), /kxxy/assets (prefix), /kxxy/api (prefix), index compat tap')
 
     return () => {
       disposePageSlash()
       disposePage()
       disposeApi()
       disposeAssets()
+      disposeCompat()
     }
   })
 }

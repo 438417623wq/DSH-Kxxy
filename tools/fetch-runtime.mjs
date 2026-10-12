@@ -16,34 +16,16 @@ import { join } from "node:path";
 import {
   fetchBuffer, downloadTo, parsePackagesIndex, resolveClosure, sha256Hex, human,
 } from "./lib/registry.mjs";
+import { SEED_PACKAGES, TERMUX_REPO } from "./lib/seeds.mjs";
 
-export const TERMUX_REPO = "https://packages.termux.dev/apt/termux-main";
+// 向后兼容：种子表与仓库常量已抽到 lib/seeds.mjs（fetch-extensions.mjs 与本脚本
+// 必须用同一份清单求交；直接 import 本文件会连 main() 一起跑），这里原样再导出。
+export { SEED_PACKAGES, TERMUX_REPO };
 
 /**
- * 种子包清单 —— 对照 termux-main `binary-aarch64/Packages` 索引逐项核实。
- *
- * 分组理由（每组都对应一个真实故障模式）：
- *   - nodejs-lts：引擎本体。刻意用 LTS 而非 nodejs（26.x）—— dsh 的
- *     internalModules() 只验证 Node 22/24/26 的 Internal 接口，24 最稳。
- *   - bash + readline/ncurses/libiconv/termux-tools：shell 工具链闭包。
- *     bash 的依赖不能靠 apt 自动递归（readline -> ncurses 是二级依赖），
- *     必须显式列出才能形成可审计的闭包。
- *   - ripgrep + pcre2：dsh-tool-fs-search 的原生搜索后端。
- *   - openssl/c-ares/libicu/libsqlite/zlib/libc++：nodejs-lts 的硬依赖。
- *   - ca-certificates：调模型 API 必需的根证书。
- *   - git：dsh 的 Git 工具与插件安装（dsh-plugin add 走 pnpm + git）。
- *   - openssh：@linxin666/dsh-ssh 之类的 SSH 扩展需要。
+ * 种子包清单已抽到 tools/lib/seeds.mjs（④ 全能精选档：基线 22 包 + G0–G9，
+ * 分组理由见该文件的逐条注释）。
  */
-export const SEED_PACKAGES = [
-  "nodejs-lts",                                        // node 本体（含 npm）
-  "bash", "readline", "ncurses", "libiconv", "termux-tools", // bash 执行闭包
-  "ripgrep", "pcre2",                                  // bionic 原生 rg
-  "openssl", "c-ares", "libicu", "libsqlite", "zlib", "libc++", // nodejs-lts 硬依赖
-  "libuv", "brotli",                                   // 静态链接兜底
-  "libandroid-support",                                // bionic 兼容层辅助
-  "ca-certificates",                                   // HTTPS 根证书
-  "git", "openssh", "libcurl", "libexpat",             // 版本控制与远程访问
-];
 
 async function main() {
   const cacheDir = process.env.KXXY_CACHE ?? join(process.cwd(), ".cache", "debs");
@@ -72,27 +54,37 @@ async function main() {
   console.log(`[3/3] 下载到 ${cacheDir} ...`);
   const manifest = [];
   let done = 0;
+  const failed = [];
+  const tryDownload = async (name, pkg, dest) => {
+    try {
+      await downloadTo(`${TERMUX_REPO}/${pkg.filename}`, dest);
+      // 校验 SHA256：Termux 索引带完整摘要。缓存命中也要验 —— 跨多次续传
+      // 拼出来的文件可能损坏，设备端表现为莫名其妙的 link 失败。
+      if (pkg.sha256) {
+        const { readFileSync } = await import("node:fs");
+        const digest = sha256Hex(readFileSync(dest));
+        if (digest !== pkg.sha256) {
+          console.error(`      ✗ ${name}: SHA256 不匹配 (${digest.slice(0, 16)}… != ${pkg.sha256.slice(0, 16)}…)`);
+          return false;
+        }
+      }
+      return true;
+    } catch (err) {
+      console.error(`      ✗ ${name}: ${err.message}`);
+      return false;
+    }
+  };
+
   for (const name of pkgs) {
     const pkg = index.get(name);
     const dest = join(cacheDir, safeName(`${name}_${pkg.version}_${pkg.arch}.deb`));
-    let status = "skip";
-    try {
-      status = await downloadTo(`${TERMUX_REPO}/${pkg.filename}`, dest);
-    } catch (err) {
-      console.error(`      ✗ ${name}: ${err.message}`);
+    const good = await tryDownload(name, pkg, dest);
+    if (!good) {
+      failed.push([name, pkg, dest]);
       process.exitCode = 1;
+      // 失败冷却：并行分段偶尔会触发服务端限流，立刻打下一个包只会连坐
+      await new Promise((r) => setTimeout(r, 5_000));
       continue;
-    }
-    // 校验 SHA256：Termux 索引带完整摘要，下载损坏必须当场发现，
-    // 否则会在设备上表现为莫名其妙的 link 失败。
-    if (existsSync(dest)) {
-      const { readFileSync } = await import("node:fs");
-      const digest = sha256Hex(readFileSync(dest));
-      if (pkg.sha256 && digest !== pkg.sha256) {
-        console.error(`      ✗ ${name}: SHA256 不匹配 (${digest.slice(0, 16)}… != ${pkg.sha256.slice(0, 16)}…)`);
-        process.exitCode = 1;
-        continue;
-      }
     }
     done += 1;
     manifest.push({
@@ -102,6 +94,25 @@ async function main() {
     });
     if (done % 10 === 0 || done === pkgs.length) {
       console.log(`      ${done}/${pkgs.length} ...`);
+    }
+  }
+
+  // 二轮重试：失败的包（多为限流窗口期误伤）冷却 30s 后再给一次机会
+  if (failed.length) {
+    console.log(`      ⏳ ${failed.length} 个包失败，冷却 30s 后二轮重试 ...`);
+    await new Promise((r) => setTimeout(r, 30_000));
+    for (const [name, pkg, dest] of failed) {
+      if (await tryDownload(name, pkg, dest)) {
+        done += 1;
+        manifest.push({
+          name, version: pkg.version, arch: pkg.arch,
+          file: dest.split(/[\\/]/).pop(), size: pkg.size, sha256: pkg.sha256,
+          depends: pkg.depends,
+        });
+        console.log(`      ↻ ${name} 二轮成功 (${done}/${pkgs.length})`);
+      } else {
+        await new Promise((r) => setTimeout(r, 5_000));
+      }
     }
   }
 

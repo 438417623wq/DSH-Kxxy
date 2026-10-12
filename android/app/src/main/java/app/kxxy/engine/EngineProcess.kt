@@ -48,6 +48,10 @@ class EngineProcess private constructor(
          * @param cwd      工作目录
          * @param env      完整环境变量数组（见 [EngineConfig.buildEnv]）
          * @param patchPath `android-overlay.yml` 的绝对路径；null 表示不注入
+         * @param rootPrefix 非 null 时以 root 启动：经探测可用的 su 形式前缀
+         *   （如 `["su","-c"]`，含 su 绝对路径首项）。argv 改为
+         *   `[su, …, "exec 'node' …"]` —— Magisk/KernelSU 的 su 会 exec 替换自身，
+         *   引擎进程仍是 forkpty 的直接子进程，PR_SET_PDEATHSIG 继续有效。
          */
         suspend fun spawn(
             nodeBin: File,
@@ -56,6 +60,7 @@ class EngineProcess private constructor(
             env: Array<String>,
             logFile: File,
             patchPath: String?,
+            rootPrefix: List<String>? = null,
         ): EngineProcess = withContext(Dispatchers.IO) {
 
             cwd.mkdirs()
@@ -66,7 +71,7 @@ class EngineProcess private constructor(
             //   已被替换为纯 JS shim，靠该 flag 才能 require internal/* 模块。
             // 刻意不设 V8 堆上限：用户真正吃内存的场景是软件编译（clang/rustc/gradle），
             //   限堆会直接导致构建 OOM。
-            val argv = buildList {
+            val nodeArgv = buildList {
                 add(nodeBin.absolutePath)
                 add("--expose-internals")
                 add(entryJs.absolutePath)
@@ -76,11 +81,22 @@ class EngineProcess private constructor(
                     add(patchPath)
                 }
                 add("--no-open")
-            }.toTypedArray()
+            }
+
+            val argv: List<String> = if (rootPrefix == null) {
+                nodeArgv
+            } else {
+                val suPath = rootPrefix.first()
+                // 拼成经 shell 解释的单命令（su 的各种形式都以 -c/位置参数收命令）
+                val command = "exec " + nodeArgv.joinToString(" ") { arg ->
+                    if (arg.contains(Regex("[\\s\"'\\\\]"))) "'" + arg.replace("'", "'\\''") + "'" else arg
+                }
+                listOf(suPath) + rootPrefix.drop(1) + listOf(command)
+            }
 
             val result = PtyBridge.nativeForkPty(
-                executable = nodeBin.absolutePath,
-                argv = argv,
+                executable = argv.first(),
+                argv = argv.toTypedArray(),
                 envp = env,
                 cwd = cwd.absolutePath,
                 rows = 40,

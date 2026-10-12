@@ -6,6 +6,10 @@
  */
 import { readFileSync } from "node:fs";
 import { inflateRawSync } from "node:zlib";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 const zipPath = process.argv[2] ?? "F:/KF/DSKX/dsh-kxxy/android/app/src/main/assets/runtime.zip";
 const buf = readFileSync(zipPath);
@@ -66,7 +70,6 @@ const NEED = [
   "lib/node_modules/@deepseek-ai/dsh-web-app/cordis.patch.yml",
   "lib/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html",
   "lib/node_modules/koffi/package.json",
-  "lib/node_modules/node-pty/package.json",
   "lib/node_modules/node-addon-require-builtin/lib/index.js",
   "lib/node_modules/@vscode/ripgrep-android-arm64/bin/rg",
   "lib/node_modules/@vscode/ripgrep-android-arm64/package.json",
@@ -78,6 +81,16 @@ const NEED = [
   "lib/node_modules/kxxy-host/web/index.html",
   "lib/node_modules/kxxy-host/web/host.js",
   "lib/node_modules/kxxy-host/web/host.css",
+  // WebView 兼容层：旧 ROM WebView（< Chrome 116 / 108）缺 AbortSignal.any、
+  // 不支持 dvh 单位，缺了它设置面板与目录选择对话框会静默显示异常
+  // （见 RuntimeInstaller 锚点 6，以及下面单独的版本标记断言）
+  "lib/node_modules/kxxy-host/web/compat.js",
+  // Android 原生 PTY 绑定：上游 createProcessInspector 不认 android，
+  // 且 node-pty 无 Android 预编译产物，缺了它「新建终端」必定报错
+  // （见 RuntimeInstaller 锚点 7，以及下面单独的版本标记断言）
+  "lib/node_modules/node-pty/package.json",
+  "lib/node_modules/node-pty/lib/index.js",
+  "lib/node_modules/node-pty/prebuilds/android-arm64/dsh_pty_node.node",
   "kxxy-runtime.json",
 ];
 const byName = new Map(entries.map((e) => [e.name, e]));
@@ -88,6 +101,68 @@ for (const n of NEED) {
   if (!e) { console.log(`  ✗ ${n}`); missing += 1; continue; }
   const kind = e.comment.startsWith("LINK:") ? `LINK→${e.comment.slice(5)}` : `${e.usize}B`;
   console.log(`  ✓ ${n}  ${kind}`);
+}
+
+// ---------------------------------------------------------------- 兼容层版本标记
+// RuntimeInstaller 锚点 6 不只判 compat.js 是否存在，还比对首行的版本标记
+// （老设备升级 APK 时 runtimeVersion 不变，只判存在会让旧兼容层逃过重装）。
+// 这里对 zip 里的实际内容做同一断言，避免「改了 compat.js 却忘了递增标记」。
+{
+  const markerNeed = /COMPAT_LAYER_MARKER\s*=\s*"([^"]+)"/.exec(
+    readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
+  );
+  const entry = byName.get("lib/node_modules/kxxy-host/web/compat.js");
+  if (!entry) {
+    console.log("\n兼容层版本标记：✗ 条目缺失，跳过");
+  } else if (markerNeed === null) {
+    console.log("\n兼容层版本标记：✗ RuntimeInstaller.kt 未定义 COMPAT_LAYER_MARKER");
+    missing += 1;
+  } else {
+    const head = readLocal(entry).toString("utf8").slice(0, 256);
+    if (!head.includes(markerNeed[1])) {
+      console.log(`\n兼容层版本标记：✗ compat.js 头部不含 ${markerNeed[1]}`);
+      missing += 1;
+    } else {
+      console.log(`\n兼容层版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- PTY 绑定版本标记
+// 同锚点 6 的道理：老设备上可能留着早期构建注入的抛错空壳，文件在但终端必报错。
+// 断言 zip 里包装层首行的标记与 RuntimeInstaller.PTY_NODE_MARKER 一致。
+{
+  const markerNeed = /PTY_NODE_MARKER\s*=\s*"([^"]+)"/.exec(
+    readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
+  );
+  const entry = byName.get("lib/node_modules/node-pty/lib/index.js");
+  if (!entry) {
+    console.log("PTY 绑定版本标记：✗ 条目缺失，跳过");
+  } else if (markerNeed === null) {
+    console.log("PTY 绑定版本标记：✗ RuntimeInstaller.kt 未定义 PTY_NODE_MARKER");
+    missing += 1;
+  } else {
+    const head = readLocal(entry).toString("utf8").slice(0, 256);
+    if (!head.includes(markerNeed[1])) {
+      console.log(`PTY 绑定版本标记：✗ node-pty/lib/index.js 头部不含 ${markerNeed[1]}`);
+      missing += 1;
+    } else {
+      console.log(`PTY 绑定版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+  // 原生模块必须是 ELF 共享库：空文件或被文本占位会一路通过存在性检查，
+  // 直到用户点开终端才炸。
+  const bin = byName.get("lib/node_modules/node-pty/prebuilds/android-arm64/dsh_pty_node.node");
+  if (bin) {
+    const buf = readLocal(bin);
+    const isElf = buf.length > 4 && buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46;
+    if (!isElf) {
+      console.log("PTY 原生模块：✗ 不是 ELF 共享库");
+      missing += 1;
+    } else {
+      console.log(`PTY 原生模块：✓ ELF，${buf.length} B`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- manifest

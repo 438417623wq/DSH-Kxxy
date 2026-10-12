@@ -18,9 +18,19 @@ import { posix } from "node:path";
  */
 export const TERMUX_PREFIX = "/data/data/com.termux/files/usr/";
 
-/** 裁剪目录：运行时用不到，占 33 MiB 量级。 */
+/**
+ * 裁剪目录：运行时用不到。
+ *
+ * ⚠️ `include/` 与扩展名 `.a` **不能裁**（早期版本裁过，会让内置的 C/C++
+ * 工具链变成废物）：
+ *   - `ndk-sysroot` 的 libc 头文件全在 `include/`（3,200 个文件），没有它
+ *     `#include <stdio.h>` 直接找不到。
+ *   - `clang` 自己的头文件也在 `include/clang*`（1,321 个 / 30.1 MiB）。
+ *   - `libomp.a` 等静态库是 `.a`，裁掉后 `-fopenmp` 链接失败。
+ * 体积代价：stage 侧 `include/` 从 0 涨到 13.0 MiB（现有 22 包）+ 30.1 MiB
+ * （clang）+ sysroot 头文件；相对 ④ 档 366 MiB 的 APK 可以接受。
+ */
 export const PRUNE_DIRS = [
-  "include/",
   "share/doc/",
   "share/man/",
   "share/info/",
@@ -34,8 +44,8 @@ export const PRUNE_DIRS = [
   "libexec/installed-tests/",
 ];
 
-/** 裁剪扩展名：静态库与文档。 */
-export const PRUNE_EXT = [".a", ".la", ".md", ".ps1", ".cmd", ".map"];
+/** 裁剪扩展名：libtool 存档、文档、Windows/Node 专用脚本。 */
+export const PRUNE_EXT = [".la", ".md", ".ps1", ".cmd", ".map"];
 
 /** 保留链接的顶层目录 —— 只有这三处的别名会被运行时真正打开。 */
 const KEEP_LINK_TOPDIRS = new Set(["bin", "lib", "libexec"]);

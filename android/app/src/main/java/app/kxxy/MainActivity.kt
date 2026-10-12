@@ -47,6 +47,24 @@ class MainActivity : Activity() {
 
     private var stateJob: Job? = null
 
+    /** 当前页面路径（onPageFinished + onDoUpdateVisitedHistory 双钩子维护）。 */
+    @Volatile
+    private var currentPath: String? = null
+
+    /** 上一次按返回键的时刻（宿主页双击退出的判定窗口用）。 */
+    private var lastBackAt = 0L
+
+    /**
+     * 进行中的文件选择回调。
+     *
+     * WebView 的 `<input type="file">`（官方前端的上传图片/上传附件/+ 菜单的
+     * 「文件」全走它）必须由 onShowFileChooser 接手，否则点击静默失效。
+     * 回调必须持有成字段：选择器跨 startActivityForResult 存活；且每条路径
+     * （收到结果 / 用户取消 / Activity 销毁）都要回掉一次 —— 不回掉的话
+     * WebView 认为还有一个悬空 chooser，之后所有点击都不再弹窗（经典坑）。
+     */
+    private var filePathCallback: android.webkit.ValueCallback<Array<android.net.Uri>>? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -106,6 +124,41 @@ class MainActivity : Activity() {
                 Log.d(TAG, "console/${msg.messageLevel()} ${msg.sourceId()}:${msg.lineNumber()} ${msg.message()}")
                 return true
             }
+
+            /**
+             * 文件选择器：官方前端的 `<input type="file">` 全靠它才有反应。
+             * createIntent() 会带上 accept 类型与多选标记，落到 DocumentsUI
+             * （系统文件管理器/相册）。任何失败路径都必须回 null，见字段注释。
+             */
+            override fun onShowFileChooser(
+                webView: WebView,
+                callback: android.webkit.ValueCallback<Array<android.net.Uri>>,
+                params: FileChooserParams,
+            ): Boolean {
+                // 上一次选择还没回来又点了一次：先把旧的作废，避免 WebView 卡死
+                filePathCallback?.onReceiveValue(null)
+                filePathCallback = callback
+
+                val intent = params.createIntent().apply {
+                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                return try {
+                    startActivityForResult(intent, REQUEST_FILE_CHOOSER)
+                    true
+                } catch (e: android.content.ActivityNotFoundException) {
+                    Log.w(TAG, "no activity for file chooser: ${e.message}")
+                    filePathCallback = null
+                    callback.onReceiveValue(null)
+                    false
+                }
+            }
+        }
+
+        // 浏览器下载：官方「下载日志 export」等产生的 ZIP 是普通下载链接，
+        // WebView 默认静默丢弃。交给系统 DownloadManager（自带通知与断点，
+        // 写公共下载目录不需要应用自身持有存储权限）。
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            handleDownload(url, userAgent, contentDisposition, mimeType)
         }
 
         webView.webViewClient = object : WebViewClient() {
@@ -114,6 +167,10 @@ class MainActivity : Activity() {
                 request: WebResourceRequest,
             ): Boolean {
                 val url = request.url.toString()
+                // 宿主内建桥：kxxy://perm/request?name=…（设置页权限卡片）
+                if (request.url.scheme == "kxxy") {
+                    return handlePermissionBridge(request.url)
+                }
                 // 只放行回环地址；其余交给系统浏览器
                 if (url.startsWith("http://127.0.0.1:") || url.startsWith("http://localhost:")) {
                     return false
@@ -128,11 +185,161 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 Log.i(TAG, "page finished: $url")
+                currentPath = pathOf(url)
                 // 方案 R：注入移动端适配层（触控尺寸 / 输入框字号 / safe-area / 去 hover）
                 AdaptLayer.inject(view)
             }
+
+            /**
+             * SPA 路由变化的捕获点：官方前端是 React 单页应用，
+             * 站内跳转不触发 onPageFinished，只触发本回调。
+             * （注意方法名没有 on 前缀 —— WebViewClient 的历史遗留命名。）
+             */
+            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                if (url != null) currentPath = pathOf(url)
+            }
         }
     }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_FILE_CHOOSER) return
+        val callback = filePathCallback
+        filePathCallback = null
+        // parseResult 兼容单选/多选（ClipData）与取消（resultCode != OK → null）
+        callback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data))
+    }
+
+    /**
+     * 下载处理：交给系统 DownloadManager（系统组件写公共下载目录不需要本应用
+     * 持有存储权限，且自带完成通知）。文件名优先取 content-disposition，
+     * 其次 URL 路径；统一落 Download/kxxy/，与导出日志的位置约定一致。
+     */
+    private fun handleDownload(url: String, userAgent: String, contentDisposition: String?, mimeType: String?) {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            runCatching { startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))) }
+            return
+        }
+        runCatching {
+            // 文件名：content-disposition 的 filename= → URL 末段 → 时间戳兜底
+            val fromDisposition = contentDisposition
+                ?.let { Regex("filename\\*?=(?:UTF-8'')?\"?([^\";]+)\"?", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1) }
+            val fromUrl = android.net.Uri.parse(url).lastPathSegment
+            val name = (fromDisposition ?: fromUrl ?: "kxxy-download.bin")
+                .takeIf { it.isNotBlank() }
+                ?: "kxxy-download.bin"
+
+            val req = android.app.DownloadManager.Request(android.net.Uri.parse(url)).apply {
+                setTitle(name)
+                setDescription(getString(R.string.download_notification_description))
+                mimeType?.let { setMimeType(it) }
+                addRequestHeader("User-Agent", userAgent)
+                // 引擎在同源 cookie 里放行鉴权；带 cookie 才能拿到需要登录的资源
+                runCatching { addRequestHeader("Cookie", android.webkit.CookieManager.getInstance().getCookie(url) ?: "") }
+                setNotificationVisibility(android.app.DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(
+                    android.os.Environment.DIRECTORY_DOWNLOADS,
+                    "kxxy/$name",
+                )
+            }
+            val dm = getSystemService(android.app.DownloadManager::class.java)
+            dm.enqueue(req)
+            Log.i(TAG, "download enqueued: $name")
+        }.onFailure { Log.w(TAG, "download failed: ${it.message}") }
+    }
+
+    /**
+     * `kxxy://perm/request?name=…` 桥（设置页「系统权限」卡片触发）。
+     *
+     * 权限请求必须由 Activity 发起，而设置页跑在 WebView 里 —— 复用
+     * shouldOverrideUrlLoading 的拦截点，自定义 scheme 在进入「外链转系统
+     * 浏览器」分支之前处理。状态回显走 kxxy-state.json（原生心跳在写），
+     * 页面轮询 /kxxy/api/state 自然可见。
+     */
+    private fun handlePermissionBridge(uri: android.net.Uri): Boolean {
+        val name = uri.getQueryParameter("name") ?: return true
+        Log.i(TAG, "permission bridge: $name")
+        when (name) {
+            "notifications" -> {
+                if (android.os.Build.VERSION.SDK_INT >= 33) {
+                    requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_PERM_NOTIFICATIONS)
+                }
+            }
+            "all-files" -> {
+                // Android 11+ 的「所有文件访问」必须去系统设置页，应用内弹不出来
+                val intent = try {
+                    android.content.Intent(
+                        android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        android.net.Uri.parse("package:$packageName"),
+                    )
+                } catch (_: Exception) {
+                    android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                }
+                runCatching { startActivity(intent) }
+            }
+            "battery" -> {
+                val intent = android.content.Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    android.net.Uri.parse("package:$packageName"),
+                )
+                runCatching { startActivity(intent) }
+                    .onFailure { Log.w(TAG, "battery intent failed: ${it.message}") }
+            }
+            "storage" -> {
+                if (android.os.Build.VERSION.SDK_INT <= 29) {
+                    requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), REQ_PERM_STORAGE)
+                }
+            }
+        }
+        return true
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // 结果不需要主动回传：权限状态由 publishState 写进 kxxy-state.json，
+        // 管理页轮询 /kxxy/api/state 数秒内自动刷新。
+        Log.i(TAG, "permission result: req=$requestCode grants=${grantResults.joinToString()}")
+    }
+
+    /**
+     * 系统返回键路由（五项改进方案 §5）。
+     *
+     * 现状是完全没有返回键处理 —— 系统默认行为 = finish() 直接退出。
+     * 用 [onBackPressed] 而非 OnBackInvokedCallback：本项目 targetSdk = 28，
+     * 后者是 API 33+ 且需要 manifest 开关，在 targetSdk 28 上根本不会被调用；
+     * Android 10+ 的返回手势最终仍以 KEYCODE_BACK 派发到本方法。
+     *
+     * 路由规则：
+     *   官方对话页（/ 及其子路径）→ 进入宿主管理页 /kxxy
+     *   宿主管理页（/kxxy）       → 回对话页；2 秒内再按一次 → 退出
+     */
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (!urlLoaded || !::webView.isInitialized) {
+            super.onBackPressed()
+            return
+        }
+        val path = currentPath
+        if (path != null && path.startsWith("/kxxy")) {
+            val now = System.currentTimeMillis()
+            if (now - lastBackAt < EXIT_CONFIRM_WINDOW_MS) {
+                finish()
+                return
+            }
+            lastBackAt = now
+            webView.loadUrl("http://127.0.0.1:${EngineConfig.DEFAULT_PORT}/")
+        } else {
+            webView.loadUrl("http://127.0.0.1:${EngineConfig.DEFAULT_PORT}/kxxy")
+        }
+    }
+
+    private fun pathOf(url: String): String? =
+        runCatching { android.net.Uri.parse(url).path }.getOrNull()
 
     /**
      * 加载引擎 URL。
@@ -175,6 +382,9 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         stateJob?.cancel()
+        // 悬空的文件选择回调会让 WebView 之后所有 input 点击静默失效
+        filePathCallback?.onReceiveValue(null)
+        filePathCallback = null
         if (::webView.isInitialized) {
             runCatching {
                 (webView.parent as? ViewGroup)?.removeView(webView)
@@ -186,5 +396,12 @@ class MainActivity : Activity() {
 
     companion object {
         private const val TAG = "KxxyMain"
+
+        /** 宿主页上判定「双击退出」的按键窗口。 */
+        private const val EXIT_CONFIRM_WINDOW_MS = 2_000L
+
+        private const val REQUEST_FILE_CHOOSER = 4201
+        private const val REQ_PERM_NOTIFICATIONS = 4202
+        private const val REQ_PERM_STORAGE = 4203
     }
 }

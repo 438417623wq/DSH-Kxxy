@@ -16,12 +16,21 @@
  */
 
 import { createServer, request as httpRequest } from 'node:http'
+import { mkdtempSync, existsSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = join(HERE, '..', 'plugins', 'kxxy-host', 'lib', 'index.js')
+
+// 插件的所有动作通道都挂在 KXXY_ENGINE_ROOT 下（restart.request /
+// stdin.request / export/ / extensions/）。冒测试给它一个临时目录，
+// 动作之后逐个验证文件真的落盘 —— 「动作真做」是这个断言的核心。
+const FAKE_ENGINE_ROOT = mkdtempSync(join(tmpdir(), 'kxxy-smoke-'))
+process.env.KXXY_ENGINE_ROOT = FAKE_ENGINE_ROOT
+delete process.env.KXXY_STATE_FILE
 
 const useAuth = !process.argv.includes('--no-auth')
 
@@ -50,10 +59,22 @@ const webServer = {
   registerFallback() {
     throw new Error('kxxy-host 不应注册 fallback')
   },
-  tapIndex() {
-    throw new Error('kxxy-host 不应 tap index')
+  /**
+   * 兼容层注入走 tapIndex（官方 WebServer 公开扩展点，见
+   * dsh-host-webserver `:220 tapIndex` / `:339 applyIndexTaps`）。
+   * 这里按官方语义登记 transform，并返回注销函数。
+   */
+  tapIndex(transform) {
+    if (typeof transform !== 'function') throw new Error('tapIndex 需要函数')
+    indexTaps.push(transform)
+    return () => {
+      const at = indexTaps.indexOf(transform)
+      if (at >= 0) indexTaps.splice(at, 1)
+    }
   },
 }
+
+const indexTaps = []
 
 // 信任判定：模拟官方 authorization 服务（存在时用它，缺失时插件应退化）
 const authorization = useAuth
@@ -115,6 +136,61 @@ if (!prefixes.has('/kxxy/assets')) fail('未注册 /kxxy/assets 前缀路由')
 // 带尾斜杠会拼出双斜杠而永不匹配（真实踩过：/kxxy 200 但 /kxxy/api/* 全 404）。
 for (const p of prefixes.keys()) {
   if (p.endsWith('/')) fail(`前缀路由 "${p}" 带尾斜杠，官方 match() 永不命中`)
+}
+
+// ── 兼容层注入（WebView 104 缺 AbortSignal.any / dvh 的兜底）──────────
+// 这是真机事故的修复点，已证实两处致命：
+//   1) 官方前端插件 bundle 用了 Chrome 116+ 的 AbortSignal.any，旧 WebView
+//      上抛 TypeError 被连接层静默吞掉，表现为「权限页显示英文 key /
+//      模型页 provider 列表空白」。
+//   2) 插件 CSS 用了 Chrome 108+ 的 dvh 单位，旧 WebView 的 CSS 解析器把整条
+//      height 声明丢弃，目录选择对话框塌成 0 高，列表整片空白。
+console.log(`  index taps：${indexTaps.length}`)
+if (indexTaps.length !== 1) fail(`应恰好注册 1 个 index tap，实为 ${indexTaps.length}`)
+else ok('已注册 index 兼容层 tap')
+
+if (indexTaps.length === 1) {
+  const html = '<!doctype html><html><head><title>t</title>'
+    + '<script type="module" src="./assets/index-abc.js"></script></head>'
+    + '<body><div id="root"></div></body></html>'
+  const out = indexTaps[0](html)
+  const atCompat = out.indexOf('data-kxxy-compat')
+  const atEntry = out.indexOf('src="./assets/index-abc.js"')
+  if (atCompat < 0) fail('index tap 未注入兼容层 script')
+  else ok('index tap 注入了兼容层 script')
+  if (atCompat > atEntry) fail('兼容层晚于入口 module（必须更早，否则 API 已缺失）')
+  else ok(`兼容层早于入口 module（compat@${atCompat} entry@${atEntry}）`)
+  if (!/<\/head>/i.test(out) || !out.includes('<div id="root"></div>')) fail('注入破坏了原 HTML')
+  else ok('注入未破坏原 HTML')
+  for (const need of ['AbortSignal.any', "defineArray('toSorted'", 'Promise.withResolvers']) {
+    if (!out.includes(need)) fail(`兼容层缺少补丁：${need}`)
+  }
+  if (out.includes('AbortSignal.any') && out.includes("defineArray('toSorted'") && out.includes('Promise.withResolvers')) {
+    ok('兼容层含 AbortSignal.any / toSorted / withResolvers 三项关键补丁')
+  }
+  // dvh 回退：必须是「文本层面替换 + MutationObserver 观察后续插入」，
+  // 因为插件 CSS 是各插件模块求值时才 append 的，晚于本脚本执行。
+  // 替换规则有两处收紧（只认「数字紧跟 dvh 且后接非字母数字」、url() 整段
+  // 保留），避免误伤 base64 数据，断言必须跟着实现走。
+  for (const need of ['var patchCssText', 'url\\([^)]*\\)|(\\d)dvh(?!', 'MutationObserver', 'observeStyles()']) {
+    if (!out.includes(need)) fail(`兼容层缺少 dvh 回退实现：${need}`)
+  }
+  ok('兼容层含 dvh→vh 回退（文本替换 + MutationObserver 观察后续插入）')
+  // 版本标记必须存在且与 RuntimeInstaller.COMPAT_LAYER_MARKER 一致，
+  // 否则老设备升级后锚点 6 判不出过期，会带着旧兼容层跳过重装。
+  const marker = /kxxy-webview-compat@(\d+)/.exec(out)
+  if (marker === null) fail('兼容层缺少版本标记 kxxy-webview-compat@N')
+  else {
+    const kotlin = readFileSync(join(HERE, '..', 'android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt'), 'utf8')
+    const kotlinMarker = /COMPAT_LAYER_MARKER\s*=\s*"([^"]+)"/.exec(kotlin)
+    if (kotlinMarker === null) fail('RuntimeInstaller.kt 未定义 COMPAT_LAYER_MARKER')
+    else if (kotlinMarker[1] !== marker[0]) fail(`版本标记不一致：compat.js=${marker[0]} RuntimeInstaller=${kotlinMarker[1]}`)
+    else ok(`版本标记一致（${marker[0]}，compat.js 与 RuntimeInstaller 同步）`)
+  }
+  // 官方 renderIndex 每次请求都重新读 dist/index.html 再跑 taps，
+  // 所以每次输入都是干净的 HTML，无需幂等；这里只确认单次调用只注入一份。
+  if (out.split('data-kxxy-compat').length - 1 !== 1) fail('单次 tap 注入了多份兼容层')
+  else ok('单次 tap 只注入一份')
 }
 
 // ── 真实 HTTP 分发 ────────────────────────────────────────────────
@@ -286,7 +362,7 @@ console.log('\n[7] GET /kxxy/api/log（引擎日志尾部）')
   else ok(`200，tail ${JSON.parse(r.text).tail.length} 字符`)
 }
 
-console.log('\n[8] POST /kxxy/api/action（动作登记）')
+console.log('\n[8] POST /kxxy/api/action（真分派表）')
 {
   const res = await fetch(base + '/kxxy/api/action', {
     method: 'POST',
@@ -294,11 +370,65 @@ console.log('\n[8] POST /kxxy/api/action（动作登记）')
     body: JSON.stringify({ action: 'restart-engine' }),
   })
   const j = await res.json()
-  if (res.status !== 202) fail(`状态码应为 202，实为 ${res.status}`)
-  else if (j.accepted !== true) fail('accepted 非 true')
-  else ok(`202 accepted，action=${j.action}`)
+  if (res.status !== 200) fail(`restart-engine 应为 200，实为 ${res.status}（${JSON.stringify(j)}）`)
+  else if (j.ok !== true || j.requested !== true) fail(`restart-engine 返回异常：${JSON.stringify(j)}`)
+  else ok('200 ok + requested（§7-2 方案 A：写请求文件，原生层轮询消费）')
+
+  const reqFile = join(FAKE_ENGINE_ROOT, 'restart.request')
+  if (!existsSync(reqFile)) fail('restart.request 未落盘')
+  else ok('restart.request 已写入引擎根目录')
+
   if (!logs.some((l) => l.includes('restart-engine'))) fail('未记录动作日志')
   else ok('动作已记入插件日志')
+}
+
+console.log('\n[8b] term-key：按键应写进 stdin.request')
+{
+  const res = await fetch(base + '/kxxy/api/action', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'term-key', key: 'ctrl-c' }),
+  })
+  const j = await res.json()
+  if (res.status !== 200 || j.ok !== true) fail(`term-key 返回异常：${res.status} ${JSON.stringify(j)}`)
+  else ok('200 ok')
+  const f = join(FAKE_ENGINE_ROOT, 'stdin.request')
+  if (!existsSync(f)) fail('stdin.request 未落盘')
+  else if (readFileSync(f).toString('utf8') !== '\x03') fail('stdin.request 内容不是 0x03')
+  else ok('stdin.request 内容为 Ctrl+C 字节')
+}
+
+console.log('\n[8c] export-logs：真打包 tar.gz（公共目录失败退回私有目录）')
+{
+  const res = await fetch(base + '/kxxy/api/action', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'export-logs' }),
+  })
+  const j = await res.json()
+  // Windows 测试机上 /sdcard 不存在，应静默退回 engineRoot/export/
+  if (res.status !== 200 || j.ok !== true) fail(`export-logs 失败：${res.status} ${JSON.stringify(j)}`)
+  else if (!j.path || !existsSync(j.path)) fail(`导出文件不存在：${j.path}`)
+  else if (j.location !== 'private') ok(`落盘位置 ${j.location}（Windows 无公共下载目录，符合预期）`)
+  else ok(`tar.gz 已落盘：${j.path}（${readFileSync(j.path).length} 字节）`)
+}
+
+console.log('\n[8d] 已迁移与未知动作：明确报错而非假成功')
+{
+  const post = (body) => fetch(base + '/kxxy/api/action', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const r1 = await post({ action: 'install-ext', id: 'ffmpeg' })
+  if (r1.status !== 400) fail(`install-ext 应 400（迁往专用端点），实为 ${r1.status}`)
+  else ok('install-ext → 400 + 迁移指引')
+  const r2 = await post({ action: 'switch-mirror' })
+  if (r2.status !== 400) fail(`switch-mirror 应 400，实为 ${r2.status}`)
+  else ok('switch-mirror → 400 + 迁移指引')
+  const r3 = await post({ action: 'make-coffee' })
+  if (r3.status !== 501) fail(`未知动作应 501，实为 ${r3.status}`)
+  else ok('未知动作 → 501 not implemented')
 }
 
 console.log('\n[9] POST /kxxy/api/action 非法 JSON')
@@ -347,6 +477,8 @@ console.log('\n[13] disposer 卸载后路由消失')
   const r = await get('/kxxy')
   if (r.status !== 404) fail(`卸载后应为 404，实为 ${r.status}`)
   else ok('卸载后 /kxxy → 404')
+  if (indexTaps.length !== 0) fail(`卸载后 index tap 未注销（剩 ${indexTaps.length} 个）`)
+  else ok('卸载后 index tap 已注销')
 }
 
 console.log(`\n插件日志：${logs.length} 条`)

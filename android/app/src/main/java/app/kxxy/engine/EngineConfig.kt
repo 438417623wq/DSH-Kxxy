@@ -56,6 +56,24 @@ object EngineConfig {
      */
     const val STATE_FILE_NAME = "kxxy-state.json"
 
+    /**
+     * 引擎 → 原生层的重启请求文件。
+     *
+     * 一个进程无法「重启自己」：kxxy-host 插件跑在引擎进程里，它只能写这个
+     * 文件，由原生层（EngineSupervisor 的请求轮询）消费后 stop+start。
+     * 与镜像源切换配套 —— buildEnv 注入的 registry 在进程启动时已固定，
+     * 改完 npmrc 必须重启引擎才生效（五项改进方案 §7-2 方案 A）。
+     */
+    const val RESTART_REQUEST_FILE_NAME = "restart.request"
+
+    /**
+     * 引擎 → 原生层的 stdin 注入文件。
+     *
+     * 宿主管理页「终端」视图的快捷键（Ctrl+C / Tab / ↑ / ↓ / Esc）借它写进
+     * 引擎的 PTY。同一轮询循环顺带消费，避免为几个字节再开一条通道。
+     */
+    const val STDIN_REQUEST_FILE_NAME = "stdin.request"
+
     /** 运行时根目录。 */
     fun engineRoot(ctx: Context): File = File(ctx.filesDir, "engine")
 
@@ -77,6 +95,35 @@ object EngineConfig {
 
     /** 原生层写给 kxxy-host 插件的状态快照（见 STATE_FILE_NAME）。 */
     fun stateFile(ctx: Context): File = File(engineRoot(ctx), STATE_FILE_NAME)
+
+    /** 引擎请求原生层重启的文件（见 RESTART_REQUEST_FILE_NAME）。 */
+    fun restartRequestFile(ctx: Context): File = File(engineRoot(ctx), RESTART_REQUEST_FILE_NAME)
+
+    /** 引擎请求向引擎 stdin 注入按键的文件（见 STDIN_REQUEST_FILE_NAME）。 */
+    fun stdinRequestFile(ctx: Context): File = File(engineRoot(ctx), STDIN_REQUEST_FILE_NAME)
+
+    /**
+     * 宿主偏好文件（kxxy-host 插件写的 set-priv-mode / set-toggle 落在这里）。
+     *
+     * 这是权限等级的**唯一真值来源**：前端改完写这个文件 + 触发引擎重启，
+     * 原生层 spawnEngine 时读取 —— 不再需要第二条原生通道。
+     */
+    fun prefsFile(ctx: Context): File = File(engineRoot(ctx), "kxxy-prefs.json")
+
+    /**
+     * 读偏好里的权限等级；缺省/损坏/非法值一律回落 normal。
+     *
+     * 容忍 UTF-8 BOM（与 kxxy-state.json 同样的事故来源）。
+     */
+    fun readPrivMode(ctx: Context): String {
+        val valid = setOf("normal", "shizuku", "root")
+        return runCatching {
+            val f = prefsFile(ctx)
+            if (!f.isFile) return "normal"
+            val json = org.json.JSONObject(f.readText().replace("\uFEFF", ""))
+            json.optString("privMode", "normal").takeIf { it in valid } ?: "normal"
+        }.getOrDefault("normal")
+    }
 
     /** 扩展根目录（用户资产，升级时绝不触碰）。 */
     fun extensionsRoot(ctx: Context): File = File(engineRoot(ctx), "extensions")
@@ -126,6 +173,11 @@ object EngineConfig {
             "HOME=${home.absolutePath}",
             "DSH_HOME=${home.absolutePath}",
             "TMPDIR=${tmp.absolutePath}",
+            // 官方终端面板的默认 shell 取 process.env.SHELL || userInfo().shell；
+            // Termux 编译的 node 在 libuv 里把 passwd 回落硬编码成 Termux 的 bash
+            // （真机症状：终端报 ".../com.termux/.../bash is not an executable file"），
+            // 必须显式指回自带 bash。
+            "SHELL=${File(root, "bin/bash").absolutePath}",
             "PORT=$port",
             "NODE_ENV=production",
             // 小写：AI 按文档写 [ "$DSH_ANDROID_PRIV_MODE" = "root" ] 才能成立

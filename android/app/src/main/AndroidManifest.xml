@@ -16,6 +16,14 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- 外置工作区读写（sessions/workspaces 外置到公开目录，卸载不丢） -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- 导出日志写 Download/kxxy/（五项改进方案 §7-3 方案 B）。
+         targetSdk 28 走 legacy storage：Android 9 及以下安装即授，
+         Android 10 需运行时授权（未授时导出自动退回应用私有目录，不报错）。 -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <!-- 设置页「系统权限」卡片请求电池优化白名单（kxxy://perm/request?name=battery） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:name=".KxxyApp"

@@ -7,6 +7,12 @@
  * 全部补丁作用在已抽取到磁盘的 dsh 依赖树上，路径基准 = <root>/lib/node_modules。
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** 仓库里自带的预编译产物目录（见各 prebuilt 子目录的 README）。 */
+const PREBUILT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "prebuilt");
 
 /** 补丁失败必须让整个构建失败：形态变了就等于补丁没打上。 */
 function must(cond, message) {
@@ -68,6 +74,20 @@ export function createPatchContext(files) {
 // ------------------------------------------------------------------ 补丁实现
 
 /**
+ * 读取仓库内预编译产物。
+ *
+ * 与 `patchRipgrep` 的 `termuxRead` 不同：那些二进制来自 Termux stage，
+ * 构建期只以 sha256 blob 形式存在；而 `tools/prebuilt/` 下的产物是**随仓库
+ * 提交**的，直接读磁盘即可。缺文件必须硬失败 —— 否则会产出一个「终端
+ * 一点开就报错」的 runtime，而构建日志里看不出任何异常。
+ */
+function prebuilt(rel) {
+  const abs = join(PREBUILT_ROOT, rel);
+  must(existsSync(abs), `缺少预编译产物 tools/prebuilt/${rel}`);
+  return readFileSync(abs);
+}
+
+/**
  * koffi：Win32 FFI 绑定（advapi32 / kernel32），Android 上既没有预编译也不需要。
  * 但**必须打桩而不是删除**：多个包在模块顶层做类型注册
  * （`koffi.struct` / `koffi.pointer` / `koffi.array`），删除会让 import 直接失败。
@@ -113,24 +133,75 @@ module.exports.default = module.exports;
 /**
  * node-pty：唯一真实加载点是 dsh-subprocess-local 的
  * `createLazyRequire("node-pty")`，只在**终端侧栏真正打开**时触发。
- * Android 上的 PTY 由 App 侧的 libdsh_pty.so 承担（见 PtyBridge.kt）。
- * 打桩而不是删除，是为了让 require 成功、把失败推迟到 spawn 时并给出可读原因。
+ *
+ * 上游 node-pty 是完整的原生 PTY 绑定（`posix_openpt` / `forkpty` 的 N-API
+ * 实现），官方不发 Android 预编译产物、仓库里也没有源码，因此这里注入一份
+ * 自研实现：`tools/prebuilt/node-pty-android/`（纯 C + JS 包装层，
+ * 契约与真机验证见该目录 README）。
+ *
+ * 历史：这个补丁原先写的是「抛错空壳」，理由是「PTY 由 App 侧的
+ * libdsh_pty.so 承担」—— 但那是宿主自己的终端面板（`plugins/kxxy-host`）
+ * 走的路径，**官方前端侧栏的终端走的是 node-pty**，两者不通。空壳让
+ * 「新建终端」必定报错，现已改为注入真实实现。
  */
 function patchNodePty(ctx) {
   if (!ctx.exists("node-pty")) return "跳过（依赖树无 node-pty）";
   ctx.rmrf("node-pty");
-  ctx.write("node-pty/package.json", `${JSON.stringify({
-    name: "node-pty",
-    version: "0.0.0-android-shim",
-    main: "lib/index.js",
-  }, null, 2)}\n`);
-  ctx.write("node-pty/lib/index.js", `"use strict";
-/** Android 空壳：真实 PTY 由 App 侧的 libdsh_pty.so 提供。 */
-module.exports.spawn = function spawn() {
-  throw new Error("node-pty unavailable in this Android build; PTY served by app-side libdsh_pty.so");
-};
-`);
-  return "node-pty → 空壳（PTY 由 libdsh_pty.so 承担）";
+  // 产物随仓库提交，直接读盘；缺文件硬失败（见 prebuilt 注释）。
+  ctx.write("node-pty/package.json", prebuilt("node-pty-android/package.json"));
+  ctx.write("node-pty/lib/index.js", prebuilt("node-pty-android/lib/index.js"));
+  ctx.write("node-pty/src/dsh_pty_node.c", prebuilt("node-pty-android/src/dsh_pty_node.c"));
+  // .node 是 ELF 共享库，权限位必须可执行（与 rg 同理）。
+  ctx.copy(
+    prebuilt("node-pty-android/prebuilds/android-arm64/dsh_pty_node.node"),
+    "node-pty/prebuilds/android-arm64/dsh_pty_node.node",
+    0o755,
+  );
+  return "node-pty → 注入 Android 原生 PTY 实现（arm64，自研 N-API 模块）";
+}
+
+/**
+ * dsh-subprocess-local 的 `createProcessInspector()` 只认 linux/darwin/win32，
+ * 其余平台直接抛 `terminal inspection is unsupported on platform <p>`。
+ * 而 Android 上 Node 的 `process.platform` 是 **"android"**（不是 "linux"），
+ * 于是三个分支全不命中 —— 终端侧栏一点开就是这个错误。
+ *
+ * 修复方式不是「让 android 冒充 linux」，而是**复用 LinuxProcessInspector**：
+ * 它的实现只依赖 `/proc`（`/proc/<pid>/stat` 的 tpgid、`/proc/<pid>/mem`、
+ * `/proc/<pid>/task/<tid>/fdinfo/<epfd>`），Android 全部具备，且
+ * `SYSCALLS` 表里 arm64 项齐备（read/pselect/ppoll/epollPwait）。
+ * 真机实测：`/proc/self/stat` 与 `/proc/self/mem` 在 app 沙箱内均可读。
+ *
+ * 定位方式：该文件在 runtime 里带内容 hash
+ * （`runner-launch-B2zsQ1Dz.js`），**不能写死文件名**，按前缀找。
+ * `createPatchContext` 没有 glob，只能自己遍历键。
+ */
+function patchSubprocessInspector(ctx) {
+  const prefix = "lib/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-";
+  const matches = [...ctx.files.keys()].filter(
+    (k) => k.startsWith(prefix) && k.endsWith(".js"),
+  );
+  if (matches.length === 0) {
+    return "跳过（依赖树无 dsh-subprocess-local/runner-launch-*）";
+  }
+  must(
+    matches.length === 1,
+    `dsh-subprocess-local 的 runner-launch-*.js 命中 ${matches.length} 个，无法确定补丁目标`,
+  );
+  const rel = matches[0].slice("lib/node_modules/".length);
+  const src = ctx.read(rel);
+  const out = replaceOnce(
+    src,
+    `\tif (platform === "linux") return new LinuxProcessInspector(arch, internals);`,
+    `\tif (platform === "linux" || platform === "android") return new LinuxProcessInspector(arch, internals);`,
+    "dsh-subprocess-local 的 createProcessInspector 平台分派",
+  );
+  must(
+    out.includes(`platform === "android"`),
+    "subprocess-local 的 android 分支补丁未生效",
+  );
+  ctx.write(rel, out);
+  return `dsh-subprocess-local/${rel.split("/").pop()} → android 复用 LinuxProcessInspector`;
 }
 
 /**
@@ -502,6 +573,7 @@ export function applyAllPatches(root, termuxRead) {
   const results = [
     patchKoffi(ctx),
     patchNodePty(ctx),
+    patchSubprocessInspector(ctx),
     patchFlock(ctx),
     patchRequireBuiltin(ctx),
     patchSandboxLocal(ctx),

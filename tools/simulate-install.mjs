@@ -9,7 +9,7 @@
  *
  * 本脚本按 RuntimeInstaller 的**精确顺序**复刻（见该文件 :65-95）：
  *   readZipIndex → extract（跳过 LINK）→ materialiseLinks → rewriteRootPlaceholder
- *   → materialiseSonameAliases → restoreExecBits → isComplete（五锚点）
+ *   → materialiseSonameAliases → restoreExecBits → isComplete（七锚点，含兼容层与 PTY 绑定版本标记）
  *
  * 用法：node tools/simulate-install.mjs [zip 路径] [目标目录]
  * 默认目标目录：<系统临时目录>/kxxy-sim-install（每次运行前清空）
@@ -38,6 +38,23 @@ const LINK_PREFIX = "LINK:";
 const ROOT_PLACEHOLDER = "@DSH_ROOT@";
 const RUNTIME_VERSION = "v0.1.0-arm64";
 const MIN_DSH_AI_FILES = 100;
+
+/**
+ * 与 RuntimeInstaller.COMPAT_LAYER_MARKER 保持一致。
+ *
+ * 老设备升级 APK 时 RUNTIME_VERSION 不变，所以「文件存在」不足以判出兼容层
+ * 过期；锚点 6 实际比对的是 compat.js 首行的版本标记。
+ */
+const COMPAT_LAYER_MARKER = "kxxy-webview-compat@2";
+
+/**
+ * 与 RuntimeInstaller.PTY_NODE_MARKER 保持一致（锚点 7）。
+ *
+ * 老设备上 node-pty 可能是早期构建注入的抛错空壳，文件在、但一点开终端
+ * 就报 `terminal inspection is unsupported on platform android`；
+ * 同样按首行版本标记判定过期。
+ */
+const PTY_NODE_MARKER = "kxxy-pty-node@1";
 const EXECUTABLE_NAMES = new Set(["rg", "esbuild", "node", "sharp", "swc", "dprint", "biome"]);
 const SONAME_ALIASES = [
   ["lib/libreadline.so.8", "lib/libreadline.so.8.3"],
@@ -187,6 +204,10 @@ for (const rel of placeholders) {
   }
   writeFileSync(f, Buffer.from(text.split(ROOT_PLACEHOLDER).join(canonicalRoot), "latin1"));
   rewritten += 1;
+  // *.dist-info/METADATA 是 PyPI 长描述（README 原文），proot-distro 的示例
+  // 命令里带着 /data/data/com.termux 字样 —— 纯文档，python 从不执行它，
+  // 不算残留；真正的脚本残留仍然要吵出来。
+  if (rel.endsWith("/METADATA")) continue;
   if (readFileSync(f).toString("latin1").includes("com.termux")) stillHasTermux.push(rel);
 }
 console.log(`[3] rewriteRootPlaceholder：改写 ${rewritten}/${placeholders.length} 个脚本`);
@@ -229,30 +250,105 @@ for (const full of walk(target)) {
   const head = readFileSync(full, { encoding: null }).subarray(0, 4);
   const isElf = head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46;
   const isScript = head[0] === 0x23 && head[1] === 0x21;
-  if ((isElf || isScript) && (rel.startsWith("bin/") || rel.startsWith("libexec/") || EXECUTABLE_NAMES.has(base))) {
+  // 与 RuntimeInstaller.restoreExecBits 的三段策略保持一致：
+  // bin/ + usr/bin/ + libexec/ 全量；lib/jvm/**/bin/（openjdk-21 布局）；
+  // node_modules 内按路径与名单。
+  if (
+    (isElf || isScript) &&
+    (rel.startsWith("bin/") ||
+      rel.startsWith("usr/bin/") ||
+      rel.startsWith("libexec/") ||
+      (rel.startsWith("lib/jvm/") && rel.includes("/bin/")) ||
+      EXECUTABLE_NAMES.has(base))
+  ) {
     chmodSync(full, 0o755);
     chmodded.push(rel);
   }
 }
 console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755`);
 
-// ---------------------------------------------------------------- isComplete（五锚点）
-console.log("[6] isComplete 五锚点：");
+// ---------------------------------------------------------------- isComplete（七锚点）
+console.log("[6] isComplete 七锚点（含兼容层与 PTY 绑定的版本标记）：");
 const anchors = [
   ["锚点 1 dsh 引擎入口", join(target, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js")],
   ["锚点 2 SONAME 别名 libreadline.so.8", join(target, "lib/libreadline.so.8")],
   ["锚点 3 node 可执行", join(target, "bin/node")],
   ["锚点 5 kxxy-host 插件", join(target, "lib/node_modules/kxxy-host/package.json")],
+  // 锚点 6：WebView 兼容层。旧 ROM 的 WebView 可能早于 Chrome 116 / 108，
+  // 缺 AbortSignal.any 会让设置面板「权限」显示英文 key、模型页 provider 空白；
+  // 不支持 dvh 单位会让目录选择对话框塌成 0 高、列表整片空白。
+  ["锚点 6 WebView 兼容层", join(target, "lib/node_modules/kxxy-host/web/compat.js")],
+  // 锚点 7：Android 原生 PTY 绑定。上游 createProcessInspector 不认 android，
+  // 且 node-pty 无 Android 预编译产物 —— 两者都由构建期补丁修掉，
+  // 但老设备的 runtime 不会因此重装，必须参与完整性判定。
+  ["锚点 7 PTY 原生模块", join(target, "lib/node_modules/node-pty/prebuilds/android-arm64/dsh_pty_node.node")],
 ];
 for (const [label, f] of anchors) {
   if (!existsSync(f)) fail(`${label} 缺失：${f.slice(target.length + 1)}`);
   else ok(`${label} 存在`);
 }
 {
+  // 锚点 6 的第二段判定：版本标记。RuntimeInstaller.compatLayerIsCurrent 读
+  // compat.js 头部做 contains 匹配，标记过期即强制重装（否则老设备带着旧兼容层
+  // 跳过重装，已修的缺陷会静默复现）。
+  const compat = join(target, "lib/node_modules/kxxy-host/web/compat.js");
+  if (existsSync(compat)) {
+    const head = readFileSync(compat, "utf8").slice(0, 256);
+    if (!head.includes(COMPAT_LAYER_MARKER)) fail(`锚点 6 版本标记过期：compat.js 头部不含 ${COMPAT_LAYER_MARKER}`);
+    else ok(`锚点 6 版本标记匹配（${COMPAT_LAYER_MARKER}）`);
+  }
+}
+{
+  // 锚点 7 的第二段判定：版本标记（同上，标记写在 JS 包装层首行）。
+  const wrapper = join(target, "lib/node_modules/node-pty/lib/index.js");
+  if (existsSync(wrapper)) {
+    const head = readFileSync(wrapper, "utf8").slice(0, 256);
+    if (!head.includes(PTY_NODE_MARKER)) fail(`锚点 7 版本标记过期：node-pty/lib/index.js 头部不含 ${PTY_NODE_MARKER}`);
+    else ok(`锚点 7 版本标记匹配（${PTY_NODE_MARKER}）`);
+  }
+}
+{
+  // 锚点 7 的第三段判定：原生模块必须是可加载的 ELF 共享库，而不是空文件。
+  // 早期构建注入的是抛错空壳（只有 lib/index.js），二进制缺失时终端必报错。
+  const node = join(target, "lib/node_modules/node-pty/prebuilds/android-arm64/dsh_pty_node.node");
+  if (existsSync(node)) {
+    const buf = readFileSync(node);
+    const isElf = buf.length > 4 && buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46;
+    if (!isElf) fail("锚点 7 原生模块不是 ELF（可能是空文件或被文本替换）");
+    else ok(`锚点 7 原生模块为 ELF（${buf.length} B）`);
+  }
+}
+{
   const aiDir = join(target, "lib/node_modules/@deepseek-ai");
   const n = existsSync(aiDir) ? walk(aiDir).length : 0;
   if (n < MIN_DSH_AI_FILES) fail(`锚点 4 @deepseek-ai 文件数 ${n} < ${MIN_DSH_AI_FILES}`);
   else ok(`锚点 4 @deepseek-ai 文件数 ${n} ≥ ${MIN_DSH_AI_FILES}`);
+}
+
+// ---------------------------------------------------------------- ④ 档锚点
+console.log("\n[6b] ④ 全能精选档锚点（五项改进方案 §4）：");
+for (const [label, f] of [
+  ["bin/python3（G1 脚本链）", join(target, "bin/python3")],
+  ["bin/clang（G3 编译链）", join(target, "bin/clang")],
+  ["bin/proot（G6 容器）", join(target, "bin/proot")],
+  ["bin/d8（G4 安卓打包链）", join(target, "bin/d8")],
+]) {
+  if (!existsSync(f)) fail(`${label} 缺失`);
+  else ok(`${label} 存在`);
+}
+{
+  // openjdk-21 装在 lib/jvm/java-21-openjdk/bin/java（Termux 布局）
+  const jvmBin = join(target, "lib/jvm");
+  const java = existsSync(jvmBin)
+    ? walk(jvmBin).find((f) => f.replace(/\\/g, "/").endsWith("/bin/java"))
+    : null;
+  if (!java) fail("lib/jvm/**/bin/java 缺失（openjdk-21 未进闭包？）");
+  else ok(`lib/jvm/**/bin/java 存在（…/${relative(target, java).split(sep).join("/").slice("lib/jvm/".length)}）`);
+  if (java && !(statSync(java).mode & 0o111)) {
+    // Windows 上 chmod 不生效，这一条只在 POSIX 宿主才有意义
+    if (process.platform !== "win32") fail("java 可执行位未置（lib/jvm 扫描缺失？）");
+    else ok("（Windows 宿主无法验证可执行位，Android 上由 RuntimeInstaller 置位）");
+  } else if (java) ok("java 可执行位已置");
 }
 
 // ---------------------------------------------------------------- 引擎启动路径

@@ -60,6 +60,23 @@ object AdaptLayer {
           if (window.__kxxyAdaptInstalled) return 'already-installed';
           window.__kxxyAdaptInstalled = true;
 
+          // ── 终端 shell 缓存自愈（三轮问题 2）────────────────────────
+          // 官方终端 UI 把选中的 shell 路径缓存在 localStorage['dsh.terminal.shell']，
+          // 新建终端时**缓存优先**、显式传给引擎。SHELL 未设的旧版本解析出的
+          // Termux 内置路径已被缓存 —— 引擎侧修复后它仍会覆盖默认值，导致
+          // 「新建终端」持续失败。这里在每次页面加载（对话页与 /kxxy 同源共缓存）
+          // 时精确清除已知坏前缀，不动其他值。
+          (function healShellCache() {
+            try {
+              var KEY = 'dsh.terminal.shell';
+              var v = localStorage.getItem(KEY);
+              if (v && v.indexOf('/data/data/com.termux') === 0) {
+                localStorage.removeItem(KEY);
+                console.log('[dsh-kxxy] removed stale terminal shell cache: ' + v);
+              }
+            } catch (e) { /* storage 不可用时忽略（无缓存即无问题） */ }
+          })();
+
           var CSS_ID = ${jsString(CSS_ID)};
           var ACTIVE_CLASS = ${jsString(ACTIVE_CLASS)};
 
@@ -127,38 +144,253 @@ object AdaptLayer {
             if (existing) existing.remove();
           }
 
-          // ── 宿主管理页入口（悬浮按钮）────────────────────────────────
+          // ── 宿主管理页入口（悬浮按钮：拖动 / 吸附 / 靠边隐藏 / 鲸鱼图标）──
           // 不用插槽：官方 slots 是浏览器侧 SlotCore，host 侧插件进不去。
           // 只在官方 UI（路径以 / 开头且不是 /kxxy）上挂；管理页自身不挂。
+          //
+          // 交互规格（五项改进方案 §1）：
+          //   按下 → 跟手拖动（transform: translate3d，避免重排）
+          //   抬手 → 位移 < 6px 视为点击（跳 /kxxy）；≥ 6px 视为拖动
+          //        → 吸附最近一侧边缘，Y 夹在安全区内
+          //        → 位置持久化 localStorage['dsh-kxxy-entry-pos'] = {side,yRatio}
+          //   闲置 2.6s → 收进边缘，只留 14px 滑块 + opacity .34
+          //   触摸滑块 → 立即展开，计时器重置
+          //
+          // 两个已知陷阱（缺一即复现）：
+          //   ① 本文件下方挂在 document 上的 touchstart/touchend 侧栏手势是
+          //     **冒泡阶段**监听 —— 按钮上所有 touch 事件必须 stopPropagation，
+          //     否则拖按钮会误触发侧栏开合。Pointer Events 与 Touch Events 是
+          //     两条独立事件流，只拦 touch 不够，pointerdown 也要拦。
+          //   ② touch-action:none + touchmove 内 preventDefault({passive:false})，
+          //     否则拖动时页面跟着滚。
           var ENTRY_ID = 'dsh-kxxy-host-entry';
+          var ENTRY_POS_KEY = 'dsh-kxxy-entry-pos';
+          var ENTRY_IDLE_MS = 2600;
+          var ENTRY_DRAG_THRESHOLD = 6;
+
+          var WHALE_SVG =
+            '<svg width="18" height="18" viewBox="0 0 32 32" fill="none" aria-hidden="true">' +
+            '<path d="M4.6 17.6c0-5.4 4.5-9.3 10.3-9.3 4.8 0 8.7 2.6 10.3 6.6h1.6' +
+            'c1.4-2 3.4-2.9 4.6-2.5-.8.9-1.1 2.1-.8 3.2-1 .4-1.8 1.2-2.2 2.2h-1.9' +
+            'c-1.5 4.2-5.5 7-10.4 7-5.9 0-10.5-3.2-10.5-7.2z" ' +
+            'fill="rgba(0,192,255,.16)" stroke="#00C0FF" stroke-width="1.6" stroke-linejoin="round"/>' +
+            '<circle cx="10.2" cy="16.4" r="1.3" fill="#00C0FF"/>' +
+            '<path d="M11.5 6.2c-1.2-1-1.8-2.3-1.7-3.9M14.8 6.4c-.9-1.3-1.2-2.7-.9-4.2" ' +
+            'stroke="#2F80ED" stroke-width="1.4" stroke-linecap="round"/>' +
+            '<path d="M8.2 20.8c3.4 2.2 8.6 2.2 12.1-.2" stroke="#2F80ED" ' +
+            'stroke-width="1.2" stroke-linecap="round" opacity=".7"/>' +
+            '</svg>';
 
           function ensureHostEntry() {
             var path = location.pathname;
             if (path.indexOf('/kxxy') === 0) return;      // 已在管理页
             if (document.getElementById(ENTRY_ID)) return;
 
+            var host = document.body || document.documentElement;
+
             var a = document.createElement('a');
             a.id = ENTRY_ID;
             a.href = '/kxxy';
-            a.textContent = '宿主';
             a.title = 'DSH Kxxy 宿主管理';
             a.setAttribute('data-kxxy-entry', '1');
+            a.setAttribute('aria-label', '打开 DSH Kxxy 宿主管理');
             // 内联样式而非外部 CSS：这个按钮必须在适配层未激活时也存在
             // （横屏 / 强制桌面模式下用户同样需要进管理页）。
             a.style.cssText = [
               'position:fixed', 'z-index:2147483000',
-              'right:max(10px, env(safe-area-inset-right))',
-              'bottom:calc(max(10px, env(safe-area-inset-bottom)) + 64px)',
-              'padding:6px 12px', 'border-radius:14px',
-              'background:rgba(20,24,34,.82)', 'color:#cfe3ff',
+              'top:0', 'left:0',                 // 位置完全由 JS 计算（left/top + transform）
+              'display:flex', 'align-items:center', 'gap:5px',
+              'padding:6px 11px 6px 8px', 'border-radius:16px',
+              'background:rgba(20,24,34,.85)', 'color:#cfe3ff',
               'font:600 12px/1.6 system-ui,sans-serif',
               'text-decoration:none', 'border:1px solid rgba(120,160,255,.35)',
-              'backdrop-filter:blur(8px)', 'opacity:.72',
-              'box-shadow:0 2px 10px rgba(0,0,0,.35)'
+              'backdrop-filter:blur(8px)', '-webkit-backdrop-filter:blur(8px)',
+              'box-shadow:0 2px 10px rgba(0,0,0,.35)',
+              'opacity:.78',
+              'touch-action:none',
+              'user-select:none', '-webkit-user-select:none',
+              '-webkit-touch-callout:none',
+              'will-change:transform',
+              'transition:opacity .22s ease, padding .22s ease, border-radius .22s ease',
+              'overscroll-behavior:contain'
             ].join(';');
-            // 半透明 + 贴边，尽量不遮挡官方输入框；按下时提到全不透明。
-            a.addEventListener('click', function () { a.style.opacity = '1'; });
-            (document.body || document.documentElement).appendChild(a);
+            a.innerHTML = WHALE_SVG + '<span style="letter-spacing:.5px">宿主</span>';
+            host.appendChild(a);
+
+            var svgEl = a.querySelector('svg');
+            var labelEl = a.querySelector('span');
+
+            /** env(safe-area-inset-*) 只在 CSS 里生效 —— 用探针元素取回数值。 */
+            function safeInsets() {
+              var probe = document.createElement('div');
+              probe.style.cssText = [
+                'position:fixed', 'visibility:hidden', 'pointer-events:none',
+                'padding:env(safe-area-inset-top) env(safe-area-inset-right)',
+                'env(safe-area-inset-bottom) env(safe-area-inset-left)'
+              ].join(';');
+              host.appendChild(probe);
+              var cs = getComputedStyle(probe);
+              var out = {
+                top: parseFloat(cs.paddingTop) || 0,
+                right: parseFloat(cs.paddingRight) || 0,
+                bottom: parseFloat(cs.paddingBottom) || 0,
+                left: parseFloat(cs.paddingLeft) || 0
+              };
+              probe.remove();
+              return out;
+            }
+
+            var state = { side: 'right', yRatio: 0.72 };   // 缺省：右缘偏低（原版位置附近）
+            try {
+              var saved = JSON.parse(localStorage.getItem(ENTRY_POS_KEY) || 'null');
+              if (saved && (saved.side === 'left' || saved.side === 'right') &&
+                  typeof saved.yRatio === 'number' && isFinite(saved.yRatio)) {
+                state.side = saved.side;
+                state.yRatio = Math.min(1, Math.max(0, saved.yRatio));
+              }
+            } catch (e) { /* 损坏的持久化数据按缺省处理 */ }
+
+            var collapsed = false;
+            var idleTimer = null;
+
+            /** 把按钮摆到 (side, yRatio) 对应的落点。collapsed 时收成 14px 滑块。 */
+            function place() {
+              var inset = safeInsets();
+              var vw = window.innerWidth, vh = window.innerHeight;
+              var m = 8;                                  // 距边缘最小间距
+              var w = a.offsetWidth, h = a.offsetHeight;
+              var minY = inset.top + m;
+              var maxY = Math.max(minY, vh - inset.bottom - m - h);
+              var y = minY + (maxY - minY) * state.yRatio;
+              var x;
+              if (collapsed) {
+                // 滑块：14px 宽，紧贴边缘，保留同侧圆角
+                x = state.side === 'right' ? vw - 14 : 0;
+                a.style.borderRadius = state.side === 'right' ? '10px 0 0 10px' : '0 10px 10px 0';
+                a.style.opacity = '.34';
+              } else {
+                x = state.side === 'right' ? vw - w - m - inset.right : m + inset.left;
+                a.style.borderRadius = '16px';
+                a.style.opacity = '.78';
+              }
+              a.style.left = Math.round(x) + 'px';
+              a.style.top = Math.round(y) + 'px';
+            }
+
+            function collapse() {
+              collapsed = true;
+              svgEl.style.display = 'none';
+              labelEl.style.display = 'none';
+              a.style.padding = '9px 0';
+              a.style.minWidth = '14px';
+              a.style.boxShadow = 'none';
+              place();
+            }
+
+            function expand() {
+              if (!collapsed) { scheduleIdle(); return; }
+              collapsed = false;
+              svgEl.style.display = '';
+              labelEl.style.display = '';
+              a.style.padding = '6px 11px 6px 8px';
+              a.style.minWidth = '';
+              a.style.boxShadow = '0 2px 10px rgba(0,0,0,.35)';
+              place();
+              scheduleIdle();
+            }
+
+            function scheduleIdle() {
+              if (idleTimer) clearTimeout(idleTimer);
+              idleTimer = setTimeout(collapse, ENTRY_IDLE_MS);
+            }
+
+            function persist() {
+              try {
+                localStorage.setItem(ENTRY_POS_KEY, JSON.stringify(state));
+              } catch (e) { /* 隐私模式等场景写不进就算了 */ }
+            }
+
+            // ── 拖动状态机 ────────────────────────────────────────────
+            var drag = null;      // {x0, y0, dx, dy, moved}
+            var suppressClick = false;
+
+            // ① 双事件流拦截：Touch 与 Pointer 各一条，缺一条都会误触侧栏手势
+            a.addEventListener('pointerdown', function (e) { e.stopPropagation(); });
+            a.addEventListener('touchstart', function (e) {
+              e.stopPropagation();
+              if (e.touches.length !== 1) return;
+              var t = e.touches[0];
+              drag = { x0: t.clientX, y0: t.clientY, dx: 0, dy: 0, moved: false };
+              suppressClick = false;
+              expand();                                  // 触摸滑块 → 立即展开
+            }, { passive: true });
+
+            a.addEventListener('touchmove', function (e) {
+              e.stopPropagation();
+              if (!drag || e.touches.length !== 1) return;
+              e.preventDefault();                        // ② 不让页面跟着滚
+              var t = e.touches[0];
+              drag.dx = t.clientX - drag.x0;
+              drag.dy = t.clientY - drag.y0;
+              if (Math.abs(drag.dx) >= ENTRY_DRAG_THRESHOLD ||
+                  Math.abs(drag.dy) >= ENTRY_DRAG_THRESHOLD) {
+                drag.moved = true;
+              }
+              // 拖动中的 Y 夹取：不允许拖出安全区
+              var inset = safeInsets();
+              var h = a.offsetHeight;
+              var baseTop = parseFloat(a.style.top) || 0;
+              var ny = baseTop + drag.dy;
+              var minY = inset.top + 8;
+              var maxY = window.innerHeight - inset.bottom - 8 - h;
+              if (ny < minY) drag.dy += minY - ny;
+              if (ny > maxY) drag.dy += maxY - ny;
+              a.style.transform = 'translate3d(' + drag.dx + 'px,' + drag.dy + 'px,0)';
+            }, { passive: false });
+
+            function endDrag(e) {
+              e.stopPropagation();
+              if (!drag) return;
+              var wasMoved = drag.moved;
+              var dx = drag.dx, dy = drag.dy;
+              drag = null;
+              a.style.transform = '';
+              if (wasMoved) {
+                suppressClick = true;                    // 拖动结束，吞掉合成的 click
+                // 吸附：按拖动后的中心 X 判断贴哪侧；Y 换算成比率持久化
+                var inset = safeInsets();
+                var vw = window.innerWidth, vh = window.innerHeight;
+                var w = a.offsetWidth, h = a.offsetHeight;
+                var baseLeft = parseFloat(a.style.left) || 0;
+                var baseTop = parseFloat(a.style.top) || 0;
+                var cx = baseLeft + dx + w / 2;
+                state.side = cx < vw / 2 ? 'left' : 'right';
+                var minY = inset.top + 8;
+                var maxY = Math.max(minY, vh - inset.bottom - 8 - h);
+                var y = Math.min(maxY, Math.max(minY, baseTop + dy));
+                state.yRatio = (y - minY) / Math.max(1, maxY - minY);
+                persist();
+                collapsed = true;                        // expand() 内部 place() 会按展开态重摆
+                expand();
+              } else {
+                scheduleIdle();
+              }
+            }
+            a.addEventListener('touchend', endDrag, { passive: true });
+            a.addEventListener('touchcancel', endDrag, { passive: true });
+
+            // 鼠标（桌面 WebView 调试）与合成 click 的兜底：拖动后的合成 click 被吞，
+            // 真实的 mouse click 仍走 href 导航。
+            a.addEventListener('click', function (e) {
+              if (suppressClick) {
+                e.preventDefault();
+                suppressClick = false;
+              }
+            });
+
+            window.addEventListener('resize', function () { place(); });
+            place();
+            scheduleIdle();
           }
 
           // ── 应用/撤销 ───────────────────────────────────────────────

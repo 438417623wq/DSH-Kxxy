@@ -66,6 +66,12 @@ android {
         // 走 asset 流式读取拿不到 comment；它已经先拷贝到 cacheDir 再用 ZipFile，
         // 所以这里的 noCompress 只影响 APK 体积与构建耗时，不影响正确性。
         noCompress += "zip"
+        // 扩展包池 assets/ext-pool/*.pool（内容是 gzip 的 tar）同理已是压缩态，
+        // 再压一遍纯浪费；且不压缩时 AssetManager.openFd() 才能取到真实 length ——
+        // RuntimeInstaller.ensureExtensionPool 靠它做「大小一致即跳过」的幂等判断。
+        // ⚠️ 后缀必须是 .pool 而非 .tar.gz：aapt2 在资产合并阶段会解包 .gz 并剥掉
+        // 后缀（实测 APK 条目变成 703MB 的明文 .tar），既撑大 APK 又破坏按名查池。
+        noCompress += "pool"
     }
 
     compileOptions {

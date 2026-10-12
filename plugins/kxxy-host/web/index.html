@@ -6,7 +6,10 @@
   <meta name="theme-color" content="#0B0D13">
   <title>DSH Kxxy 控制台</title>
   <!-- 必须用绝对路径：页面 URL 是 /kxxy（无尾斜杠），相对路径会被浏览器解析成
-       /host.css 而落到官方前端的 fallback 上 → 404，页面将完全无样式无交互。 -->
+       /host.css 而落到官方前端的 fallback 上 → 404，页面将完全无样式无交互。
+       theme.css 是构建期从官方 dsh-client-ui-theme 抽取的 token 定义（勿手改），
+       必须在 host.css 之前加载，host.css 的变量才能引用到官方色板。 -->
+  <link rel="stylesheet" href="/kxxy/assets/theme.css">
   <link rel="stylesheet" href="/kxxy/assets/host.css">
 </head>
 <body>
@@ -17,10 +20,10 @@
         <div class="header-branding">
           <div class="brand-logo" aria-hidden="true">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-              <path d="M12 2L3 7V17L12 22L21 17V7L12 2Z" stroke="#00C0FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              <path d="M12 22V12" stroke="#00C0FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              <path d="M21 7L12 12L3 7" stroke="#00C0FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              <circle cx="12" cy="12" r="3" fill="#2F80ED" />
+              <path d="M12 2L3 7V17L12 22L21 17V7L12 2Z" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M12 22V12" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M21 7L12 12L3 7" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <circle cx="12" cy="12" r="3" style="fill:var(--accent-cyan)" />
             </svg>
           </div>
           <div class="brand-text">
@@ -327,153 +330,35 @@
 
       <!-- 2. 扩展视图 -->
       <section class="view-pane" data-view="extensions" id="view-extensions">
-        <!-- 镜像源状态栏 -->
+        <!-- 镜像源状态栏（真实数据：/kxxy/api/mirror；假数据「清华源 38ms」已删） -->
         <div class="card mirror-card">
           <div class="mirror-left">
             <span class="mirror-icon" aria-hidden="true">🌐</span>
             <div class="mirror-info">
-              <span class="mirror-title">镜像源加速：<strong class="mirror-active-source" id="current-mirror-name">清华源 TUNA (Android 镜像包)</strong></span>
-              <span class="mirror-sub">平均延迟 38ms · 自动同步官方构建</span>
+              <span class="mirror-title">镜像源加速：<strong class="mirror-active-source" id="current-mirror-name">读取中…</strong></span>
+              <span class="mirror-sub" id="mirror-sub">点击「测速」获取各源真实延迟</span>
             </div>
           </div>
           <button class="button button-subtle button-sm" id="btn-switch-mirror">测速</button>
         </div>
 
+        <!-- 测速结果（点击应用切换，切换后提示重启引擎） -->
+        <div class="mirror-results" id="mirror-results"></div>
+
+        <!-- 已内置说明（④ 全能精选档：构建链 220 包直接预装在 runtime.zip 里） -->
+        <div class="card builtin-card" id="builtin-summary" style="display:none"></div>
+
         <!-- 扩展分类标签栏 -->
         <div class="tab-category-bar">
           <button class="category-chip active" data-category="all">全部</button>
           <button class="category-chip" data-category="toolchain">语言与编译链</button>
-          <button class="category-chip" data-category="system">系统与媒体</button>
+          <button class="category-chip" data-category="media">媒体与文档</button>
           <button class="category-chip" data-category="devtools">开发工具</button>
         </div>
 
-        <!-- 扩展卡片列表容器 -->
+        <!-- 扩展卡片列表容器（真实目录渲染；分组落节 + 多选） -->
         <div class="extensions-container" id="extensions-list">
-          <!-- 卡片 1 -->
-          <div class="card ext-card" data-category="toolchain">
-            <div class="ext-card-inner">
-              <div class="ext-icon-box python-color">Py</div>
-              <div class="ext-body">
-                <div class="ext-header">
-                  <h4 class="ext-name">Python 3.11 独立环境</h4>
-                  <span class="ext-version">v3.11.8</span>
-                </div>
-                <p class="ext-desc">内嵌精简版 Python 运行时，预置 pip、wheel 及基础科学计算桥接。</p>
-                <div class="ext-tags">
-                  <span class="tag-item">python3</span>
-                  <span class="tag-item">pip</span>
-                </div>
-              </div>
-              <div class="ext-action">
-                <button class="button button-installed button-sm" disabled>已激活</button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 卡片 2 -->
-          <div class="card ext-card" data-category="devtools">
-            <div class="ext-card-inner">
-              <div class="ext-icon-box git-color">Git</div>
-              <div class="ext-body">
-                <div class="ext-header">
-                  <h4 class="ext-name">Git &amp; OpenSSH 工具集</h4>
-                  <span class="ext-version">v2.43.0</span>
-                </div>
-                <p class="ext-desc">完整 Git 命令行版本控制，支持 SSH Key 认证与远程代码拉取提交。</p>
-                <div class="ext-tags">
-                  <span class="tag-item">git</span>
-                  <span class="tag-item">ssh</span>
-                </div>
-              </div>
-              <div class="ext-action">
-                <button class="button button-installed button-sm" disabled>已激活</button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 卡片 3 -->
-          <div class="card ext-card" data-category="toolchain">
-            <div class="ext-card-inner">
-              <div class="ext-icon-box clang-color">C++</div>
-              <div class="ext-body">
-                <div class="ext-header">
-                  <h4 class="ext-name">Clang / LLVM 编译套件</h4>
-                  <span class="ext-version">v17.0.6</span>
-                </div>
-                <p class="ext-desc">用于在 Android 端编译 Node C++ 原生 Native Addon 模块与 C 依赖库。</p>
-                <div class="ext-tags">
-                  <span class="tag-item">clang</span>
-                  <span class="tag-item">make</span>
-                </div>
-              </div>
-              <div class="ext-action">
-                <button class="button button-primary button-sm" data-action="install-ext" data-ext-id="llvm-toolchain">获取</button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 卡片 4 -->
-          <div class="card ext-card" data-category="system">
-            <div class="ext-card-inner">
-              <div class="ext-icon-box media-color">FF</div>
-              <div class="ext-body">
-                <div class="ext-header">
-                  <h4 class="ext-name">FFmpeg 极简多媒体编解码</h4>
-                  <span class="ext-version">v6.1</span>
-                </div>
-                <p class="ext-desc">音频格式转换、元数据抽取与语音识别切片处理工具。</p>
-                <div class="ext-tags">
-                  <span class="tag-item">ffmpeg</span>
-                  <span class="tag-item">ffprobe</span>
-                </div>
-              </div>
-              <div class="ext-action">
-                <button class="button button-primary button-sm" data-action="install-ext" data-ext-id="ffmpeg-mini">获取</button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 卡片 5 -->
-          <div class="card ext-card" data-category="devtools">
-            <div class="ext-card-inner">
-              <div class="ext-icon-box rg-color">Rg</div>
-              <div class="ext-body">
-                <div class="ext-header">
-                  <h4 class="ext-name">Ripgrep &amp; Fd 搜索加速</h4>
-                  <span class="ext-version">v14.1.0</span>
-                </div>
-                <p class="ext-desc">Rust 编写的代码树文本检索与文件名模糊匹配器，提速 10 倍以上。</p>
-                <div class="ext-tags">
-                  <span class="tag-item">rg</span>
-                  <span class="tag-item">fd</span>
-                </div>
-              </div>
-              <div class="ext-action">
-                <button class="button button-installed button-sm" disabled>已激活</button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 卡片 6 -->
-          <div class="card ext-card" data-category="devtools">
-            <div class="ext-card-inner">
-              <div class="ext-icon-box rust-color">Rs</div>
-              <div class="ext-body">
-                <div class="ext-header">
-                  <h4 class="ext-name">Rust 编译器与 Cargo</h4>
-                  <span class="ext-version">v1.75.0</span>
-                </div>
-                <p class="ext-desc">支持在本地直接编译带有 rust 代码的 Agent 依赖扩展工具。</p>
-                <div class="ext-tags">
-                  <span class="tag-item">rustc</span>
-                  <span class="tag-item">cargo</span>
-                </div>
-              </div>
-              <div class="ext-action">
-                <button class="button button-primary button-sm" data-action="install-ext" data-ext-id="rust-toolchain">获取</button>
-              </div>
-            </div>
-          </div>
+          <div class="empty-state">正在加载扩展目录…</div>
         </div>
       </section>
 
@@ -494,24 +379,23 @@
             </div>
           </div>
 
-          <!-- 终端显示区域 -->
+          <!-- 终端 shell 诊断（三轮②：同源 localStorage 缓存的失效 shell 会让
+               「新建终端」持续失败，这里检测并提供一键清除） -->
+          <div class="card shell-diag-card">
+            <div class="card-title-row">
+              <div class="card-title-group">
+                <h3 class="card-title">终端 Shell 诊断</h3>
+                <span class="card-subtitle">对话页新建终端失败时，多半是这里缓存了失效路径</span>
+              </div>
+            </div>
+            <div id="shell-diag-body">
+              <div class="setting-info"><span class="setting-title">加载中…</span></div>
+            </div>
+          </div>
+
+          <!-- 终端显示区域（真实引擎日志由轮询填充；旧版写死的假启动日志已删） -->
           <div class="terminal-viewport" id="terminal-viewport">
-            <pre class="terminal-code" id="terminal-code-stream">
-<span class="ansi-cyan">[dsh-init]</span> Android Bionic environment initialized.
-<span class="ansi-cyan">[dsh-init]</span> Platform: android (aarch64), Kernel: 5.15.78-android13
-<span class="ansi-cyan">[dsh-init]</span> Loading core binaries...
-$ node -v
-<span class="ansi-green">v20.11.1</span>
-$ pnpm -v
-<span class="ansi-green">8.15.4</span>
-$ dsh --profile desktop --workspace /data/user/0/app.kxxy/files/kxxy-home/workspaces
-<span class="ansi-yellow">[boot]</span> Loading configuration from /data/user/0/app.kxxy/files/kxxy-home/profiles/desktop/package.json
-<span class="ansi-yellow">[boot]</span> Applying Android runtime compatibility layers (13 patches active)
-<span class="ansi-yellow">[boot]</span> SQLite storage connected: state.db (WAL enabled)
-<span class="ansi-green">[http]</span> Server listening at http://127.0.0.1:3080/
-<span class="ansi-green">[http]</span> Route /kxxy mounted for Host Management Dashboard
-<span class="ansi-green">[http]</span> Route / connected to Official React Web Client
-<span class="ansi-cyan">[agent]</span> Engine core ready. Waiting for user tasks...</pre>
+            <pre class="terminal-code" id="terminal-code-stream"><span style="color:var(--text-muted)">正在加载引擎日志…</span></pre>
           </div>
 
           <!-- 终端底部快捷键操作栏 -->
@@ -528,30 +412,45 @@ $ dsh --profile desktop --workspace /data/user/0/app.kxxy/files/kxxy-home/worksp
 
       <!-- 4. 设置视图 -->
       <section class="view-pane" data-view="settings" id="view-settings">
-        <!-- 权限等级分段选择 -->
+        <!-- 外观（读写官方 ui-theme 偏好：控制台与对话界面同步生效） -->
+        <div class="card block-card">
+          <div class="card-title-group">
+            <h3 class="card-title">外观</h3>
+            <span class="card-subtitle">与对话界面的深浅色设置同源 —— 在这里切换，对话页立即跟随</span>
+          </div>
+          <div class="appearance-list" id="appearance-list">
+            <div class="setting-info"><span class="setting-title">加载中…</span></div>
+          </div>
+        </div>
+
+        <!-- 系统权限卡片（状态来自原生心跳，申请走 kxxy:// 桥） -->
+        <div class="card block-card">
+          <div class="card-title-group">
+            <h3 class="card-title">系统权限</h3>
+            <span class="card-subtitle">Android 能力开关 —— 影响通知、日志导出与后台保活</span>
+          </div>
+          <div class="setting-list" id="perm-list">
+            <div class="setting-row">
+              <div class="setting-info">
+                <span class="setting-title">加载中…</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 宿主运行权限等级：模式卡片组 -->
         <div class="card block-card">
           <div class="card-title-group">
             <h3 class="card-title">宿主运行权限等级</h3>
             <span class="card-subtitle">控制 Agent 进程获取宿主 Android API 及系统执行边界</span>
           </div>
 
-          <div class="segmented-control" id="priv-mode-segment" role="radiogroup" aria-label="权限模式">
-            <button class="segment-btn active" data-mode="normal" role="radio" aria-checked="true">
-              <span class="seg-title">沙箱 Normal</span>
-              <span class="seg-sub">应用专属目录隔离</span>
-            </button>
-            <button class="segment-btn" data-mode="shizuku" role="radio" aria-checked="false">
-              <span class="seg-title">Shizuku ADB</span>
-              <span class="seg-sub">系统 ADB 调试权限</span>
-            </button>
-            <button class="segment-btn" data-mode="root" role="radio" aria-checked="false">
-              <span class="seg-title">Root 最高</span>
-              <span class="seg-sub">su 无限制系统调用</span>
-            </button>
+          <div class="priv-cards" id="priv-cards">
+            <div class="setting-info"><span class="setting-title">加载中…</span></div>
           </div>
-          <div class="segment-hint" id="priv-mode-description">
-            当前处于标准应用沙箱环境，保护隐私同时满足绝大多数 Harness Agent 代码任务。
-          </div>
+
+          <button class="button button-primary button-block priv-apply" id="btn-priv-apply" disabled>应用并重启引擎</button>
+          <div class="segment-hint" id="priv-mode-description"></div>
         </div>
 
         <!-- 功能开关组 -->
@@ -659,6 +558,17 @@ $ dsh --profile desktop --workspace /data/user/0/app.kxxy/files/kxxy-home/worksp
         </div>
       </section>
     </main>
+
+    <!-- 批量操作条（勾选卡片后浮出，吸附在底栏导航之上） -->
+    <div class="ext-batch-bar" id="ext-batch-bar" hidden>
+      <span class="ext-batch-count" id="ext-batch-count">已选 0 项</span>
+      <div class="ext-batch-actions">
+        <button class="button button-subtle button-sm" id="btn-ext-select-all">全选</button>
+        <button class="button button-subtle button-sm" id="btn-ext-select-none">取消全选</button>
+        <button class="button button-primary button-sm" id="btn-ext-batch-install">激活所选 (0)</button>
+        <button class="button button-warning button-sm" id="btn-ext-batch-remove">卸载所选</button>
+      </div>
+    </div>
 
     <!-- 底部固定 Tab 导航 -->
     <nav class="app-tabbar" aria-label="底栏导航">
