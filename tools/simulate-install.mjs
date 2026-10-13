@@ -63,7 +63,16 @@ const PTY_NODE_MARKER = "kxxy-pty-node@1";
  * 于是「改了 host.js / lib/index.js 却只重装 APK」的设备一直跑旧插件，
  * 且七锚点全通过、永不重装。标记写在插件入口 lib/index.js 首行。
  */
-const HOST_PLUGIN_MARKER = "kxxy-host@2";
+const HOST_PLUGIN_MARKER = "kxxy-host@3";
+
+/**
+ * 与 RuntimeInstaller.MOBILE_UI_MARKER 保持一致（锚点 9）。
+ *
+ * 适配层是纯静态资产（mobile.css + mobile.js），只改它时插件入口
+ * lib/index.js 的标记不动，锚点 8 会判「已是最新」而跳过重装 —— 真机上
+ * 表现为「新写的移动端布局完全没生效」。两份文件共用一个编号。
+ */
+const MOBILE_UI_MARKER = "kxxy-mobile-ui@2";
 const EXECUTABLE_NAMES = new Set(["rg", "esbuild", "node", "sharp", "swc", "dprint", "biome"]);
 const SONAME_ALIASES = [
   ["lib/libreadline.so.8", "lib/libreadline.so.8.3"],
@@ -276,8 +285,8 @@ for (const full of walk(target)) {
 }
 console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755`);
 
-// ---------------------------------------------------------------- isComplete（八锚点）
-console.log("[6] isComplete 八锚点（含兼容层、PTY 绑定与宿主插件的版本标记）：");
+// ---------------------------------------------------------------- isComplete（九锚点）
+console.log("[6] isComplete 九锚点（含兼容层、PTY 绑定、宿主插件与移动端适配层的版本标记）：");
 const anchors = [
   ["锚点 1 dsh 引擎入口", join(target, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js")],
   ["锚点 2 SONAME 别名 libreadline.so.8", join(target, "lib/libreadline.so.8")],
@@ -294,6 +303,10 @@ const anchors = [
   // 锚点 8：宿主插件本体。锚点 5 的 package.json 从 v0.1.0 起内容未变，
   // 光判它存在会让「改了 host.js 却只重装 APK」的设备一直跑旧插件。
   ["锚点 8 宿主插件入口", join(target, "lib/node_modules/kxxy-host/lib/index.js")],
+  // 锚点 9：移动端 UI 适配层。纯静态资产，只改它时插件入口标记不动，
+  // 锚点 8 会判「已是最新」而跳过重装，真机表现为新布局完全没生效。
+  ["锚点 9 移动端适配样式", join(target, "lib/node_modules/kxxy-host/web/mobile.css")],
+  ["锚点 9 移动端适配脚本", join(target, "lib/node_modules/kxxy-host/web/mobile.js")],
 ];
 for (const [label, f] of anchors) {
   if (!existsSync(f)) fail(`${label} 缺失：${f.slice(target.length + 1)}`);
@@ -337,6 +350,20 @@ for (const [label, f] of anchors) {
     const head = readFileSync(entry, "utf8").slice(0, 256);
     if (!head.includes(HOST_PLUGIN_MARKER)) fail(`锚点 8 版本标记过期：lib/index.js 头部不含 ${HOST_PLUGIN_MARKER}`);
     else ok(`锚点 8 版本标记匹配（${HOST_PLUGIN_MARKER}）`);
+  }
+}
+{
+  // 锚点 9 的第二段判定：移动端适配层版本标记（css 与 js 共用一个编号，
+  // 两份都必须匹配 —— 只升一份会导致「样式更新了、脚本还是旧的」这种半新状态）。
+  for (const [label, rel] of [
+    ["样式", "lib/node_modules/kxxy-host/web/mobile.css"],
+    ["脚本", "lib/node_modules/kxxy-host/web/mobile.js"],
+  ]) {
+    const f = join(target, rel);
+    if (!existsSync(f)) continue;   // 缺失已由上面的 anchors 循环报过
+    const head = readFileSync(f, "utf8").slice(0, 256);
+    if (!head.includes(MOBILE_UI_MARKER)) fail(`锚点 9 ${label}版本标记过期：头部不含 ${MOBILE_UI_MARKER}`);
+    else ok(`锚点 9 ${label}版本标记匹配（${MOBILE_UI_MARKER}）`);
   }
 }
 {

@@ -91,6 +91,10 @@ const NEED = [
   "lib/node_modules/node-pty/package.json",
   "lib/node_modules/node-pty/lib/index.js",
   "lib/node_modules/node-pty/prebuilds/android-arm64/dsh_pty_node.node",
+  // 移动端 UI 适配层：窄屏重排官方设置面板 + 左侧栏覆盖式抽屉。
+  // 纯静态资产，独立于插件入口标记（见 RuntimeInstaller 锚点 9）
+  "lib/node_modules/kxxy-host/web/mobile.css",
+  "lib/node_modules/kxxy-host/web/mobile.js",
   "kxxy-runtime.json",
 ];
 const byName = new Map(entries.map((e) => [e.name, e]));
@@ -186,6 +190,39 @@ for (const n of NEED) {
       missing += 1;
     } else {
       console.log(`宿主插件版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- 移动端适配层版本标记
+// 独立于锚点 8：适配层是纯静态资产，只改它时插件入口 lib/index.js 的标记不动，
+// 锚点 8 会判「已是最新」而跳过重装，真机表现为新布局完全没生效。
+// 两份文件共用一个编号，必须都与 RuntimeInstaller.MOBILE_UI_MARKER 一致。
+{
+  const markerNeed = /MOBILE_UI_MARKER\s*=\s*"([^"]+)"/.exec(
+    readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
+  );
+  if (markerNeed === null) {
+    console.log("移动端适配层版本标记：✗ RuntimeInstaller.kt 未定义 MOBILE_UI_MARKER");
+    missing += 1;
+  } else {
+    for (const rel of [
+      "lib/node_modules/kxxy-host/web/mobile.css",
+      "lib/node_modules/kxxy-host/web/mobile.js",
+    ]) {
+      const e = byName.get(rel);
+      if (!e) {
+        console.log(`移动端适配层版本标记：✗ ${rel} 条目缺失`);
+        missing += 1;
+        continue;
+      }
+      const head = readLocal(e).toString("utf8").slice(0, 256);
+      if (!head.includes(markerNeed[1])) {
+        console.log(`移动端适配层版本标记：✗ ${rel} 头部不含 ${markerNeed[1]}`);
+        missing += 1;
+      } else {
+        console.log(`移动端适配层版本标记：✓ ${rel.split("/").pop()} = ${markerNeed[1]}`);
+      }
     }
   }
 }

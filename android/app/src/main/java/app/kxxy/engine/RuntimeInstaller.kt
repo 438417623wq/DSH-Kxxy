@@ -151,7 +151,7 @@ class RuntimeInstaller(private val ctx: Context) {
     }
 
     /**
-     * 八锚点完整性探针。
+     * 九锚点完整性探针。
      *
      * 任一锚点缺失即认为需要重装。刻意不只看版本戳 —— 见方法注释上方的 m1.13 事故。
      */
@@ -236,6 +236,24 @@ class RuntimeInstaller(private val ctx: Context) {
         // plugins/kxxy-host/ 下任何文件后都要递增编号，并同步本常量。
         if (!markerIsCurrent(root, HOST_PLUGIN_ENTRY, HOST_PLUGIN_MARKER)) {
             Log.w(TAG, "runtime probe: kxxy-host plugin outdated, forcing reinstall")
+            return false
+        }
+
+        // 锚点 9：移动端 UI 适配层（mobile.css + mobile.js）在位且为当前版本。
+        //
+        // 独立于锚点 8：适配层是纯静态资产，只改它时插件入口 lib/index.js 的
+        // 标记不动，锚点 8 会判「已是最新」而跳过重装 —— 真机上表现为「新写的
+        // 移动端布局完全没生效」。两份文件都要在，且都带同一个版本标记。
+        if (!File(root, MOBILE_UI_CSS).isFile || !File(root, MOBILE_UI_SCRIPT).isFile) {
+            Log.w(TAG, "runtime probe: mobile ui layer missing, forcing reinstall")
+            return false
+        }
+        if (!markerIsCurrent(root, MOBILE_UI_CSS, MOBILE_UI_MARKER)) {
+            Log.w(TAG, "runtime probe: mobile ui stylesheet outdated, forcing reinstall")
+            return false
+        }
+        if (!markerIsCurrent(root, MOBILE_UI_SCRIPT, MOBILE_UI_MARKER)) {
+            Log.w(TAG, "runtime probe: mobile ui script outdated, forcing reinstall")
             return false
         }
 
@@ -656,7 +674,20 @@ class RuntimeInstaller(private val ctx: Context) {
          * 旧插件跳过重装。改动 plugins/kxxy-host/ 下任何文件后递增编号。
          */
         private const val HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js"
-        private const val HOST_PLUGIN_MARKER = "kxxy-host@2"
+        private const val HOST_PLUGIN_MARKER = "kxxy-host@3"
+
+        /**
+         * 移动端 UI 适配层版本标记（锚点 9），写在 kxxy-host/web/mobile.css
+         * 与 mobile.js 首行（两份文件共用一个编号）。
+         *
+         * 独立于锚点 8 的原因：锚点 8 只探 lib/index.js，而适配层是纯静态
+         * 资产 —— 只改 mobile.css / mobile.js 时插件入口的标记不动，老设备
+         * 会带着旧适配层跳过重装，用户看到的是「新功能没生效」。两份文件都
+         * 必须存在且标记一致，改动其中任何一份都要同步递增编号。
+         */
+        private const val MOBILE_UI_CSS = "lib/node_modules/kxxy-host/web/mobile.css"
+        private const val MOBILE_UI_SCRIPT = "lib/node_modules/kxxy-host/web/mobile.js"
+        private const val MOBILE_UI_MARKER = "kxxy-mobile-ui@2"
 
         /** 读版本标记时探测的头部字节数；标记都写在首行，取小值即可。 */
         private const val COMPAT_MARKER_PROBE_BYTES = 256

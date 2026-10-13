@@ -10,6 +10,10 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+# Gradle/JVM 崩溃日志：本机内存只有 7.8 GB，构建期 OOM 时会落在 android/ 下，
+# 内容是堆栈快照而非源码，不入库
+hs_err_pid*.log
+replay_pid*.log
 
 # ---- 运行时装配产物 ----
 # runtime.zip 是 tools/build-runtime.mjs 的产物（④ 全能精选档 497 MiB / 35250 条目），

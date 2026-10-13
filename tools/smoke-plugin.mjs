@@ -60,9 +60,12 @@ const webServer = {
     throw new Error('kxxy-host 不应注册 fallback')
   },
   /**
-   * 兼容层注入走 tapIndex（官方 WebServer 公开扩展点，见
+   * index 注入走 tapIndex（官方 WebServer 公开扩展点，见
    * dsh-host-webserver `:220 tapIndex` / `:339 applyIndexTaps`）。
    * 这里按官方语义登记 transform，并返回注销函数。
+   *
+   * 当前有 **两个** tap：兼容层（injectCompat）与移动端适配样式
+   * （injectMobileCss），注册顺序即执行顺序。
    */
   tapIndex(transform) {
     if (typeof transform !== 'function') throw new Error('tapIndex 需要函数')
@@ -146,14 +149,15 @@ for (const p of prefixes.keys()) {
 //   2) 插件 CSS 用了 Chrome 108+ 的 dvh 单位，旧 WebView 的 CSS 解析器把整条
 //      height 声明丢弃，目录选择对话框塌成 0 高，列表整片空白。
 console.log(`  index taps：${indexTaps.length}`)
-if (indexTaps.length !== 1) fail(`应恰好注册 1 个 index tap，实为 ${indexTaps.length}`)
-else ok('已注册 index 兼容层 tap')
+if (indexTaps.length !== 2) fail(`应恰好注册 2 个 index tap（兼容层 + 移动端适配层），实为 ${indexTaps.length}`)
+else ok('已注册 index 兼容层 tap 与移动端适配 tap')
 
-if (indexTaps.length === 1) {
+if (indexTaps.length === 2) {
   const html = '<!doctype html><html><head><title>t</title>'
     + '<script type="module" src="./assets/index-abc.js"></script></head>'
     + '<body><div id="root"></div></body></html>'
-  const out = indexTaps[0](html)
+  // 官方 applyIndexTaps 按注册顺序依次跑 transform，逐个累加。
+  const out = indexTaps.reduce((acc, fn) => fn(acc), html)
   const atCompat = out.indexOf('data-kxxy-compat')
   const atEntry = out.indexOf('src="./assets/index-abc.js"')
   if (atCompat < 0) fail('index tap 未注入兼容层 script')
@@ -191,6 +195,99 @@ if (indexTaps.length === 1) {
   // 所以每次输入都是干净的 HTML，无需幂等；这里只确认单次调用只注入一份。
   if (out.split('data-kxxy-compat').length - 1 !== 1) fail('单次 tap 注入了多份兼容层')
   else ok('单次 tap 只注入一份')
+
+  // ── 移动端 UI 适配层 ─────────────────────────────────────────────
+  // 与兼容层的时序要求相反：兼容层必须**早于**入口 module（API 要在求值前
+  // 就位），而适配样式必须**晚于**官方样式表（同权重规则才不会被覆盖回去），
+  // 所以它插在 </head> 之前。
+  const atMobile = out.indexOf('data-kxxy-mobile>')
+  if (atMobile < 0) fail('index tap 未注入移动端适配样式')
+  else ok('index tap 注入了移动端适配样式')
+  if (atMobile < atEntry) fail('移动端样式早于入口 module（应在 </head> 前，晚于官方样式表）')
+  else ok(`移动端样式位于文档后段（mobile@${atMobile} entry@${atEntry}）`)
+  if (atMobile < atCompat) fail('移动端样式早于兼容层（注册顺序应保持 兼容层 → 移动端适配层）')
+  else ok('注册顺序正确（兼容层先，移动端适配层后）')
+  // 样式内容必须真的带上了：窄屏媒体查询、面板锚点、以及 flex-basis 那个坑
+  // 的修复（flex:0 0 auto 与 height 必须同时出现，只写 height 会被顶掉）。
+  for (const need of [
+    '@media (max-width: 767px)',
+    '[data-shortcut-modal="settings"]',
+    '[class*="navList"]',
+    '[class*="_themeCube"]',
+  ]) {
+    if (!out.includes(need)) fail(`移动端样式缺少关键规则：${need}`)
+  }
+  ok('移动端样式含媒体查询 / 面板锚点 / tab 条 / 外观卡片规则')
+  const cubeRule = /\[class\*="_themeCube"\][^}]*\}/.exec(out)
+  if (cubeRule === null) fail('移动端样式未定义 themeCube 规则')
+  else if (!/flex:\s*0 0 auto/.test(cubeRule[0]) || !/height:\s*52px/.test(cubeRule[0])) {
+    fail('themeCube 规则必须同时写 flex:0 0 auto 与 height（flex-basis 优先于 height）')
+  } else ok('themeCube 规则含 flex:0 0 auto + height（flex-basis 坑已规避）')
+  if (out.split('data-kxxy-mobile>').length - 1 !== 1) fail('单次 tap 注入了多份移动端样式')
+  else ok('移动端样式单次只注入一份')
+
+  // ── 左侧栏抽屉（mobile.css ⑪/⑫ + mobile.js）──────────────────────
+  // 三条硬约束，缺一条真机上就会复现事故：
+  //   1) grid 列宽必须 !important —— 官方把列宽写在 React inline style 上
+  //   2) 侧栏必须 absolute 而非 fixed —— 祖先链上有 z-index:40 的 static 容器，
+  //      fixed 层会输掉层叠竞争，表现为「测量正确但整块不可见」
+  //   3) centerCol 必须显式 grid-column:2 —— 侧栏脱流后 grid 自动重排会把
+  //      主内容放到第 1 列（0px 宽），不指定就压成 0 宽
+  const railOpenRule = /\[class\*="BynINW_frame"\]\.kxxy-rail-open\s*\{[^}]*\}/.exec(out)
+  if (railOpenRule === null) fail('移动端样式未定义 .kxxy-rail-open 的 grid 规则')
+  else if (!/grid-template-columns:[^;]*!important/.test(railOpenRule[0])) {
+    fail('.kxxy-rail-open 的 grid-template-columns 必须带 !important（官方 inline style 无它则胜出）')
+  } else ok('.kxxy-rail-open 用 !important 覆盖 React inline grid')
+  const railColRule = /\[class\*="BynINW_frame"\]\.kxxy-rail-open\s*>\s*\[class\*="sidebarCol"\]\s*\{[^}]*\}/.exec(out)
+  if (railColRule === null) fail('移动端样式未定义抽屉态 sidebarCol 规则')
+  else if (!/position:\s*absolute/.test(railColRule[0])) {
+    fail('抽屉必须用 position:absolute（fixed 会输给祖先链上的 z-index:40 容器）')
+  } else if (/position:\s*fixed/.test(railColRule[0])) {
+    fail('抽屉不得使用 position:fixed')
+  } else ok('抽屉用 absolute 覆盖（避开 fixed 的层叠竞争）')
+  if (!/\.kxxy-rail-open\s*>\s*\[class\*="centerCol"\]\s*\{[^}]*grid-column:\s*2/.test(out)) {
+    fail('抽屉态必须给 centerCol 显式 grid-column:2（侧栏脱流后会重排到 0px 的第 1 列）')
+  } else ok('抽屉态显式把 centerCol 放回第 2 列')
+  if (!out.includes('kxxy-rail-open::after')) fail('移动端样式缺少抽屉遮罩 ::after')
+  else ok('抽屉含遮罩层（点击收起）')
+
+  const atMobileJs = out.indexOf('data-kxxy-mobile-js')
+  if (atMobileJs < 0) fail('index tap 未注入移动端适配脚本')
+  else ok('index tap 注入了移动端适配脚本')
+  if (atMobileJs < atMobile) fail('移动端脚本早于样式（样式必须先就位，否则改 class 时会闪一帧未重排布局）')
+  else ok(`移动端脚本晚于样式（js@${atMobileJs} css@${atMobile}）`)
+  for (const need of [
+    "var OPEN_CLASS = 'kxxy-rail-open'",
+    'gridTemplateColumns',
+    'matchMedia',
+    'addListener',
+  ]) {
+    if (!out.includes(need)) fail(`移动端脚本缺少实现：${need}`)
+  }
+  ok('移动端脚本含切类 / inline grid 判档 / 窄屏媒体查询监听')
+  // 判档必须读 inline style：我们自己会用 !important 把 computed 压成 0px，
+  // 读 computed 会永远得到「已折叠」，抽屉永不打开。
+  if (/getComputedStyle\([^)]*\)\.gridTemplateColumns/.test(out)) {
+    fail('移动端脚本不得用 computed 的 gridTemplateColumns 判档（会被自己的 !important 骗到）')
+  } else ok('移动端脚本用 inline gridTemplateColumns 判档（不受自身 !important 影响）')
+  // WebView 104 没有 MediaQueryList.addEventListener，必须留 addListener 兜底分支。
+  if (!/addListener/.test(out)) fail('移动端脚本缺少 WebView 104 的 addListener 兜底')
+  else ok('移动端脚本兼容 WebView 104 的 MediaQueryList 旧 API')
+  if (out.split('data-kxxy-mobile-js').length - 1 !== 1) fail('单次 tap 注入了多份移动端脚本')
+  else ok('移动端脚本单次只注入一份')
+
+  // 版本标记必须与 RuntimeInstaller.MOBILE_UI_MARKER 一致，否则老设备
+  // 升级后锚点 8 判不出过期，会带着旧适配层跳过重装。
+  const mobileMarker = /kxxy-mobile-ui@(\d+)/.exec(out)
+  if (mobileMarker === null) fail('移动端适配层缺少版本标记 kxxy-mobile-ui@N')
+  else {
+    const kotlin2 = readFileSync(join(HERE, '..', 'android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt'), 'utf8')
+    const mobileKotlinMarker = /MOBILE_UI_MARKER\s*=\s*"([^"]+)"/.exec(kotlin2)
+    if (mobileKotlinMarker === null) fail('RuntimeInstaller.kt 未定义 MOBILE_UI_MARKER')
+    else if (mobileKotlinMarker[1] !== mobileMarker[0]) {
+      fail(`移动端适配层版本标记不一致：mobile.css=${mobileMarker[0]} RuntimeInstaller=${mobileKotlinMarker[1]}`)
+    } else ok(`移动端适配层版本标记一致（${mobileMarker[0]}）`)
+  }
 }
 
 // ── 真实 HTTP 分发 ────────────────────────────────────────────────
@@ -478,7 +575,7 @@ console.log('\n[13] disposer 卸载后路由消失')
   if (r.status !== 404) fail(`卸载后应为 404，实为 ${r.status}`)
   else ok('卸载后 /kxxy → 404')
   if (indexTaps.length !== 0) fail(`卸载后 index tap 未注销（剩 ${indexTaps.length} 个）`)
-  else ok('卸载后 index tap 已注销')
+  else ok('卸载后 index tap 已注销（兼容层 + 移动端样式）')
 }
 
 console.log(`\n插件日志：${logs.length} 条`)

@@ -19,7 +19,7 @@
 │  WebViewGate        WebView ≥ Chrome 85 检测                      │
 │  EngineSupervisor   进程监管 + 指数退避 + 状态文件                 │
 │  EngineProcess      PTY 启动引擎（--expose-internals 是硬前提）    │
-│  RuntimeInstaller   解包 runtime.zip（含 LINK 物化 / 八锚点自愈）  │
+│  RuntimeInstaller   解包 runtime.zip（含 LINK 物化 / 九锚点自愈）  │
 │  EngineService      前台服务保活（specialUse）                     │
 │  Privilege          Normal / Shizuku / Root 三级权限               │
 │  dsh_pty.c          forkpty 原生 PTY（Android 无 posix_openpt）    │
@@ -63,6 +63,9 @@ dsh-kxxy/
 │   ├── cordis.patch.yml          挂载声明
 │   ├── lib/index.js              路由 + API
 │   └── web/                      管理页 HTML/CSS/JS（含 compat.js 兼容层）
+│       ├── compat.js             旧 ROM WebView 兼容层（缺陷 I/J）
+│       ├── mobile.css            移动端适配：设置面板重排 + 左侧栏抽屉（缺陷 O）
+│       └── mobile.js             同上，负责切类 / 遮罩点击 / 恢复入口
 ├── tools/                        构建与验证工具链（8 个脚本）
 │   ├── fetch-runtime.mjs         拉取 Termux aarch64 deb 包
 │   ├── build-runtime.mjs         装配 runtime.zip（8 个阶段）
@@ -156,7 +159,7 @@ cd android
 
 ---
 
-## 五、移植过程中发现并修掉的 14 个真实缺陷
+## 五、移植过程中发现并修掉的 15 个真实缺陷
 
 这些都是**只在真机/端到端路径上才会暴露**的问题，构建全绿时完全看不出来：
 
@@ -175,7 +178,8 @@ cd android
 | K | Android 无 PTY 支持（两处独立缺口） | 「新建终端」面板只剩「重试」按钮与红字 `终端错误：subprocess-local: terminal inspection is unsupported on platform android` | ① 上游 `dsh-subprocess-local` 的 `createProcessInspector()` 只认 linux/darwin/win32，而 Android 上 `process.platform === "android"`（不是 `"linux"`），三分支全不命中直接抛错；② 即使过了这关，`node-pty` 在 Android 上没有官方预编译产物，早期构建注入的是**抛错空壳**。两处都由构建期补丁修掉：`patchSubprocessInspector` 让 android 复用 `LinuxProcessInspector`（其实现只依赖 `/proc`，arm64 的 `SYSCALLS` 表齐备，真机实测 `/proc/self/stat` 与 `/proc/self/mem` 均可读），`patchNodePty` 改为注入自研 N-API 模块（`tools/prebuilt/node-pty-android/`） |
 | L | Root 模式启动必然失败 | 选「Root 提权」后引擎永远起不来：`启动失败，32 秒后重试（第 N 次）`；logcat 里只有 `exit 127` 与 `EIO`，**没有一行报错** | `Privilege.usableSuPrefix()` 用 `findSu()` 的**绝对路径**去探测（探测成功），返回值却是硬编码的**裸名** `["su","-c"]`；该值一路传到 `EngineProcess.spawn` → `dsh_pty.c` 的 `execve` —— 而 `execve` **不搜索 PATH**，裸名直接 ENOENT、exit 127。讽刺的是 `Privilege.kt` 文件头注释早已写明这条约束。修复：`usableSuPrefix()` 返回 `listOf(suBin) + args`（首项必为绝对路径），`EngineProcess` 增 `requireAbsolute()` 守卫在起点拦下裸名 |
 | M | Shizuku 模式从未实现 | 「Shizuku ADB」档位可选中、可保存、可重启，但**没有任何 ADB 能力**；用户感知为「Shizuku 权限有问题」 | 原实现只做了两件事：检测管理器是否安装（`packageManager.getPackageInfo`）+ 把 `DSH_ANDROID_PRIV_MODE=shizuku` 写进引擎环境变量。依赖里没有 `dev.rikka.shizuku:*`、清单里没有 `ShizukuProvider`、没有任何 binder 调用 —— 前端卡片自己都写着「完整注入为四期项」。修复见 `ShizukuBridge` + `ShizukuShellServer`：走 `IShizukuService.Stub.asInterface(Shizuku.getBinder()).newProcess(...)`（`Shizuku.newProcess` 在 13.x 已私有化且计划于 API 14 移除，但其实现只有这一行），应用侧轮询 `<engineRoot>/shz/request` 执行后写 `response`，引擎内用生成的 `bin/shz` 闸门脚本调用 |
-| N | 插件更新不会到达老设备 | 只重装 APK 后，界面仍是旧插件（Shizuku 卡片的「请求授权」按钮、`priv-hint` 提示块全都不出现），必须手工 push 才生效 | `RuntimeInstaller.isComplete()` 的锚点 5 只判 `kxxy-host/package.json` 存在，而那个文件**从 v0.1.0 起内容就没变过**；`runtimeVersion` 戳也不变，于是七锚点全通过、永不重装。修复：新增锚点 8，按插件入口 `kxxy-host/lib/index.js` 首行的版本标记 `kxxy-host@N` 判定过期（与锚点 6/7 同一手法）。**约定：改动 `plugins/kxxy-host/` 下任何文件后，必须递增 `lib/index.js` 首行标记并同步 `RuntimeInstaller.HOST_PLUGIN_MARKER`**，否则老设备不会自愈 |
+| N | 插件更新不会到达老设备 | 只重装 APK 后，界面仍是旧插件（Shizuku 卡片的「请求授权」按钮、`priv-hint` 提示块全都不出现），必须手工 push 才生效 | `RuntimeInstaller.isComplete()` 的锚点 5 只判 `kxxy-host/package.json` 存在，而那个文件**从 v0.1.0 起内容就没变过**；`runtimeVersion` 戳也不变，于是七锚点全通过、永不重装。修复：新增锚点 8，按插件入口 `kxxy-host/lib/index.js` 首行的版本标记 `kxxy-host@N` 判定过期（与锚点 6/7 同一手法）。**约定：改动 `plugins/kxxy-host/` 下任何文件后，必须递增 `lib/index.js` 首行标记并同步 `RuntimeInstaller.HOST_PLUGIN_MARKER`**，否则老设备不会自愈。后来适配层（纯静态资产）又踩了同一个坑：只改 `mobile.css` / `mobile.js` 时插件入口标记不动，锚点 8 仍判「已是最新」→ 再加**锚点 9**（两份文件共用标记 `kxxy-mobile-ui@N`） |
+| O | 官方前端无移动端适配 | ① 设置面板：411px 视口下面板仅 363px 宽，左侧导航硬吃 188px，右侧内容区只剩 175px，`_rowText` 扣掉 `padding-right:48px` 后标题宽 **0px** → 「选择新会话的默认权限模式」每个字一行、「权限」「语言」竖排、模型卡片「编辑/删除」竖排溢出卡片外；② 左侧栏：展开后主内容列从 355px 被压到 **131px** | 官方是纯桌面布局，**没有断点也没有移动端分支**。① 宽度链是 `panel 363px`（`width:800px; max-width:calc(-48px + 100vw)`）→ `nav 188px`（`flex:0 0 auto`，不可压缩）→ `content 175px`（`flex:1 1 0%`）→ `options` 再扣 `padding:0 24px` 只剩 127px → `rowText` 再扣 48px 归零；② `BynINW_frame` 的 `grid-template-columns: 280px minmax(0px,1fr) minmax(0px,0px)` 由 **React 写死在 inline style**（自定义属性全为空、官方样式表里 0 命中），它就是硬挤第二列，没有「覆盖层」概念。修复：新增插件侧移动端适配层 `plugins/kxxy-host/web/mobile.css` + `mobile.js`，注入到 `</head>` 之前（必须晚于官方样式表）。设置面板改为「顶部横向 tab 条 + 全宽内容」；左侧栏改为**覆盖式抽屉** —— 第一列压到 0px（inline 无 `!important`，CSS `!important` 可胜出）、侧栏 `position:absolute` 脱离 grid 流、`centerCol` 显式 `grid-column: 2`（脱流后 grid 会自动把它排到 0px 宽的第 1 列） |
 
 **构建期陷阱（非代码缺陷，但会毁掉产物）**：Gradle 的 `packageDebug` 走 zipflinger **增量打包** —— 它打开已存在的 APK 原地更新，条目变大时把新数据追加到文件末尾，**旧数据留成空洞且不截断文件**。本次 `runtime.zip` 只增大了 448 字节，`app-debug.apk` 却从 1.62 GB 涨到 **2.14 GB**（凭空多出 521 MB，恰好一整个旧 `runtime.zip`）。用中央目录逐条核对偏移即可确诊（空洞在 `classes5.dex` 之后、`DebugProbesKt.bin` 之前）。删掉产物重新 `assembleDebug` 后回到 1620993963 B。**发布前必须核对 APK 体积量级**，否则会发出一个白胖一倍的包。
 
@@ -215,6 +219,30 @@ Buffer、`onExit` 的 `signal` 是数字还是名字、`resize(cols, rows)` 与�
 因为上游的 `onExit` 处理器会 `output.end()`，顺序反了会把子进程临终输出截断，
 而这个 bug 在交互式终端里几乎看不出来（只在 `exit` 提示行消失时才显形）。
 
+**缺陷 O 的定位手法**（可复用）：症状是「中文逐字竖排」，第一直觉会去查字体或
+`writing-mode`，但两者都正常。真正的判据是**逐层量宽度**：从面板根一路量到出问题
+的那一行，得到 `363 → 188 → 175 → 127 → 0`，一眼看出每一层各吃掉多少 ——
+标题宽 0px 时，任何文字都只能一字一行。三条硬约束：
+① **官方运行时类名不在静态 CSS 文件里** —— 前端有 140+ 个运行时 `<style>` 标签，
+每个客户端插件用 `data-plugin="<包名>"` 注入，在 `dist/*.css` 里 grep 全部 0 命中，
+定位必须走 `document.styleSheets` 遍历 + 按 `ownerNode.getAttribute('data-plugin')` 归属；
+② **适配层不能依赖 CSS-module 哈希** —— 官方同时存在 `_语义_hash_行号`（如 `_3HsggG_rowText`）
+与 `hash_语义`（如 `wCInkW_nav`）两套格式，只能按**语义名中缀**匹配
+（`[class*="navList"]`），否则升级即失效；③ **`flex-basis` 优先于 `height`** ——
+外观卡片官方是 `flex:1 1 180px`，在 `flex-direction:column` 容器里 180px 是**主轴（高度）**
+尺寸，只写 `height:52px` 会被顶掉（实测仍 180px），必须先 `flex:0 0 auto`。
+
+**缺陷 O 的验证通道**（可复用）：Android WebView 没法开 CDP（`app.kxxy` 未调
+`setWebContentsDebuggingEnabled`），但**桌面 Chrome 打开同一个 `dsh web` 页面**
+就能拿到完全相同的 DOM —— 用 `Emulation.setDeviceMetricsOverride` 设 411x914、
+`setTouchEmulationEnabled` 让 `pointer: coarse` 命中，再 `Page.captureScreenshot` 出图。
+两条硬约束：① 引擎 cookie 绑 authority 且 `HttpOnly + SameSite=Strict`，手工
+`Network.setCookie` 会被 CDP 以 `Sanitizing cookie failed` 拒绝，**也不能先导航到
+about:blank 再回来**（无发起者的跨站导航不带 Strict cookie → 401，症状是 body 恰好
+68 字节），必须直接 `Page.navigate` 打 token URL 让浏览器自己走完 303 → Set-Cookie →
+重定向；② 要在**入口 module 求值之前**注入，用 `Page.addScriptToEvaluateOnNewDocument`
+（等价于原生层的 `evaluateJavascript`），否则会先渲染一帧桌面布局再跳变。
+
 ---
 
 ## 六、验证体系（五层）
@@ -222,7 +250,7 @@ Buffer、`onExit` 的 `signal` 是数字还是名字、`resize(cols, rows)` 与�
 | 脚本 | 验证什么 | 为什么需要它 |
 |---|---|---|
 | `verify-runtime.mjs` | zip 结构（条目数 / LINK 注释 / 占位符残留 / 版本标记 / ELF 校验） | 产物完整性 |
-| `simulate-install.mjs` | 复刻 `RuntimeInstaller` 的 7 步解包与八锚点判定 | 结构对 ≠ 设备上能装出可启动的树 |
+| `simulate-install.mjs` | 复刻 `RuntimeInstaller` 的 7 步解包与九锚点判定 | 结构对 ≠ 设备上能装出可启动的树 |
 | `smoke-plugin.mjs` | 复刻官方 `WebServer` 路由契约起真实 HTTP | 文件铺对了 ≠ 插件能挂起来 |
 | `check-bundle.mjs` | 用**真实** `dsh-app-boot` 走解析链 | 插件能跑 ≠ DSH 能发现它 |
 | `test-pty-patch.mjs` | 12 个补丁的离线单测（自带 fixture，不依赖仓库外文件） | 补丁改错了构建照样全绿，只有点开终端才炸 |
