@@ -687,7 +687,7 @@ class RuntimeInstaller(private val ctx: Context) {
          */
         private const val MOBILE_UI_CSS = "lib/node_modules/kxxy-host/web/mobile.css"
         private const val MOBILE_UI_SCRIPT = "lib/node_modules/kxxy-host/web/mobile.js"
-        private const val MOBILE_UI_MARKER = "kxxy-mobile-ui@2"
+        private const val MOBILE_UI_MARKER = "kxxy-mobile-ui@3"
 
         /** 读版本标记时探测的头部字节数；标记都写在首行，取小值即可。 */
         private const val COMPAT_MARKER_PROBE_BYTES = 256

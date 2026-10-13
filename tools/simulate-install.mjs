@@ -72,7 +72,7 @@ const HOST_PLUGIN_MARKER = "kxxy-host@3";
  * lib/index.js 的标记不动，锚点 8 会判「已是最新」而跳过重装 —— 真机上
  * 表现为「新写的移动端布局完全没生效」。两份文件共用一个编号。
  */
-const MOBILE_UI_MARKER = "kxxy-mobile-ui@2";
+const MOBILE_UI_MARKER = "kxxy-mobile-ui@3";
 const EXECUTABLE_NAMES = new Set(["rg", "esbuild", "node", "sharp", "swc", "dprint", "biome"]);
 const SONAME_ALIASES = [
   ["lib/libreadline.so.8", "lib/libreadline.so.8.3"],

@@ -1,4 +1,4 @@
-/* kxxy-mobile-ui@2 */
+/* kxxy-mobile-ui@3 */
 /**
  * DSH Kxxy 移动端 UI 适配 —— 窄屏重排层
  *
@@ -7,7 +7,7 @@
  * 的 injectMobileCss）。**不修改官方前端任何文件**，官方升级时本层不受影响；
  * 若官方 DOM 结构变化导致选择器落空，最坏结果是回到官方原样，不会破坏页面。
  *
- * 版本标记 `kxxy-mobile-ui@1`（首行）：改动本文件后必须同步递增编号，并
+ * 版本标记 `kxxy-mobile-ui@N`（首行）：改动本文件后必须同步递增编号，并
  * 确认 RuntimeInstaller 的完整性锚点能识别它 —— 老设备的 runtime 版本戳
  * 不变，只判「文件存在」会让旧样式静默留下（这与 compat.js 踩过的坑同源）。
  *
@@ -256,39 +256,70 @@
     background: rgba(0, 0, 0, 0.42) !important;
   }
 
-  /* ⑫ 兜底路径：官方 toggle 按钮定位不到时，直接隐藏整列 + 浮出恢复按钮。
-   *    正常版本（按钮找得到）不会进这个态。 */
+  /* ⑫ 窄屏默认态：左侧栏**完全隐藏**，只留官方那个开合按钮当入口
+   *
+   * 用户要求：用官方原本那个按钮，点它就把整栏完全收进去。
+   * 所以这里不能整列 display:none（按钮在列内，会跟着一起消失），而是：
+   *   · 第一列压到 0px        → 主内容拿到全部宽度
+   *   · 整列 visibility:hidden → 图标栏在视觉上彻底消失
+   *   · 官方开合按钮 visibility:visible → 唯一残留的入口
+   * **visibility 可以被后代覆盖，display:none 不行** —— 这是本方案的关键，
+   * 也是它相比「自造一个悬浮按钮」唯一正确的理由。
+   *
+   * ⚠ 按钮用 position:fixed 浮回左上角原位。列宽已压成 0，按钮若留在文档流
+   *   内会被压成 0 宽；祖先链上没有任何 transform / filter / contain /
+   *   will-change，fixed 不会被截断或改写包含块（实测过）。
+   * ⚠ 主内容首行（tab 条）必须让开按钮占的 46px：411px 下官方 tab 条从 x=1
+   *   开始排，「开始」标签落在 11..111，正好压在按钮底下，实测点不到标签左侧。
+   *   给 tabStrip 补 48px 左内边距是最小改动 —— 不碰 tab 自身尺寸。
+   *
+   * 按钮找不到时（跨版本类名大改）JS 会整个跳过隐藏，保留官方 56px 图标栏 ——
+   * 宁可不好看，也不能让用户失去唯一入口。 */
   [class*="BynINW_frame"].kxxy-rail-hidden {
     grid-template-columns: 0px minmax(0px, 1fr) minmax(0px, 0px) !important;
-  }
-  [class*="BynINW_frame"].kxxy-rail-hidden > [class*="sidebarCol"] {
-    display: none !important;
   }
   [class*="BynINW_frame"].kxxy-rail-hidden > [class*="centerCol"] {
     grid-column: 2 !important;
   }
-  .kxxy-rail-restore {
+  /* ⚠ 显式写 display:block，不能省。
+   * 这是 @2 版的遗留：@2 用 display:none 实现「整列收掉」，@3 换成 visibility。
+   * 但设备上跑着旧 runtime 时，引擎会把**旧版 mobile.css** 内联进页面，与新版
+   * 同时生效；旧规则声明了 display:none，新版若不显式覆盖，旧的那条就仍然胜出
+   * —— 症状是按钮定位/可见性全部正确（computed 对得上）却渲染成 0x0，
+   * 因为祖先 display:none 会让整棵子树退出渲染。
+   * 显式覆盖后，新旧两份样式表并存也不再互相拆台。 */
+  [class*="BynINW_frame"].kxxy-rail-hidden > [class*="sidebarCol"] {
+    display: block !important;
+    overflow: visible !important;
+    background: transparent !important;
+    border-right: 0 !important;
+  }
+  /* tabStrip 不在 centerCol 里 —— 它挂在第三列（rightbarCol）的子树下，而
+   * centerCol 只有一个 display:contents 的直接子元素。所以这里不能写成
+   * `> [class*="centerCol"] [class*="tabStrip"]`（实测 0 命中），必须按
+   * tabStrip 自己的类名匹配，与它落在哪一列无关。 */
+  [class*="BynINW_frame"].kxxy-rail-hidden [class*="tabStrip"] {
+    padding-left: 48px !important;
+  }
+  [class*="BynINW_frame"].kxxy-rail-hidden > [class*="sidebarCol"] * {
+    visibility: hidden !important;
+  }
+  /* 特异性 0-4-0，压过上面 0-3-0 的隐藏规则；两条都带 !important，靠特异性决胜。
+   *
+   * ⚠ 必须把按钮的**后代**也设回 visible。上面那条 `* { visibility: hidden }`
+   *   会命中按钮内部的 svg / span，visibility 是可继承属性，父级改回 visible
+   *   并不能救回被显式声明为 hidden 的子元素 —— 症状是按钮的
+   *   getBoundingClientRect() 正确（36x36@10,18）却什么也画不出来，
+   *   截图上看就是一片空白，极易误判成「按钮没渲染」。 */
+  [class*="BynINW_frame"].kxxy-rail-hidden > [class*="sidebarCol"] [class*="toggle"],
+  [class*="BynINW_frame"].kxxy-rail-hidden > [class*="sidebarCol"] [class*="toggle"] * {
+    visibility: visible !important;
+  }
+  [class*="BynINW_frame"].kxxy-rail-hidden > [class*="sidebarCol"] [class*="toggle"] {
     position: fixed !important;
     left: 10px !important;
-    bottom: calc(96px + env(safe-area-inset-bottom)) !important;
+    top: 18px !important;
     z-index: 70 !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    box-sizing: border-box !important;
-    width: 44px !important;
-    height: 44px !important;
-    padding: 0 !important;
-    border-radius: 22px !important;
-    border: 0.5px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.14)) !important;
-    background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.96)) !important;
-    color: var(--dsw-alias-text-1, #0f1115) !important;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22) !important;
-    cursor: pointer !important;
-    -webkit-tap-highlight-color: transparent !important;
-  }
-  /* 恢复按钮默认收起，只有 body 带标记时才显示（JS 内联 display 兜底） */
-  body:not(.kxxy-rail-hidden-active) .kxxy-rail-restore {
-    display: none !important;
+    pointer-events: auto !important;
   }
 }

@@ -64,8 +64,8 @@ dsh-kxxy/
 │   ├── lib/index.js              路由 + API
 │   └── web/                      管理页 HTML/CSS/JS（含 compat.js 兼容层）
 │       ├── compat.js             旧 ROM WebView 兼容层（缺陷 I/J）
-│       ├── mobile.css            移动端适配：设置面板重排 + 左侧栏抽屉（缺陷 O）
-│       └── mobile.js             同上，负责切类 / 遮罩点击 / 恢复入口
+│       ├── mobile.css            移动端适配：设置面板重排 + 左侧栏隐藏/抽屉（缺陷 O）
+│       └── mobile.js             同上，负责切类 / 遮罩点击 / 官方按钮判档
 ├── tools/                        构建与验证工具链（8 个脚本）
 │   ├── fetch-runtime.mjs         拉取 Termux aarch64 deb 包
 │   ├── build-runtime.mjs         装配 runtime.zip（8 个阶段）
@@ -179,7 +179,7 @@ cd android
 | L | Root 模式启动必然失败 | 选「Root 提权」后引擎永远起不来：`启动失败，32 秒后重试（第 N 次）`；logcat 里只有 `exit 127` 与 `EIO`，**没有一行报错** | `Privilege.usableSuPrefix()` 用 `findSu()` 的**绝对路径**去探测（探测成功），返回值却是硬编码的**裸名** `["su","-c"]`；该值一路传到 `EngineProcess.spawn` → `dsh_pty.c` 的 `execve` —— 而 `execve` **不搜索 PATH**，裸名直接 ENOENT、exit 127。讽刺的是 `Privilege.kt` 文件头注释早已写明这条约束。修复：`usableSuPrefix()` 返回 `listOf(suBin) + args`（首项必为绝对路径），`EngineProcess` 增 `requireAbsolute()` 守卫在起点拦下裸名 |
 | M | Shizuku 模式从未实现 | 「Shizuku ADB」档位可选中、可保存、可重启，但**没有任何 ADB 能力**；用户感知为「Shizuku 权限有问题」 | 原实现只做了两件事：检测管理器是否安装（`packageManager.getPackageInfo`）+ 把 `DSH_ANDROID_PRIV_MODE=shizuku` 写进引擎环境变量。依赖里没有 `dev.rikka.shizuku:*`、清单里没有 `ShizukuProvider`、没有任何 binder 调用 —— 前端卡片自己都写着「完整注入为四期项」。修复见 `ShizukuBridge` + `ShizukuShellServer`：走 `IShizukuService.Stub.asInterface(Shizuku.getBinder()).newProcess(...)`（`Shizuku.newProcess` 在 13.x 已私有化且计划于 API 14 移除，但其实现只有这一行），应用侧轮询 `<engineRoot>/shz/request` 执行后写 `response`，引擎内用生成的 `bin/shz` 闸门脚本调用 |
 | N | 插件更新不会到达老设备 | 只重装 APK 后，界面仍是旧插件（Shizuku 卡片的「请求授权」按钮、`priv-hint` 提示块全都不出现），必须手工 push 才生效 | `RuntimeInstaller.isComplete()` 的锚点 5 只判 `kxxy-host/package.json` 存在，而那个文件**从 v0.1.0 起内容就没变过**；`runtimeVersion` 戳也不变，于是七锚点全通过、永不重装。修复：新增锚点 8，按插件入口 `kxxy-host/lib/index.js` 首行的版本标记 `kxxy-host@N` 判定过期（与锚点 6/7 同一手法）。**约定：改动 `plugins/kxxy-host/` 下任何文件后，必须递增 `lib/index.js` 首行标记并同步 `RuntimeInstaller.HOST_PLUGIN_MARKER`**，否则老设备不会自愈。后来适配层（纯静态资产）又踩了同一个坑：只改 `mobile.css` / `mobile.js` 时插件入口标记不动，锚点 8 仍判「已是最新」→ 再加**锚点 9**（两份文件共用标记 `kxxy-mobile-ui@N`） |
-| O | 官方前端无移动端适配 | ① 设置面板：411px 视口下面板仅 363px 宽，左侧导航硬吃 188px，右侧内容区只剩 175px，`_rowText` 扣掉 `padding-right:48px` 后标题宽 **0px** → 「选择新会话的默认权限模式」每个字一行、「权限」「语言」竖排、模型卡片「编辑/删除」竖排溢出卡片外；② 左侧栏：展开后主内容列从 355px 被压到 **131px** | 官方是纯桌面布局，**没有断点也没有移动端分支**。① 宽度链是 `panel 363px`（`width:800px; max-width:calc(-48px + 100vw)`）→ `nav 188px`（`flex:0 0 auto`，不可压缩）→ `content 175px`（`flex:1 1 0%`）→ `options` 再扣 `padding:0 24px` 只剩 127px → `rowText` 再扣 48px 归零；② `BynINW_frame` 的 `grid-template-columns: 280px minmax(0px,1fr) minmax(0px,0px)` 由 **React 写死在 inline style**（自定义属性全为空、官方样式表里 0 命中），它就是硬挤第二列，没有「覆盖层」概念。修复：新增插件侧移动端适配层 `plugins/kxxy-host/web/mobile.css` + `mobile.js`，注入到 `</head>` 之前（必须晚于官方样式表）。设置面板改为「顶部横向 tab 条 + 全宽内容」；左侧栏改为**覆盖式抽屉** —— 第一列压到 0px（inline 无 `!important`，CSS `!important` 可胜出）、侧栏 `position:absolute` 脱离 grid 流、`centerCol` 显式 `grid-column: 2`（脱流后 grid 会自动把它排到 0px 宽的第 1 列） |
+| O | 官方前端无移动端适配 | ① 设置面板：411px 视口下面板仅 363px 宽，左侧导航硬吃 188px，右侧内容区只剩 175px，`_rowText` 扣掉 `padding-right:48px` 后标题宽 **0px** → 「选择新会话的默认权限模式」每个字一行、「权限」「语言」竖排、模型卡片「编辑/删除」竖排溢出卡片外；② 左侧栏：展开后主内容列从 355px 被压到 **131px** | 官方是纯桌面布局，**没有断点也没有移动端分支**。① 宽度链是 `panel 363px`（`width:800px; max-width:calc(-48px + 100vw)`）→ `nav 188px`（`flex:0 0 auto`，不可压缩）→ `content 175px`（`flex:1 1 0%`）→ `options` 再扣 `padding:0 24px` 只剩 127px → `rowText` 再扣 48px 归零；② `BynINW_frame` 的 `grid-template-columns: 280px minmax(0px,1fr) minmax(0px,0px)` 由 **React 写死在 inline style**（自定义属性全为空、官方样式表里 0 命中），它就是硬挤第二列，没有「覆盖层」概念。修复：新增插件侧移动端适配层 `plugins/kxxy-host/web/mobile.css` + `mobile.js`，注入到 `</head>` 之前（必须晚于官方样式表）。设置面板改为「顶部横向 tab 条 + 全宽内容」；左侧栏做**两态**：折叠态**整栏完全收掉**（连 56px 图标栏都不留）、展开态改为**覆盖式抽屉**。四条硬约束：① 第一列压到 0px 靠 `!important`（官方把列宽写在 React inline style 上，inline 无 `!important` 时 CSS `!important` 可胜出）；② 抽屉必须 `position:absolute` 而非 `fixed` —— 祖先链上有 `z-index:40` 的 static 容器，`fixed` 会输掉层叠竞争，症状是「测量全对但整块不可见」；③ 侧栏脱流后 `centerCol` 必须显式 `grid-column: 2`（grid 会自动把它排到 0px 宽的第 1 列）；④ 隐藏必须用 `visibility` 而**不是** `display:none` —— 官方开合按钮在列内，`display:none` 会让整棵子树退出渲染、按钮一起消失，用户永久失去唯一入口（详见下段「缺陷 O 的补充教训」） |
 
 **构建期陷阱（非代码缺陷，但会毁掉产物）**：Gradle 的 `packageDebug` 走 zipflinger **增量打包** —— 它打开已存在的 APK 原地更新，条目变大时把新数据追加到文件末尾，**旧数据留成空洞且不截断文件**。本次 `runtime.zip` 只增大了 448 字节，`app-debug.apk` 却从 1.62 GB 涨到 **2.14 GB**（凭空多出 521 MB，恰好一整个旧 `runtime.zip`）。用中央目录逐条核对偏移即可确诊（空洞在 `classes5.dex` 之后、`DebugProbesKt.bin` 之前）。删掉产物重新 `assembleDebug` 后回到 1620993963 B。**发布前必须核对 APK 体积量级**，否则会发出一个白胖一倍的包。
 
@@ -242,6 +242,27 @@ about:blank 再回来**（无发起者的跨站导航不带 Strict cookie → 40
 68 字节），必须直接 `Page.navigate` 打 token URL 让浏览器自己走完 303 → Set-Cookie →
 重定向；② 要在**入口 module 求值之前**注入，用 `Page.addScriptToEvaluateOnNewDocument`
 （等价于原生层的 `evaluateJavascript`），否则会先渲染一帧桌面布局再跳变。
+
+**缺陷 O 的补充教训：隐藏侧栏不能用 `display:none`**（用户要求「点官方那个按钮
+之后它完全隐藏进去」，这条约束是用户催出来的）：第一版用 `display:none` 把
+`sidebarCol` 收掉，结果官方开合按钮就在这一列**内部** —— 整棵子树退出渲染，
+按钮跟着消失，用户再也打不开侧栏。改用 `visibility:hidden`（可被后代
+`visibility:visible` 覆盖）后仍有第二个坑：只把按钮自己设回 `visible` 不够，
+因为上面那条 `* { visibility: hidden }` 同样命中了按钮内部的 `svg`/`span`，
+而 **`visibility` 是可继承属性，父级改回 `visible` 救不回被显式声明为 `hidden`
+的子元素** —— 症状极具误导性：`getBoundingClientRect()` 完全正确（36x36@10,18），
+`getComputedStyle` 也全是期望值，但屏幕上什么都不画。判据只能是
+`document.elementFromPoint()` 的命中测试，`rect` 与 `computed style` 都会骗人。
+所以规则要写成**双选择器组**（`[class*="toggle"], [class*="toggle"] *`）。
+
+**缺陷 O 的第三层教训：页面里会同时存在两份注入样式表**。`data-kxxy-mobile`
+（引擎按设备上**旧 runtime** 注入）与 `data-kxxy-css`（桌面驱动注入的新版）并存时，
+新版把 `display:none` 换成 `visibility` 后**没有显式声明 `display`**，于是旧版那条
+`display: none !important` 仍然胜出 —— 现象与上面那条一模一样。所以隐藏态
+`sidebarCol` 规则必须**显式写 `display: block !important`**，把旧规则顶回去。
+定位这条根因时，JS 侧遍历 `document.styleSheets` 两次都返回 `totalRules: 0`
+（遍历器自身有 bug），**换用 CDP 的 `CSS.getMatchedStylesForNode` 一次就拿到
+胜出规则**——教训是：当 JS 侧的自查结果与现象矛盾时，别再改遍历器，直接换权威通道。
 
 ---
 

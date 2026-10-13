@@ -251,6 +251,61 @@ if (indexTaps.length === 2) {
   if (!out.includes('kxxy-rail-open::after')) fail('移动端样式缺少抽屉遮罩 ::after')
   else ok('抽屉含遮罩层（点击收起）')
 
+  // ── 左侧栏完全隐藏（mobile.css ⑫ + mobile.js）────────────────────
+  // 用户要求：用官方原本那个按钮，点它就把整栏完全收进去。
+  // 这里最容易踩的三个坑，逐条钉死：
+  const railHiddenGrid = /\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*\{[^}]*\}/.exec(out)
+  if (railHiddenGrid === null) fail('移动端样式未定义 .kxxy-rail-hidden 的 grid 规则')
+  else if (!/grid-template-columns:[^;]*!important/.test(railHiddenGrid[0])) {
+    fail('.kxxy-rail-hidden 的 grid-template-columns 必须带 !important')
+  } else ok('.kxxy-rail-hidden 用 !important 覆盖 React inline grid')
+
+  const railHiddenCol = /\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\{[^}]*\}/.exec(out)
+  if (railHiddenCol === null) fail('移动端样式未定义隐藏态 sidebarCol 规则')
+  else {
+    // ① 绝不能用 display:none 实现隐藏 —— 官方开合按钮在列内，整棵子树退出
+    //    渲染后按钮一起消失，用户永久失去唯一入口。必须 visibility。
+    if (/display:\s*none/.test(railHiddenCol[0])) {
+      fail('隐藏态不得用 display:none（会连官方开合按钮一起吞掉，用户再也打不开侧栏）')
+    }
+    // ② 反过来还必须**显式写 display:block**：设备上跑旧 runtime 时引擎会把旧版
+    //    mobile.css（@2 用 display:none）一起内联进来，两条规则并存时旧的那条
+    //    仍然胜出，症状是按钮定位全对却渲染成 0x0。
+    else if (!/display:\s*block/.test(railHiddenCol[0])) {
+      fail('隐藏态 sidebarCol 必须显式 display:block（否则并存的旧版样式表会用 display:none 拆台）')
+    } else ok('隐藏态 sidebarCol 用 visibility 隐藏且显式 display:block')
+  }
+
+  if (!/\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\*\s*\{[^}]*visibility:\s*hidden/.test(out)) {
+    fail('隐藏态缺少「sidebarCol 全后代 visibility:hidden」规则（图标栏会残留）')
+  } else ok('隐藏态整列后代 visibility:hidden（图标栏视觉消失）')
+
+  // ③ 按钮与其**后代**都必须设回 visible。visibility 是可继承属性，只把按钮
+  //    自己设回 visible 救不回被显式声明为 hidden 的 svg/span —— 症状是
+  //    getBoundingClientRect() 正确（36x36@10,18）却什么也画不出来。
+  const toggleVis = /\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\[class\*="toggle"\][^{]*\{[^}]*visibility:\s*visible/.exec(out)
+  if (toggleVis === null) fail('隐藏态未把官方开合按钮设回 visible（用户将失去唯一入口）')
+  else ok('隐藏态保留官方开合按钮为可见入口')
+  const toggleStar = /\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\[class\*="toggle"\]\s*,\s*\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\[class\*="toggle"\]\s*\*/.exec(out)
+  if (toggleStar === null) {
+    fail('隐藏态必须把按钮的后代（svg/span）也设回 visible，否则按钮 rect 正确但画不出来')
+  } else ok('隐藏态按钮后代一并设回 visible（否则图标被祖先规则吞掉）')
+
+  const toggleFixed = /\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\[class\*="toggle"\]\s*\{[^}]*position:\s*fixed/.exec(out)
+  if (toggleFixed === null) {
+    fail('隐藏态按钮必须 position:fixed 浮回左上角（列宽已压 0，留在流内会被压成 0 宽）')
+  } else ok('隐藏态按钮用 fixed 浮回左上角原位')
+
+  // ④ tabStrip 的归属必须按它自己的类名匹配，**不能**写成
+  //    `> [class*="centerCol"] [class*="tabStrip"]` —— 实测 tabStrip 挂在第三列
+  //    （rightbarCol）的子树下，centerCol 只有一个 display:contents 的直接子元素，
+  //    写成 centerCol 后代选择器会 0 命中，48px 让位永远不生效。
+  if (/\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="centerCol"\]\s*\[class\*="tabStrip"\]/.test(out)) {
+    fail('tabStrip 让位规则不得挂在 centerCol 后代下（实测 tabStrip 不在 centerCol 内，会 0 命中）')
+  } else if (!/\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s+\[class\*="tabStrip"\]\s*\{[^}]*padding-left/.test(out)) {
+    fail('隐藏态缺少 tabStrip 左内边距让位规则（官方 tab 条会压在悬浮按钮底下）')
+  } else ok('隐藏态给 tabStrip 让出左侧空间（按 tabStrip 自身类名匹配）')
+
   const atMobileJs = out.indexOf('data-kxxy-mobile-js')
   if (atMobileJs < 0) fail('index tap 未注入移动端适配脚本')
   else ok('index tap 注入了移动端适配脚本')

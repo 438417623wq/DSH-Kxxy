@@ -1,4 +1,4 @@
-/* kxxy-mobile-ui@2 */
+/* kxxy-mobile-ui@3 */
 /**
  * dsh-kxxy 移动端 UI 适配 —— 左侧栏「覆盖式抽屉」
  *
@@ -26,10 +26,31 @@
  * ⚠ 读 inline 而不是 computed —— 我们自己会用 !important 把 computed 压成 0px，
  *   读 computed 会永远得到 0px，判断失效。
  *
- * ── 兜底 ────────────────────────────────────────────────────────
- * 若官方 toggle 按钮定位不到（跨版本类名大改），退化为 .kxxy-rail-hidden：
- * 直接把侧栏 display:none，并在左下角浮出一个恢复按钮。这条路径只在
- * 「官方按钮找不到」时才走，正常版本不会出现。
+ * ── 两种形态 ────────────────────────────────────────────────────
+ * 窄屏下左侧栏只有两个状态，由本脚本给 frame 打类切换：
+ *
+ *   ① 隐藏态 .kxxy-rail-hidden（默认）
+ *      第一列压到 0px、整列 visibility:hidden → 主内容拿到全部宽度。
+ *      唯一残留的是**官方那个开合按钮**（mobile.css ⑫ 用 visibility:visible
+ *      把它单独放出来并 fixed 到左上角原位）—— 用户要求「用官方原本那个按钮」，
+ *      所以这里不自造任何 UI。
+ *   ② 抽屉态 .kxxy-rail-open（点官方按钮后）
+ *      官方把 inline grid 改成 280px，本脚本随即把它转成覆盖层 + 半透明遮罩。
+ *      点遮罩 → 调官方自己的「收起侧边栏」按钮 → 官方回落 → 下一 tick 回到隐藏态。
+ *
+ * 两个状态之间**没有第三种态**：官方那 56px 图标栏在窄屏下不再出现。
+ *
+ * ── 为什么不直接用 CSS 判断「官方是否展开」──────────────────────
+ * 官方展开态没有稳定的 CSS 锚点：语义类 `_2H3hWW_collapsed` 挂在侧栏**内部**
+ * （哈希前缀跨版本会变），而 :has() 需要 Chrome 105+，目标设备 WebView 是 104。
+ * 所以由本脚本读 frame 的 **inline** grid-template-columns 第一列来判断。
+ *
+ * ⚠ 读 inline 而不是 computed —— 我们自己会用 !important 把 computed 压成 0px，
+ *   读 computed 会永远得到 0px，判断失效。
+ *
+ * ── 安全阀 ──────────────────────────────────────────────────────
+ * 只有定位到官方开合按钮时才隐藏整列（canHide）。按钮找不到就保持官方 56px
+ * 图标栏原样 —— 隐藏态的唯一入口就是那个按钮，宁可不好看也不能把入口锁死。
  */
 (function () {
   'use strict';
@@ -41,9 +62,6 @@
   var SIDEBAR_NEEDLE = 'sidebarCol';
   var OPEN_CLASS = 'kxxy-rail-open';
   var HIDDEN_CLASS = 'kxxy-rail-hidden';
-  var RESTORE_CLASS = 'kxxy-rail-restore';
-  var RESTORE_ID = 'kxxy-rail-restore';
-  var BODY_FLAG = 'kxxy-rail-hidden-active';
 
   var NARROW_QUERY = '(max-width: 767px)';
   var EXPANDED_MIN_PX = 120;   // 官方折叠 56px / 展开 280px，取中间值判档
@@ -109,51 +127,22 @@
     return null;
   }
 
-  // ── 恢复按钮（仅兜底路径用）────────────────────────────────────
-
-  function ensureRestoreButton() {
-    var btn = document.getElementById(RESTORE_ID);
-    if (btn) return btn;
-    if (!document.body) return null;
-
-    btn = document.createElement('button');
-    btn.id = RESTORE_ID;
-    btn.type = 'button';
-    btn.className = RESTORE_CLASS;
-    btn.setAttribute('aria-label', '打开侧边栏');
-    btn.innerHTML =
-      '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
-      '<rect x="3" y="4" width="18" height="16" rx="2.5" stroke="currentColor" stroke-width="1.7"/>' +
-      '<path d="M9 4v16" stroke="currentColor" stroke-width="1.7"/>' +
-      '</svg>';
-    btn.addEventListener('click', function (e) {
-      e.stopPropagation();
-      var frame = frameRef || findFrame();
-      if (!frame) return;
-      setClass(frame, HIDDEN_CLASS, false);
-      setClass(frame, OPEN_CLASS, true);
-      syncRestore();
-    });
-    document.body.appendChild(btn);
-    return btn;
-  }
-
-  function syncRestore() {
-    var on = document.body && document.body.classList.contains(BODY_FLAG);
-    var btn = document.getElementById(RESTORE_ID);
-    if (on && !btn) btn = ensureRestoreButton();
-    if (btn) btn.style.display = on ? 'flex' : 'none';
-  }
-
-  function setBodyFlag(on) {
-    if (!document.body) return;
-    var has = document.body.classList.contains(BODY_FLAG);
-    if (on && !has) document.body.classList.add(BODY_FLAG);
-    else if (!on && has) document.body.classList.remove(BODY_FLAG);
-  }
-
   // ── 抽屉开合 ───────────────────────────────────────────────────
 
+  /**
+   * 打开抽屉。
+   *
+   * ⚠ 必须优先走官方 toggle 按钮 —— 官方侧栏的**内容形态**取决于它自己的
+   *   折叠状态：折叠态只渲染图标栏（新会话 / 插件 / 设置 三个图标），展开态
+   *   才渲染品牌头、工作区列表与会话列表。若我们只把折叠态那 56px 拉宽成
+   *   280px 覆盖层，得到的是一个「拉宽了的图标栏」，不是用户要的抽屉。
+   *   点官方按钮让官方把 inline grid 改成 280px，下一 tick 的 sync() 再打上
+   *   OPEN_CLASS 把它转成覆盖层 —— 内容与层级就都对了。
+   *
+   * 这里**不自造按钮**：窄屏隐藏态下官方那个 toggle 已经被 CSS 单独放出来
+   * （mobile.css ⑫：整列 visibility:hidden，唯独 toggle visibility:visible），
+   * 用户点它就走官方原生链路，外观与行为都与官方一致。
+   */
   function openDrawer(frame) {
     setClass(frame, HIDDEN_CLASS, false);
     setClass(frame, OPEN_CLASS, true);
@@ -170,7 +159,6 @@
     }
     setClass(frame, OPEN_CLASS, false);
     setClass(frame, HIDDEN_CLASS, true);
-    syncRestore();
   }
 
   function bindFrame(frame) {
@@ -194,31 +182,38 @@
       frame = frameRef;
       boundFrame = null;
     }
-    if (!frame) {
-      setBodyFlag(false);
-      syncRestore();
-      return;
-    }
+    if (!frame) return;
     bindFrame(frame);
 
     if (!isNarrow()) {
       setClass(frame, OPEN_CLASS, false);
       setClass(frame, HIDDEN_CLASS, false);
-      setBodyFlag(false);
-      syncRestore();
       return;
     }
 
     var expanded = officialWidth(frame) >= EXPANDED_MIN_PX;
 
-    // 官方已折叠 → 兜底隐藏态没有存在意义，撤掉
-    if (!expanded) setClass(frame, HIDDEN_CLASS, false);
+    if (expanded) {
+      // 官方已展开 → 转成覆盖式抽屉
+      openDrawer(frame);
+      return;
+    }
 
-    if (expanded && !frame.classList.contains(HIDDEN_CLASS)) openDrawer(frame);
-    else setClass(frame, OPEN_CLASS, false);
+    // 官方已折叠 → 完全隐藏，只留官方那个开合按钮
+    setClass(frame, OPEN_CLASS, false);
+    setClass(frame, HIDDEN_CLASS, canHide(frame));
+  }
 
-    setBodyFlag(frame.classList.contains(HIDDEN_CLASS));
-    syncRestore();
+  /**
+   * 只有在官方开合按钮定位得到时才允许完全隐藏。
+   *
+   * 隐藏态的入口就是官方那个按钮（mobile.css ⑫ 把它单独放出来）。若按钮
+   * 定位不到（跨版本类名大改），隐藏会让用户**永久失去侧栏入口** —— 宁可
+   * 保留官方 56px 图标栏不好看，也不能把功能锁死。
+   */
+  function canHide(frame) {
+    var col = childByNeedle(frame, SIDEBAR_NEEDLE);
+    return !!(col && findToggle(col));
   }
 
   // ── 启动 ───────────────────────────────────────────────────────
