@@ -1,7 +1,6 @@
 package app.kxxy.engine
 
 import android.content.Context
-import android.content.pm.PackageManager
 import android.util.Log
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -72,9 +71,18 @@ object Privilege {
         "/system/bin/busybox",
     )
 
-    private val SHIZUKU_PACKAGES = listOf(
-        "moe.shizuku.privileged.api",
-        "moe.shizuku.manager",
+    /**
+     * su 的参数形式（**不含可执行文件本身**）。
+     *
+     * 刻意与 [SU_PATHS] 分离：这里只描述「怎么把命令交给 su」，可执行文件一律由
+     * [findSu] 解析成绝对路径后再拼到最前面。二者混在一起正是缺陷 L 的成因 ——
+     * 早期版本把裸名 "su" 写在这张表里并直接返回给调用方，而引擎是经 execve
+     * 启动的（不搜索 PATH），于是每次 root 启动都 exit 127。
+     */
+    private val SU_ARG_FORMS = listOf(
+        listOf("-c"),
+        listOf("0"),
+        listOf("root", "-c"),
     )
 
     // ── 模式持久化 ──────────────────────────────────────────────────────
@@ -101,14 +109,9 @@ object Privilege {
      * 放主线程最坏阻塞 6 秒以上 → ANR 风险。
      */
     fun probeRoot(): Boolean {
-        val forms = listOf(
-            arrayOf("su", "-c"),
-            arrayOf("su", "0"),
-            arrayOf("su", "root", "-c"),
-        )
-        for (f in forms) {
-            if (trySu(*f, "cd / && echo uid=0")) {
-                Log.i(TAG, "root probe succeeded with form: ${f.joinToString(" ")}")
+        for (f in SU_ARG_FORMS) {
+            if (trySuPrefix(f, "cd / && echo uid=0")) {
+                Log.i(TAG, "root probe succeeded with form: su ${f.joinToString(" ")}")
                 return true
             }
         }
@@ -119,29 +122,29 @@ object Privilege {
     /**
      * 探测可用的 su 形式前缀，返回 null 表示不可用。
      *
+     * **返回值的第一项一定是 su 的绝对路径**（缺陷 L 的修复点）：调用方会把它
+     * 直接当作 execve 的 `file` 参数，传裸名会 exit 127。内部探测同样走
+     * [trySuPrefix] 的绝对路径形态，保证「探测成功的形态」与「真正使用的形态」
+     * 是同一个，不会出现探测通过但启动失败。
+     *
      * 两条硬约束（都来自参考项目的回归事故）：
      *   ① 只有经 shell 解释才能成功（探针必须让 shell 执行，而非直接 exec 二进制）
      *   ② 输出必须含 `uid=0`（否则无法区分「su 成功但没输出」和「su 失败」）
      */
     fun usableSuPrefix(): List<String>? {
-        val forms = listOf(
-            listOf("su", "-c"),
-            listOf("su", "0"),
-            listOf("su", "root", "-c"),
-        )
-        for (f in forms) {
+        val suBin = findSu() ?: return null
+        for (f in SU_ARG_FORMS) {
             if (trySuPrefix(f, "cd / && echo uid=0")) {
-                return f
+                return listOf(suBin) + f
             }
         }
         return null
     }
 
-    private fun trySuPrefix(prefix: List<String>, command: String): Boolean {
-        // 表达式体函数里不允许 return，这里必须用块体
+    private fun trySuPrefix(args: List<String>, command: String): Boolean {
         return try {
             val suBin = findSu() ?: return false
-            val argv = (listOf(suBin) + prefix.drop(1) + command).toTypedArray()
+            val argv = (listOf(suBin) + args + command).toTypedArray()
             val p = ProcessBuilder(*argv).redirectErrorStream(true).start()
             val finished = p.waitFor(2, TimeUnit.SECONDS)
             if (!finished) {
@@ -152,22 +155,9 @@ object Privilege {
                 out.contains("uid=0")
             }
         } catch (e: Exception) {
-            Log.w(TAG, "trySuPrefix(${prefix.joinToString(" ")}) failed: ${e.message}")
+            Log.w(TAG, "trySuPrefix(${args.joinToString(" ")}) failed: ${e.message}")
             false
         }
-    }
-
-    private fun trySu(vararg argv: String): Boolean = try {
-        val p = ProcessBuilder(*argv).redirectErrorStream(true).start()
-        val finished = p.waitFor(2, TimeUnit.SECONDS)
-        if (!finished) {
-            p.destroy()
-            false
-        } else {
-            p.inputStream.bufferedReader().readText().contains("uid=0")
-        }
-    } catch (e: Exception) {
-        false
     }
 
     /** 返回第一个存在的 su 绝对路径。 */
@@ -200,14 +190,14 @@ object Privilege {
 
     // ── Shizuku 探测 ────────────────────────────────────────────────────
 
-    /** Shizuku 管理器是否已安装。 */
-    fun shizukuInstalled(ctx: Context): Boolean = SHIZUKU_PACKAGES.any { pkg ->
-        try {
-            ctx.packageManager.getPackageInfo(pkg, 0) != null
-        } catch (e: PackageManager.NameNotFoundException) {
-            false
-        }
-    }
+    /**
+     * Shizuku 管理器是否已安装。
+     *
+     * 委托给 [ShizukuBridge]（单一事实来源）。这里保留薄封装是因为历史调用点
+     * 把它当作「Privilege 提供的能力探测」；真实的状态判定（binder 是否送达、
+     * 是否已授权）都在 [ShizukuBridge.status] 里，见 [EngineSupervisor.privAvailability]。
+     */
+    fun shizukuInstalled(ctx: Context): Boolean = ShizukuBridge.installed(ctx)
 
     // ── dsh-home 属主修复 ───────────────────────────────────────────────
 

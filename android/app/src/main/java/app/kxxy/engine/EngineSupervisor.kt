@@ -256,6 +256,10 @@ class EngineSupervisor(private val ctx: Context) {
 
                 EngineConfig.ensureOverlay(ctx)
                 ensureDirs()
+                // 闸门脚本必须每轮重装：RuntimeInstaller 重装 runtime 时会整棵覆盖
+                // bin/，写在那里的 shz 会消失。放在启动路径上比在安装器里登记
+                // 「额外产物」更不容易漏（见 ShizukuShellServer.installGateScript）。
+                ShizukuShellServer.installGateScript(ctx)
 
                 _state.value = State.Starting
                 proc = spawnEngine()
@@ -423,11 +427,31 @@ class EngineSupervisor(private val ctx: Context) {
         }
     }
 
-    /** root/shizuku 可用性（segmented 控件灰化依据，均只 stat 不弹框）。 */
+    /**
+     * root/shizuku 可用性（segmented 控件灰化依据，均只 stat 不弹框）。
+     *
+     * shizuku 的判定用 [ShizukuBridge.status]：装了管理器即可选（用户点「应用」时
+     * 若还没授权，会引导去授权），但**是否真正可用**由 `shizukuUsable` 单独给出，
+     * 前端据此显示不同的徽章。此前这里只看「管理器是否安装」，
+     * 导致「装了但服务没起 / 没授权」也被显示成可用 —— 那是旧版把 shizuku 模式
+     * 做成纯环境变量的遗留判定，现在通道是真实的，判定必须跟着变严。
+     */
     private fun privAvailability(): String {
         val root = Privilege.rootAvailableMinimal()
-        val shizuku = Privilege.shizukuInstalled(ctx)
-        return "{\"root\": $root, \"shizuku\": $shizuku}"
+        val shz = ShizukuBridge.status.value
+        return buildString {
+            append("{")
+            append("\"root\": $root,")
+            // 可选项：装了管理器就让用户能选（否则连授权入口都点不到）
+            append("\"shizuku\": ${shz.installed},")
+            append("\"shizukuUsable\": ${shz.usable},")
+            append("\"shizukuInstalled\": ${shz.installed},")
+            append("\"shizukuGranted\": ${shz.granted},")
+            append("\"shizukuVersion\": ${shz.version},")
+            append("\"shizukuUid\": ${shz.serverUid},")
+            append("\"shizukuError\": \"${(shz.lastError ?: "").replace("\"", "'").replace("\\", "/")}\"")
+            append("}")
+        }
     }
 
     /** 读 /proc/<pid>/status 的 VmRSS（KB）。读不到返回 0。 */
@@ -455,8 +479,14 @@ class EngineSupervisor(private val ctx: Context) {
         val logOffset = EngineConfig.logFile(ctx).let { if (it.isFile) it.length() else 0L }
 
         // 权限等级：前端写 kxxy-prefs.json + 一键重启 → 这里消费（此前硬编码 normal，
-        // 管理页的权限等级开关是死的）。root 需要真提权，见下；shizuku 本期只改
-        // 引擎可感知的环境变量，不改变进程 uid（Shizuku 的 binder 能力给不了子进程）。
+        // 管理页的权限等级开关是死的）。三种模式的语义各不相同，不可互相冒充：
+        //   normal  —— 引擎以应用身份运行，不申请任何提权。
+        //   root    —— 引擎**整体**以 uid 0 启动（进程级提权），见下。
+        //   shizuku —— 引擎仍以应用身份运行，但获得一条**按需**以 adb/shell 身份
+        //              （uid 2000）执行单条命令的通道 `bin/shz`。通道的服务端在应用
+        //              进程里（只有它持有 Shizuku binder），见 ShizukuShellServer。
+        //              shizuku **不会**改变引擎进程的 uid —— 这是 Shizuku 的固有边界，
+        //              不是实现取巧：引擎是 execve 起的独立进程，uid 由内核在 fork 时决定。
         val requestedMode = EngineConfig.readPrivMode(ctx)
         var effectiveMode = requestedMode
         var rootPrefix: List<String>? = null
@@ -475,6 +505,21 @@ class EngineSupervisor(private val ctx: Context) {
                 }
                 Privilege.backupHome(ctx)
                 rootPrefix = prefix
+            }
+        } else if (requestedMode == "shizuku") {
+            // 不回落。回落会让用户以为「已生效」，而真实原因（服务没起 / 没授权）
+            // 被掩盖成「设置没保存」。通道不可用时 shz 会打印确切原因，
+            // 控制台权限卡片也会显示对应徽章。
+            val s = ShizukuBridge.status.value
+            if (!s.usable) {
+                Log.w(
+                    TAG,
+                    "privMode=shizuku but channel not ready " +
+                        "(installed=${s.installed} binder=${s.binderReady} granted=${s.granted}); " +
+                        "engine starts anyway, bin/shz will report the reason",
+                )
+            } else {
+                Log.i(TAG, "privMode=shizuku, adb channel ready (server uid=${s.serverUid})")
             }
         }
 

@@ -13,6 +13,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import app.kxxy.engine.EngineConfig
 import app.kxxy.engine.EngineSupervisor
+import app.kxxy.engine.ShizukuBridge
 import app.kxxy.service.EngineService
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
@@ -289,6 +290,15 @@ class MainActivity : Activity() {
             "storage" -> {
                 if (android.os.Build.VERSION.SDK_INT <= 29) {
                     requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), REQ_PERM_STORAGE)
+                }
+            }
+            "shizuku" -> {
+                // Shizuku 的授权不是系统权限对话框，而是 Shizuku 自己的界面：
+                // 由 Shizuku server 弹出，结果经 addRequestPermissionResultListener
+                // 回到 ShizukuBridge（见 ShizukuBridge.init）。
+                val ok = ShizukuBridge.requestPermission()
+                if (!ok) {
+                    Log.w(TAG, "shizuku permission request rejected (binder not ready)")
                 }
             }
         }

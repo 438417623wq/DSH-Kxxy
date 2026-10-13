@@ -19,7 +19,7 @@
 │  WebViewGate        WebView ≥ Chrome 85 检测                      │
 │  EngineSupervisor   进程监管 + 指数退避 + 状态文件                 │
 │  EngineProcess      PTY 启动引擎（--expose-internals 是硬前提）    │
-│  RuntimeInstaller   解包 runtime.zip（含 LINK 物化 / 七锚点自愈）  │
+│  RuntimeInstaller   解包 runtime.zip（含 LINK 物化 / 八锚点自愈）  │
 │  EngineService      前台服务保活（specialUse）                     │
 │  Privilege          Normal / Shizuku / Root 三级权限               │
 │  dsh_pty.c          forkpty 原生 PTY（Android 无 posix_openpt）    │
@@ -156,7 +156,7 @@ cd android
 
 ---
 
-## 五、移植过程中发现并修掉的 11 个真实缺陷
+## 五、移植过程中发现并修掉的 14 个真实缺陷
 
 这些都是**只在真机/端到端路径上才会暴露**的问题，构建全绿时完全看不出来：
 
@@ -173,6 +173,11 @@ cd android
 | I | 旧 ROM WebView 缺 `AbortSignal.any` | 设置 → 通用设置 →「权限」原样显示英文 `permission catalog has no active Host connection`；设置 →「模型」provider 列表整块空白 | 官方前端插件 bundle 用了 Chrome 116+ 的 `AbortSignal.any`，旧 WebView 上抛 `TypeError` 被 `ConnectionController.loop()` 静默吞掉，`connection.generation` 恒 undefined；另叠加 `rows.toSorted`（Chrome 110+）缺失使 provider 列表渲染抛错。修复见 `plugins/kxxy-host/web/compat.js` |
 | J | 旧 ROM WebView 不支持 `dvh` 单位 | 「选择工作区目录」对话框只剩标题栏与底部按钮，目录列表整片空白（行在 DOM 里但不可见） | 插件 CSS 用了 Chrome 108+ 的 `dvh`：`dsh-client-ui-directory-picker-browse` 的 `.…_dialog{height:min(500px,100dvh - 32px)}`。WebView 104 的 CSS 解析器把整条 `height` 声明丢弃 → 对话框退化为 `height:auto`；其内部是 flex 列 + 子项 `flex:1 1 0`，auto 高度下被压成 0，列表行虽在 DOM 里却被 0 高的 `overflow:auto` 容器裁掉。`dsh-client-ui-schedule` 的 `min(420px,100dvh - 48px)` 是同一缺陷。修复同样在 `compat.js`（文本层面 `dvh → vh` + `MutationObserver` 观察后续插入的 `<style>`） |
 | K | Android 无 PTY 支持（两处独立缺口） | 「新建终端」面板只剩「重试」按钮与红字 `终端错误：subprocess-local: terminal inspection is unsupported on platform android` | ① 上游 `dsh-subprocess-local` 的 `createProcessInspector()` 只认 linux/darwin/win32，而 Android 上 `process.platform === "android"`（不是 `"linux"`），三分支全不命中直接抛错；② 即使过了这关，`node-pty` 在 Android 上没有官方预编译产物，早期构建注入的是**抛错空壳**。两处都由构建期补丁修掉：`patchSubprocessInspector` 让 android 复用 `LinuxProcessInspector`（其实现只依赖 `/proc`，arm64 的 `SYSCALLS` 表齐备，真机实测 `/proc/self/stat` 与 `/proc/self/mem` 均可读），`patchNodePty` 改为注入自研 N-API 模块（`tools/prebuilt/node-pty-android/`） |
+| L | Root 模式启动必然失败 | 选「Root 提权」后引擎永远起不来：`启动失败，32 秒后重试（第 N 次）`；logcat 里只有 `exit 127` 与 `EIO`，**没有一行报错** | `Privilege.usableSuPrefix()` 用 `findSu()` 的**绝对路径**去探测（探测成功），返回值却是硬编码的**裸名** `["su","-c"]`；该值一路传到 `EngineProcess.spawn` → `dsh_pty.c` 的 `execve` —— 而 `execve` **不搜索 PATH**，裸名直接 ENOENT、exit 127。讽刺的是 `Privilege.kt` 文件头注释早已写明这条约束。修复：`usableSuPrefix()` 返回 `listOf(suBin) + args`（首项必为绝对路径），`EngineProcess` 增 `requireAbsolute()` 守卫在起点拦下裸名 |
+| M | Shizuku 模式从未实现 | 「Shizuku ADB」档位可选中、可保存、可重启，但**没有任何 ADB 能力**；用户感知为「Shizuku 权限有问题」 | 原实现只做了两件事：检测管理器是否安装（`packageManager.getPackageInfo`）+ 把 `DSH_ANDROID_PRIV_MODE=shizuku` 写进引擎环境变量。依赖里没有 `dev.rikka.shizuku:*`、清单里没有 `ShizukuProvider`、没有任何 binder 调用 —— 前端卡片自己都写着「完整注入为四期项」。修复见 `ShizukuBridge` + `ShizukuShellServer`：走 `IShizukuService.Stub.asInterface(Shizuku.getBinder()).newProcess(...)`（`Shizuku.newProcess` 在 13.x 已私有化且计划于 API 14 移除，但其实现只有这一行），应用侧轮询 `<engineRoot>/shz/request` 执行后写 `response`，引擎内用生成的 `bin/shz` 闸门脚本调用 |
+| N | 插件更新不会到达老设备 | 只重装 APK 后，界面仍是旧插件（Shizuku 卡片的「请求授权」按钮、`priv-hint` 提示块全都不出现），必须手工 push 才生效 | `RuntimeInstaller.isComplete()` 的锚点 5 只判 `kxxy-host/package.json` 存在，而那个文件**从 v0.1.0 起内容就没变过**；`runtimeVersion` 戳也不变，于是七锚点全通过、永不重装。修复：新增锚点 8，按插件入口 `kxxy-host/lib/index.js` 首行的版本标记 `kxxy-host@N` 判定过期（与锚点 6/7 同一手法）。**约定：改动 `plugins/kxxy-host/` 下任何文件后，必须递增 `lib/index.js` 首行标记并同步 `RuntimeInstaller.HOST_PLUGIN_MARKER`**，否则老设备不会自愈 |
+
+**构建期陷阱（非代码缺陷，但会毁掉产物）**：Gradle 的 `packageDebug` 走 zipflinger **增量打包** —— 它打开已存在的 APK 原地更新，条目变大时把新数据追加到文件末尾，**旧数据留成空洞且不截断文件**。本次 `runtime.zip` 只增大了 448 字节，`app-debug.apk` 却从 1.62 GB 涨到 **2.14 GB**（凭空多出 521 MB，恰好一整个旧 `runtime.zip`）。用中央目录逐条核对偏移即可确诊（空洞在 `classes5.dex` 之后、`DebugProbesKt.bin` 之前）。删掉产物重新 `assembleDebug` 后回到 1620993963 B。**发布前必须核对 APK 体积量级**，否则会发出一个白胖一倍的包。
 
 **教训**：`simulate-install.mjs` 的判据比设备端 Kotlin 代码更正确（它认 `libexec/`），
 正是这个分歧暴露了缺陷 B。**测试脚本不该照抄实现，而该照抄规格。**
@@ -217,7 +222,7 @@ Buffer、`onExit` 的 `signal` 是数字还是名字、`resize(cols, rows)` 与�
 | 脚本 | 验证什么 | 为什么需要它 |
 |---|---|---|
 | `verify-runtime.mjs` | zip 结构（条目数 / LINK 注释 / 占位符残留 / 版本标记 / ELF 校验） | 产物完整性 |
-| `simulate-install.mjs` | 复刻 `RuntimeInstaller` 的 7 步解包与七锚点判定 | 结构对 ≠ 设备上能装出可启动的树 |
+| `simulate-install.mjs` | 复刻 `RuntimeInstaller` 的 7 步解包与八锚点判定 | 结构对 ≠ 设备上能装出可启动的树 |
 | `smoke-plugin.mjs` | 复刻官方 `WebServer` 路由契约起真实 HTTP | 文件铺对了 ≠ 插件能挂起来 |
 | `check-bundle.mjs` | 用**真实** `dsh-app-boot` 走解析链 | 插件能跑 ≠ DSH 能发现它 |
 | `test-pty-patch.mjs` | 12 个补丁的离线单测（自带 fixture，不依赖仓库外文件） | 补丁改错了构建照样全绿，只有点开终端才炸 |

@@ -41,6 +41,23 @@ class EngineProcess private constructor(
         private const val READ_BUFFER = 4096
 
         /**
+         * 校验 execve 的 `file` 参数是绝对路径。
+         *
+         * 原生层走 `execve(3)`（`dsh_pty.c` 的 G3 硬约束），它**不搜索 PATH**：
+         * 传裸名会让子进程以 exit 127 立即死亡，而 PTY 随即 EIO，宿主侧看不到
+         * 任何 stderr —— 表现为「启动失败 + 无限重试」且日志空白。宁可在这里
+         * 抛一个带名字的异常，也不要把裸名交给 fork。
+         */
+        private fun requireAbsolute(path: String, what: String): String {
+            if (!path.startsWith("/")) {
+                throw EngineStartException(
+                    "$what 必须是绝对路径，收到 \"$path\"（execve 不搜索 PATH，裸名会 exit 127）",
+                )
+            }
+            return path
+        }
+
+        /**
          * 启动引擎进程。
          *
          * @param nodeBin  `engine/bin/node` 的**绝对路径**（execve 不搜索 PATH）
@@ -48,10 +65,15 @@ class EngineProcess private constructor(
          * @param cwd      工作目录
          * @param env      完整环境变量数组（见 [EngineConfig.buildEnv]）
          * @param patchPath `android-overlay.yml` 的绝对路径；null 表示不注入
-         * @param rootPrefix 非 null 时以 root 启动：经探测可用的 su 形式前缀
-         *   （如 `["su","-c"]`，含 su 绝对路径首项）。argv 改为
+         * @param rootPrefix 非 null 时以 root 启动：经探测可用的 su 形式前缀，
+         *   **首项必须是 su 的绝对路径**（如 `["/system/bin/su","-c"]`）。argv 改为
          *   `[su, …, "exec 'node' …"]` —— Magisk/KernelSU 的 su 会 exec 替换自身，
          *   引擎进程仍是 forkpty 的直接子进程，PR_SET_PDEATHSIG 继续有效。
+         *
+         *   传裸名会直接 ENOENT：原生层用 execve 启动（见 `dsh_pty.c` 的 G3），
+         *   execve 不搜索 PATH。此处用 [requireAbsolute] 硬校验，把这类错误挡在
+         *   fork 之前 —— 否则症状是子进程 exit 127、PTY 立即 EIO、日志里连一行
+         *   报错都没有，只能靠 logcat 反推（缺陷 L 就是这样排查了两轮）。
          */
         suspend fun spawn(
             nodeBin: File,
@@ -86,7 +108,7 @@ class EngineProcess private constructor(
             val argv: List<String> = if (rootPrefix == null) {
                 nodeArgv
             } else {
-                val suPath = rootPrefix.first()
+                val suPath = requireAbsolute(rootPrefix.first(), "rootPrefix")
                 // 拼成经 shell 解释的单命令（su 的各种形式都以 -c/位置参数收命令）
                 val command = "exec " + nodeArgv.joinToString(" ") { arg ->
                     if (arg.contains(Regex("[\\s\"'\\\\]"))) "'" + arg.replace("'", "'\\''") + "'" else arg

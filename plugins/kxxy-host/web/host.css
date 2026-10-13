@@ -1341,6 +1341,32 @@ html, body {
   color: var(--text-muted);
 }
 
+/*
+ * Shizuku 通道未就绪时的原因提示。
+ *
+ * 用暖色左边框而非整块底色：这条提示会与「不可用」徽章同时出现，
+ * 再加一个色块会让卡片看起来像报错面板，而它其实是引导。
+ *
+ * 底色刻意用固定 rgba 而不是 color-mix()：color-mix 是 Chrome 111+ 的特性，
+ * 本工程的目标设备里存在 WebView 104（见 README 缺陷 I/J），
+ * 用了会整条声明被丢弃、提示块没有底色。
+ */
+.priv-hint {
+  margin-top: 10px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--accent-orange);
+  background-color: rgba(242, 153, 74, 0.08);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* 「请求授权」按钮：与 priv-hint 之间留出间距，避免贴成一块 */
+.priv-card > .button {
+  margin-top: 10px;
+}
+
 .priv-apply {
   margin-top: 4px;
 }

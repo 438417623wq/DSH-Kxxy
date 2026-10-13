@@ -108,4 +108,20 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     // .deb 的 data.tar.xz 解码（纯 Java 实现，约 110 KB）—— 扩展中心解包链路
     implementation("org.tukaani:xz:1.10")
+
+    // Shizuku：ADB 身份执行通道。
+    //
+    // 为什么要它：Shizuku 的 binder 能力给不了引擎子进程（引擎是 execve 起的独立
+    // 进程，uid 由内核决定），所以「shizuku 模式」的语义是**给引擎注入一个以
+    // adb/shell 身份执行命令的通道**，而不是给引擎提权。
+    //
+    // api 传递带入 aidl（moe.shizuku.server.IShizukuService / IRemoteProcess）与
+    // shared；provider 传递带入 api。三者都在 mavenCentral，无需新增仓库。
+    //
+    // 为什么用 13.1.5 而不是更新版本：Shizuku.newProcess() 在 13.x 已降级为
+    // private static，官方推荐 UserService 或 transactRemote。我们走
+    // ShizukuBinderWrapper + IShizukuService.Stub.asInterface(...) 这条等价路径，
+    // 不依赖该私有方法，因此 13.1.5 的 API 面足够且长期稳定。
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 }

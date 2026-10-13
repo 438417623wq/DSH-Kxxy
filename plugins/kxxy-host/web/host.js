@@ -1091,11 +1091,11 @@
       id: 'shizuku',
       icon: '⚡',
       name: 'Shizuku ADB',
-      tagline: '经 Shizuku 注入 ADB shell 级身份；本期改变引擎可感知的环境变量，不改进程 uid。',
+      tagline: '经 Shizuku 获得 ADB shell 级身份；引擎以应用身份运行，特权命令按需走 shz 通道。',
       caps: [
+        ['✓', '引擎内可用 shz 以 adb / shell 身份执行命令'],
         ['✓', '引擎内 DSH_ANDROID_PRIV_MODE=shizuku，脚本可感知'],
-        ['✓', 'ADB 级能力接口（完整注入为四期项）'],
-        ['✗', '不会给引擎子进程提权'],
+        ['✗', '引擎进程本身不提权（Shizuku 的固有边界）'],
       ],
       needs: 'shizuku',
       unavailableReason: '未检测到 Shizuku 管理器',
@@ -1163,6 +1163,26 @@
             `<div class="priv-cap"><span class="priv-cap-mark ${mark === '✓' ? 'ok' : mark === '⚠' ? 'warn' : 'off'}">${mark}</span>${escapeHtml(text)}</div>`).join('')}
         </div>
       `;
+
+      // Shizuku 通道未就绪时，把确切原因和「请求授权」入口直接给出来。
+      //
+      // 为什么必须在这里给：装了管理器但服务没起 / 没授权，是 Shizuku 最常见的
+      // 两种状态，而它们在 UI 上都表现为「这个模式点了没用」。只写「不可用」
+      // 等于把用户扔在原地 —— 实测中用户正是这么描述的（「Shizuku ADB 权限有问题」）。
+      if (mode.id === 'shizuku' && available && !engine.privAvailable?.shizukuUsable) {
+        const why = engine.privAvailable?.shizukuError || '';
+        const tip = el(`<div class="priv-hint">${escapeHtml(why || 'Shizuku 通道未就绪')}</div>`);
+        card.appendChild(tip);
+        if (engine.privAvailable?.shizukuGranted === false) {
+          const btn = el('<button class="button button-subtle button-sm">请求授权</button>');
+          btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            window.location.href = 'kxxy://perm/request?name=shizuku';
+            showToast('已发起 Shizuku 授权请求，请在 Shizuku 弹窗中确认', 'info');
+          });
+          card.appendChild(btn);
+        }
+      }
 
       if (!available && mode.guide) {
         const guide = el(`<a class="button button-subtle button-sm" href="${escapeHtml(mode.guide.url)}" target="_blank" rel="noreferrer">${escapeHtml(mode.guide.label)}</a>`);

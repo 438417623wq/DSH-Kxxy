@@ -63,5 +63,24 @@
                 android:value="local_ai_agent_engine" />
         </service>
 
+        <!--
+          Shizuku binder 接收通道。
+
+          三条属性都是 ShizukuProvider 的硬性要求（照抄官方模板，改动会静默失联）：
+          - android:permission 必须是一个「授给 Shell(com.android.shell) 但不给普通
+            应用」的权限。INTERACT_ACROSS_USERS_FULL 满足：只有系统与 adb shell 持有，
+            于是该 provider 只对「本应用自身」和「Shizuku server（以 adb/root 身份运行）」
+            开放。换成普通权限会让任何应用都能来取 binder。
+          - android:exported 必须 true —— Shizuku server 以 adb 身份跨进程访问。
+          - android:multiprocess 必须 false —— Shizuku server 只在应用启动时取一次 uid，
+            多进程会让 uid 判定错乱。
+        -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
     </application>
 </manifest>

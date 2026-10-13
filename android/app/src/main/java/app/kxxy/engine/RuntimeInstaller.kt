@@ -58,7 +58,7 @@ class RuntimeInstaller(private val ctx: Context) {
     /**
      * 幂等安装。已安装且完整时立即返回。
      *
-     * 完整性判定用**七锚点探针**而非单一版本戳 —— 参考项目 m1.13 事故：
+     * 完整性判定用**八锚点探针**而非单一版本戳 —— 参考项目 m1.13 事故：
      * 覆盖升级后 `@deepseek-ai` 目录只剩空壳（JS 文件未落地）但版本戳已写成功，
      * 于是「引擎存在 + 版本匹配」直接跳装，导致 MODULE_NOT_FOUND 反复重启。
      */
@@ -151,7 +151,7 @@ class RuntimeInstaller(private val ctx: Context) {
     }
 
     /**
-     * 七锚点完整性探针。
+     * 八锚点完整性探针。
      *
      * 任一锚点缺失即认为需要重装。刻意不只看版本戳 —— 见方法注释上方的 m1.13 事故。
      */
@@ -221,6 +221,21 @@ class RuntimeInstaller(private val ctx: Context) {
         }
         if (!markerIsCurrent(root, PTY_NODE_WRAPPER, PTY_NODE_MARKER)) {
             Log.w(TAG, "runtime probe: android pty binding outdated, forcing reinstall")
+            return false
+        }
+
+        // 锚点 8：宿主插件本体（kxxy-host）为当前版本。
+        //
+        // 锚点 5 只判 `kxxy-host/package.json` 存在，而那个文件从 v0.1.0 起
+        // 内容就没变过 —— 于是「改了 host.js / lib/index.js 却只重装 APK」时，
+        // 设备上跑的是旧插件，且因为七锚点全通过而永远不会自愈。真机踩过：
+        // 新版 Shizuku 权限卡片（含「请求授权」按钮）在 APK 安装后仍不可见，
+        // 设备上的 host.js 停在 55168 字节的旧版，必须手工 push 才生效。
+        //
+        // 标记写在插件入口 lib/index.js 首行（`kxxy-host@N`），改动
+        // plugins/kxxy-host/ 下任何文件后都要递增编号，并同步本常量。
+        if (!markerIsCurrent(root, HOST_PLUGIN_ENTRY, HOST_PLUGIN_MARKER)) {
+            Log.w(TAG, "runtime probe: kxxy-host plugin outdated, forcing reinstall")
             return false
         }
 
@@ -633,6 +648,15 @@ class RuntimeInstaller(private val ctx: Context) {
             "lib/node_modules/node-pty/prebuilds/android-arm64/dsh_pty_node.node"
         private const val PTY_NODE_WRAPPER = "lib/node_modules/node-pty/lib/index.js"
         private const val PTY_NODE_MARKER = "kxxy-pty-node@1"
+
+        /**
+         * 宿主插件版本标记（锚点 8），写在 kxxy-host/lib/index.js 首行。
+         *
+         * 与锚点 6/7 同理：runtime 版本戳不变，只判文件存在会让老设备带着
+         * 旧插件跳过重装。改动 plugins/kxxy-host/ 下任何文件后递增编号。
+         */
+        private const val HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js"
+        private const val HOST_PLUGIN_MARKER = "kxxy-host@2"
 
         /** 读版本标记时探测的头部字节数；标记都写在首行，取小值即可。 */
         private const val COMPAT_MARKER_PROBE_BYTES = 256

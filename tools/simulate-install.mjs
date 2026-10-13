@@ -9,7 +9,7 @@
  *
  * 本脚本按 RuntimeInstaller 的**精确顺序**复刻（见该文件 :65-95）：
  *   readZipIndex → extract（跳过 LINK）→ materialiseLinks → rewriteRootPlaceholder
- *   → materialiseSonameAliases → restoreExecBits → isComplete（七锚点，含兼容层与 PTY 绑定版本标记）
+ *   → materialiseSonameAliases → restoreExecBits → isComplete（八锚点，含兼容层、PTY 绑定与宿主插件的版本标记）
  *
  * 用法：node tools/simulate-install.mjs [zip 路径] [目标目录]
  * 默认目标目录：<系统临时目录>/kxxy-sim-install（每次运行前清空）
@@ -55,6 +55,15 @@ const COMPAT_LAYER_MARKER = "kxxy-webview-compat@2";
  * 同样按首行版本标记判定过期。
  */
 const PTY_NODE_MARKER = "kxxy-pty-node@1";
+
+/**
+ * 与 RuntimeInstaller.HOST_PLUGIN_MARKER 保持一致（锚点 8）。
+ *
+ * 锚点 5 只判 kxxy-host/package.json 存在，而那个文件从 v0.1.0 起内容未变；
+ * 于是「改了 host.js / lib/index.js 却只重装 APK」的设备一直跑旧插件，
+ * 且七锚点全通过、永不重装。标记写在插件入口 lib/index.js 首行。
+ */
+const HOST_PLUGIN_MARKER = "kxxy-host@2";
 const EXECUTABLE_NAMES = new Set(["rg", "esbuild", "node", "sharp", "swc", "dprint", "biome"]);
 const SONAME_ALIASES = [
   ["lib/libreadline.so.8", "lib/libreadline.so.8.3"],
@@ -267,8 +276,8 @@ for (const full of walk(target)) {
 }
 console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755`);
 
-// ---------------------------------------------------------------- isComplete（七锚点）
-console.log("[6] isComplete 七锚点（含兼容层与 PTY 绑定的版本标记）：");
+// ---------------------------------------------------------------- isComplete（八锚点）
+console.log("[6] isComplete 八锚点（含兼容层、PTY 绑定与宿主插件的版本标记）：");
 const anchors = [
   ["锚点 1 dsh 引擎入口", join(target, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js")],
   ["锚点 2 SONAME 别名 libreadline.so.8", join(target, "lib/libreadline.so.8")],
@@ -282,6 +291,9 @@ const anchors = [
   // 且 node-pty 无 Android 预编译产物 —— 两者都由构建期补丁修掉，
   // 但老设备的 runtime 不会因此重装，必须参与完整性判定。
   ["锚点 7 PTY 原生模块", join(target, "lib/node_modules/node-pty/prebuilds/android-arm64/dsh_pty_node.node")],
+  // 锚点 8：宿主插件本体。锚点 5 的 package.json 从 v0.1.0 起内容未变，
+  // 光判它存在会让「改了 host.js 却只重装 APK」的设备一直跑旧插件。
+  ["锚点 8 宿主插件入口", join(target, "lib/node_modules/kxxy-host/lib/index.js")],
 ];
 for (const [label, f] of anchors) {
   if (!existsSync(f)) fail(`${label} 缺失：${f.slice(target.length + 1)}`);
@@ -316,6 +328,15 @@ for (const [label, f] of anchors) {
     const isElf = buf.length > 4 && buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46;
     if (!isElf) fail("锚点 7 原生模块不是 ELF（可能是空文件或被文本替换）");
     else ok(`锚点 7 原生模块为 ELF（${buf.length} B）`);
+  }
+}
+{
+  // 锚点 8 的第二段判定：宿主插件版本标记（写在 lib/index.js 首行）。
+  const entry = join(target, "lib/node_modules/kxxy-host/lib/index.js");
+  if (existsSync(entry)) {
+    const head = readFileSync(entry, "utf8").slice(0, 256);
+    if (!head.includes(HOST_PLUGIN_MARKER)) fail(`锚点 8 版本标记过期：lib/index.js 头部不含 ${HOST_PLUGIN_MARKER}`);
+    else ok(`锚点 8 版本标记匹配（${HOST_PLUGIN_MARKER}）`);
   }
 }
 {

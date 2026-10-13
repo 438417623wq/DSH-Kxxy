@@ -165,6 +165,31 @@ for (const n of NEED) {
   }
 }
 
+// ---------------------------------------------------------------- 宿主插件版本标记
+// 同锚点 6/7 的道理：锚点 5 只判 kxxy-host/package.json 存在，而它从 v0.1.0 起
+// 内容未变；「改了 host.js 却只重装 APK」的设备会一直跑旧插件。
+// 断言 zip 里插件入口首行的标记与 RuntimeInstaller.HOST_PLUGIN_MARKER 一致。
+{
+  const markerNeed = /HOST_PLUGIN_MARKER\s*=\s*"([^"]+)"/.exec(
+    readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
+  );
+  const entry = byName.get("lib/node_modules/kxxy-host/lib/index.js");
+  if (!entry) {
+    console.log("宿主插件版本标记：✗ 条目缺失，跳过");
+  } else if (markerNeed === null) {
+    console.log("宿主插件版本标记：✗ RuntimeInstaller.kt 未定义 HOST_PLUGIN_MARKER");
+    missing += 1;
+  } else {
+    const head = readLocal(entry).toString("utf8").slice(0, 256);
+    if (!head.includes(markerNeed[1])) {
+      console.log(`宿主插件版本标记：✗ lib/index.js 头部不含 ${markerNeed[1]}`);
+      missing += 1;
+    } else {
+      console.log(`宿主插件版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+}
+
 // ---------------------------------------------------------------- manifest
 const mf = byName.get("kxxy-runtime.json");
 if (!mf) throw new Error("缺 kxxy-runtime.json");
