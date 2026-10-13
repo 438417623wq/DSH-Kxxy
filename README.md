@@ -58,6 +58,8 @@ dsh-kxxy/
 │       ├── assets/runtime.zip    497 MiB 运行时（构建产物，**不入库**，见 tools/）
 │       ├── assets/ext-pool/      1.0 GiB 扩展包池（构建产物，**不入库**）
 │       ├── cpp/                  PTY 原生层
+│       ├── res/values/           浅色主题 + 窗口/启动页配色（缺陷 P）
+│       ├── res/values-night/     深色主题（同一组资源名，缺陷 P）
 │       └── java/app/kxxy/        Kotlin 源码 12 个文件
 ├── plugins/kxxy-host/            Cordis 插件（宿主管理页）
 │   ├── cordis.patch.yml          挂载声明
@@ -159,7 +161,7 @@ cd android
 
 ---
 
-## 五、移植过程中发现并修掉的 15 个真实缺陷
+## 五、移植过程中发现并修掉的 17 个真实缺陷
 
 这些都是**只在真机/端到端路径上才会暴露**的问题，构建全绿时完全看不出来：
 
@@ -180,6 +182,30 @@ cd android
 | M | Shizuku 模式从未实现 | 「Shizuku ADB」档位可选中、可保存、可重启，但**没有任何 ADB 能力**；用户感知为「Shizuku 权限有问题」 | 原实现只做了两件事：检测管理器是否安装（`packageManager.getPackageInfo`）+ 把 `DSH_ANDROID_PRIV_MODE=shizuku` 写进引擎环境变量。依赖里没有 `dev.rikka.shizuku:*`、清单里没有 `ShizukuProvider`、没有任何 binder 调用 —— 前端卡片自己都写着「完整注入为四期项」。修复见 `ShizukuBridge` + `ShizukuShellServer`：走 `IShizukuService.Stub.asInterface(Shizuku.getBinder()).newProcess(...)`（`Shizuku.newProcess` 在 13.x 已私有化且计划于 API 14 移除，但其实现只有这一行），应用侧轮询 `<engineRoot>/shz/request` 执行后写 `response`，引擎内用生成的 `bin/shz` 闸门脚本调用 |
 | N | 插件更新不会到达老设备 | 只重装 APK 后，界面仍是旧插件（Shizuku 卡片的「请求授权」按钮、`priv-hint` 提示块全都不出现），必须手工 push 才生效 | `RuntimeInstaller.isComplete()` 的锚点 5 只判 `kxxy-host/package.json` 存在，而那个文件**从 v0.1.0 起内容就没变过**；`runtimeVersion` 戳也不变，于是七锚点全通过、永不重装。修复：新增锚点 8，按插件入口 `kxxy-host/lib/index.js` 首行的版本标记 `kxxy-host@N` 判定过期（与锚点 6/7 同一手法）。**约定：改动 `plugins/kxxy-host/` 下任何文件后，必须递增 `lib/index.js` 首行标记并同步 `RuntimeInstaller.HOST_PLUGIN_MARKER`**，否则老设备不会自愈。后来适配层（纯静态资产）又踩了同一个坑：只改 `mobile.css` / `mobile.js` 时插件入口标记不动，锚点 8 仍判「已是最新」→ 再加**锚点 9**（两份文件共用标记 `kxxy-mobile-ui@N`） |
 | O | 官方前端无移动端适配 | ① 设置面板：411px 视口下面板仅 363px 宽，左侧导航硬吃 188px，右侧内容区只剩 175px，`_rowText` 扣掉 `padding-right:48px` 后标题宽 **0px** → 「选择新会话的默认权限模式」每个字一行、「权限」「语言」竖排、模型卡片「编辑/删除」竖排溢出卡片外；② 左侧栏：展开后主内容列从 355px 被压到 **131px** | 官方是纯桌面布局，**没有断点也没有移动端分支**。① 宽度链是 `panel 363px`（`width:800px; max-width:calc(-48px + 100vw)`）→ `nav 188px`（`flex:0 0 auto`，不可压缩）→ `content 175px`（`flex:1 1 0%`）→ `options` 再扣 `padding:0 24px` 只剩 127px → `rowText` 再扣 48px 归零；② `BynINW_frame` 的 `grid-template-columns: 280px minmax(0px,1fr) minmax(0px,0px)` 由 **React 写死在 inline style**（自定义属性全为空、官方样式表里 0 命中），它就是硬挤第二列，没有「覆盖层」概念。修复：新增插件侧移动端适配层 `plugins/kxxy-host/web/mobile.css` + `mobile.js`，注入到 `</head>` 之前（必须晚于官方样式表）。设置面板改为「顶部横向 tab 条 + 全宽内容」；左侧栏做**两态**：折叠态**整栏完全收掉**（连 56px 图标栏都不留）、展开态改为**覆盖式抽屉**。四条硬约束：① 第一列压到 0px 靠 `!important`（官方把列宽写在 React inline style 上，inline 无 `!important` 时 CSS `!important` 可胜出）；② 抽屉必须 `position:absolute` 而非 `fixed` —— 祖先链上有 `z-index:40` 的 static 容器，`fixed` 会输掉层叠竞争，症状是「测量全对但整块不可见」；③ 侧栏脱流后 `centerCol` 必须显式 `grid-column: 2`（grid 会自动把它排到 0px 宽的第 1 列）；④ 隐藏必须用 `visibility` 而**不是** `display:none` —— 官方开合按钮在列内，`display:none` 会让整棵子树退出渲染、按钮一起消失，用户永久失去唯一入口（详见下段「缺陷 O 的补充教训」） |
+
+| P | 「跟随系统」外观恒为深色 | 系统是浅色，app 里「外观 → 跟随系统」却始终渲染深色；切系统深浅色完全没反应 | 官方前端与控制台**都只判 `matchMedia('(prefers-color-scheme: dark)').matches`**（`ui-theme` 的 `buildSnapshot()` 里 `resolvedId = preference === "system" ? (media?.matches === true ? "dark" : "light") : preference`；官方三份 CSS 里 `prefers-color-scheme` 命中数为 **0**，暗色块只挂 `body[data-ds-dark-theme]`）。而 Android WebView 的该媒体特性**不看系统 `Configuration.uiMode`，只看宿主 Activity 主题的 `android:isLightTheme`** —— 本 app 的 `Theme.Kxxy` parent 是 `Theme.Material.NoActionBar`（深色），`isLightTheme=false`，于是恒报 dark。实测探针（改完强制重启，系统 night=no / yes 两次）：`prefersDark=true prefersLight=false rootColorScheme=normal` **两次完全相同**。修复：`values/themes.xml` 的 parent 改为 `Theme.Material.Light.NoActionBar` + 新增 `values-night/themes.xml`（深色 parent，窗口色与原值逐字节相同），另建 `values/colors.xml` 与 `values-night/colors.xml` 供 `MainActivity` / `BootstrapActivity` 取窗口色与启动页文字色（原先两者都硬编码 `0xFF0B0D13` 等） |
+| Q | 控制台终端页浅色下配色错配 | 浅色主题下终端卡片里嵌着一张**纯白**的「终端 Shell 诊断」卡，底部六个快捷键按钮**白底浅灰字**几乎不可读 | 终端容器把底色**硬编码**成深色（`.terminal-container` `#151517`、`.terminal-bar`/`.terminal-shortcuts` `#1b1b1c`、`.terminal-viewport` `#101012`、`.terminal-code` `#D1D5DB`，注释还自承「终端保持深色（终端惯例）」），而内部文字与按钮用的是**语义变量**（`.terminal-title` 用 `--text-muted`、`.term-key` 用 `--bg-card` + `--text-secondary`）。浅色主题下这些变量翻成「深灰字、白底」，画在深底上就出现上述两个症状。修复：引入 `--term-surface` / `--term-chrome` / `--term-viewport` / `--term-fg` / `--term-key-bg` / `--term-key-fg` / `--term-border` / `--term-shadow` 一组变量，浅色段与 `body[data-ds-dark-theme]` 段各给一份取值（深色值与原硬编码逐字节相同，零回归）；另给 `.shell-diag-card` 加外边距并抬到 `--bg-elevated` 一层，使其读作「终端内部的独立面板」而不是「嵌进去的补丁」。顺带修掉该诊断卡的**误导性判据**：它原先只判 `cached.startsWith(engineRoot + '/')`，于是引擎 `bin/` 下的任何可执行文件都算「✓ 缓存有效」—— 设备上缓存着 `…/engine/bin/cmd`（那是 Android 的 `cmd` 服务工具，`cmd --help` 报 `Can't find service`，根本不是 shell），卡片却显示有效。现收紧为「必须是已知 shell 的可执行文件名」，并把标题改为「终端 Shell 缓存」+ 说明「官方当前版本已不读该缓存」 |
+
+**关于缺陷 Q 的额外结论（终端功能本身是好的）**：`dsh.terminal.shell` 这个键**已被官方废弃** —— 在四个运行时 bundle（`sidebar-terminal` / `client.terminal` / `terminal-bash` / `terminal`）里对 `/terminal\.shell/` 与 `/localStorage/` 的命中数**都是 0**；官方新建终端走 `webTerminals.selectShell(path)` → 开 tab 时把 `shellPath` 作为参数传下去（`terminal-bash` 的默认值是 `DEFAULT_BASH_SHELL = "/bin/bash"`，可被 `config.shellPath` 覆盖，而该配置由引擎侧注入）。所以那张卡显示的 `bin/cmd` 只是**历史遗留值**，不影响终端；真机上终端本身工作正常（`bash-5.3$` 提示符、`uname -a` 正常），即缺陷 K 的修复仍然有效。对照实验也证明**官方终端天然跟随主题**：浅色下 `.xterm-viewport` 背景透明、文字 `rgb(15,17,21)`，官方 `sidebar-terminal` 插件全部用 `var(--dsw-alias-*)` 官方 token。
+
+**缺陷 P 的定位手法**（可复用）：症状是「跟随系统没反应」，第一直觉会去查官方前端的
+主题逻辑，但它那行 `resolvedId = preference === "system" ? (media?.matches === true ? "dark" : "light") : preference`
+完全正确。真正的判据是**把媒体查询的取值打出来**：往 `compat.js` 尾部追加一段探针读
+`matchMedia('(prefers-color-scheme: dark)').matches`，经 `onConsoleMessage` 转发到 logcat。
+两条硬约束：① **必须 `force-stop` 后重启**再取值 —— `prefers-color-scheme` 是 WebView
+创建时算一次的快照，只切系统 night mode 不重启会拿到上一次的缓存值，从而无法区分
+「WebView 读系统 uiMode」与「读宿主主题」这两种假设（第一次实验就栽在这里）；
+② 对照实验要做**双向**（night=no 与 night=yes 各一次），两次结果相同才能排除系统因素。
+确定根因后不要急着改官方前端 —— **官方与控制台两处判定同源**（都是同一句 `matchMedia`），
+修好宿主主题这一处，两处一起跟随。
+
+**缺陷 Q 的定位手法**（可复用）：症状是「浅色下难看」，先别改配色，先把**每个元素的
+实际计算色**打出来（`bg` / `color` / `border` 一起取），错配立刻显形：容器底是
+`rgb(21,21,23)` 而内部的卡是 `rgb(255,255,255)`、按钮是 `bg=rgb(255,255,255) color=rgb(97,102,107)`。
+一条硬约束：**页面是从设备上的插件目录加载的**，本地改完必须先 `adb push` + `run-as … cat >`
+覆盖设备文件再量测，否则会看到「改了没反应」（第一次跑就踩了）。
+验证时必须**浅色与深色各跑一遍并人工读图**：只验证浅色会漏掉「深色被改坏」，
+而深色值本就应当逐像素不变（因为原硬编码值原样搬进了 `body[data-ds-dark-theme]` 段）。
 
 **构建期陷阱（非代码缺陷，但会毁掉产物）**：Gradle 的 `packageDebug` 走 zipflinger **增量打包** —— 它打开已存在的 APK 原地更新，条目变大时把新数据追加到文件末尾，**旧数据留成空洞且不截断文件**。本次 `runtime.zip` 只增大了 448 字节，`app-debug.apk` 却从 1.62 GB 涨到 **2.14 GB**（凭空多出 521 MB，恰好一整个旧 `runtime.zip`）。用中央目录逐条核对偏移即可确诊（空洞在 `classes5.dex` 之后、`DebugProbesKt.bin` 之前）。删掉产物重新 `assembleDebug` 后回到 1620993963 B。**发布前必须核对 APK 体积量级**，否则会发出一个白胖一倍的包。
 

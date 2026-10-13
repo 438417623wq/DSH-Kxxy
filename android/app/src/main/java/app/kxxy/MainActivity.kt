@@ -72,7 +72,9 @@ class MainActivity : Activity() {
         webView = WebView(this)
         setContentView(
             FrameLayout(this).apply {
-                setBackgroundColor(0xFF0B0D13.toInt())
+                // 跟随系统深浅色：原先硬编码深色，浅色主题下会在 WebView
+                // 首次绘制前闪一块深底。取值见 res/values{,-night}/colors.xml。
+                setBackgroundColor(getColor(R.color.kxxy_window_bg))
                 addView(
                     webView,
                     FrameLayout.LayoutParams(

@@ -123,20 +123,21 @@ class BootstrapActivity : Activity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(0xFF0B0D13.toInt())
+            // 跟随系统深浅色，取值见 res/values{,-night}/colors.xml
+            setBackgroundColor(getColor(R.color.kxxy_window_bg))
             setPadding(d(32), d(32), d(32), d(32))
         }
 
         titleView = TextView(this).apply {
             text = getString(R.string.boot_title)
-            setTextColor(0xFFF0F3F8.toInt())
+            setTextColor(getColor(R.color.kxxy_boot_title))
             textSize = 26f
             gravity = Gravity.CENTER
         }
 
         statusView = TextView(this).apply {
             text = getString(R.string.boot_checking)
-            setTextColor(0xFF9DA7B8.toInt())
+            setTextColor(getColor(R.color.kxxy_boot_status))
             textSize = 14f
             gravity = Gravity.CENTER
             setPadding(0, d(20), 0, d(20))
@@ -152,7 +153,7 @@ class BootstrapActivity : Activity() {
 
         hintView = TextView(this).apply {
             text = getString(R.string.boot_hint)
-            setTextColor(0xFF5C6577.toInt())
+            setTextColor(getColor(R.color.kxxy_boot_hint))
             textSize = 11f
             gravity = Gravity.CENTER
             setPadding(0, d(20), 0, 0)

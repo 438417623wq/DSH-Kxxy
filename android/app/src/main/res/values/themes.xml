@@ -1,10 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- DSH Kxxy 主题：深色、无 ActionBar，WebView 全屏铺底 -->
-    <style name="Theme.Kxxy" parent="@android:style/Theme.Material.NoActionBar">
-        <item name="android:windowBackground">#0B0D13</item>
-        <item name="android:statusBarColor">#0E1017</item>
-        <item name="android:navigationBarColor">#0E1017</item>
-        <item name="android:windowLightStatusBar">false</item>
+    <!--
+      DSH Kxxy 主题（浅色）。
+
+      ⚠ 为什么必须有 values-night 姊妹文件：
+      Android WebView 的 `prefers-color-scheme` 媒体查询**不读系统 uiMode**，
+      它取的是宿主 Activity 主题的 `android:isLightTheme`（Chromium 的
+      AwSettings.getPreferredColorScheme() 走 AwDarkMode，而 AwDarkMode 由
+      theme.isLightTheme 决定）。本应用 targetSdk=28，WebView 的 force-dark
+      默认为 FORCE_DARK_AUTO，即「跟主题走」。
+
+      实测证据（真机，每步都 force-stop 后重启）：
+        cmd uimode night no  → 探针 prefersDark=true
+        cmd uimode night yes → 探针 prefersDark=true
+      两次完全相同 ⇒ 系统深浅色对 WebView 毫无影响，恒报 dark。
+
+      而官方前端与自研控制台的「跟随系统」都只判这一句：
+        matchMedia('(prefers-color-scheme: dark)').matches
+      所以只要让主题按 night 资源限定符跟随系统，两处一起好，
+      无需改动官方前端。
+
+      parent 用 Theme.Material.Light.NoActionBar（isLightTheme=true），
+      深色那一套放 values-night/themes.xml。
+    -->
+    <style name="Theme.Kxxy" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FFFFFF</item>
+        <item name="android:statusBarColor">#F9FAFB</item>
+        <item name="android:navigationBarColor">#F9FAFB</item>
+        <item name="android:windowLightStatusBar">true</item>
     </style>
 </resources>

@@ -674,7 +674,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 旧插件跳过重装。改动 plugins/kxxy-host/ 下任何文件后递增编号。
          */
         private const val HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js"
-        private const val HOST_PLUGIN_MARKER = "kxxy-host@3"
+        private const val HOST_PLUGIN_MARKER = "kxxy-host@4"
 
         /**
          * 移动端 UI 适配层版本标记（锚点 9），写在 kxxy-host/web/mobile.css

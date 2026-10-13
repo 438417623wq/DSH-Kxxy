@@ -32,9 +32,36 @@ body {
 
   /* 顶栏/底栏的半透明底（跟随主题；老 WebView 不支持 color-mix，给两套字面量） */
   --bg-overlay: rgba(249, 250, 251, 0.86);
+
+  /* 终端配色（浅色）。
+     ⚠ 终端必须跟随主题，不能像早期版本那样硬编码深底：
+     容器底写死 #151517 而内部文字/按钮用语义变量（--text-secondary、
+     --bg-card 等），浅色主题下这些变量翻成「深灰字、白底」，画在深底上
+     就出现两个刺眼症状——终端里嵌一张纯白诊断卡、快捷键按钮白底浅灰字
+     几乎不可读。官方终端本身就是主题自适应的（实测浅色下 viewport 背景
+     透明、文字 rgb(15,17,21)），这里对齐它。 */
+  --term-surface: var(--dsw-static-neutral-bluish-50, #f9fafb);
+  --term-chrome: var(--dsw-static-neutral-bluish-100, #ebeef2);
+  --term-viewport: #ffffff;
+  --term-fg: var(--dsw-static-neutral-bluish-1000, #0f1115);
+  --term-key-bg: #ffffff;
+  --term-key-fg: var(--dsw-static-neutral-bluish-700, #61666b);
+  --term-border: var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.10));
+  --term-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
 }
 body[data-ds-dark-theme] {
   --bg-overlay: rgba(21, 21, 23, 0.88);
+
+  /* 终端配色（深色）：取值与改动前的硬编码值完全一致，
+     夜间模式的观感逐像素不变。 */
+  --term-surface: var(--dsw-static-neutral-bluish-950, #151517);
+  --term-chrome: var(--dsw-static-neutral-bluish-900, #1b1b1c);
+  --term-viewport: #101012;
+  --term-fg: #D1D5DB;
+  --term-key-bg: var(--dsw-static-neutral-bluish-875, #232324);
+  --term-key-fg: var(--dsw-static-neutral-bluish-300, #cfd3d6);
+  --term-border: rgba(255, 255, 255, 0.12);
+  --term-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
 }
 
 :root {
@@ -1201,7 +1228,17 @@ html, body {
   background: linear-gradient(90deg, rgba(65, 118, 230, 0.10), transparent);
 }
 
-/* 终端 shell 诊断卡（三轮②） */
+/* 终端 shell 诊断卡（三轮②）
+   ⚠ 这张卡位于 .terminal-container 内部（DOM 上夹在 terminal-bar 与
+   terminal-viewport 之间）。容器已跟随主题，但卡片自身是 .card（底色
+   --bg-card、圆角、padding），如果贴着容器边缘会显得像「嵌进去的一块补丁」——
+   早期版本正是这样，浅色下表现为「深色终端里一张纯白卡片」。
+   这里给它四周留白并抬高一层，使其读作「终端内部的独立面板」。 */
+.shell-diag-card {
+  margin: 10px 10px 0;
+  background-color: var(--bg-elevated);
+}
+
 .shell-diag-card .setting-row {
   padding-bottom: 0;
   border-bottom: none;
@@ -1377,19 +1414,21 @@ html, body {
 
 /* 终端视图 */
 .terminal-container {
-  /* 终端保持深色（终端惯例）：浅色主题下也用固定深底 */
-  background-color: #151517;
-  border: 1px solid var(--border-strong);
+  /* 跟随主题（见 body 段的 --term-* 变量）。
+     早期版本在这里写死 #151517 并注释「终端惯例」，但内部文字与按钮用的是
+     语义变量，浅色主题下就变成「深底 + 深灰字/白底按钮」的错配。 */
+  background-color: var(--term-surface);
+  border: 1px solid var(--term-border);
   border-radius: var(--radius-lg);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+  box-shadow: var(--term-shadow);
 }
 
 .terminal-bar {
   height: 38px;
-  background-color: #1b1b1c;
+  background-color: var(--term-chrome);
   border-bottom: 1px solid var(--border-subtle);
   padding: 0 12px;
   display: flex;
@@ -1460,7 +1499,7 @@ html, body {
   max-height: 380px;
   overflow-y: auto;
   padding: 12px;
-  background-color: #101012;
+  background-color: var(--term-viewport);
   overscroll-behavior: contain;
 }
 
@@ -1469,7 +1508,7 @@ html, body {
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.6;
-  color: #D1D5DB;
+  color: var(--term-fg);
   white-space: pre-wrap;
   word-break: break-all;
 }
@@ -1495,7 +1534,7 @@ html, body {
   display: flex;
   gap: 6px;
   padding: 8px 10px;
-  background-color: #1b1b1c;
+  background-color: var(--term-chrome);
   border-top: 1px solid var(--border-subtle);
   overflow-x: auto;
   scrollbar-width: none;
@@ -1510,10 +1549,10 @@ html, body {
   height: 32px;
   min-width: 44px;
   padding: 0 10px;
-  background-color: var(--bg-card);
+  background-color: var(--term-key-bg);
   border: 1px solid var(--border-subtle);
   border-radius: 6px;
-  color: var(--text-secondary);
+  color: var(--term-key-fg);
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 500;

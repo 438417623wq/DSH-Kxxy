@@ -380,12 +380,14 @@
           </div>
 
           <!-- 终端 shell 诊断（三轮②：同源 localStorage 缓存的失效 shell 会让
-               「新建终端」持续失败，这里检测并提供一键清除） -->
+               「新建终端」持续失败，这里检测并提供一键清除。
+               注意 dsh.terminal.shell 这个键官方已废弃（bundle 里 0 命中），
+               所以本卡是「历史遗留缓存的清理入口」，不是终端故障的唯一解释） -->
           <div class="card shell-diag-card">
             <div class="card-title-row">
               <div class="card-title-group">
-                <h3 class="card-title">终端 Shell 诊断</h3>
-                <span class="card-subtitle">对话页新建终端失败时，多半是这里缓存了失效路径</span>
+                <h3 class="card-title">终端 Shell 缓存</h3>
+                <span class="card-subtitle">官方当前版本已不读该缓存；这里是早期遗留值的清理入口</span>
               </div>
             </div>
             <div id="shell-diag-body">

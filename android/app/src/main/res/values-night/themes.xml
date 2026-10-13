@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      DSH Kxxy 主题（深色）。
+
+      系统开启深色模式时，Android 会选用本文件（-night 资源限定符）。
+      与 values/themes.xml 成对存在，两者只有 parent 与窗口色不同：
+      这里 parent 是 Theme.Material.NoActionBar（isLightTheme=false），
+      于是 WebView 的 prefers-color-scheme 报 dark，官方前端与自研控制台
+      的「跟随系统」同时切到深色。
+
+      见 values/themes.xml 的注释：WebView 不看系统 uiMode，只看主题
+      isLightTheme，所以这是让「跟随系统」真正生效的唯一途径。
+    -->
+    <style name="Theme.Kxxy" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0B0D13</item>
+        <item name="android:statusBarColor">#0E1017</item>
+        <item name="android:navigationBarColor">#0E1017</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

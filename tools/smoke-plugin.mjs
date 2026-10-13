@@ -449,7 +449,37 @@ console.log('\n[2] GET /kxxy/assets/host.css')
   const r = await get('/kxxy/assets/host.css')
   if (r.status !== 200) fail(`状态码 ${r.status}`)
   else if (!r.type?.includes('text/css')) fail(`content-type = ${r.type}`)
-  else ok(`200 ${r.type}，${r.text.length} 字节`)
+  else {
+    ok(`200 ${r.type}，${r.text.length} 字节`)
+
+    // ── 终端配色必须跟随主题（浅色错配是真实缺陷）────────────────────
+    // 早期版本把终端容器/标题栏/视口/快捷键栏的背景写死成深色
+    // （#151517 / #1b1b1c / #101012），而内部文字与按钮用的是语义变量
+    // （--text-secondary / --bg-card 等）。浅色主题下这些变量翻成
+    // 「深灰字、白底」，画在深底上就出现两个刺眼症状：
+    //   ① 终端里嵌一张纯白「终端 Shell 诊断」卡；
+    //   ② 快捷键按钮白底浅灰字，几乎不可读。
+    // 修法是引入 --term-* 一组变量，两套主题各给一份取值。
+    const css = r.text
+    // 只禁「直接当背景/前景用」的写法；这些色值仍合法地出现在
+    // var() 的兜底位与注释里（例如 --term-surface: var(--dsw-…, #151517)）。
+    const direct = /(background-color|background|color)\s*:\s*#(151517|1b1b1c|101012|D1D5DB)\b/i.exec(css)
+    if (direct !== null) {
+      fail(`host.css 仍把 ${direct[2]} 直接用作 ${direct[1]}（应改用 --term-* 变量，否则浅色主题下错配）`)
+    } else ok('终端区不再直接硬编码深色底色/前景')
+    for (const v of ['--term-surface', '--term-chrome', '--term-viewport', '--term-fg', '--term-key-bg', '--term-key-fg']) {
+      if (!css.includes(v)) fail(`host.css 缺少终端主题变量 ${v}`)
+    }
+    // 两套主题都必须给出取值：浅色在 body 段、深色在 body[data-ds-dark-theme] 段。
+    const darkBlock = /body\[data-ds-dark-theme\]\s*\{([\s\S]*?)\n\}/.exec(css)
+    if (darkBlock === null) fail('host.css 找不到 body[data-ds-dark-theme] 段')
+    else if (!darkBlock[1].includes('--term-surface')) {
+      fail('深色段未定义 --term-surface（深色终端会落到浅色值）')
+    } else ok('终端配色改用 --term-* 变量，两套主题各一份取值')
+    if (!/\.term-key\s*\{[^}]*background-color:\s*var\(--term-key-bg\)/.test(css)) {
+      fail('.term-key 未使用 --term-key-bg（浅色下会白底浅灰字不可读）')
+    } else ok('.term-key 底色跟随主题')
+  }
 }
 
 console.log('\n[3] GET /kxxy/assets/host.js')

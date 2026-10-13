@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      宿主窗口与引导页配色（深色）。
+
+      这些值与原 MainActivity / BootstrapActivity 里的硬编码常量完全一致，
+      所以夜间模式下的观感与改动前逐像素相同。见 values/colors.xml 的说明。
+    -->
+    <color name="kxxy_window_bg">#0B0D13</color>
+    <color name="kxxy_boot_title">#F0F3F8</color>
+    <color name="kxxy_boot_status">#9DA7B8</color>
+    <color name="kxxy_boot_hint">#5C6577</color>
+</resources>

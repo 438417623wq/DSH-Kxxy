@@ -431,11 +431,22 @@
   /**
    * 终端 shell 诊断卡（三轮②）。
    *
-   * 终端 UI 会把选中的 shell 路径缓存在同源 localStorage `dsh.terminal.shell`，
-   * 且新建终端时**缓存优先**、显式传给引擎 —— SHELL 修复前解析出的坏路径
-   * （Termux 前缀）会一直覆盖引擎默认值。这里检测失效并给一键清除。
+   * ⚠ 关于 `dsh.terminal.shell` 这个键：它**已被官方前端废弃**。
+   * 在运行时 bundle 里逐文件统计（sidebar-terminal / client.terminal /
+   * terminal-bash / terminal 四个包）对 `/terminal\.shell/`、`/localStorage/`
+   * 的命中数都是 0 —— 官方当前版本根本不读这个键。官方新建终端走的是
+   * `webTerminals.selectShell(path)` → 打开 tab 时把 `shellPath` 作为参数传下去。
+   *
+   * 所以这张卡的定位是「历史遗留缓存的清理入口」，不是「终端故障的唯一解释」。
+   * 早期版本的判据只有 `cached.startsWith(engineRoot + '/')`，于是引擎 bin 目录下的
+   * **任何**可执行文件都算「有效」—— 实测设备上缓存着 `…/engine/bin/cmd`
+   * （那是 Android 的 `cmd` 服务工具，`cmd --help` 报 "Can't find service"，
+   * 完全不是 shell），卡片却显示「✓ 缓存有效」，误导用户以为终端没问题/问题在此。
+   * 现在判据收紧到「必须是已知 shell 的可执行文件名」。
    */
   const SHELL_CACHE_KEY = 'dsh.terminal.shell';
+  /** 引擎 bin/ 下真正的 shell（实测清单：ash 4320B / bash 880416B / dash 117040B / sh 117040B）。 */
+  const KNOWN_SHELLS = ['bash', 'sh', 'dash', 'ash', 'zsh', 'fish'];
   let shellWarnShown = false;
 
   function shellCacheState(engineRoot) {
@@ -447,11 +458,18 @@
     }
     if (!cached) return { cached: null, valid: null, reason: '未缓存（新建终端将使用引擎默认 shell）' };
     if (!engineRoot) return { cached, valid: null, reason: '引擎根目录未知，无法校验' };
-    const valid = cached.startsWith(engineRoot + '/') || cached === engineRoot + '/bin/bash';
+    const inEngine = cached.startsWith(engineRoot + '/');
+    const base = cached.slice(cached.lastIndexOf('/') + 1).toLowerCase();
+    const isShell = KNOWN_SHELLS.includes(base);
+    const valid = inEngine && isShell;
     return {
       cached,
       valid,
-      reason: valid ? '缓存有效' : '缓存路径已失效（指向不存在的 shell）',
+      reason: valid
+        ? '缓存指向引擎自带的 shell'
+        : !inEngine
+          ? '缓存路径不在引擎目录内（多半是 SHELL 修复前留下的旧路径）'
+          : `缓存指向的不是 shell（${base}），新建终端会失败`,
     };
   }
 
@@ -472,16 +490,16 @@
     } else if (st.valid === true) {
       div.innerHTML = `
         <div class="setting-info">
-          <span class="setting-title">✓ 缓存有效</span>
+          <span class="setting-title">✓ ${escapeHtml(st.reason)}</span>
           <span class="setting-desc code-font">${escapeHtml(st.cached)}</span>
         </div>
       `;
     } else {
       div.innerHTML = `
         <div class="setting-info">
-          <span class="setting-title" style="color:var(--accent-red)">⚠ 缓存的 shell 已失效</span>
+          <span class="setting-title" style="color:var(--accent-red)">⚠ ${escapeHtml(st.reason)}</span>
           <span class="setting-desc code-font">${escapeHtml(st.cached)}</span>
-          <span class="setting-desc">这是引擎 SHELL 修复前留下的缓存；不清除的话「新建终端」会一直用它并失败。</span>
+          <span class="setting-desc">这是早期版本留下的缓存；不清除的话「新建终端」会一直用它并失败。</span>
         </div>
       `;
       const btn = el('<button class="button button-warning button-sm">清除缓存</button>');
