@@ -704,7 +704,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 光判「文件存在」会让它们带着不含新补丁的旧兼容层跳过重装，症状
          * 静默复现。改动 compat.js 时必须同步递增此处的编号。
          */
-        private const val COMPAT_LAYER_MARKER = "kxxy-webview-compat@5"
+        private const val COMPAT_LAYER_MARKER = "kxxy-webview-compat@6"
 
         /** 兼容层脚本路径，锚点 6 与 [compatLayerIsCurrent] 共用。 */
         private const val COMPAT_LAYER_FILE = "lib/node_modules/kxxy-host/web/compat.js"

@@ -1,12 +1,15 @@
 /**
- * `plugins/kxxy-host/web/compat.js` 里 CSS 补丁的离线单测（缺陷 S / W / AB）。
+ * `plugins/kxxy-host/web/compat.js` 里 CSS 补丁的离线单测（缺陷 S / W / AB / AC）。
  *
- * 覆盖三段：
+ * 覆盖四段：
  *   [1] `dvh → vh`（Chrome 108+）—— 目录选择对话框列表空白。
  *   [2] `@scope` 展开（Chrome 118+）—— 侧边栏预览 .xlsx / .csv 时表格塌成单列。
  *   [3] `:has()` 改写为标记属性（Chrome 105+）—— 内置移动端插件
  *       `dsh-web-mobile` 的 301 处 `:has()` 全部被解析器整条丢弃，设置面板
  *       于是维持桌面两栏布局（「权限」「语言」被挤成一字一行）。
+ *   [4] 插件 hash 锚点代际归一化 —— 插件按宿主某一代构建，选择器写死那一代的
+ *       CSS-module hash 前缀，宿主换代后 330/451 条规则零命中，对话界面右上角
+ *       于是多出一个与插件文件按钮重叠的侧栏图标。
  *
  * 做法：用 `vm` 造一个最小 DOM 沙箱（`document.querySelectorAll('style')` 返回
  * 我们塞进去的假节点），把**真实的 compat.js** 灌进去执行 —— compat.js 在求值
@@ -33,26 +36,48 @@ const source = readFileSync(COMPAT, "utf8");
 /**
  * 在最小 DOM 沙箱里跑 compat.js，返回改写后的样式文本。
  * 每次调用都是全新的沙箱，避免上一次的定义泄漏到下一次。
+ *
+ * `styles` 可传一组假 style 节点（`{textContent, getAttribute}`），用于缺陷 AC
+ * 那类「要区分宿主样式表与插件样式表」的改写；返回的 `nodes` 就是同一批节点，
+ * 断言时直接读它们的 `textContent`。
  */
-const patch = (css) => {
-  const node = { textContent: css };
+const runInDom = (styles, documentElement = {}) => {
+  const nodes = styles.map((s) => ({
+    textContent: s.textContent,
+    getAttribute: (name) => (name === "data-plugin" ? s.plugin ?? null : null),
+  }));
+  // compat.js 的 `hashObserve` 在没有 MutationObserver 时直接 return，连带
+  // `hashRefresh()` 都不跑 —— 真实浏览器里一定存在，所以这里必须给个空壳。
+  class MutationObserver {
+    observe() {}
+    disconnect() {}
+  }
   const sandbox = {
     URL: globalThis.URL,
     AbortSignal: globalThis.AbortSignal,
     AbortController: globalThis.AbortController,
+    MutationObserver,
     Promise, Object, Array, Set, Map, String, Number, Math, JSON, Symbol, RegExp,
     Uint8Array, Int8Array, RangeError, TypeError, Error, DOMException,
     setTimeout, clearTimeout, console,
     document: {
-      querySelectorAll: () => [node],
-      documentElement: {},
+      querySelectorAll: (selector) => {
+        if (selector === "style") return nodes;
+        if (selector === "style[data-plugin]") {
+          return nodes.filter((n) => n.getAttribute("data-plugin") !== null);
+        }
+        return [];
+      },
+      documentElement,
     },
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox, { filename: "compat.js" });
-  return node.textContent;
+  return nodes;
 };
+
+const patch = (css) => runInDom([{ textContent: css }])[0].textContent;
 
 let pass = 0;
 let fail = 0;
@@ -277,6 +302,73 @@ check(
   "第二次跑不变（此时已只有属性选择器）",
   patch(patch("div:has(span){color:red}")),
   'div[data-kxxy-has~="h0"]{color:red}',
+);
+
+// ---- [7] 缺陷 AC：插件选择器里宿主 class hash 的代际归一化 -------------------
+// 内置插件 dsh-web-mobile 是按宿主某一代构建的，选择器写死那一代的 CSS-module
+// hash 前缀。宿主换代后真机实测：插件 451 条规则里 330 条 selectorText 在 DOM
+// 上零命中，其中含「隐藏标题行 headerCorner」那条 —— 症状就是对话界面右上角
+// 多出一个侧栏图标（与插件自己的文件按钮重叠）。
+//
+// 判据刻意保守：后缀集合必须被候选**完整包含**，且候选**唯一**才建立映射；
+// 模糊宁可不映射（真机上 `QsffPG_root` 这类单后缀锚点有 23 个候选，一律放弃）。
+const runHash = (hostCss, pluginCss) =>
+  runInDom([
+    { plugin: "@deepseek-ai/dsh-client-ui-conversation", textContent: hostCss },
+    { plugin: "dsh-web-mobile", textContent: pluginCss },
+  ])[1].textContent;
+
+console.log("\n[7] 插件 hash 锚点代际归一化（真机形态：wSkVaW → Dc7zOa）");
+check(
+  "后缀集合唯一包含时改写为宿主当前代",
+  runHash(
+    ".Dc7zOa_titleRow{color:red}.Dc7zOa_headerCorner{color:red}",
+    '[class*="wSkVaW_titleRow"] > [class*="_headerCorner"]{display:none !important}',
+  ),
+  '[class*="Dc7zOa_titleRow"] > [class*="_headerCorner"]{display:none !important}',
+);
+check(
+  "类选择器形态 .HASH_tail 同样改写",
+  runHash(
+    ".Dc7zOa_titleRow{color:red}.Dc7zOa_headerCorner{color:red}",
+    ".wSkVaW_titleRow{color:blue}",
+  ),
+  ".Dc7zOa_titleRow{color:blue}",
+);
+check(
+  "两个候选都完整包含后缀时不猜（保持原文）",
+  runHash(
+    ".Dc7zOa_titleRow{}.Dc7zOa_headerCorner{}.oXE0lW_titleRow{}.oXE0lW_headerCorner{}",
+    '[class*="wSkVaW_titleRow"]{display:none}',
+  ),
+  '[class*="wSkVaW_titleRow"]{display:none}',
+);
+check(
+  "候选缺一个后缀时不映射（宿主换了结构，不能凑）",
+  runHash(
+    ".Dc7zOa_titleRow{color:red}",
+    '.wSkVaW_titleRow{color:blue}[class*="wSkVaW_headerUtilities"]{color:blue}',
+  ),
+  '.wSkVaW_titleRow{color:blue}[class*="wSkVaW_headerUtilities"]{color:blue}',
+);
+check(
+  "候选前缀已被插件自己占用时不采用（避免把锚点并到同代）",
+  runHash(
+    ".Dc7zOa_titleRow{color:red}.Dc7zOa_headerCorner{color:red}",
+    '.Dc7zOa_x{color:green}[class*="wSkVaW_titleRow"]{color:blue}',
+  ),
+  '.Dc7zOa_x{color:green}[class*="wSkVaW_titleRow"]{color:blue}',
+);
+check(
+  "第二次跑结果不变（映射稳定后不再改写）",
+  runHash(
+    ".Dc7zOa_titleRow{color:red}.Dc7zOa_headerCorner{color:red}",
+    runHash(
+      ".Dc7zOa_titleRow{color:red}.Dc7zOa_headerCorner{color:red}",
+      '[class*="wSkVaW_titleRow"] > [class*="_headerCorner"]{display:none}',
+    ),
+  ),
+  '[class*="Dc7zOa_titleRow"] > [class*="_headerCorner"]{display:none}',
 );
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

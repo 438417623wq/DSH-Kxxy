@@ -32,7 +32,7 @@
                               │
 ┌─ 运行时层（零改动 dsh 依赖树）────────────────────────────────────┐
 │  Node 24.18.0 (Termux aarch64) + bash + git + rg + 524 个 npm 包   │
-│  dsh web profile：dsh-base → dsh-web-app → kxxy-host               │
+│  dsh web profile：dsh-base → dsh-web-app → kxxy-host → dsh-web-mobile │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,7 +54,7 @@
 dsh-kxxy/
 ├── android/                      Android 工程（AGP 8.5.2 / Kotlin 1.9.24 / JDK 17）
 │   └── app/src/main/
-│       ├── assets/runtime.zip    555 MiB 运行时（构建产物，**不入库**，见 tools/）
+│       ├── assets/runtime.zip    557 MiB 运行时（构建产物，**不入库**，见 tools/）
 │       ├── assets/ext-pool/      1.0 GiB 扩展包池（构建产物，**不入库**）
 │       ├── cpp/                  PTY 原生层
 │       ├── res/values/           浅色主题 + 窗口/启动页配色（缺陷 P）
@@ -64,7 +64,7 @@ dsh-kxxy/
 │   ├── cordis.patch.yml          挂载声明
 │   ├── lib/index.js              路由 + API
 │   └── web/                      管理页 HTML/CSS/JS（含 compat.js 兼容层）
-│       ├── compat.js             旧 ROM WebView 兼容层（缺陷 I/J）
+│       ├── compat.js             旧 ROM WebView 兼容层（缺陷 I/J/R/W/AC/AD）
 │       └── modern.js             现代内建补齐层（页面 + blob worker/iframe）
 ├── tools/                        构建与验证工具链
 │   ├── fetch-runtime.mjs         拉取 Termux aarch64 deb 包
@@ -76,7 +76,9 @@ dsh-kxxy/
 │   ├── check-bundle.mjs          用真实 dsh-app-boot 验证 bundle 解析
 │   ├── test-pty-patch.mjs        补丁离线单测（含原生 PTY 注入）
 │   ├── test-compat-url.mjs       compat.js URL 补丁单测（104 行为沙箱）
+│   ├── test-compat-css.mjs       compat.js CSS 补丁单测（dvh / @scope / :has() / hash 归一化）
 │   ├── test-modern.mjs           modern.js 补齐层单测（104 行为沙箱 + blob 作用域）
+│   ├── test-archive-providers.mjs 归档 provider 单测（zip 中央目录 + epub OPF）
 │   ├── prebuilt/                 自研原生产物（Android arm64）
 │   └── lib/                      装配/补丁/打包库
 └── .cache/                       构建缓存（debs / stage，可删）
@@ -89,7 +91,7 @@ dsh-kxxy/
 前置：JDK 17、Android SDK（platforms 36 / build-tools 36 / ndk 28.2 / cmake 3.22.1）。
 本机没有 gradle wrapper，用已安装的 Gradle 8.10.2。
 
-> **仓库不含 `assets/runtime.zip`**（555 MiB，`.gitignore` 已排除）—— 它是构建产物，
+> **仓库不含 `assets/runtime.zip`**（557 MiB，`.gitignore` 已排除）—— 它是构建产物，
 > 由下面第 1、2 步从**本机已安装的 DSH 桌面版** `app.asar` + Termux aarch64 `.deb` 现场装配。
 > 所以完整重建需要本机装有 DSH 桌面版（提供 `dsh` 的 JS 依赖树与前端 dist）。
 
@@ -143,7 +145,7 @@ cd android
 | 5 | 兼容补丁 | 17 个补丁（见下） |
 | 6 | 注入 | corepack 包装器 + `kxxy-host` 插件 + 悬空 LINK 清扫 |
 | 6.5 | 打包引擎资产 | LibreOffice wasm 引擎（49 文件，剥离 `os` 字段）+ 两份 CJK 字体 |
-| 6.6 | 打包移动端插件 | 第三方 `dsh-web-mobile`（209 文件）整包塞进 `lib/node_modules/` |
+| 6.6 | 打包移动端插件 | 第三方 `dsh-web-mobile`（209 文件）整包塞进 `lib/node_modules/`（它进「已安装」列表靠的是启动时 `EngineConfig.ensureProfileManifest` 写 profile manifest，见缺陷 AB） |
 | 7 | 合并 | 目录 3657 / 文件 30325 / LINK 1560（未压缩 1.43 GiB） |
 | 8 | 写出 | 条目 35,543，zip 557.96 MiB |
 
@@ -166,12 +168,12 @@ cd android
 | `libreoffice-kit-font-fallbacks` | 给 `FONT_FALLBACKS` 追加 Android 实存族 + 13 组 Windows/macOS 族（缺陷 X） |
 | `office-to-pdf-formats` | 扩展名白名单补 `odt` / `ods` / `odp`（底层引擎本就支持 ODF） |
 | `document-preview-office-extensions` | 客户端 office provider 的 `extensions` 同步补 `odt` / `ods` / `odp` |
-| `document-preview-archive-providers` | 注入 zip / epub 两个归档 provider（缺陷 Y，官方两个格式都没有渲染器） |
+| `document-preview-archive-providers` | 注入 zip / epub 两个归档 provider（缺陷 Z，官方两个格式都没有渲染器） |
 | `dsh-manifest` | 把 `kxxy-host` 与内置的 `dsh-web-mobile` 写进 `@deepseek-ai/dsh` 的 dependencies（installation scope，否则 `dsh-client-modules` 扫不到那条 Loader entry） |
 
 ---
 
-## 五、移植过程中发现并修掉的 29 个真实缺陷
+## 五、移植过程中发现并修掉的 30 个真实缺陷
 
 这些都是**只在真机/端到端路径上才会暴露**的问题，构建全绿时完全看不出来：
 
@@ -206,6 +208,8 @@ cd android
 | AA | 自研移动端适配层与官方 UI 冲突，改为内置第三方客户端插件 | 缺陷 O 的第一版修法是**注入 CSS**（`mobile.css` + `mobile.js` 打进 `</head>`），能治「设置面板挤压」与「侧栏遮挡」两件事，但覆盖面有限（弹层、状态栏安全区、软键盘顶起、触控目标尺寸都要自己补），且每处规则都靠 `[class*="语义名"]` 匹配官方运行时类名，官方一升级就可能失效 | 根因是**选错了扩展点**：官方前端本来就是可插拔的（`dsh-client-modules` 会扫 Loader entries，对每个声明了 `package.json` → `dsh.client.platform === "web"` 的包，把它的 `exports["./client"]` 挂进页面 module 图），所以正确的做法是**写一个客户端插件**，而不是从外面往里灌样式。修复：① **整体删除**自研适配层 —— 删 `android/app/src/main/java/app/kxxy/AdaptLayer.kt`（466 行）、`plugins/kxxy-host/web/mobile.css`（16,080 B）与 `mobile.js`（10,816 B）、`plugins/kxxy-host/lib/index.js` 里的 `mobileCss()`/`mobileScript()`/`injectMobileUi()` 与 `ctx.webServer.tapIndex(injectMobileUi)`，以及 `RuntimeInstaller` 的锚点 9（`kxxy-mobile-ui@N`）；② 新增**阶段 6.6** 从 npmmirror 拉 `dsh-web-mobile@3.1.0`（`unpackedSize` 4,159,505，209 文件）整包解进 `lib/node_modules/dsh-web-mobile/`，并在包内写一份 `plugin.version`（内容 `kxxy-mobile-plugin@1`）作为**锚点 10** 的探针；③ `patchDshManifest` 除 `kxxy-host` 外再写一行 `dsh-web-mobile` 进 `@deepseek-ai/dsh/package.json` 的 `dependencies` —— **这一步是决定性的**：`dsh-app-boot` 的 `collectInstallationScopePackages()` 从该 manifest 出发 BFS `dependencies` + `peerDependencies` 产出 installation scope，**只有进了 scope 的包才会被 `routeScoped` 判成 `{kind:"interception"}`**；漏掉它的话插件文件全都在设备上，但永远不产生 Loader entry，`dsh-client-modules` 扫不到，表现与「没打包」一模一样；④ 先按 `EngineConfig.overlayContent()` 的 `insert:` 列表补一行 `- id: dsh-web-mobile` / `name: dsh-web-mobile`（**不是**加进 `plugins/kxxy-host/cordis.patch.yml` —— kxxy-host 本身不是 profile bundle，那个文件在设备上根本没被加载，真正生效的一直是 `--patch android-overlay.yml`）—— **但这一步真机验收时被证明不够**：插件能跑，官方「插件」页却完全不显示它，用户仍然以为没装上；最终改为**登记进 profile manifest**（`EngineConfig.ensureProfileManifest`），并撤掉 overlay 那一行以免重复注册，详见缺陷 AB。三条硬约束：① 客户端半区通过 `package.json` 的 `dsh.client` **声明**被发现，不是通过 `cordis.patch.yml`（后者只让宿主 Loader 里有一行，且宿主半区可以是空 `apply`）；② `exports` 必须给出 `./client`，否则 `dsh-client-modules` 直接抛 `declares dsh.client but exports no "./client" bundle`；③ 内置第三方插件的整包必须**原样**落盘（含 `lib/client.js` 814,043 B 的预构建产物），构建期不重新打包 —— 它的客户端 bundle 是自研打包器（`scripts/build-client.mjs`）的产物，`require()` 的 56 个相对模块 + 3 个外部名（`react` / `react/jsx-runtime` / `@deepseek-ai/dsh-client-ui-primitives`）都依赖那个打包格式 |
 | AB | 内置插件只在 overlay 里 insert 时，官方「插件」页完全不显示它 | 插件确实在运行、移动端布局也已生效，但侧栏「插件」页只有「官方 8」一段，**没有「已安装」分组**；用户据此判定「根本没装进去」（插件页截图里 `dsh-web-mobile` 完全不出现） | 官方「插件」页（`dsh-client-ui-plugin-manager`）「已安装」分组的数据源是 `pluginManager.listBundles()`（`dsh-plugin-manager/lib/index.js:1456`）：名单 = profile 的 `dsh.profile.bundles` ∪ profile `dependencies` ∪ 安装锚点（`@deepseek-ai/dsh/package.json`）的 `dependencies`，其中 **`installed` 判据是「名字出现在 profile 的 `.dependencies` 里」、`enabled` 判据是「出现在 `dsh.profile.bundles` 里」**；解析不到 `dsh.bundle` 的包只有 `enabled` 为真时才以 `error.code = "not-bundle"` 入列。客户端再过滤一遍（`dsh-client-ui-plugin-manager/lib/client.js:3342`）：`!BUILTIN_PROFILE_BUNDLES.has(name) && (installed || optional || error)`，`:3343` 的 `mine = listed.filter((pkg) => pkg.installed || !pkg.optional)` 就是「已安装」。而上游 `dsh-app-boot` 的 `initProfile`（`dsh-app-boot/lib/index.js:26125`）**只在 `package.json` 不存在时才写模板**，设备上 profile 早已存在 ⇒ 永远不会被改写，只靠 overlay insert 的 Loader entry 在页面上完全不可见。修复：新增 `EngineConfig.ensureProfileManifest(ctx)`（`android/app/src/main/java/app/kxxy/engine/EngineConfig.kt:320-368`），由 `EngineSupervisor.ensureDirs()` 调用，**读-改-写** `$HOME/profiles/web/package.json`：`dependencies` 补 `"dsh-web-mobile": "3.1.0"`、`dsh.profile.bundles` 补 `"dsh-web-mobile"`，并**撤掉 `overlayContent(ctx)` 里与之重复的 insert 行**（否则同一插件被注册两次）。一条硬约束：**绝不能整体覆盖该文件** —— 用户通过插件页自装的插件写在同一 `dependencies` 里，覆盖会抹掉用户插件；只做「确保存在」式补写 |
 | AC | 旧 ROM WebView 不支持 `:has()`（Chrome 105） | 内置插件 `dsh-web-mobile` 的样式表在真机上被解析器**成片丢弃** —— 278,723 字符的表只解析出 **39 条**顶层规则，设置面板仍是桌面两栏布局、「权限」「语言」「字号大小」逐字竖排，症状与缺陷 O 一模一样，极易误判成「插件根本没装上」 | 真机探针：`CSS.supports('selector(div:has(span))')` 为 **false**，注入三条规则只有不带 `:has()` 的那条存活；插件表里 `:has(` 出现 **301** 次，遍历 CSSOM 得到的 `selectorText` 含 `:has(` 的规则 **0 条**。修复：在 `compat.js` 里把 `:has(X)` 于 **CSS 文本层**改写为属性选择器 `[data-kxxy-has~="hN"]`（按实参特异性重复若干次以补齐权重），再用 `MutationObserver` 在真实 DOM 上维护标记 —— 由子代/兄弟/后代三种前导分别精确求值（`E:has(A B)` ⇔ E 是匹配 `A B` 元素的祖先；`E:has(> A B)` 再用 `:scope >` 验证；`+`/`~` 走 `previousElementSibling`；`:not(:has(X))` 必须精确故一律回落到 `matches()` 过滤）；递归进 `@media`/`@supports`/`@layer`/`@container`，`@keyframes`/`@font-face` 内部原样保留。修后真机复测：`rewrittenTags=17`、插件表 `remainHas` 从 **301 降到 22**、注入标记 **339 个**、**27 个元素**带标记、CSSOM 里 **189 条**规则恢复生效，设置面板变成移动端布局。**中途踩的最深的坑**：垫片里调用的 `matchParen` **从未定义**（全文 5 处调用、0 处定义），首次调用即抛 `ReferenceError`，而 `patchAllStyles()` 没有任何异常隔离 ⇒ 异常冒泡把 `observeStyles()` 一起带崩，**整层 CSS 改写（包括 v0.1.6 已验收过的 `dvh` 与 `@scope`）全部静默失效**；补上 `matchParen` 并给 `patchStyleTag` 加 `try/catch` 后才恢复。三条可复用教训：① 探针必须 `setTimeout` **延时**（15 s / 30 s）才看得到插件 append 之后的样式表，同步探针读到 `styleTags=0` 是假阴性；② 一个未定义标识符足以让整层适配静默失效，「改了没效果」要先去查有没有异常，而不是先怀疑选择器写错；③ Android WebView 未开 `setWebContentsDebuggingEnabled`、`onConsoleMessage` 又收不到未捕获异常 ⇒ **logcat 干净不能证明没有 JS 报错** |
+
+| AD | 内置插件的 CSS 锚点锁死在宿主**旧代** class hash 上 | 对话界面右上角**多出一个侧栏图标** —— 插件自己的「文件浏览」按钮与宿主的「打开右侧边栏」按钮**重叠绘制**成一个「文件夹 + 双栏框」的怪图标；「开始」空态页顶栏本该有的三枚按钮**全部消失**。用户 m19951（逐字）：「你看对话界面右上角，我给你发的图片是正常的渲染，怎么现在给到的结果会多一个侧边栏图标呢，还有第二个人界面也不对，是不是插件没完全挂载啊」，随后 m20235 给出正确判据：「这个是我让你内置的插件，按道理插件只要完全生效，这些问题是不会出现的」 | 新版官方前端给每个 CSS module 生成**随机 hash 前缀**（本次为 `Dc7zOa_`），而 `dsh-web-mobile` 是按某一代宿主构建的，选择器里写死了那一代的 hash —— 真机实测插件样式表 **451 条规则里 320 条** `selectorText` 在 DOM 上零命中。其中要命的是插件用来**隐藏宿主 headerCorner** 的那条 `… header:has([class*="_headerLeading"]) [class*="wSkVaW_titleRow"] > [class*="_headerCorner"] { display: none !important }`（`layout.css.ts:2027-2035`，注释明确写着「新宿主把右侧栏入口放进了 titleRow 的 headerCorner，和插件的文件按钮是同一个面板的两个入口」，其**上一代写法** `wSkVaW_titleRow` 与真机的 `Dc7zOa_titleRow` 不匹配 ⇒ 整条失效 ⇒ 宿主按钮没被隐藏，与插件按钮叠在一起）。插件作者自己也知道这批锚点「代际脆弱」——`docs/upstream/compat-contracts.json` 里 28 条契约每条都标了 owner 包名与 `lazy` 标记，另备了一批结构化 marker 作兜底。**为什么不能改成「补样式」**：用户要的是「插件完全生效」，手工补规则只能治眼前这一处，宿主再升级一次又要补；正解是**把插件写死的旧代 hash 在运行时归一化到宿主当前代**。修复：`compat.js` 新增第 4 段（在 `dvh` / `@scope` / `:has(` **之前**）—— `hashScan` 从插件样式表收集旧锚点的**后缀集合**，`hashLivePrefixes` 只从 `style[data-plugin^="@deepseek-ai/"]` 的**宿主样式表**（带完整类名清单，比当前 DOM 全）取候选代，**后缀集合被候选完整包含且候选唯一**才建立映射（模糊宁可不映射 —— 真机上 `QsffPG_root` 有 23 个候选，按设计放弃），随后 `hashRewrite` 把 `[class*="OLD_` 与 `.OLD_` 两种写法一并替换。映射建立后主动调一次 `patchAllStyles()`，并挂 300 ms 去抖的 `MutationObserver`（`attributeFilter: ['class']`，上限 40 轮）跟随宿主渐进渲染。**两个关键细节**：① `hashLivePrefixes()` 必须只认 `@deepseek-ai/` 前缀的样式表 —— 插件自己那张表也带 hash，混进来会把锚点「并到同代」；② 判据用**唯一超集**而非最大交集 —— 只按交集打分会让 `_root` / `_label` 这类常见后缀成群误配。**定位手法（可复用）**：症状是「多出一个图标 / 少了一排图标」，第一直觉会去查插件是不是没挂载；正确的第一步是**把「插件样式表里有多少条规则在 DOM 上零命中」打出来**（探针遍历 `style[data-plugin]` 的 `cssRules` 逐个 `document.querySelector(selectorText)`），再对每条零命中规则提取 `[class*="H_s"]` 里的 `H_s`，按「后缀集合 ⊆ 宿主某个模块的前缀后缀集合」反查 owner 包 —— 一眼就能看出是**整代 hash 全都对不上**，而不是某条选择器写错 |
 
 **关于缺陷 Q 的额外结论（终端功能本身是好的）**：`dsh.terminal.shell` 这个键**已被官方废弃** —— 在四个运行时 bundle（`sidebar-terminal` / `client.terminal` / `terminal-bash` / `terminal`）里对 `/terminal\.shell/` 与 `/localStorage/` 的命中数**都是 0**；官方新建终端走 `webTerminals.selectShell(path)` → 开 tab 时把 `shellPath` 作为参数传下去（`terminal-bash` 的默认值是 `DEFAULT_BASH_SHELL = "/bin/bash"`，可被 `config.shellPath` 覆盖，而该配置由引擎侧注入）。所以那张卡显示的 `bin/cmd` 只是**历史遗留值**，不影响终端；真机上终端本身工作正常（`bash-5.3$` 提示符、`uname -a` 正常），即缺陷 K 的修复仍然有效。对照实验也证明**官方终端天然跟随主题**：浅色下 `.xterm-viewport` 背景透明、文字 `rgb(15,17,21)`，官方 `sidebar-terminal` 插件全部用 `var(--dsw-alias-*)` 官方 token。
 
@@ -323,7 +327,7 @@ about:blank 再回来**（无发起者的跨站导航不带 Strict cookie → 40
 | `check-bundle.mjs` | 用**真实** `dsh-app-boot` 走解析链 | 插件能跑 ≠ DSH 能发现它 |
 | `test-pty-patch.mjs` | 17 个补丁的离线单测（自带 fixture，不依赖仓库外文件） | 补丁改错了构建照样全绿，只有点开终端才炸 |
 | `test-compat-url.mjs` | 在「WebView 104 行为沙箱」里跑真实 `compat.js`，断言 URL 补丁的 25 组取值与 8 组回归 | `smoke-plugin` 只能验「实现在场」，验不了语义边界（特殊协议、空 authority、userinfo/port）—— 而边界恰恰最容易改坏 |
-| `test-compat-css.mjs` | 断言 `dvh → vh`、`@scope` 展开器与 `:has()` 标记改写共 39 组取值（含嵌套 `@media`/`@supports`/`@layer`、`@keyframes` 内部原样保留、真机设置面板门控形态） | 两段器都是纯文本重写，一个括号配平错误就会让整张样式表失效 |
+| `test-compat-css.mjs` | 断言 `dvh → vh`、`@scope` 展开器、`:has()` 标记改写与插件 hash 锚点代际归一化共 45 组取值（含嵌套 `@media`/`@supports`/`@layer`、`@keyframes` 内部原样保留、真机设置面板门控形态、哈希映射的「唯一超集才采纳」边界） | 三段器都是纯文本重写，一个括号配平错误或一个标识符未定义就会让**整层**样式改写失效（缺陷 AC 的 `matchParen` 事故） |
 | `test-modern.mjs` | 每个用例一个**独立 vm realm** 的「104 沙箱」，跑真实 `modern.js`，断言补齐结果 + `URL.createObjectURL` 对 script/html 两类 blob 的前置注入 + 幂等 | 补齐层最危险的失败模式是「本地全绿、真机只显示渲染进程无法继续」—— 补齐源码要被 `Function.prototype.toString()` 搬进 worker 执行，引用本文件作用域里任何变量都不会在本地报错 |
 | `test-archive-providers.mjs` | 在 `vm` 沙箱里跑 `tools/prebuilt/documentpreview-archive/providers.js`，断言 ZIP 中央目录解析（含 ZIP64、目录项、加密位）、`kxxyInflateRaw`、EPUB OPF/spine 解析、内联资源与预算控制 | 归档 provider 是**注入进 26 万字符扁平 bundle 作用域**的片段，本地没有模块边界兜底；ZIP 解析器的边界（EOCD 扫描窗口、ZIP64 扩展字段顺序）只有单测能覆盖 |
 
