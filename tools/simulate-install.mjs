@@ -9,7 +9,7 @@
  *
  * 本脚本按 RuntimeInstaller 的**精确顺序**复刻（见该文件 :65-95）：
  *   readZipIndex → extract（跳过 LINK）→ materialiseLinks → rewriteRootPlaceholder
- *   → materialiseSonameAliases → restoreExecBits → isComplete（八锚点，含兼容层、PTY 绑定与宿主插件的版本标记）
+ *   → materialiseSonameAliases → restoreExecBits → isComplete（十一锚点，含兼容层、PTY 绑定、宿主插件、移动端适配层、office 资产与构建期补丁集的版本标记）
  *
  * 用法：node tools/simulate-install.mjs [zip 路径] [目标目录]
  * 默认目标目录：<系统临时目录>/kxxy-sim-install（每次运行前清空）
@@ -45,7 +45,17 @@ const MIN_DSH_AI_FILES = 100;
  * 老设备升级 APK 时 RUNTIME_VERSION 不变，所以「文件存在」不足以判出兼容层
  * 过期；锚点 6 实际比对的是 compat.js 首行的版本标记。
  */
-const COMPAT_LAYER_MARKER = "kxxy-webview-compat@2";
+const COMPAT_LAYER_MARKER = "kxxy-webview-compat@4";
+
+/**
+ * 与 RuntimeInstaller.MODERN_LAYER_MARKER 保持一致（锚点 6 的第二份资产）。
+ *
+ * modern.js 补齐 Chrome 105–139 才有的 JS 内建，并包装
+ * `URL.createObjectURL` 把同一份代码注入 blob worker / blob iframe。
+ * 缺它时 PDF 渲染 worker 与 HTML 预览 iframe 都会在独立全局里抛
+ * `ReferenceError: Iterator is not defined`。
+ */
+const MODERN_LAYER_MARKER = "kxxy-modern@2";
 
 /**
  * 与 RuntimeInstaller.PTY_NODE_MARKER 保持一致（锚点 7）。
@@ -63,7 +73,7 @@ const PTY_NODE_MARKER = "kxxy-pty-node@1";
  * 于是「改了 host.js / lib/index.js 却只重装 APK」的设备一直跑旧插件，
  * 且七锚点全通过、永不重装。标记写在插件入口 lib/index.js 首行。
  */
-const HOST_PLUGIN_MARKER = "kxxy-host@4";
+const HOST_PLUGIN_MARKER = "kxxy-host@5";
 
 /**
  * 与 RuntimeInstaller.MOBILE_UI_MARKER 保持一致（锚点 9）。
@@ -73,6 +83,36 @@ const HOST_PLUGIN_MARKER = "kxxy-host@4";
  * 表现为「新写的移动端布局完全没生效」。两份文件共用一个编号。
  */
 const MOBILE_UI_MARKER = "kxxy-mobile-ui@3";
+
+/**
+ * 与 RuntimeInstaller.OFFICE_LAYER_MARKER 保持一致（锚点 10）。
+ *
+ * LibreOffice wasm 引擎与单文件 CJK 字体是随 runtime 发的「新增资产」，
+ * 而 RUNTIME_VERSION 从未变过 —— 老设备升级 APK 时前九个锚点全部通过，
+ * isComplete() 判真并跳过重装，设备上永远没有这两份文件，Office 预览
+ * 一直报「Office 预览不可用」。标记写在独立小文件里（TTF 头部不能动）。
+ */
+const OFFICE_LAYER_MARKER = "kxxy-office@1";
+const OFFICE_LAYER_MARKER_FILE = "lib/node_modules/kxxy-host/fonts/office-assets.version";
+const OFFICE_WASM_ENGINE =
+  "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.wasm";
+const OFFICE_FONT_FILES = [
+  "lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf",
+  "lib/node_modules/kxxy-host/fonts/NotoSansSC-Bold.ttf",
+];
+
+/**
+ * 与 RuntimeInstaller.PATCHSET_MARKER 保持一致（锚点 11）。
+ *
+ * 前十个锚点探的全是自有资产，而绝大多数补丁改的是**上游文件**
+ * （documentpreview 的 client.js / client.pdf.js、libreoffice-kit、
+ * dsh-office-to-pdf …），它们没有任何可探的版本标记。真机事故：补上
+ * zip / epub provider、重建 runtime 与 APK 装机后，设备上
+ * `grep -c kxxyArchiveApply` 仍是 0 —— 前十个锚点全通过，isComplete()
+ * 判真，补丁根本没解出来。标记由 build-runtime.mjs 写在 kxxy-host 目录下。
+ */
+const PATCHSET_MARKER = "kxxy-patchset@1";
+const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 const EXECUTABLE_NAMES = new Set(["rg", "esbuild", "node", "sharp", "swc", "dprint", "biome"]);
 const SONAME_ALIASES = [
   ["lib/libreadline.so.8", "lib/libreadline.so.8.3"],
@@ -285,8 +325,8 @@ for (const full of walk(target)) {
 }
 console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755`);
 
-// ---------------------------------------------------------------- isComplete（九锚点）
-console.log("[6] isComplete 九锚点（含兼容层、PTY 绑定、宿主插件与移动端适配层的版本标记）：");
+// ---------------------------------------------------------------- isComplete（十锚点）
+console.log("[6] isComplete 十锚点（含兼容层、PTY 绑定、宿主插件、移动端适配层与 office 资产）：");
 const anchors = [
   ["锚点 1 dsh 引擎入口", join(target, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js")],
   ["锚点 2 SONAME 别名 libreadline.so.8", join(target, "lib/libreadline.so.8")],
@@ -296,6 +336,10 @@ const anchors = [
   // 缺 AbortSignal.any 会让设置面板「权限」显示英文 key、模型页 provider 空白；
   // 不支持 dvh 单位会让目录选择对话框塌成 0 高、列表整片空白。
   ["锚点 6 WebView 兼容层", join(target, "lib/node_modules/kxxy-host/web/compat.js")],
+  // 锚点 6 的第二份资产：现代内建补齐层。它负责页面主作用域之外的 blob
+  // worker / blob iframe —— PDF 渲染 worker 与 HTML 预览 iframe 都在那里，
+  // 缺它时右侧栏 PDF 报「渲染进程无法继续」、HTML 整片空白。
+  ["锚点 6 现代内建补齐层", join(target, "lib/node_modules/kxxy-host/web/modern.js")],
   // 锚点 7：Android 原生 PTY 绑定。上游 createProcessInspector 不认 android，
   // 且 node-pty 无 Android 预编译产物 —— 两者都由构建期补丁修掉，
   // 但老设备的 runtime 不会因此重装，必须参与完整性判定。
@@ -307,6 +351,17 @@ const anchors = [
   // 锚点 8 会判「已是最新」而跳过重装，真机表现为新布局完全没生效。
   ["锚点 9 移动端适配样式", join(target, "lib/node_modules/kxxy-host/web/mobile.css")],
   ["锚点 9 移动端适配脚本", join(target, "lib/node_modules/kxxy-host/web/mobile.js")],
+  // 锚点 10：office 预览链。wasm 引擎与 CJK 字体是随 runtime 发的「新增
+  // 资产」，RUNTIME_VERSION 从未变过 ⇒ 老设备前九锚点全过、跳过重装，
+  // 设备上永远没有这两份文件，Office 预览一直报「Office 预览不可用」。
+  ["锚点 10 office 资产标记", join(target, OFFICE_LAYER_MARKER_FILE)],
+  ["锚点 10 LibreOffice wasm 引擎", join(target, OFFICE_WASM_ENGINE)],
+  ...OFFICE_FONT_FILES.map((f, i) => [`锚点 10 CJK 字体 ${i + 1}`, join(target, f)]),
+  // 锚点 11：构建期补丁集版本。前十个锚点探的全是自有资产，而补丁改的是
+  // 上游文件（documentpreview 的 client.js / client.pdf.js、libreoffice-kit、
+  // dsh-office-to-pdf …），它们没有版本标记可探 —— 补丁落地与否只能靠这个
+  // 构建期写入的小文件判定。
+  ["锚点 11 补丁集标记", join(target, PATCHSET_MARKER_FILE)],
 ];
 for (const [label, f] of anchors) {
   if (!existsSync(f)) fail(`${label} 缺失：${f.slice(target.length + 1)}`);
@@ -321,6 +376,13 @@ for (const [label, f] of anchors) {
     const head = readFileSync(compat, "utf8").slice(0, 256);
     if (!head.includes(COMPAT_LAYER_MARKER)) fail(`锚点 6 版本标记过期：compat.js 头部不含 ${COMPAT_LAYER_MARKER}`);
     else ok(`锚点 6 版本标记匹配（${COMPAT_LAYER_MARKER}）`);
+  }
+
+  const modern = join(target, "lib/node_modules/kxxy-host/web/modern.js");
+  if (existsSync(modern)) {
+    const head = readFileSync(modern, "utf8").slice(0, 256);
+    if (!head.includes(MODERN_LAYER_MARKER)) fail(`锚点 6 版本标记过期：modern.js 头部不含 ${MODERN_LAYER_MARKER}`);
+    else ok(`锚点 6 现代内建补齐层标记匹配（${MODERN_LAYER_MARKER}）`);
   }
 }
 {
@@ -364,6 +426,16 @@ for (const [label, f] of anchors) {
     const head = readFileSync(f, "utf8").slice(0, 256);
     if (!head.includes(MOBILE_UI_MARKER)) fail(`锚点 9 ${label}版本标记过期：头部不含 ${MOBILE_UI_MARKER}`);
     else ok(`锚点 9 ${label}版本标记匹配（${MOBILE_UI_MARKER}）`);
+  }
+}
+{
+  // 锚点 10 的第二段判定：office 资产标记文件内容（RuntimeInstaller 只做
+  // contains 匹配，这里同样）。wasm 主体与字体的存在性已由 anchors 循环判过。
+  const marker = join(target, OFFICE_LAYER_MARKER_FILE);
+  if (existsSync(marker)) {
+    const head = readFileSync(marker, "utf8").slice(0, 256);
+    if (!head.includes(OFFICE_LAYER_MARKER)) fail(`锚点 10 版本标记过期：office-assets.version 不含 ${OFFICE_LAYER_MARKER}`);
+    else ok(`锚点 10 office 资产标记匹配（${OFFICE_LAYER_MARKER}）`);
   }
 }
 {

@@ -45,8 +45,9 @@ import {
   resolveClosure,
 } from "./lib/assemble.mjs";
 import { applyAllPatches, assertEngineFlags } from "./lib/patches.mjs";
-import { openAsar } from "./lib/registry.mjs";
+import { downloadTo, openAsar, sha256Hex } from "./lib/registry.mjs";
 import { TERMUX_PREFIX, isPruned } from "./lib/stage.mjs";
+import { untarGz } from "./lib/targz.mjs";
 import { ZipWriter } from "./lib/zipwrite.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -401,7 +402,169 @@ function extractOfficialTheme(asarFiles) {
   console.log(`      ✓ theme.css：抽取 ${blocks.length} 个 token 块（${css.length} 字节）`);
 }
 
-function main() {
+// -------------------------------------------------------------- office 引擎
+/*
+ * 为什么这两个 npm 包要在**构建期**下载、而不是随仓库提交：
+ *
+ *   1. wasm 引擎包 145 MiB（`soffice.wasm` 单文件就 122 MiB），提交进 git 会让
+ *      仓库体积翻几十倍；它本来就是 registry 上的公开产物，且有 sha256 可校验。
+ *   2. 字体包 57 MiB（只用其中两个字重，约 21 MiB）同理。
+ *
+ * 为什么不能用设备 `/system/fonts` 里的字体：
+ *   那台安卓 13 上唯一含完整 CJK 的是 `NotoSansCJK-Regular.ttc`（19.5 MiB），
+ *   而 LibreOffice wasm 后端把 **`.ttc` 集合**里的 face 导出成**无字形的 Type1
+ *   空壳**（descriptor 用 `/FontFile`、没有 `/CharStrings`），pdf.js 据此建不出
+ *   `toFontChar`，于是把 code 当 ASCII 画 —— 真机症状就是「Office」渲染成
+ *   「O f ce」。单文件 TTF 才被正确嵌入为 `/FontFile2`。所以必须自带单文件字体。
+ *
+ * 缓存目录 `.cache/office/` 已被 .gitignore 覆盖，重复构建直接复用。
+ */
+const OFFICE_CACHE = join(PROJECT, ".cache", "office");
+
+const WASM_PKG = {
+  url: "https://registry.npmmirror.com/@deepseek-ai/libreoffice-kit-wasm/-/libreoffice-kit-wasm-0.1.1.tgz",
+  file: "libreoffice-kit-wasm-0.1.1.tgz",
+  sha256: "95f1d8ef29a2bc13bd1939fb4ae121fc2ae95324ba63964b2544d91039ceea8a",
+  zipBase: "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/",
+};
+
+const FONT_PKG = {
+  url: "https://registry.npmmirror.com/@expo-google-fonts/noto-sans-sc/-/noto-sans-sc-0.4.4.tgz",
+  file: "noto-sans-sc-0.4.4.tgz",
+  sha256: "e18cd1a1fbb95d7c25fc133406dfd1b2b25d718835b51ec23d556dc4b11578a8",
+  zipBase: "lib/node_modules/kxxy-host/fonts/",
+  pick: [
+    ["package/400Regular/NotoSansSC_400Regular.ttf", "NotoSansSC-Regular.ttf"],
+    ["package/700Bold/NotoSansSC_700Bold.ttf", "NotoSansSC-Bold.ttf"],
+  ],
+};
+
+/**
+ * office 资产的版本标记（锚点 10 的判据），与
+ * `RuntimeInstaller.OFFICE_LAYER_MARKER` 逐字一致。
+ *
+ * 为什么必须有：字体与 wasm 引擎是「新增资产」，老设备升级 APK 时
+ * runtime 版本戳不变、九锚点全通过，`isComplete()` 会判真而跳过重装，
+ * 新资产永远不落地。改字体字重、换字体包版本、或 wasm 引擎包版本时，
+ * **这个编号必须一起递增**，否则设备上跑的仍是旧字体/旧引擎。
+ */
+const OFFICE_FONTS_MARKER = "kxxy-office@1";
+const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
+
+/**
+ * 构建期补丁集版本标记（锚点 11 的判据），与
+ * `RuntimeInstaller.PATCHSET_MARKER` 逐字一致。
+ *
+ * 为什么需要它：前面十个锚点探的全是**自有资产**（compat.js / modern.js /
+ * node-pty / kxxy-host / mobile.* / office 字体），而绝大多数补丁改的是
+ * **上游文件** —— documentpreview 的 `client.js` 与 `client.pdf.js`、
+ * `libreoffice-kit/lib/index.js`、`dsh-office-to-pdf/lib/index.js` 等等。
+ * 这些文件没有任何版本标记可探，老设备升级 APK 后前十个锚点全部通过，
+ * `isComplete()` 判真并跳过重装，新补丁永远到不了设备 —— 真机踩过：
+ * 补了 zip / epub provider 重建 APK 装机后，`grep -c kxxyArchiveApply`
+ * 仍是 0，logcat 里只有一句 `runtime already installed and complete`。
+ *
+ * 与其它标记的约定相同：**改动 patches.mjs 里任何补丁、或增删补丁时，
+ * 这个编号必须一起递增**。它不追求精确到「哪个补丁变了」，只保证
+ * 「补丁集变了 ⇒ 设备必然重装一次」。代价是一次几百 MB 的重装，
+ * 而漏判的代价是设备上静默复现已经修过的缺陷。
+ */
+const PATCHSET_MARKER = "kxxy-patchset@1";
+const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
+
+/** 下载（带缓存与 sha256 校验）并解开一个 npm tarball。 */
+async function fetchTgz(pkg) {
+  const dest = join(OFFICE_CACHE, pkg.file);
+  const state = await downloadTo(pkg.url, dest);
+  const buf = readFileSync(dest);
+  const got = sha256Hex(buf);
+  if (got !== pkg.sha256) {
+    throw new Error(
+      `${pkg.file} 校验失败：期望 sha256 ${pkg.sha256}，实得 ${got}（${human(buf.length)}）。` +
+        `删除 ${dest} 后重试。`,
+    );
+  }
+  console.log(`      ✓ ${pkg.file}（${state === "cached" ? "缓存" : "下载"}，${human(buf.length)}）`);
+  return untarGz(buf);
+}
+
+/**
+ * 把 LibreOffice wasm 引擎与单文件 CJK 字体塞进 asarPart。
+ *
+ * 为什么不能走 `readPluginFiles` / 依赖树：wasm 包的 `package.json` 声明了
+ * `"os": ["linux"]`，会被 assemble.mjs 的 isPlatformSpecific 直接排除；
+ * 而它恰恰是安卓上唯一可用的 office 后端（原生 LOK 没有 android 目标）。
+ */
+async function bundleOfficeAssets(asarPart) {
+  console.log("[6.5/8] 打包 LibreOffice wasm 引擎与 CJK 字体");
+
+  const wasm = await fetchTgz(WASM_PKG);
+  let wasmCount = 0;
+  for (const e of wasm) {
+    if (e.type !== "0") continue;
+    if (!e.path.startsWith("package/")) continue;
+    const rel = e.path.slice("package/".length);
+    if (rel === "package.json") continue; // 由下面的改写版覆盖
+    const zipPath = WASM_PKG.zipBase + rel;
+    if (asarPart.has(zipPath)) throw new Error(`wasm 引擎条目与既有条目冲突：${zipPath}`);
+    asarPart.set(zipPath, { data: e.data, mode: 0o644 });
+    wasmCount += 1;
+  }
+
+  /*
+   * `package.json` 必须**改写**：上游声明 `"os": ["linux"]`，而 libreoffice-kit
+   * 在 resolveEngine 里读它做 `pkg.name` / `pkg.version` 校验。os 字段对
+   * Node 的 require.resolve 有实际影响（不是纯元数据），安卓上会抛
+   * EBADPLATFORM，所以只保留校验真正需要的字段。
+   */
+  const pkgEntry = wasm.find((e) => e.path === "package/package.json");
+  if (!pkgEntry) throw new Error("wasm 引擎包里找不到 package.json");
+  const pkgJson = JSON.parse(pkgEntry.data.toString("utf8"));
+  if (pkgJson.name !== "@deepseek-ai/libreoffice-kit-wasm" || pkgJson.version !== "0.1.1") {
+    throw new Error(`wasm 引擎包版本漂移：${pkgJson.name}@${pkgJson.version}，补丁与常量按 0.1.1 写死`);
+  }
+  delete pkgJson.os;
+  delete pkgJson.cpu;
+  delete pkgJson.libc;
+  asarPart.set(
+    `${WASM_PKG.zipBase}package.json`,
+    { data: Buffer.from(`${JSON.stringify(pkgJson, null, "\t")}\n`, "utf8"), mode: 0o644 },
+  );
+  wasmCount += 1;
+  console.log(`      + ${WASM_PKG.zipBase}（${wasmCount} 文件，os 字段已剥离）`);
+
+  const fonts = await fetchTgz(FONT_PKG);
+  let fontCount = 0;
+  for (const [src, dst] of FONT_PKG.pick) {
+    const e = fonts.find((x) => x.path === src);
+    if (!e) throw new Error(`字体包里找不到 ${src}`);
+    const zipPath = FONT_PKG.zipBase + dst;
+    if (asarPart.has(zipPath)) throw new Error(`字体条目与既有条目冲突：${zipPath}`);
+    asarPart.set(zipPath, { data: e.data, mode: 0o644 });
+    fontCount += 1;
+    console.log(`      + ${zipPath}（${human(e.data.length)}）`);
+  }
+
+  /*
+   * 版本标记文件（锚点 10 的判据）。
+   *
+   * 字体与 wasm 包都是「新增资产」：老设备升级 APK 时 runtime 版本戳不变，
+   * 九锚点全通过 ⇒ isComplete() 为真 ⇒ 新资产永远不落地。所以必须像
+   * compat.js / modern.js 那样留一个可探的版本标记。标记写成独立小文件
+   * 而不是塞进字体首行 —— TTF 的 sfnt 头部不能动。
+   */
+  const markerPath = `${FONT_PKG.zipBase}${OFFICE_FONTS_MARKER_FILE}`;
+  if (asarPart.has(markerPath)) throw new Error(`字体标记条目与既有条目冲突：${markerPath}`);
+  asarPart.set(markerPath, {
+    data: Buffer.from(`${OFFICE_FONTS_MARKER}\n`, "utf8"),
+    mode: 0o644,
+  });
+  console.log(`      + ${markerPath}（${OFFICE_FONTS_MARKER}）`);
+
+  return { wasmCount, fontCount };
+}
+
+async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
   if (!existsSync(join(opts.stage, "entries.json"))) {
@@ -559,6 +722,29 @@ function main() {
     { files: deduped.files, links: deduped.links },
     asarPart,
   );
+
+  // office 预览链：wasm 引擎 + 单文件 CJK 字体（见 bundleOfficeAssets 注释）。
+  // 必须放在 mergeEntries 之后：它们只进 asarPart，不参与 stage 冲突检查。
+  await bundleOfficeAssets(asarPart);
+
+  /*
+   * 补丁集版本标记（锚点 11）。
+   *
+   * 上面那十条锚点探的全是自有资产，而补丁改的是上游文件（documentpreview 的
+   * client.js / client.pdf.js、libreoffice-kit、dsh-office-to-pdf …）—— 它们
+   * 没有任何可探的版本标记。真机事故：补了 zip / epub provider、重建 APK 装机后
+   * `grep -c kxxyArchiveApply` 仍是 0，logcat 只有 `runtime already installed and
+   * complete`：前十个锚点全通过，isComplete() 判真，补丁根本没解出来。
+   *
+   * 标记写进 kxxy-host 目录（那是自有插件的地盘，不与上游文件抢路径）。
+   */
+  const patchsetPath = PATCHSET_MARKER_FILE;
+  if (asarPart.has(patchsetPath)) throw new Error(`补丁集标记与既有条目冲突：${patchsetPath}`);
+  asarPart.set(patchsetPath, {
+    data: Buffer.from(`${PATCHSET_MARKER}\n`, "utf8"),
+    mode: 0o644,
+  });
+  console.log(`      + ${patchsetPath}（${PATCHSET_MARKER}）`);
 
   /*
    * 悬空 LINK 清扫。

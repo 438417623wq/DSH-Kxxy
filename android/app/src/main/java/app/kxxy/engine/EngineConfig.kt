@@ -141,6 +141,20 @@ object EngineConfig {
     fun tlsDir(ctx: Context): File = File(engineRoot(ctx), "etc/tls")
 
     /**
+     * 随 runtime 打包的单文件字体目录（office 预览用）。
+     *
+     * 为什么不能直接用 `/system/fonts`：安卓 13 上唯一含完整 CJK 的是
+     * `NotoSansCJK-Regular.ttc`，而 LibreOffice 的 wasm 后端把 **`.ttc` 集合**
+     * 里的 face 导出成**无字形的 Type1 空壳**（descriptor 用 `/FontFile`、没有
+     * `/CharStrings`），pdf.js 据此建不出 `toFontChar`，于是把字符码当 ASCII 画
+     * —— 真机症状是「Office」渲染成「O f ce」。单文件 TTF 才会被正确嵌入为
+     * `/FontFile2`。所以字体随 runtime 走（见 build-runtime.mjs 的
+     * bundleOfficeAssets），落在 kxxy-host 插件目录下。
+     */
+    fun officeFontsDir(ctx: Context): File =
+        File(engineRoot(ctx), "lib/node_modules/kxxy-host/fonts")
+
+    /**
      * 构造引擎进程的完整环境变量数组。
      *
      * ⚠️ 这是**完整替换**而非增量：原生层用 `execve(cmd, argv, envp)`，
@@ -223,8 +237,13 @@ object EngineConfig {
      *      否则 permission-presets 抛 "composed sandbox and approval defaults match no preset"；
      *   3. permission 必须给全 presets 表 —— 插件 schema 默认只带
      *      workspace-write + danger-full-access，丢 read-only 会少一个预设。
+     *
+     * `office-to-pdf` 那一行同样受约束 1 支配：它原本在上游
+     * `@deepseek-ai/dsh-web-app/cordis.patch.yml` 里没有 config，这里补上
+     * `fontDirectories`。不给它就只能靠 `systemFontDirectories()`，而那条路在
+     * Android 上返回的是 XDG 目录（`/usr/share/fonts` 之类），一个都不存在。
      */
-    fun overlayContent(): String = """
+    fun overlayContent(ctx: Context): String = """
         # [dsh-kxxy] Android compatibility overlay (auto-generated, do not edit)
         - id: sandbox-policy
           config:
@@ -252,6 +271,10 @@ object EngineConfig {
                 approval: never
                 name: danger-full-access
                 description: No sandbox boundary.
+        - id: office-to-pdf
+          config:
+            fontDirectories:
+              - ${officeFontsDir(ctx).absolutePath}
         - insert:
             - id: kxxy-host
               name: kxxy-host
@@ -260,10 +283,72 @@ object EngineConfig {
     /** 确保覆盖层文件存在且内容最新（幂等，内容比对后才写）。 */
     fun ensureOverlay(ctx: Context) {
         val f = overlayFile(ctx)
-        val text = overlayContent()
+        val text = overlayContent(ctx)
         if (!f.isFile || f.readText() != text) {
             f.parentFile?.mkdirs()
             f.writeText(text)
         }
     }
+
+    /** `$HOME/.bashrc`（用户 shell 初始化，非 runtime 资产，升级不触碰）。 */
+    fun userShellInitFile(ctx: Context): File = File(dshHome(ctx), ".bashrc")
+
+    /**
+     * 给官方终端补上「显示当前目录」的默认提示符。
+     *
+     * 上游官方终端走 `dsh-api-terminal-controller` → `dsh-subprocess-local`：
+     * `spawnTerminal` 只传 `env = { DSH_SESSION_ID }`，随后
+     * `prepareShellActivity` 生成一个临时 rcfile，并以
+     * `bash --rcfile <临时文件> -i` 启动。那个临时 rcfile 的**第一行**是
+     *
+     *     [[ ! -r ~/.bashrc ]] || builtin source ~/.bashrc
+     *
+     * —— 这正是上游留给用户自定义提示符的**正式挂点**。但 `$HOME` 下原本
+     * 没有 `.bashrc`，于是 bash 回落到内置默认提示符 `\s-\v\$`；真机症状是
+     * 终端只显示 `bash-5.3$`，完全看不出自己在哪个目录。
+     *
+     * 覆盖规则：**只在文件不存在、或首行仍带本项目标记时写入**。用户自己
+     * 改过（首行不再是 `# kxxy-shell@`）就绝不再覆盖 —— 这是用户资产。
+     *
+     * 幂等：内容一致时不写盘。标记版本递增后会自动重写一次。
+     */
+    fun ensureUserShellInit(ctx: Context) {
+        val f = userShellInitFile(ctx)
+        val text = userShellInitContent()
+        if (f.isFile) {
+            val firstLine = runCatching {
+                f.bufferedReader().use { it.readLine() }
+            }.getOrNull()
+            if (firstLine == null || !firstLine.startsWith(USER_SHELL_INIT_TAG)) return
+            if (f.readText() == text) return
+        }
+        runCatching {
+            f.parentFile?.mkdirs()
+            f.writeText(text)
+        }
+    }
+
+    /**
+     * 默认 `~/.bashrc` 内容。
+     *
+     * `\w` 会把 `$HOME` 缩写成 `~`，于是会话工作区显示为
+     * `~/workspaces/<name>`，与桌面系统的观感一致；不用颜色，是为了在浅色与
+     * 深色两套终端主题下都保持可读。
+     */
+    private fun userShellInitContent(): String = """
+        # kxxy-shell@1
+        # [dsh-kxxy] 官方终端在 Android 上的默认交互式 shell 初始化。
+        #
+        # 上游以 `bash --rcfile <临时文件> -i` 启动终端，那个临时 rcfile 的第一行是
+        #     [[ ! -r ~/.bashrc ]] || builtin source ~/.bashrc
+        # 而 ${'$'}HOME 下原本没有 .bashrc，bash 于是回落到内置默认提示符 `\s-\v\${'$'}`，
+        # 终端里只显示 `bash-5.3${'$'}`，看不出当前目录。本文件补上这一环。
+        #
+        # 可以随意修改；一旦首行不再是我们写的标记，宿主就不再覆盖它
+        # （见 EngineConfig.ensureUserShellInit）。
+        PS1='\w\${'$'} '
+    """.trimIndent() + "\n"
+
+    /** 首行标记前缀，用于识别「这个 .bashrc 是我们写的」，避免覆盖用户自定义。 */
+    private const val USER_SHELL_INIT_TAG = "# kxxy-shell@"
 }

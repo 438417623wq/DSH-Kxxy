@@ -19,7 +19,7 @@
 │  WebViewGate        WebView ≥ Chrome 85 检测                      │
 │  EngineSupervisor   进程监管 + 指数退避 + 状态文件                 │
 │  EngineProcess      PTY 启动引擎（--expose-internals 是硬前提）    │
-│  RuntimeInstaller   解包 runtime.zip（含 LINK 物化 / 九锚点自愈）  │
+│  RuntimeInstaller   解包 runtime.zip（含 LINK 物化 / 十一锚点自愈）│
 │  EngineService      前台服务保活（specialUse）                     │
 │  Privilege          Normal / Shizuku / Root 三级权限               │
 │  dsh_pty.c          forkpty 原生 PTY（Android 无 posix_openpt）    │
@@ -55,7 +55,7 @@
 dsh-kxxy/
 ├── android/                      Android 工程（AGP 8.5.2 / Kotlin 1.9.24 / JDK 17）
 │   └── app/src/main/
-│       ├── assets/runtime.zip    497 MiB 运行时（构建产物，**不入库**，见 tools/）
+│       ├── assets/runtime.zip    555 MiB 运行时（构建产物，**不入库**，见 tools/）
 │       ├── assets/ext-pool/      1.0 GiB 扩展包池（构建产物，**不入库**）
 │       ├── cpp/                  PTY 原生层
 │       ├── res/values/           浅色主题 + 窗口/启动页配色（缺陷 P）
@@ -77,6 +77,8 @@ dsh-kxxy/
 │   ├── smoke-plugin.mjs          插件路由冒烟测试
 │   ├── check-bundle.mjs          用真实 dsh-app-boot 验证 bundle 解析
 │   ├── test-pty-patch.mjs        补丁离线单测（含原生 PTY 注入）
+│   ├── test-compat-url.mjs       compat.js URL 补丁单测（104 行为沙箱）
+│   ├── test-modern.mjs           modern.js 补齐层单测（104 行为沙箱 + blob 作用域）
 │   ├── prebuilt/                 自研原生产物（Android arm64）
 │   └── lib/                      装配/补丁/打包库
 └── .cache/                       构建缓存（debs / stage，可删）
@@ -89,7 +91,7 @@ dsh-kxxy/
 前置：JDK 17、Android SDK（platforms 36 / build-tools 36 / ndk 28.2 / cmake 3.22.1）。
 本机没有 gradle wrapper，用已安装的 Gradle 8.10.2。
 
-> **仓库不含 `assets/runtime.zip`**（497 MiB，`.gitignore` 已排除）—— 它是构建产物，
+> **仓库不含 `assets/runtime.zip`**（555 MiB，`.gitignore` 已排除）—— 它是构建产物，
 > 由下面第 1、2 步从**本机已安装的 DSH 桌面版** `app.asar` + Termux aarch64 `.deb` 现场装配。
 > 所以完整重建需要本机装有 DSH 桌面版（提供 `dsh` 的 JS 依赖树与前端 dist）。
 
@@ -103,18 +105,20 @@ $gradle = "C:\Users\XiaoXin\.gradle\wrapper\dists\gradle-8.10.2-bin\a04bxjujx95o
 # 1.5) 解 stage（poolextract/build-runtime 依赖它；Python 3.12 标准库解 data.tar.xz）
 & "C:\Users\XiaoXin\AppData\Local\Programs\Python\Python312\python.exe" tools/lib/debextract.py --debs .cache\debs --out .cache\stage
 
-# 2) 装配 runtime.zip（从 app.asar 抽取 dsh 依赖树 + 打 12 个兼容补丁）
+# 2) 装配 runtime.zip（从 app.asar 抽取 dsh 依赖树 + 打 17 个兼容补丁 + 打包 LibreOffice wasm 与 CJK 字体）
 & $node tools/build-runtime.mjs
 
 # 2.5) 构建扩展包池（J/K 组边际闭包 → assets/ext-pool/*.tar.gz + 扩展目录 extensions.json）
 & $node tools/fetch-extensions.mjs
 
-# 3) 五套验证
+# 3) 七套验证
 & $node tools/verify-runtime.mjs
 & $node tools/simulate-install.mjs
 & $node tools/smoke-plugin.mjs
 & $node tools/check-bundle.mjs
 & $node tools/test-pty-patch.mjs
+& $node tools/test-compat-url.mjs
+& $node tools/test-modern.mjs
 
 # 4) 打包 APK（必须 clean：AGP 增量打包是 append-only，会残留孤儿数据）
 cd android
@@ -138,12 +142,13 @@ cd android
 | 3 | 路径归一化 | 1121 个脚本的 `com.termux` 绝对路径改写成 `@DSH_ROOT@`；剔除 39 个死解释器脚本 |
 | — | 目录链接展开 | `lib/clang/latest`(316) / `lib/icu/current`(2) / `lib/terminfo`(40) 是目录型链接，必须逐成员展开 |
 | 4 | 闭包解析 | 从 asar 递归 **524 个包**；**按包实例建模**（含嵌套 node_modules） |
-| 5 | 兼容补丁 | 12 个补丁（见下） |
+| 5 | 兼容补丁 | 17 个补丁（见下） |
 | 6 | 注入 | corepack 包装器 + `kxxy-host` 插件 + 悬空 LINK 清扫 |
-| 7 | 合并 | 目录 3628 / 文件 30061 / LINK 1560（未压缩 1.26 GiB） |
-| 8 | 写出 | 条目 35,250，zip 497.24 MiB |
+| 6.5 | 打包引擎资产 | LibreOffice wasm 引擎（49 文件，剥离 `os` 字段）+ 两份 CJK 字体 |
+| 7 | 合并 | 目录 3638 / 文件 30117 / LINK 1560（未压缩 1.42 GiB） |
+| 8 | 写出 | 条目 35,316，zip 555.44 MiB |
 
-### 12 个兼容补丁
+### 17 个兼容补丁
 
 | 补丁 | 原因 |
 |---|---|
@@ -157,11 +162,17 @@ cd android
 | `ripgrep` | 指向 Termux 的 aarch64 `rg` |
 | `fs-local` | 剥离 kernel32 / LibreOffice 平台分支 |
 | `attachment-local` | `link()` 退化为 `copyFile` + 目录 fsync 容忍跳过 |
+| `document-preview-unicode-sets` | PDF 分块的 `v` 标志正则（Chrome 111+）在 104 上是 `SyntaxError`，改写为 `u` 模式 |
+| `libreoffice-kit-platform` | 三处 `platform !== "linux"` 放行 `android`，启用 wasm 后端（缺陷 X） |
+| `libreoffice-kit-font-fallbacks` | 给 `FONT_FALLBACKS` 追加 Android 实存族 + 13 组 Windows/macOS 族（缺陷 X） |
+| `office-to-pdf-formats` | 扩展名白名单补 `odt` / `ods` / `odp`（底层引擎本就支持 ODF） |
+| `document-preview-office-extensions` | 客户端 office provider 的 `extensions` 同步补 `odt` / `ods` / `odp` |
+| `document-preview-archive-providers` | 注入 zip / epub 两个归档 provider（缺陷 Y，官方两个格式都没有渲染器） |
 | `dsh-manifest` | 把 `kxxy-host` 写进 `@deepseek-ai/dsh` 的 dependencies |
 
 ---
 
-## 五、移植过程中发现并修掉的 17 个真实缺陷
+## 五、移植过程中发现并修掉的 26 个真实缺陷
 
 这些都是**只在真机/端到端路径上才会暴露**的问题，构建全绿时完全看不出来：
 
@@ -182,9 +193,17 @@ cd android
 | M | Shizuku 模式从未实现 | 「Shizuku ADB」档位可选中、可保存、可重启，但**没有任何 ADB 能力**；用户感知为「Shizuku 权限有问题」 | 原实现只做了两件事：检测管理器是否安装（`packageManager.getPackageInfo`）+ 把 `DSH_ANDROID_PRIV_MODE=shizuku` 写进引擎环境变量。依赖里没有 `dev.rikka.shizuku:*`、清单里没有 `ShizukuProvider`、没有任何 binder 调用 —— 前端卡片自己都写着「完整注入为四期项」。修复见 `ShizukuBridge` + `ShizukuShellServer`：走 `IShizukuService.Stub.asInterface(Shizuku.getBinder()).newProcess(...)`（`Shizuku.newProcess` 在 13.x 已私有化且计划于 API 14 移除，但其实现只有这一行），应用侧轮询 `<engineRoot>/shz/request` 执行后写 `response`，引擎内用生成的 `bin/shz` 闸门脚本调用 |
 | N | 插件更新不会到达老设备 | 只重装 APK 后，界面仍是旧插件（Shizuku 卡片的「请求授权」按钮、`priv-hint` 提示块全都不出现），必须手工 push 才生效 | `RuntimeInstaller.isComplete()` 的锚点 5 只判 `kxxy-host/package.json` 存在，而那个文件**从 v0.1.0 起内容就没变过**；`runtimeVersion` 戳也不变，于是七锚点全通过、永不重装。修复：新增锚点 8，按插件入口 `kxxy-host/lib/index.js` 首行的版本标记 `kxxy-host@N` 判定过期（与锚点 6/7 同一手法）。**约定：改动 `plugins/kxxy-host/` 下任何文件后，必须递增 `lib/index.js` 首行标记并同步 `RuntimeInstaller.HOST_PLUGIN_MARKER`**，否则老设备不会自愈。后来适配层（纯静态资产）又踩了同一个坑：只改 `mobile.css` / `mobile.js` 时插件入口标记不动，锚点 8 仍判「已是最新」→ 再加**锚点 9**（两份文件共用标记 `kxxy-mobile-ui@N`） |
 | O | 官方前端无移动端适配 | ① 设置面板：411px 视口下面板仅 363px 宽，左侧导航硬吃 188px，右侧内容区只剩 175px，`_rowText` 扣掉 `padding-right:48px` 后标题宽 **0px** → 「选择新会话的默认权限模式」每个字一行、「权限」「语言」竖排、模型卡片「编辑/删除」竖排溢出卡片外；② 左侧栏：展开后主内容列从 355px 被压到 **131px** | 官方是纯桌面布局，**没有断点也没有移动端分支**。① 宽度链是 `panel 363px`（`width:800px; max-width:calc(-48px + 100vw)`）→ `nav 188px`（`flex:0 0 auto`，不可压缩）→ `content 175px`（`flex:1 1 0%`）→ `options` 再扣 `padding:0 24px` 只剩 127px → `rowText` 再扣 48px 归零；② `BynINW_frame` 的 `grid-template-columns: 280px minmax(0px,1fr) minmax(0px,0px)` 由 **React 写死在 inline style**（自定义属性全为空、官方样式表里 0 命中），它就是硬挤第二列，没有「覆盖层」概念。修复：新增插件侧移动端适配层 `plugins/kxxy-host/web/mobile.css` + `mobile.js`，注入到 `</head>` 之前（必须晚于官方样式表）。设置面板改为「顶部横向 tab 条 + 全宽内容」；左侧栏做**两态**：折叠态**整栏完全收掉**（连 56px 图标栏都不留）、展开态改为**覆盖式抽屉**。四条硬约束：① 第一列压到 0px 靠 `!important`（官方把列宽写在 React inline style 上，inline 无 `!important` 时 CSS `!important` 可胜出）；② 抽屉必须 `position:absolute` 而非 `fixed` —— 祖先链上有 `z-index:40` 的 static 容器，`fixed` 会输掉层叠竞争，症状是「测量全对但整块不可见」；③ 侧栏脱流后 `centerCol` 必须显式 `grid-column: 2`（grid 会自动把它排到 0px 宽的第 1 列）；④ 隐藏必须用 `visibility` 而**不是** `display:none` —— 官方开合按钮在列内，`display:none` 会让整棵子树退出渲染、按钮一起消失，用户永久失去唯一入口（详见下段「缺陷 O 的补充教训」） |
-
 | P | 「跟随系统」外观恒为深色 | 系统是浅色，app 里「外观 → 跟随系统」却始终渲染深色；切系统深浅色完全没反应 | 官方前端与控制台**都只判 `matchMedia('(prefers-color-scheme: dark)').matches`**（`ui-theme` 的 `buildSnapshot()` 里 `resolvedId = preference === "system" ? (media?.matches === true ? "dark" : "light") : preference`；官方三份 CSS 里 `prefers-color-scheme` 命中数为 **0**，暗色块只挂 `body[data-ds-dark-theme]`）。而 Android WebView 的该媒体特性**不看系统 `Configuration.uiMode`，只看宿主 Activity 主题的 `android:isLightTheme`** —— 本 app 的 `Theme.Kxxy` parent 是 `Theme.Material.NoActionBar`（深色），`isLightTheme=false`，于是恒报 dark。实测探针（改完强制重启，系统 night=no / yes 两次）：`prefersDark=true prefersLight=false rootColorScheme=normal` **两次完全相同**。修复：`values/themes.xml` 的 parent 改为 `Theme.Material.Light.NoActionBar` + 新增 `values-night/themes.xml`（深色 parent，窗口色与原值逐字节相同），另建 `values/colors.xml` 与 `values-night/colors.xml` 供 `MainActivity` / `BootstrapActivity` 取窗口色与启动页文字色（原先两者都硬编码 `0xFF0B0D13` 等） |
 | Q | 控制台终端页浅色下配色错配 | 浅色主题下终端卡片里嵌着一张**纯白**的「终端 Shell 诊断」卡，底部六个快捷键按钮**白底浅灰字**几乎不可读 | 终端容器把底色**硬编码**成深色（`.terminal-container` `#151517`、`.terminal-bar`/`.terminal-shortcuts` `#1b1b1c`、`.terminal-viewport` `#101012`、`.terminal-code` `#D1D5DB`，注释还自承「终端保持深色（终端惯例）」），而内部文字与按钮用的是**语义变量**（`.terminal-title` 用 `--text-muted`、`.term-key` 用 `--bg-card` + `--text-secondary`）。浅色主题下这些变量翻成「深灰字、白底」，画在深底上就出现上述两个症状。修复：引入 `--term-surface` / `--term-chrome` / `--term-viewport` / `--term-fg` / `--term-key-bg` / `--term-key-fg` / `--term-border` / `--term-shadow` 一组变量，浅色段与 `body[data-ds-dark-theme]` 段各给一份取值（深色值与原硬编码逐字节相同，零回归）；另给 `.shell-diag-card` 加外边距并抬到 `--bg-elevated` 一层，使其读作「终端内部的独立面板」而不是「嵌进去的补丁」。顺带修掉该诊断卡的**误导性判据**：它原先只判 `cached.startsWith(engineRoot + '/')`，于是引擎 `bin/` 下的任何可执行文件都算「✓ 缓存有效」—— 设备上缓存着 `…/engine/bin/cmd`（那是 Android 的 `cmd` 服务工具，`cmd --help` 报 `Can't find service`，根本不是 shell），卡片却显示有效。现收紧为「必须是已知 shell 的可执行文件名」，并把标题改为「终端 Shell 缓存」+ 说明「官方当前版本已不读该缓存」 |
+| R | 旧 ROM WebView 把非特殊协议的 authority 折进 pathname | 右侧栏「工作区文件」里点开 html / 图片 / 任意文件，预览区恒显示「文件资源服务不可用」（重试无效，文件树本身正常）；子代理聊天标签页也打不开 | Android WebView 104 的 `URL` 解析器**不承认非特殊协议（http/https/ws/wss/ftp/file 之外）的 `//authority` 形式**，把 authority 整段折进 pathname：`new URL('dsh-resource://file/session/abc/whale.html')` 在 104 上得到 `hostname=""`、`pathname="//file/session/abc/whale.html"`，规范值是 `hostname="file"`、`pathname="/session/abc/whale.html"`（本机 Node v24 实测对照；`https://file/…` 这类特殊协议在 104 上是对的）。后果链：`dsh-client-resources` 的 `protocolOf(address)` 写的是 `parsed.hostname === "" ? void 0 : parsed.hostname.toLowerCase()` → 恒 undefined → `providerOf()` 找不到已注册的 `file` provider（真机探针实测 `providers=[subagentchat,plan,file]`，注册本身没问题）→ `ResourceRegistry.create()` 建出 `status:"none"` 的记录 → `TextPreview` 渲染 `t("resourceUnavailable")`。同一缺陷还打断 `dsh-client-ui-subagent` 的 `parseSubagentChatAddress`（`url.hostname.toLowerCase() !== "subagentchat"` 恒真）与 `dsh-client-ui-sidebar-right` 的 `pathOf`（返回 `"//file/session/…"`）。修复在 `compat.js`：**行为探测**（`new URL('x-dsh-probe://host/p').hostname !== 'host'`）后包一层 `URL.prototype` 的 `hostname`/`host`/`pathname` 取值器，从折进来的 `//authority` 反推三个分量。四条硬约束：① 必须探测式触发，已支持的环境原样不动；② 只包 getter、原样保留 setter（`href`/`protocol`/`search`/`hash` 在 104 上本就正确，不动）；③ **必须排除特殊协议** —— `file:////x` 在 104 与规范上都是 `host=""`、`path="//x"`，不排除就会把本来正确的地址改坏；④ 空 authority（`dsh-resource:///file/x`、`dsh-resource://`）要按规范剥掉分隔斜杠，不能当成 host |
+| S | 官方终端提示符不显示当前目录 | 终端打开只显示 `bash-5.3$`，看不出自己在哪个目录 | 上游终端走 `dsh-api-terminal-controller` → `dsh-subprocess-local`：`spawnTerminal` 只传 `env = { DSH_SESSION_ID }`，随后 `prepareShellActivity` 生成临时 rcfile 并以 `bash --rcfile <临时文件> -i` 启动。那个 rcfile 的**第一行**是 `[[ ! -r ~/.bashrc ]] || builtin source ~/.bashrc` —— 这正是上游留给用户自定义提示符的**正式挂点**；但 `$HOME` 下原本没有 `.bashrc`，bash 于是回落到内置默认提示符 `\s-\v\$`。修复：宿主在 `EngineSupervisor.ensureDirs()` 里调 `EngineConfig.ensureUserShellInit()`，写一份首行带 `# kxxy-shell@1` 标记、内容为 `PS1='\w\$ '` 的 `$HOME/.bashrc`（`\w` 会把 `$HOME` 缩写成 `~`，会话工作区显示为 `~/workspaces/<name>`；不用颜色，浅色/深色两套终端主题下都可读）。**绝不动用户资产**：文件已存在且首行不带标记时直接返回，内容一致也不写盘 |
+| U | 外链拦截把预览 iframe 的 `blob:` 导航当成外链劫持 | HTML 预览**整片空白**（缺陷 T 修好 `Iterator` 后仍然空白，且没有任何错误文案）；PDF 预览正常。logcat 里只有两行：`external url intercepted: blob:http://127.0.0.1:3080/…` 与 `START u0 {act=android.intent.action.VIEW dat=blob:}` | `MainActivity` 的 `shouldOverrideUrlLoading` 只放行 `http://127.0.0.1:` / `http://localhost:` 前缀，其余一律 `startActivity(ACTION_VIEW)` 交给系统浏览器并返回 `true`（本意是「用户点外链就离开应用」）。而 HTML 预览是宿主侧 `createHtmlDocument(bundle)` 拼出 bootstrap 文档 → `URL.createObjectURL(new Blob([html], {type:"text/html"}))` → 塞进预览 iframe 的 `src` —— 这次导航是**子框架**且 scheme 为 `blob:`，被上面的判据命中后导航被取消、系统收到一个无法处理的 `blob:` VIEW intent。修复：拦截前先判 `request.isForMainFrame`（子框架一律 `return false` 放行），并把 `blob` / `data` / `about` / `javascript` 四个非网络 scheme 显式放行。**这条必须放在 `http://127.0.0.1:` 判据之前** —— 否则子框架请求会先被外链分支吃掉。定位手法：症状是「PDF 好了、HTML 还是空白」，直觉会继续往 WebView 兼容层里找，但真正有信息量的是 **logcat 全量**（而不是 `-s KxxyMain:D` 过滤后的那几行）——`external url intercepted` 这行本身就写在宿主里，一眼可见 |
+| T | 旧 ROM WebView 缺现代 JS 内建（且 blob 作用域是**独立全局**） | 右侧栏「工作区文件」里点开 HTML 预览整片空白、点开 PDF 显示「PDF 渲染进程无法继续，请重试」；**同一 slot 崩溃会让所有格式一起预览不出来**（缺陷 R 修好后 html 仍空白的原因） | 两个独立缺口叠加。① **内建缺失**：DSH 前端按现代 Chrome 编写，104 缺 `Iterator` / `AsyncIterator` 全局（122/124）、`Map.prototype.getOrInsertComputed`（140 提案）、`Promise.withResolvers`（119）、`Set.prototype.union` 等（122）、`toSorted`（110）、`Uint8Array.fromBase64/toHex`（130/133）—— 真机上按「修好一个才暴露下一个」的顺序逐个炸：先是 pdf 解析器的 `v` 标志正则 `SyntaxError`（构建期补丁改写为 `u` 模式），再是 `ReferenceError: Iterator is not defined` 让 `sidebar.right.tab.document` 这个 slot 整个崩溃（所有格式一起空白）。② **作用域够不到**：PDF 渲染 worker 与 HTML 预览 iframe 都跑在 `blob:` 地址的**独立全局**里 —— pdf.js 6.3.289 把自己的 worker 源码当字符串常量内联进 bundle，再 `URL.createObjectURL(new Blob([...], {type:"text/javascript"}))` 成 module worker，其模块求值**第一行**就是 `"function"!=typeof Iterator.prototype.join&&(Iterator.prototype.join=…)`，于是 `worker.addEventListener("error", workerFailed)` 接住 ReferenceError，界面只剩「渲染进程无法继续」；HTML 预览同理（宿主拼 bootstrap 文档 → `createObjectURL` → iframe 里 `document.open/write` 用户 html）。`<head>` 注入的 `compat.js` 对这两个作用域**完全无效**，而报错只出现在 logcat 的 `blob:` URL 行上。修复：新增 `plugins/kxxy-host/web/modern.js`（独立资产、独立标记 `kxxy-modern@N`、锚点 6 的第二段判定），两步走 —— ① 在页面主作用域补齐全部缺口；② 包装 `URL.createObjectURL`，在**建 URL 之前**把同一份补齐源码**前置**到 script 类与 html 类 blob 的内容里（`new Blob([源码, 原 Blob])` 同步且廉价，Blob part 允许是 Blob，不会立即读字节）。三条硬约束：① 补齐实现必须**完全自包含**（它的源码文本经 `Function.prototype.toString()` 注入 worker，引用本文件作用域里任何变量都会在真机上只表现为「渲染进程无法继续」而本地零报错）；② HTML blob 的前置片段**必须自带 `<!doctype html>`** —— 原文档的 doctype 被顶到第二位会被解析器忽略，文档掉进 quirks 模式；③ 前置片段内不得出现裸 `</script`，否则提前闭合 HTML blob 的 script 标签 |
+| V | 旧 ROM WebView 缺 `ArrayBuffer.prototype.transferToFixedLength` | PDF 预览「能打开」但纸张**整片空白** —— 标签、路径、纸张框、缩放控件全正常，无任何错误文案，logcat 里也没有 console 错误 | pdf.js 6.3.289 的字体编译路径 `compileFontInfo` / `compileSystemFontInfo` 结尾是 `assert(c <= o.byteLength, …); return o.transferToFixedLength(c)` —— `transferToFixedLength` 属 Chrome 114 的 `ArrayBuffer.prototype.transfer` 家族，104 上没有。它抛出的 `UnknownErrorException` **只走 worker 出站流，主线程完全看不见**：`executeOperatorList` 在 `index=1` 等 `g_d0_f1` 这个 `dependency` 对象，而 `commonObjs` 里永远不会有它，于是 `return i` 静默挂起（既不报错也不继续）；与此同时 `lastChunk` 又因为收到 ERROR 流被置真 → `_next()` → `endDrawing()` 把空 canvas 交出去 → 界面「成功但空白」。真机取证靠三件事：① 在 `compat.js` 尾部挂探针转储 C2D 调用序列，只有 `fillRect`（铺背景）+ 三次 `measureText`（TextLayer）+ `drawImage`（endDrawing 合成），**零 `beginPath` / `fill` / `fillText`**；② 转储 worker 出站流，看到 `stream=5`（`StreamKind.ERROR`）带 `name=UnknownErrorException message=o.transferToFixedLength is not a function`，而同一 worker 此前刚发过 `stream=8 … success=true`；③ operatorList 本身正确（`FN=9 [beginText, dependency["g_d0_f1"], setFont, moveText, showText, …]`），证明问题在对象池而非算子生成。修复在 `modern.js`：补 `transfer` / `transferToFixedLength` 两族（TypedArray 与 ArrayBuffer，返回同类型新视图/新缓冲、照抄 `min(srcLen,newLength)` 字节，并用 `structuredClone(buf, { transfer: [buf] })` 尽力分离原缓冲）。**单测陷阱**：`vm.createContext` 出来的新 realm 里没有 `structuredClone`，必须 `vm.createContext({ structuredClone })` 显式注入（等价于浏览器 104 原生存在），否则单测会在「宿主没有」这件事上假失败 |
+| W | 旧 ROM WebView 不支持 `@scope` | csv / xlsx 预览「能打开但显示错误」：表格**塌成一列**，列头与数据挤在一起 | excel 预览把 50,018 字符的 fortune-sheet 样式表整段包进 `@scope ([data-excel-preview]) { … }`（`const scopedStyles = \`@scope ([data-excel-preview]) { ${index_css_default} }\``）。`@scope` 是 Chrome 118 特性，104 的 CSS 解析器**把整块丢弃且不报错** —— 真机探针实测 `scope_plain` / `scope_bare` / `scope_to` / `container` / `starting_style` / `has_sel` 全为 **0**，而 `media` / `supports` / `layer` / `is_sel` / `where_sel` / `nesting` 为 1；页面上真实样式表 50,018 B 而 `cssRules.length === 0`。修复在 `compat.js`：新增 `expandScopeBlocks` / `matchBrace` / `scopeRootOf` / `scopeSelector` / `expandScopeBody`，把 `@scope (root) { body }` 展开成「root 前缀化的普通规则」，并递归穿透 `@media` / `@supports` / `@layer` / `@container`（`@keyframes` / `@font-face` / `@page` / `@property` 内部原样保留，prelude 与 `{` 之间的空白也原样保留）。端到端 50,018 → 60,029 字符、无残留 `@scope`、未加前缀规则 0 |
+| X | Office 预览在 Android 上完全不可用（四重门禁叠加） | 点开 docx / pptx / odt 显示「读取失败：Office 预览不可用。请在运行 DeepSeek Harness 的主机上启用文档预览服务。」 | 官方 office 链路是 `客户端 provider → remote.officeToPdf.render → @deepseek-ai/dsh-office-to-pdf → @deepseek-ai/libreoffice-kit → 引擎包`，这条链上有四道只认桌面平台的闸门：① `libreoffice-kit` 的 `platformTarget` / `resolveEngine` 三处 `if (platform !== "linux")` 直接把 android 判死（android 上 `report().header?.glibcVersionRuntime` 为空，`platformTarget` 本就返回 `void 0`）；② `dsh-office-to-pdf` 的扩展名白名单只认 `doc/docx/xls/xlsx/ppt/pptx`，`odt` 连门都进不去（底层 `CONVERSION_FORMATS` 其实完整支持 ODF）；③ 客户端 office provider 的 `extensions` 同样不含 odt/ods/odp；④ `libreoffice-kit` 的 `systemFontDirectories()` 在 android 上返回 XDG 目录（`/usr/share/fonts` 之类），一个都不存在 ⇒ 必须显式配 `fontDirectories`。四道闸门全部由构建期补丁打开，并新增**阶段 6.5**：从 npmmirror 拉 `@deepseek-ai/libreoffice-kit-wasm@0.1.1`（145 MiB，**必须锁 0.1.1** —— `readEngine` 会拿 `ENGINE_VERSIONS.wasm` 校验版本，0.2.0 直接抛「incompatible or incomplete manifest」）与 `@expo-google-fonts/noto-sans-sc@0.4.4`（取 400Regular / 700Bold 两份真 TTF），直接塞进 `asarPart` —— **不能走 `assemble.mjs` 的平台过滤**，因为该包 `package.json` 写着 `"os": ["linux"]`，会被 `isPlatformSpecific` 挡掉；写进 zip 前还要 `delete pkgJson.os`，否则设备上 `require.resolve` 抛 EBADPLATFORM。最后由 `EngineConfig.overlayContent()` 注入 `office-to-pdf.config.fontDirectories`（patch 语义是**整体替换** config，所以那一行必须重述全部 key）。**为什么不能直接用设备 `/system/fonts`**：安卓 13 上唯一含完整 CJK 的是 `NotoSansCJK-Regular.ttc`，而 wasm 后端会把 `.ttc` 字体集合里的 face 导出成**无字形的 Type1 空壳**（descriptor 用 `/FontFile`、`/Encoding` 全是 `dup N /cidNNNNN put`、**无 `/CharStrings` / `/sfnts` / `/Subrs`**），pdf.js 据此建不出 `toFontChar` ⇒ 把 code 当 ASCII 画；单文件 `.ttf` 才被正确嵌入为 `/FontFile2`（A/B 真机实验：同一 docx，字体目录只放单文件时 4 个 Font 全 `Subtype=TrueType` + `/FontFile2`，掺入 `.ttc` 后立刻出现 `EAAAAA+NotoSansCJKhk-Regular` + `/Subtype=Type1` + `/FontFile`）。**PDF 转换本身在设备上完全可行**：wasm 模块加载 1.37 s、docx → PDF 约 4.2–5.3 s、RSS 约 400–715 MiB（设备 MemAvailable 2.6 GB）；硬约束是必须设 `TMPDIR`（否则 `mkdtemp` 落到 `/data/data/com.termux/files/usr/tmp` → ENOENT）、`render` 要求输入输出都是**绝对路径**且输出目录**已存在**（否则 `ENOENT: … open '…/out/x.pdf'`）、输出文件已存在抛 `EEXIST` |
+| Y | 旧 ROM WebView 缺 `Math.sumPrecise`（Office 字形错位） | docx / pptx 装上 CJK 字体后中文恢复正常，但**部分字符被画成别的 ASCII 字形** —— 源文 `Office` 渲染成 `O f ce`、`器等软件的打开效果` 渲染成 `！" 件的 # $ % &`、列表项变成 `' ( ) * +`、表格 `项目` / `数值` 变成 `3 4` / `5 6` | `Math.sumPrecise`（Chrome 138 提案）在 `pdf.worker.mjs` 有 **5 处**调用，**全部在重建字体表的路径上**：`Glyph.prototype.getSize()`（`Math.sumPrecise(this.glyphs.map(g => g.getSize() + 3 & ~3))`）、`CompositeGlyph.getSize()`、以及 `nameTable` 的三处 `exactLength`。104 上它不存在 ⇒ pdf.js worker 的 `checkAndRepair` 在重建 `glyf` / `loca` / `name` 表时抛 `TypeError` ⇒ **整个字体修复中断** ⇒ `FontFaceObject.missingFile === true`、`toFontChar` 为空 ⇒ 主线程 `_charToGlyph` 里 `let isInFont = this.toFontChar[charcode] !== undefined; fontCharCode = this.toFontChar[charcode] \|\| charcode;` 退化成 `fontCharCode = charcode`（正常路径下 `toFontChar[charcode]` 是 `nextAvailableFontCharCode++` 分配的私用区码点，浏览器拿它去匹配 `createCmapTable` 重建的 cmap）。**定位手法（可复用）**：先用 MuPDF 证明「PDF 本身完全正确」（`page.get_text()` 与渲染逐字一致，`page.get_fonts(full=True)` 显示四个字体都在），再用同一份 pdf.js 6.3.289 在 Node/V8 上跑差分 —— Node 每次运行报 **4 次** `Warning: TypeError: Math.sumPrecise is not a function`，次数正好等于字体数；手工补上后 4 个字体立刻全 `missingFile=false`（且 `dependency` id 从 `f1/f3/f4/f6` 变成 `f1/f2/f3/f4`，证明算子列表本身也变了）。修复在 `modern.js`：按提案实现 Neumaier 补偿求和（`compensation += (Math.abs(sum) >= Math.abs(v) ? (sum - t) + v : (v - t) + sum)`），空集返回 `0`，非可迭代或含非数字抛 `TypeError` |
+| Z | epub / zip 官方没有任何渲染器 | `电子书.epub` 与 `archive.zip` 都显示「该格式文件暂时无法预览」（unsupported 空态） | 官方 66 个 client bundle 里 `ctx.documentPreviews.register({...})` 只有 8 处（text / markdown / html / image / pdf / code / office / excel），**epub 与 zip 都不在其中**：`zip` 被列进 `UNVIEWABLE_BINARY_EXTENSIONS` 走 unsupported 空态；`epub` 连黑名单都没进（全 bundle 对 `"epub"` / `.epub` / `epub+zip` 的严格字面量命中数都是 0，仅有的 4 处大小写不敏感命中全是 `"republishing"` 子串或 base64 图片噪声）⇒ 落纯文本兜底，把 ZIP 二进制当文本读。而**浏览器侧任何 bundle 都没有 ZIP 解压能力**（全量扫 `fflate` / `DecompressionStream` / `inflateRaw` / `unzipSync` / `jszip` / `PK\x03\x04` 全部零命中）。修复：构建期补丁把 `tools/prebuilt/documentpreview-archive/providers.js` 注入官方 `client.js`（插在 `exports.apply = apply;` 之前，模块作用域内可直接复用上游已 `require` 的 `react` / `react_jsx_runtime` / `_deepseek_ai_dsh_client_ui_primitives`），并在 `apply$3(ctx)` 之后追加一次 `kxxyArchiveApply(ctx)`。片段自带：手写 ZIP 中央目录解析器（从尾部 66,000 字节内找 EOCD `0x06054b50`，支持 ZIP64 的 EOCD 定位器 `0x07064b50` 与扩展字段 `0x0001`；**只读目录 + 按需解单条**，不一次性全解）、`DecompressionStream("deflate-raw")` 解压（真机实测 104 原生支持 `deflate-raw` / `deflate` / `gzip`）、EPUB 的 `META-INF/container.xml` → OPF → spine 解析，以及把章节内的图片/样式**内联成 data URI**（sandbox 帧是不透明源，`blob:` 子资源在那里取不到）。全部标识符带 `kxxy` 前缀 —— 目标是 26 万字符的扁平 bundle 作用域，不加前缀极易撞名。**为什么用构建期补丁而不是运行时注册**：`__ModuleLoader__` 在 `compat.js` 的注入点（`<head>` 开头）**尚未定义**（真机探针实测 `ML=undefined BOOT=none`），它是 `dsh-client-modules.js` 求值后才挂上的；`create(options)` 在 boot 后调用会抛「called after module-system boot」；而全 bundle 没有任何暴露 cordis 根 ctx 的全局（`globalThis.__DSH_*` 只有 4 个：`__DSH_BOOT__` / `__DSH_BOOT_READY__` / `__DSH_CODE_ICON_INSTANCE__` / `__DSH_TRANSPORT__`）⇒ 从页面外部拿不到 `ctx` 去调 `ctx.documentPreviews.register` |
 
 **关于缺陷 Q 的额外结论（终端功能本身是好的）**：`dsh.terminal.shell` 这个键**已被官方废弃** —— 在四个运行时 bundle（`sidebar-terminal` / `client.terminal` / `terminal-bash` / `terminal`）里对 `/terminal\.shell/` 与 `/localStorage/` 的命中数**都是 0**；官方新建终端走 `webTerminals.selectShell(path)` → 开 tab 时把 `shellPath` 作为参数传下去（`terminal-bash` 的默认值是 `DEFAULT_BASH_SHELL = "/bin/bash"`，可被 `config.shellPath` 覆盖，而该配置由引擎侧注入）。所以那张卡显示的 `bin/cmd` 只是**历史遗留值**，不影响终端；真机上终端本身工作正常（`bash-5.3$` 提示符、`uname -a` 正常），即缺陷 K 的修复仍然有效。对照实验也证明**官方终端天然跟随主题**：浅色下 `.xterm-viewport` 背景透明、文字 `rgb(15,17,21)`，官方 `sidebar-terminal` 插件全部用 `var(--dsw-alias-*)` 官方 token。
 
@@ -232,8 +251,7 @@ CDP 看不到它的 WebView；而 `onConsoleMessage` 只转发 `console.*`、**�
 `<style>`，所以不能靠遍历样式表来做剥离或修复，只能改文本。
 
 **缺陷 K 的定位手法**（可复用）：报错文案里已经写明了平台，所以第一步不是读前端，
-而是在设备上 `grep -rl` 那个字面量，直接落到唯一文件与唯一行。
-真正花时间的是**第二处缺口**：`createProcessInspector` 修好之后终端仍然打不开，
+而是在设备上 `grep -rl` 那个字面量，直接落到唯一文件与唯一行。真正花时间的是**第二处缺口**：`createProcessInspector` 修好之后终端仍然打不开，
 因为 `node-pty` 是抛错空壳 —— 这条路径在源码里被 `createLazyRequire("node-pty")`
 藏起来了（`require` 本身成功，只在**终端侧栏真正打开**时才 `spawn`），
 所以「`require("node-pty")` 不报错」不能作为「PTY 可用」的证据。
@@ -292,15 +310,19 @@ about:blank 再回来**（无发起者的跨站导航不带 Strict cookie → 40
 
 ---
 
-## 六、验证体系（五层）
+## 六、验证体系（九层）
 
 | 脚本 | 验证什么 | 为什么需要它 |
 |---|---|---|
-| `verify-runtime.mjs` | zip 结构（条目数 / LINK 注释 / 占位符残留 / 版本标记 / ELF 校验） | 产物完整性 |
-| `simulate-install.mjs` | 复刻 `RuntimeInstaller` 的 7 步解包与九锚点判定 | 结构对 ≠ 设备上能装出可启动的树 |
-| `smoke-plugin.mjs` | 复刻官方 `WebServer` 路由契约起真实 HTTP | 文件铺对了 ≠ 插件能挂起来 |
+| `verify-runtime.mjs` | zip 结构（条目数 / LINK 注释 / 占位符残留 / 版本标记 / ELF 校验 / 字体 sfnt 魔数） | 产物完整性 |
+| `simulate-install.mjs` | 复刻 `RuntimeInstaller` 的 7 步解包与十一锚点判定 | 结构对 ≠ 设备上能装出可启动的树 |
+| `smoke-plugin.mjs` | 复刻官方 `WebServer` 路由契约起真实 HTTP，并断言兼容层/移动端适配层的关键实现在场、版本标记与 Kotlin 常量一致 | 文件铺对了 ≠ 插件能挂起来 |
 | `check-bundle.mjs` | 用**真实** `dsh-app-boot` 走解析链 | 插件能跑 ≠ DSH 能发现它 |
-| `test-pty-patch.mjs` | 12 个补丁的离线单测（自带 fixture，不依赖仓库外文件） | 补丁改错了构建照样全绿，只有点开终端才炸 |
+| `test-pty-patch.mjs` | 17 个补丁的离线单测（自带 fixture，不依赖仓库外文件） | 补丁改错了构建照样全绿，只有点开终端才炸 |
+| `test-compat-url.mjs` | 在「WebView 104 行为沙箱」里跑真实 `compat.js`，断言 URL 补丁的 25 组取值与 8 组回归 | `smoke-plugin` 只能验「实现在场」，验不了语义边界（特殊协议、空 authority、userinfo/port）—— 而边界恰恰最容易改坏 |
+| `test-compat-css.mjs` | 断言 `@scope` 展开器的 27 组取值（含嵌套 `@media`/`@supports`/`@layer`、`@keyframes` 内部原样保留） | 展开器是纯文本重写，一个括号配平错误就会让整张样式表失效 |
+| `test-modern.mjs` | 每个用例一个**独立 vm realm** 的「104 沙箱」，跑真实 `modern.js`，断言补齐结果 + `URL.createObjectURL` 对 script/html 两类 blob 的前置注入 + 幂等 | 补齐层最危险的失败模式是「本地全绿、真机只显示渲染进程无法继续」—— 补齐源码要被 `Function.prototype.toString()` 搬进 worker 执行，引用本文件作用域里任何变量都不会在本地报错 |
+| `test-archive-providers.mjs` | 在 `vm` 沙箱里跑 `tools/prebuilt/documentpreview-archive/providers.js`，断言 ZIP 中央目录解析（含 ZIP64、目录项、加密位）、`kxxyInflateRaw`、EPUB OPF/spine 解析、内联资源与预算控制 | 归档 provider 是**注入进 26 万字符扁平 bundle 作用域**的片段，本地没有模块边界兜底；ZIP 解析器的边界（EOCD 扫描窗口、ZIP64 扩展字段顺序）只有单测能覆盖 |
 
 外加**端到端实测**：用宿主 node 直接跑装配产物，验证
 `/`（官方前端 + token 认证）、`/kxxy`（管理页）、`/kxxy/api/*`（API）、
@@ -312,7 +334,8 @@ about:blank 再回来**（无发起者的跨站导航不带 Strict cookie → 40
 
 | 项 | 状态 |
 |---|---|
-| Office 文档预览 | Android 上抛 `Unsupported LibreOfficeKit host: android-arm64`（可接受降级，PDF/Markdown/代码预览正常） |
+| Office 文档预览 | **已可用**（缺陷 X）—— 走 LibreOffice wasm 后端，doc/docx/odt/xls/xlsx/ods/ppt/pptx/odp 九种格式都能转 PDF。代价是包体：wasm 引擎 145 MiB + 两份 CJK 字体 21 MiB 使 runtime.zip 从 497 MiB 涨到 555 MiB、APK 从 1,545 MiB 涨到 1,604 MiB；转换在设备上约 4–5 s、峰值 RSS 约 400–715 MiB。**首次转换有冷启动**（wasm 模块加载约 1.4 s） |
+| 归档 / 电子书预览 | **已可用**（缺陷 Z）—— zip 列条目 + 点开预览文本条目；epub 按 OPF spine 拼出可滚动单页。**限制**：zip 单条目解压上限 16 MiB、epub 内联资源总预算 24 MiB；只支持 `stored` 与 `deflate`（`deflate64` / `bzip2` / `lzma` 等少见方式会报「不支持的压缩方式」）；加密 zip 明确拒绝；**纯前端解压，不做流式**，打开超大 zip 会把整个文件读进内存 |
 | 沙箱隔离 | Android 无 landlock/seatbelt，固定 `danger-full-access` |
 | 无障碍服务 | 未实现（参考项目有 1,495 行，方案 T 下属可选后置） |
 | 语音输入 | 未实现 |

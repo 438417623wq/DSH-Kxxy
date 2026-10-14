@@ -85,6 +85,10 @@ const NEED = [
   // 不支持 dvh 单位，缺了它设置面板与目录选择对话框会静默显示异常
   // （见 RuntimeInstaller 锚点 6，以及下面单独的版本标记断言）
   "lib/node_modules/kxxy-host/web/compat.js",
+  // 现代内建补齐层（锚点 6 的第二份资产）：补齐 Chrome 105–139 才有的 JS
+  // 内建，并把同一份源码前置进 blob worker / blob iframe。缺了它，PDF 渲染
+  // worker 与 HTML 预览 iframe 都会在独立全局里抛 ReferenceError
+  "lib/node_modules/kxxy-host/web/modern.js",
   // Android 原生 PTY 绑定：上游 createProcessInspector 不认 android，
   // 且 node-pty 无 Android 预编译产物，缺了它「新建终端」必定报错
   // （见 RuntimeInstaller 锚点 7，以及下面单独的版本标记断言）
@@ -95,6 +99,20 @@ const NEED = [
   // 纯静态资产，独立于插件入口标记（见 RuntimeInstaller 锚点 9）
   "lib/node_modules/kxxy-host/web/mobile.css",
   "lib/node_modules/kxxy-host/web/mobile.js",
+  // office 预览链（锚点 10）：LibreOffice wasm 引擎 + 单文件 CJK 字体。
+  // 两者都是「新增资产」而 RUNTIME_VERSION 从未变过 —— 缺了它们老设备
+  // 前九锚点全过、跳过重装，Office 预览永远报「Office 预览不可用」。
+  "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.wasm",
+  "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.data",
+  "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.cjs",
+  "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/prebuilds.json",
+  "lib/node_modules/kxxy-host/fonts/office-assets.version",
+  "lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf",
+  "lib/node_modules/kxxy-host/fonts/NotoSansSC-Bold.ttf",
+  // 构建期补丁集版本标记（锚点 11）。前十个锚点探的全是自有资产，而补丁改的
+  // 是上游文件（documentpreview 的 client.js / client.pdf.js、libreoffice-kit、
+  // dsh-office-to-pdf …），它们没有版本标记可探 —— 补丁是否落地只能靠它判定。
+  "lib/node_modules/kxxy-host/patchset.version",
   "kxxy-runtime.json",
 ];
 const byName = new Map(entries.map((e) => [e.name, e]));
@@ -128,6 +146,106 @@ for (const n of NEED) {
       missing += 1;
     } else {
       console.log(`\n兼容层版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- 现代内建补齐层版本标记
+// 锚点 6 的第二段判定（与 compat.js 同一锚点、独立标记）：modern.js 补齐
+// Chrome 105–139 才有的 JS 内建，并包装 URL.createObjectURL 把同一份源码注入
+// blob worker / blob iframe。缺它时右侧栏 PDF 报「渲染进程无法继续」、
+// HTML 预览整片空白，而页面主作用域看起来完全正常。
+{
+  const markerNeed = /MODERN_LAYER_MARKER\s*=\s*"([^"]+)"/.exec(
+    readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
+  );
+  const entry = byName.get("lib/node_modules/kxxy-host/web/modern.js");
+  if (!entry) {
+    console.log("现代内建补齐层版本标记：✗ 条目缺失，跳过");
+    missing += 1;
+  } else if (markerNeed === null) {
+    console.log("现代内建补齐层版本标记：✗ RuntimeInstaller.kt 未定义 MODERN_LAYER_MARKER");
+    missing += 1;
+  } else {
+    const head = readLocal(entry).toString("utf8").slice(0, 256);
+    if (!head.includes(markerNeed[1])) {
+      console.log(`现代内建补齐层版本标记：✗ modern.js 头部不含 ${markerNeed[1]}`);
+      missing += 1;
+    } else {
+      console.log(`现代内建补齐层版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- office 资产版本标记
+// 锚点 10：LibreOffice wasm 引擎与单文件 CJK 字体是随 runtime 发的「新增资产」，
+// 而 RUNTIME_VERSION 从未变过 —— 老设备前九锚点全过、跳过重装，设备上永远没有
+// 这两份文件，Office 预览一直报「Office 预览不可用」。断言标记文件内容与
+// RuntimeInstaller.OFFICE_LAYER_MARKER 一致，并校验两份字体的 sfnt 魔数
+// （0x00010000 或 "true"/"OTTO"），防止把空文件或占位文本写进 zip。
+{
+  const markerNeed = /OFFICE_LAYER_MARKER\s*=\s*"([^"]+)"/.exec(
+    readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
+  );
+  const entry = byName.get("lib/node_modules/kxxy-host/fonts/office-assets.version");
+  if (!entry) {
+    console.log("office 资产版本标记：✗ 条目缺失");
+    missing += 1;
+  } else if (markerNeed === null) {
+    console.log("office 资产版本标记：✗ RuntimeInstaller.kt 未定义 OFFICE_LAYER_MARKER");
+    missing += 1;
+  } else {
+    const head = readLocal(entry).toString("utf8").slice(0, 256);
+    if (!head.includes(markerNeed[1])) {
+      console.log(`office 资产版本标记：✗ 标记文件不含 ${markerNeed[1]}`);
+      missing += 1;
+    } else {
+      console.log(`office 资产版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+
+  for (const name of [
+    "lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf",
+    "lib/node_modules/kxxy-host/fonts/NotoSansSC-Bold.ttf",
+  ]) {
+    const font = byName.get(name);
+    if (!font) continue;   // 缺失已由 NEED 循环报过
+    const buf = readLocal(font);
+    const tag = buf.length >= 4 ? buf.readUInt32BE(0) : 0;
+    const isSfnt = tag === 0x00010000 || tag === 0x74727565 /* true */ || tag === 0x4f54544f /* OTTO */;
+    if (!isSfnt) {
+      console.log(`office 字体：✗ ${name.split("/").pop()} 不是 sfnt（首 4 字节 0x${tag.toString(16)}）`);
+      missing += 1;
+    } else {
+      console.log(`office 字体：✓ ${name.split("/").pop()} sfnt，${buf.length} B`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- 补丁集版本标记
+// 锚点 11：前十个锚点探的全是自有资产，而补丁改的是上游文件（documentpreview
+// 的 client.js / client.pdf.js、libreoffice-kit、dsh-office-to-pdf …），它们
+// 没有版本标记可探。真机事故：补上 zip / epub provider、重建 runtime 与 APK
+// 装机后，设备上 `grep -c kxxyArchiveApply` 仍是 0 —— isComplete() 判真跳过重装。
+// 这里断言 zip 里的标记文件与 RuntimeInstaller.PATCHSET_MARKER 一致。
+{
+  const markerNeed = /PATCHSET_MARKER\s*=\s*"([^"]+)"/.exec(
+    readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
+  );
+  const entry = byName.get("lib/node_modules/kxxy-host/patchset.version");
+  if (!entry) {
+    console.log("补丁集版本标记：✗ 条目缺失");
+    missing += 1;
+  } else if (markerNeed === null) {
+    console.log("补丁集版本标记：✗ RuntimeInstaller.kt 未定义 PATCHSET_MARKER");
+    missing += 1;
+  } else {
+    const head = readLocal(entry).toString("utf8").slice(0, 256);
+    if (!head.includes(markerNeed[1])) {
+      console.log(`补丁集版本标记：✗ 标记文件不含 ${markerNeed[1]}`);
+      missing += 1;
+    } else {
+      console.log(`补丁集版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
     }
   }
 }

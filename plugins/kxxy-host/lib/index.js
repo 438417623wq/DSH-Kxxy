@@ -1,4 +1,4 @@
-/* kxxy-host@4 */
+/* kxxy-host@5 */
 /**
  * kxxy-host — DSH Kxxy 宿主管理页插件。
  *
@@ -120,17 +120,50 @@ function compatScript() {
 }
 
 /**
+ * 现代 JS 内建补齐层（含 blob 作用域注入），惰性读取后常驻。
+ *
+ * 与 compat.js 的分工见 web/modern.js 头部说明。一句话：compat.js 修「页面主
+ * 作用域」，modern.js 修「页面 + blob worker / blob iframe」。真机事故是
+ * pdf.js 的渲染 worker 与 HTML 预览 iframe 都跑在 blob: 的独立全局里，
+ * `<head>` 注入够不到，导致右侧栏 PDF 显示「PDF 渲染进程无法继续」、
+ * HTML 整片空白，而 logcat 里只有一条 blob: URL 上的
+ * `ReferenceError: Iterator is not defined`。
+ */
+let cachedModernScript = null
+
+function modernScript() {
+  if (cachedModernScript === null) {
+    try {
+      const raw = readFileSync(join(WEB_DIR, 'modern.js'), 'utf8')
+      // inline script 内不得出现 `</script`，否则会提前闭合标签
+      cachedModernScript = raw.replace(/<\/script/gi, '<\\/script')
+    } catch {
+      cachedModernScript = ''
+    }
+  }
+  return cachedModernScript
+}
+
+/**
  * 把兼容层插到 `<head>` 开标签之后（早于一切 module/classic script）。
  *
  * 时序是硬约束：官方前端入口是 `<head>` 内的 `<script type="module">`，
  * 兼容层必须排在它前面才能在其求值前装好 API。官方 `renderIndex` 的
  * 结构化注入行也插在同一位置、且在 tapIndex **之前**，因此本函数用
  * 相同的锚点即可，无需关心行顺序。
+ *
+ * 两份脚本共用一个注入点、且 compat 在前：compat.js 负责 URL/CSS 层面的
+ * 修正，modern.js 负责内建补齐与 `URL.createObjectURL` 包装；后者包装的是
+ * 全局函数，必须晚于任何可能读取它的代码（这里就是官方入口 module，仍在
+ * 其后）。缺任何一份都不算失败 —— 文件缺失时静默降级，不影响页面启动。
  */
 function injectCompat(html) {
   const script = compatScript()
-  if (script === '') return html
-  const markup = `<script data-kxxy-compat>${script}</script>`
+  const modern = modernScript()
+  let markup = ''
+  if (script !== '') markup += `<script data-kxxy-compat>${script}</script>`
+  if (modern !== '') markup += `<script data-kxxy-modern>${modern}</script>`
+  if (markup === '') return html
   const open = /<head(?:\s[^>]*)?>/i.exec(html)
   if (open === null) return `${markup}${html}`
   const at = open.index + open[0].length

@@ -174,6 +174,19 @@ class MainActivity : Activity() {
                 if (request.url.scheme == "kxxy") {
                     return handlePermissionBridge(request.url)
                 }
+                // 子框架一律放行。右侧栏「工作区文件」的 HTML 预览是宿主拼出
+                // bootstrap 文档、createObjectURL 成 blob: 再塞进 iframe ——
+                // 它属于子框架导航，一旦被当外链丢给系统，预览区就只剩空白，
+                // 而 logcat 里只有一行 "external url intercepted: blob:…"。
+                // 外链拦截的本意只针对「用户点击链接离开应用」，那必然是主框架。
+                if (!request.isForMainFrame) {
+                    return false
+                }
+                // 页面内联资源（图片/字体/媒体）与 blob/data 文档不走网络请求，
+                // 但少数路径仍会经过这里，同样必须放行。
+                when (request.url.scheme) {
+                    "blob", "data", "about", "javascript" -> return false
+                }
                 // 只放行回环地址；其余交给系统浏览器
                 if (url.startsWith("http://127.0.0.1:") || url.startsWith("http://localhost:")) {
                     return false

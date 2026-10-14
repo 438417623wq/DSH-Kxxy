@@ -530,6 +530,241 @@ async function link(source, target) {
 }
 
 /**
+ * 文档预览 PDF 分块里那个 Chrome 112+ 才支持的 `v` 标志正则（原文与 `u` 模式等价写法）。
+ *
+ * 独立成常量而不是内联，是因为它们很长，且必须逐字节精确 —— 锚点对不上时
+ * `replaceOnce` 会硬失败，这正是我们想要的。
+ */
+const PDF_UNICODE_SETS =
+  String.raw`/\b(?:https?:\/\/|mailto:|www\.)(?:[\S--[\p{P}<>]]|\/|[\S--[\[\]]]+[\S--[\p{P}<>]])+|(?=\p{L})[\S--[@\p{Ps}\p{Pe}<>]]{1,64}@([\S--[[\p{P}--\-]<>]]{1,63}(?:\.[\S--[[\p{P}--\-]<>]]{1,63})+)/gv`;
+
+const PDF_UNICODE_SETS_U_MODE =
+  String.raw`/\b(?:https?:\/\/|mailto:|www\.)(?:[^\s\p{P}<>]|\/|[^\s\[\]]+[^\s\p{P}<>])+|(?=\p{L})[^\s@\p{Ps}\p{Pe}<>]{1,64}@((?:[^\s<>\p{P}]|-){1,63}(?:\.(?:[^\s<>\p{P}]|-){1,63})+)/gu`;
+
+/**
+ * 文档预览的 PDF 分块：`client.pdf.js` 用了 Chrome 112+ 才支持的 `v` 标志正则。
+ *
+ * 症状（Android 13 / ROM 内置 WebView 104 实测，2026-10-13）：7.1 MiB 的 chunk
+ * 在**解析阶段**就抛 `Uncaught SyntaxError: Invalid regular expression flags`，
+ * 因此永远走不到 `__ModuleLoader__.load(...)`；client-modules 于是判定
+ * `bundle …client.pdf.js… loaded without registering …`，并把
+ * `sidebar.right.tab.document` 这个 slot 条目整条打崩。
+ *
+ * **症状极具误导性**：表现是「右侧栏每一种格式的预览都是空白」（实测
+ * png / pptx / docx / odt / pdf / html 全中），看起来像每个渲染器各自坏了，
+ * 实际只有一个分块解析失败 —— 挂掉的是承载全部预览的那一个 slot 条目。
+ *
+ * 为什么不能在 compat.js 里救：`v` 标志是**语法层**特性。解析失败时页面里
+ * 根本不存在那个模块，而 compat.js 早已跑完；polyfill 对 SyntaxError 无能为力。
+ * 唯一可用手段就是构建期把它改写成等价的 `u` 模式正则。
+ *
+ * 等价性依据（`v` 模式的集合差 → `u` 模式的取反类；`\S` 即「非空白」）：
+ *   `[\S--[\p{P}<>]]`         → `[^\s\p{P}<>]`
+ *   `[\S--[\[\]]]`            → `[^\s\[\]]`
+ *   `[\S--[@\p{Ps}\p{Pe}<>]]` → `[^\s@\p{Ps}\p{Pe}<>]`
+ *   `[\S--[[\p{P}--\-]<>]]`   → `(?:[^\s<>\p{P}]|-)`
+ *     （`\S` 扣掉「`\p{P}` 去掉 `-` 之后再并入 `<` `>`」的集合；`<` `>` 是
+ *       Unicode `Sm`，本就不在 `\p{P}` 里，所以那一半必须显式并进来）
+ * 所有新增分组一律用 `(?:…)` 非捕获，**保证 `match[1]`（emailDomain）的编号
+ * 不变** —— 调用点写的是 `const [url, emailDomain] = match`，多一个捕获组就错位。
+ */
+function patchDocumentPreviewUnicodeSets(ctx) {
+  const rel = "@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.pdf.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无文档预览 PDF 分块）";
+  const patched = replaceOnce(
+    ctx.read(rel),
+    PDF_UNICODE_SETS,
+    PDF_UNICODE_SETS_U_MODE,
+    "文档预览 PDF 分块的 v-标志正则",
+  );
+  ctx.write(rel, patched);
+  return "文档预览 PDF 分块 → v-标志正则改写为等价的 u 模式（WebView 104 可解析）";
+}
+
+// ------------------------------------------------------- office（文档 → PDF）链路
+
+/**
+ * libreoffice-kit 的宿主平台门禁：Android 上必须放行 wasm 后端。
+ *
+ * 上游把「非 linux」一律当不支持的宿主，代码里三处硬编码：
+ *   1. `platformTarget()` 尾部 `if (platform !== "linux") return void 0;`
+ *   2. `resolveEngine()` 里原生包缺失时 `if (platform !== "linux") throw …Required…missing`
+ *   3. `resolveEngine()` 尾部 `if (platform !== "linux") throw …Unsupported LibreOfficeKit host`
+ * 第 3 处是决定性的：Android 上 `platformTarget()` 本就返回 `void 0`（`details` 为空、
+ * 取不到 `glibcVersionRuntime`），流程必然走到第 3 处抛错，永远到不了紧随其后的
+ * `readEngine(resolvePackage('@deepseek-ai/libreoffice-kit-wasm'), "wasm", "wasm")`。
+ *
+ * 为什么必须放行 wasm 而不是补原生包：Android 上没有 linux-glibc 预编译产物，
+ * 而 `@deepseek-ai/libreoffice-kit-wasm` 是纯 wasm 引擎（soffice.wasm + soffice.data），
+ * 与宿主 ABI 无关，实测在 arm64 Android 上可完成 docx/pptx → PDF（约 4.5 s）。
+ *
+ * 安全性依据：三处判据只影响「要不要用 wasm 后端」这一条路径选择。Android 上
+ * 原生包本来就解析不到，放行后行为等同于「原生缺失 → 落到 wasm」，与桌面
+ * Linux 上原生缺失时的行为一致。
+ */
+function patchLibreOfficeKitPlatform(ctx) {
+  const rel = "@deepseek-ai/libreoffice-kit/lib/index.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无 libreoffice-kit）";
+  const src = ctx.read(rel);
+  const from = 'if (platform !== "linux")';
+  const to = 'if (platform !== "linux" && platform !== "android")';
+  const hits = src.split(from).length - 1;
+  must(hits === 3, `libreoffice-kit 平台门禁 —— 期望 3 处，实际 ${hits} 处`);
+  ctx.write(rel, src.split(from).join(to));
+  return "libreoffice-kit → 平台门禁放行 android（启用 wasm 后端）";
+}
+
+/**
+ * libreoffice-kit 的字体回退表：补上 Android 上真实存在的字体族。
+ *
+ * 为什么必须打：`systemFontDirectories()` 在 android 上走的是 XDG 分支
+ * （`XDG_DATA_DIRS` 的 `fonts/` 子目录 + `~/.fonts`），Android 上这些路径全部
+ * 不存在，于是「文档里声明的族」一个都解析不到 —— docx 渲染成整片空白。
+ *
+ * 修法分两半：
+ *   a) 给已有 13 组回退链各追加 Android 实存族，让「Arial → Roboto/Noto Sans SC」
+ *      这类映射真的接得上；
+ *   b) 新增 13 组上游没收录的族（Aptos、等线、游ゴシック、Calibri 单列、
+ *      Cambria、Times New Roman、Segoe UI、Microsoft JhengHei/YaHei …），
+ *      这些是 OOXML 文档里最常见的声明名。
+ *
+ * 注入点选在 `const DEFAULT_LIMITS = {` 之前：那里紧邻 `FONT_FALLBACKS` 的
+ * 定义尾部，`FONT_FALLBACKS` 在模块作用域可见且未被 `Object.freeze`
+ * （已核对 `freeze(FONT_FALLBACKS` 零命中）。
+ */
+function patchLibreOfficeKitFontFallbacks(ctx) {
+  const rel = "@deepseek-ai/libreoffice-kit/lib/index.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无 libreoffice-kit）";
+  const src = ctx.read(rel);
+  const anchor = "const DEFAULT_LIMITS = {";
+  must(src.split(anchor).length - 1 === 1, "libreoffice-kit 字体回退 —— DEFAULT_LIMITS 锚点不唯一");
+  const inject = `const KXXY_SANS = ["Noto Sans SC", "Roboto", "Source Sans Pro", "MiSans C"];
+const KXXY_SERIF = ["Noto Serif SC", "Noto Serif CJK SC", "Noto Serif"];
+const KXXY_MONO = ["Droid Sans Mono", "Noto Sans Mono CJK SC"];
+for (const kxxyGroup of FONT_FALLBACKS) {
+	const kxxyNames = kxxyGroup.map((kxxyName) => kxxyName.toLowerCase());
+	if (kxxyNames.includes("monospace") || kxxyNames.includes("courier new")) kxxyGroup.push(...KXXY_MONO, ...KXXY_SANS);
+	else if (kxxyNames.includes("serif") || kxxyNames.includes("times new roman") || kxxyNames.includes("cambria")) kxxyGroup.push(...KXXY_SERIF, ...KXXY_SANS);
+	else kxxyGroup.push(...KXXY_SANS);
+}
+FONT_FALLBACKS.push(
+	["Aptos", "Aptos Display", "Noto Sans SC", "Roboto"],
+	["等线", "DengXian", "DengXian Light", "Noto Sans SC", "Roboto"],
+	["游ゴシック", "Yu Gothic", "Yu Gothic Light", "Noto Sans SC"],
+	["游明朝", "Yu Mincho", "Noto Serif SC"],
+	["ＭＳ Ｐゴシック", "MS PGothic", "MS Gothic", "Noto Sans SC"],
+	["맑은 고딕", "Malgun Gothic", "Noto Sans SC"],
+	["新細明體", "PMingLiU", "MingLiU", "Noto Serif SC"],
+	["Calibri", "Noto Sans SC", "Roboto"],
+	["Cambria", "Noto Serif SC", "Noto Serif"],
+	["Times New Roman", "Noto Serif SC", "Noto Serif"],
+	["Segoe UI", "Noto Sans SC", "Roboto"],
+	["Microsoft JhengHei", "Noto Sans SC"],
+	["Microsoft YaHei", "Noto Sans SC", "Roboto"]
+);
+const KXXY_ANDROID_FALLBACKS = true;
+`;
+  ctx.write(rel, src.slice(0, src.indexOf(anchor)) + inject + src.slice(src.indexOf(anchor)));
+  return "libreoffice-kit → 字体回退表追加 Android 实存族（含 13 组新族）";
+}
+
+/**
+ * `@deepseek-ai/dsh-office-to-pdf` 的扩展名白名单：补 odt / ods / odp。
+ *
+ * 为什么必须打：这是 office 转换链上**唯一**的白名单。客户端把 .odt 交上来后，
+ * `renderFile()` 先按后缀拦一道，不在名单里直接抛
+ * `OfficeToPdfError("unsupported-format", …)`，用户看到的是「无法预览此 Office
+ * 文件。文件可能已损坏、受密码保护，或与扩展名不符。」—— 归因完全错位。
+ * 客户端那份 `extensions` 数组里也没有 odt/ods/odp，所以两处都得补。
+ *
+ * 安全性依据：底层 `libreoffice-kit` 本就完整支持这三种格式
+ * （`CONVERSION_FORMATS` 的 Writer 组 `inputs: ["doc","docx","odt"]`、
+ * Calc 组 `["xls","xlsx","ods"]`、Impress 组 `["ppt","pptx","odp"]`），
+ * `worker.js` 的 `DOCUMENT_EXTENSIONS` 也已含它们。这一层只是漏登记。
+ * `convertBytes()` 走的是另一条路径、本就不做后缀校验，不受影响。
+ */
+function patchOfficeToPdfFormats(ctx) {
+  const rel = "@deepseek-ai/dsh-office-to-pdf/lib/index.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无 dsh-office-to-pdf）";
+  const from =
+    'if (extension !== "doc" && extension !== "docx" && extension !== "xls" && extension !== "xlsx" && extension !== "ppt" && extension !== "pptx") throw new OfficeToPdfError("unsupported-format", "The path must end in doc, docx, xls, xlsx, ppt, or pptx.");';
+  const to =
+    'if (extension !== "doc" && extension !== "docx" && extension !== "odt" && extension !== "xls" && extension !== "xlsx" && extension !== "ods" && extension !== "ppt" && extension !== "pptx" && extension !== "odp") throw new OfficeToPdfError("unsupported-format", "The path must end in doc, docx, odt, xls, xlsx, ods, ppt, pptx, or odp.");';
+  const patched = replaceOnce(ctx.read(rel), from, to, "dsh-office-to-pdf 扩展名白名单");
+  ctx.write(rel, patched);
+  return "dsh-office-to-pdf → 扩展名白名单补 odt / ods / odp";
+}
+
+/**
+ * 客户端 office 预览器的扩展名清单：补 odt / ods / odp。
+ *
+ * 为什么必须打：`documentpreviews` 的候选是按 `extensions` 匹配的，
+ * `.odt` 不在清单里就永远没有候选；又因为 `UNVIEWABLE_BINARY_EXTENSIONS`
+ * 里明确列了 `"odt" / "ods" / "odp"`，最终落到「该格式文件暂时无法预览」空态。
+ *
+ * 为什么只改这一处、不动黑名单：黑名单只在**没有任何候选**时被查询
+ * （`if (matched.length === 0 && unviewable) return matched;`），
+ * 一旦 office provider 声明了这三个后缀就必然命中，黑名单形同不存在。
+ * 保留它反而是正确的语义：万一 office 服务不可用，用户看到的是
+ * 「预览器不可用」而不是把 ZIP 二进制当文本读。
+ *
+ * `binaryExtensions: extensions` 是整份复用，因此 odt/ods/odp 会一并成为
+ * 「二进制后缀」—— 这正是我们要的：`binaryDocumentPath` 为真 ⇒ 只留 office
+ * 一个候选，不会追加纯文本兜底、不会出现「打开方式」菜单。
+ */
+function patchDocumentPreviewOfficeExtensions(ctx) {
+  const rel = "@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无文档预览客户端）";
+  const from = 'const extensions = [\n\t\t\t\t"doc",\n\t\t\t\t"docx",\n\t\t\t\t"ppt",\n\t\t\t\t"pptx"\n\t\t\t];';
+  const to =
+    'const extensions = [\n\t\t\t\t"doc",\n\t\t\t\t"docx",\n\t\t\t\t"odt",\n\t\t\t\t"ppt",\n\t\t\t\t"pptx",\n\t\t\t\t"odp",\n\t\t\t\t"ods"\n\t\t\t];';
+  const patched = replaceOnce(ctx.read(rel), from, to, "文档预览 office provider 的扩展名清单");
+  ctx.write(rel, patched);
+  return "文档预览 office provider → 扩展名补 odt / ods / odp";
+}
+
+/**
+ * 给文档预览客户端补上 zip / epub 两个 provider。
+ *
+ * 为什么必须打：上游 8 个内置 provider 里没有任何一个能读 ZIP 容器。
+ * `.zip` 在 `UNVIEWABLE_BINARY_EXTENSIONS` 里，落到「该格式文件暂时无法预览」
+ * 空态；`.epub` 更彻底 —— 全 bundle 只有 `"republishing"` 这种子串噪声，
+ * 既不在 provider 清单也不在黑名单，于是把 ZIP 二进制当纯文本读。桌面版
+ * 同样如此，这是上游能力缺口而不是 Android 特有问题。
+ *
+ * 为什么放在客户端而不是宿主：解压只需要 `DecompressionStream('deflate-raw')`
+ * （真机 WebView 104 实测 `raw/deflate/gzip` 三种都可用），宿主侧做的话要新增
+ * 一条 remote 命名空间、改 typert 契约、再让客户端长轮询，成本与风险都高得多。
+ *
+ * 注入位置与安全性：片段（`tools/prebuilt/documentpreview-archive/providers.js`）
+ * 拼进模块作用域的 `exports.apply = apply;` 之前，因此可以直接用上游已经
+ * `require` 好的 `react` 局部变量；随后在 `apply(ctx)` 末尾追加一次
+ * `kxxyArchiveApply(ctx);`。两处锚点都断言唯一，形态变了就让构建失败。
+ * 片段内所有标识符带 `kxxy` / `KXXY_` 前缀 —— 这是个 26 万字符的扁平作用域，
+ * 不加前缀极易与上游局部变量撞名。
+ */
+function patchDocumentPreviewArchiveProviders(ctx) {
+  const rel = "@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无文档预览客户端）";
+  const fragment = prebuilt("documentpreview-archive/providers.js").toString("utf8").trimEnd();
+  must(
+    fragment.includes("function kxxyArchiveApply("),
+    "文档预览归档 provider —— 片段缺少 kxxyArchiveApply 入口",
+  );
+  must(
+    !fragment.includes("</script"),
+    "文档预览归档 provider —— 片段含 </script，内联进 bundle 会截断脚本",
+  );
+
+  const tail = "\t\t//#endregion\n\t\texports.apply = apply;";
+  const call = "\t\t\tapply$3(ctx);\n";
+  let patched = replaceOnce(ctx.read(rel), tail, `${fragment}\n${tail}`, "文档预览客户端模块尾部");
+  patched = replaceOnce(patched, call, `${call}\t\t\tkxxyArchiveApply(ctx);\n`, "文档预览 apply() 的收尾调用");
+  ctx.write(rel, patched);
+  return "文档预览客户端 → 新增 zip / epub 两个归档 provider";
+}
+
+/**
  * 上游 web bundle 里 `if (execArgv.includes('--expose-internals')) return req(id)`
  * 的 fallback 说明 --expose-internals 是官方认可路径；这里只做一次断言，
  * 确认 EngineProcess.kt 传的 flag 与补丁假设一致。
@@ -582,6 +817,12 @@ export function applyAllPatches(root, termuxRead) {
     patchRipgrep(ctx, termuxRead),
     patchFsLocal(ctx),
     patchAttachmentLocal(ctx),
+    patchDocumentPreviewUnicodeSets(ctx),
+    patchLibreOfficeKitPlatform(ctx),
+    patchLibreOfficeKitFontFallbacks(ctx),
+    patchOfficeToPdfFormats(ctx),
+    patchDocumentPreviewOfficeExtensions(ctx),
+    patchDocumentPreviewArchiveProviders(ctx),
     patchDshManifest(ctx),
   ];
   return results;

@@ -180,6 +180,27 @@ if (indexTaps.length === 2) {
     if (!out.includes(need)) fail(`兼容层缺少 dvh 回退实现：${need}`)
   }
   ok('兼容层含 dvh→vh 回退（文本替换 + MutationObserver 观察后续插入）')
+  // URL 非特殊协议修正：必须「探测式触发 + 只包 getter + 排除特殊协议」。
+  // 三者缺一都会出事：没有探测会让已支持的环境也被改写；动了 setter 会
+  // 改变写语义；不排除 file: 之类会把 `file:////x` 这种本来正确的地址改坏。
+  for (const need of [
+    "new URL('x-dsh-probe://host/p').hostname !== 'host'",
+    'var splitFoldedAuthority',
+    'var foldedAuthorityOf',
+    'var wrapUrlGetter',
+    'SPECIAL_SCHEMES',
+    "wrapUrlGetter(nativeHostname, 'hostname'",
+    "wrapUrlGetter(nativeHost, 'host'",
+    "wrapUrlGetter(nativePathname, 'pathname'",
+  ]) {
+    if (!out.includes(need)) fail(`兼容层缺少 URL 修正实现：${need}`)
+  }
+  ok('兼容层含 URL 非特殊协议 authority 修正（探测式 + 只包 getter + 特殊协议守卫）')
+  // getter 必须原样保留 setter，否则 URL 实例的写语义被改变。
+  const urlWrapper = /var wrapUrlGetter[\s\S]*?\n    \}/.exec(out)
+  if (urlWrapper === null) fail('兼容层未定义 wrapUrlGetter')
+  else if (!/set:\s*descriptor\.set/.test(urlWrapper[0])) fail('wrapUrlGetter 未保留原 setter')
+  else ok('wrapUrlGetter 原样保留 setter（不改变写语义）')
   // 版本标记必须存在且与 RuntimeInstaller.COMPAT_LAYER_MARKER 一致，
   // 否则老设备升级后锚点 6 判不出过期，会带着旧兼容层跳过重装。
   const marker = /kxxy-webview-compat@(\d+)/.exec(out)
@@ -195,6 +216,58 @@ if (indexTaps.length === 2) {
   // 所以每次输入都是干净的 HTML，无需幂等；这里只确认单次调用只注入一份。
   if (out.split('data-kxxy-compat').length - 1 !== 1) fail('单次 tap 注入了多份兼容层')
   else ok('单次 tap 只注入一份')
+
+  // ── 现代内建补齐层（锚点 6 的第二份资产）──────────────────────────
+  // 与 compat.js 分开成独立资产的原因见 RuntimeInstaller.MODERN_LAYER_MARKER：
+  // 它多了一层「blob 作用域注入」——包装 URL.createObjectURL，把同一份
+  // polyfill 前置到 text/javascript 的 blob 与 text/html 的 blob 文档里。
+  // 真机事故：PDF 渲染 worker 与 HTML 预览 iframe 都跑在 blob: 的独立全局，
+  // `<head>` 注入够不到，表现为「PDF 渲染进程无法继续」与 HTML 整片空白。
+  const atModern = out.indexOf('data-kxxy-modern')
+  if (atModern < 0) fail('index tap 未注入现代内建补齐层 script')
+  else ok('index tap 注入了现代内建补齐层 script')
+  if (atModern < atCompat) fail('现代内建补齐层早于兼容层（应在兼容层之后）')
+  else ok(`注入顺序正确（compat@${atCompat} modern@${atModern}）`)
+  if (atModern > atEntry) fail('现代内建补齐层晚于入口 module（必须更早）')
+  else ok('现代内建补齐层早于入口 module')
+  // 三个关键内建：Iterator（PDF worker 里 Iterator.prototype.join 的报错源）、
+  // Map.prototype.getOrInsertComputed（pdf.js 6.3 高频使用，104 完全没有）、
+  // 以及 blob 注入本身。
+  for (const need of [
+    "'Iterator'",
+    'getOrInsertComputed',
+    'patchedBlob',
+    'nativeCreateObjectURL',
+    "base === 'text/html'",
+    'INSTALL_SOURCE',
+    "<!doctype html><meta charset=\"utf-8\"><script>",
+  ]) {
+    if (!out.includes(need)) fail(`现代内建补齐层缺少实现：${need}`)
+  }
+  ok('现代内建补齐层含 Iterator / getOrInsertComputed / blob 作用域注入')
+  // 前置到 blob 的必须是「可独立执行的源码字符串」，且不得含 `</script`
+  // （HTML blob 会被包进 <script>，裸 `</script` 会提前闭合标签）。
+  const installSource = /var INSTALL_SOURCE = ([\s\S]*?)\n/.exec(out)
+  if (installSource === null) fail('现代内建补齐层未定义 INSTALL_SOURCE')
+  else if (/<\/script/i.test(installSource[1])) fail('INSTALL_SOURCE 含裸 </script，会提前闭合 HTML blob 的 script 标签')
+  else ok('INSTALL_SOURCE 已转义 </script')
+  // HTML blob 必须自带 doctype：原文档的 `<!doctype html>` 被顶到第二位会被
+  // 解析器忽略，文档掉进 quirks 模式，预览排版与桌面端不一致。
+  if (!out.includes("'<!doctype html><meta charset=\"utf-8\"><script>'")) {
+    fail('HTML blob 注入未自带 doctype（会掉进 quirks 模式）')
+  } else ok('HTML blob 注入自带 doctype（避免 quirks 模式）')
+  // 版本标记：与 RuntimeInstaller.MODERN_LAYER_MARKER 双向一致。
+  const modernMarker = /kxxy-modern@(\d+)/.exec(out)
+  if (modernMarker === null) fail('现代内建补齐层缺少版本标记 kxxy-modern@N')
+  else {
+    const kotlin = readFileSync(join(HERE, '..', 'android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt'), 'utf8')
+    const kotlinModern = /MODERN_LAYER_MARKER\s*=\s*"([^"]+)"/.exec(kotlin)
+    if (kotlinModern === null) fail('RuntimeInstaller.kt 未定义 MODERN_LAYER_MARKER')
+    else if (kotlinModern[1] !== modernMarker[0]) fail(`版本标记不一致：modern.js=${modernMarker[0]} RuntimeInstaller=${kotlinModern[1]}`)
+    else ok(`版本标记一致（${modernMarker[0]}，modern.js 与 RuntimeInstaller 同步）`)
+  }
+  if (out.split('data-kxxy-modern').length - 1 !== 1) fail('单次 tap 注入了多份现代内建补齐层')
+  else ok('现代内建补齐层单次 tap 只注入一份')
 
   // ── 移动端 UI 适配层 ─────────────────────────────────────────────
   // 与兼容层的时序要求相反：兼容层必须**早于**入口 module（API 要在求值前

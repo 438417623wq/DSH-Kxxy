@@ -201,8 +201,16 @@ class RuntimeInstaller(private val ctx: Context) {
             Log.w(TAG, "runtime probe: webview compat layer missing, forcing reinstall")
             return false
         }
+        if (!File(root, MODERN_LAYER_FILE).isFile) {
+            Log.w(TAG, "runtime probe: webview modern layer missing, forcing reinstall")
+            return false
+        }
         if (!compatLayerIsCurrent(root)) {
             Log.w(TAG, "runtime probe: webview compat layer outdated, forcing reinstall")
+            return false
+        }
+        if (!modernLayerIsCurrent(root)) {
+            Log.w(TAG, "runtime probe: webview modern layer outdated, forcing reinstall")
             return false
         }
 
@@ -257,6 +265,50 @@ class RuntimeInstaller(private val ctx: Context) {
             return false
         }
 
+        // 锚点 10：office 预览链（LibreOffice wasm 引擎 + 单文件 CJK 字体）。
+        //
+        // 这两份都是「新增资产」：老设备升级 APK 时 runtime 版本戳不变，前九
+        // 个锚点全通过 ⇒ isComplete() 判真 ⇒ 新资产永远不落地。真机踩过：手工
+        // push 的 wasm 包与字体在下次自愈重装后被整体删除，Office 预览回到
+        // 「Office 预览不可用」。
+        //
+        // 只判标记文件不够，还要判 wasm 主体在位 —— 标记文件很小、写入成功
+        // 而 122 MiB 的 soffice.wasm 被中途截断是完全可能的（存储不足）。
+        if (!markerIsCurrent(root, OFFICE_LAYER_MARKER_FILE, OFFICE_LAYER_MARKER)) {
+            Log.w(TAG, "runtime probe: office assets outdated, forcing reinstall")
+            return false
+        }
+        if (!File(root, OFFICE_WASM_ENGINE).isFile) {
+            Log.w(TAG, "runtime probe: libreoffice wasm engine missing, forcing reinstall")
+            return false
+        }
+        for (font in OFFICE_FONT_FILES) {
+            if (!File(root, font).isFile) {
+                Log.w(TAG, "runtime probe: office font $font missing, forcing reinstall")
+                return false
+            }
+        }
+
+        // 锚点 11：构建期补丁集版本。
+        //
+        // 前十个锚点探的全是**自有资产**（compat.js / modern.js / node-pty /
+        // kxxy-host / mobile.* / office 字体），而绝大多数补丁改的是**上游文件**
+        // —— documentpreview 的 client.js 与 client.pdf.js、libreoffice-kit、
+        // dsh-office-to-pdf …… 这些文件没有任何版本标记可探。
+        //
+        // 真机事故：给 documentpreview 补上 zip / epub 两个 provider、重建
+        // runtime.zip 与 APK、装机重启后，设备上 `grep -c kxxyArchiveApply`
+        // 仍是 0，logcat 里只有一句 `runtime already installed and complete`。
+        // 前十个锚点全部通过 ⇒ isComplete() 判真 ⇒ 新补丁根本没解出来。
+        //
+        // 标记由 build-runtime.mjs 写在 kxxy-host 目录下（自有插件的地盘，
+        // 不与上游文件抢路径）。改动 patches.mjs 里任何补丁、或增删补丁时，
+        // 必须同步递增 [PATCHSET_MARKER]。
+        if (!markerIsCurrent(root, PATCHSET_MARKER_FILE, PATCHSET_MARKER)) {
+            Log.w(TAG, "runtime probe: patch set outdated, forcing reinstall")
+            return false
+        }
+
         return true
     }
 
@@ -269,6 +321,10 @@ class RuntimeInstaller(private val ctx: Context) {
      */
     private fun compatLayerIsCurrent(root: File): Boolean =
         markerIsCurrent(root, COMPAT_LAYER_FILE, COMPAT_LAYER_MARKER)
+
+    /** 现代内建补齐层是否与当前构建一致；判据同 [compatLayerIsCurrent]。 */
+    private fun modernLayerIsCurrent(root: File): Boolean =
+        markerIsCurrent(root, MODERN_LAYER_FILE, MODERN_LAYER_MARKER)
 
     /**
      * 通用版本标记探针：读文件头部，看是否含指定标记。
@@ -650,10 +706,23 @@ class RuntimeInstaller(private val ctx: Context) {
          * 光判「文件存在」会让它们带着不含新补丁的旧兼容层跳过重装，症状
          * 静默复现。改动 compat.js 时必须同步递增此处的编号。
          */
-        private const val COMPAT_LAYER_MARKER = "kxxy-webview-compat@2"
+        private const val COMPAT_LAYER_MARKER = "kxxy-webview-compat@4"
 
         /** 兼容层脚本路径，锚点 6 与 [compatLayerIsCurrent] 共用。 */
         private const val COMPAT_LAYER_FILE = "lib/node_modules/kxxy-host/web/compat.js"
+
+        /**
+         * 现代 JS 内建补齐层（锚点 6 的第二份资产）。
+         *
+         * 与 compat.js 分开成两个文件、两套标记的原因：职责不同、失效表现
+         * 也不同。compat.js 修页面主作用域的 URL/CSS 缺陷；modern.js 补齐
+         * Chrome 105–139 才有的内建，并包装 `URL.createObjectURL` 把同一份
+         * 代码注入 blob worker / blob iframe —— 真机上 PDF 渲染 worker 与
+         * HTML 预览 iframe 都跑在 blob: 的独立全局里，`<head>` 注入够不到。
+         * 分开标记可以让「只改了其中一份」时仍然强制重装。
+         */
+        private const val MODERN_LAYER_MARKER = "kxxy-modern@2"
+        private const val MODERN_LAYER_FILE = "lib/node_modules/kxxy-host/web/modern.js"
 
         /**
          * Android 原生 PTY 绑定（锚点 7）。
@@ -674,7 +743,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 旧插件跳过重装。改动 plugins/kxxy-host/ 下任何文件后递增编号。
          */
         private const val HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js"
-        private const val HOST_PLUGIN_MARKER = "kxxy-host@4"
+        private const val HOST_PLUGIN_MARKER = "kxxy-host@5"
 
         /**
          * 移动端 UI 适配层版本标记（锚点 9），写在 kxxy-host/web/mobile.css
@@ -688,6 +757,52 @@ class RuntimeInstaller(private val ctx: Context) {
         private const val MOBILE_UI_CSS = "lib/node_modules/kxxy-host/web/mobile.css"
         private const val MOBILE_UI_SCRIPT = "lib/node_modules/kxxy-host/web/mobile.js"
         private const val MOBILE_UI_MARKER = "kxxy-mobile-ui@3"
+
+        /**
+         * office 预览链版本标记（锚点 10），由构建期写入
+         * `kxxy-host/fonts/office-assets.version`（与 build-runtime.mjs 的
+         * OFFICE_FONTS_MARKER 逐字一致）。
+         *
+         * 为什么需要独立锚点：LibreOffice wasm 引擎（145 MiB）与单文件 CJK
+         * 字体（约 21 MiB）是随 runtime 一起发的**新增资产**，而 runtime 版本
+         * 戳（[RUNTIME_VERSION]）从未变过。老设备升级 APK 时前九个锚点全部通过，
+         * isComplete() 判真并跳过重装，设备上就永远没有这两份文件，Office 预览
+         * 一直报「Office 预览不可用」。改动字体字重、字体包版本或 wasm 引擎包
+         * 版本时，必须同步递增此编号。
+         *
+         * 标记写成独立小文件而不是字体首行 —— TTF 的 sfnt 头部不能动。
+         */
+        private const val OFFICE_LAYER_MARKER = "kxxy-office@1"
+        private const val OFFICE_LAYER_MARKER_FILE =
+            "lib/node_modules/kxxy-host/fonts/office-assets.version"
+
+        /** wasm 引擎主体；122 MiB，光有标记文件不足以证明它完整落地。 */
+        private const val OFFICE_WASM_ENGINE =
+            "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.wasm"
+
+        /** 随 runtime 发布的单文件 CJK 字体（正体 + 粗体）。 */
+        private val OFFICE_FONT_FILES = listOf(
+            "lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf",
+            "lib/node_modules/kxxy-host/fonts/NotoSansSC-Bold.ttf",
+        )
+
+        /**
+         * 构建期补丁集版本标记（锚点 11），由 build-runtime.mjs 写在
+         * `kxxy-host/patchset.version`（与该脚本的 PATCHSET_MARKER 逐字一致）。
+         *
+         * 为什么必须有：前十个锚点探的全是**自有资产**，而绝大多数补丁改的是
+         * **上游文件** —— documentpreview 的 `client.js` 与 `client.pdf.js`、
+         * `libreoffice-kit/lib/index.js`、`dsh-office-to-pdf/lib/index.js` 等等，
+         * 它们没有任何可探的版本标记。真机事故：给 documentpreview 补上
+         * zip / epub provider、重建 runtime 与 APK 装机后，设备上
+         * `grep -c kxxyArchiveApply` 仍是 0，logcat 只有一句
+         * `runtime already installed and complete` —— 前十个锚点全通过，
+         * isComplete() 判真，补丁根本没解出来。
+         *
+         * 改动 patches.mjs 里任何补丁、或增删补丁时，必须同步递增此编号。
+         */
+        private const val PATCHSET_MARKER = "kxxy-patchset@1"
+        private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /** 读版本标记时探测的头部字节数；标记都写在首行，取小值即可。 */
         private const val COMPAT_MARKER_PROBE_BYTES = 256
