@@ -777,7 +777,8 @@ export function assertEngineFlags(engineProcessSource) {
 }
 
 /**
- * 把自有插件 kxxy-host 挂进 `@deepseek-ai/dsh` 的 dependencies。
+ * 把自有插件 kxxy-host 与内置的第三方插件 dsh-web-mobile 挂进
+ * `@deepseek-ai/dsh` 的 dependencies。
  *
  * 为什么必须改这里：profile 的包解析由 dsh-app-boot 的
  * `collectInstallationScopePackages(installAnchor, …)` 决定，它从 installAnchor
@@ -785,22 +786,37 @@ export function assertEngineFlags(engineProcessSource) {
  * `dependencies` + `peerDependencies` 两个字段，产出
  * `resolution.entries`。只有进了 entries 的包才会被 `routeScoped` 判成
  * `{kind:"interception"}` —— 否则裸包名会落到 `native-after-interception`，
- * 由 profile 目录的 node_modules 去解析，而那里没有 kxxy-host。
+ * 由 profile 目录的 node_modules 去解析，而那里没有这两个包。
  *
- * 声明版本用 `0.1.0`（与插件 package.json 一致）。这个字段不参与 npm 安装
- * （运行时树是离线装配的），只被 `profileDependencyNames` 读键名，
- * 但写真实版本号可让 `dsh plugin` 的 pnpm 操作在人工介入时不至于困惑。
+ * dsh-web-mobile 尤其容易踩这个坑：它的宿主半区在设备上不会报错，只是
+ * 「Loader 里没有这一行」⇒ `dsh-client-modules` 扫 entries 时扫不到它 ⇒
+ * 客户端半区不激活 ⇒ 手机上仍是官方桌面布局，且 logcat 里一行线索都没有。
+ *
+ * 声明版本用各自 package.json 里的真实版本（kxxy-host 0.1.0、
+ * dsh-web-mobile 3.1.0）。这个字段不参与 npm 安装（运行时树是离线装配的），
+ * 只被 `profileDependencyNames` 读键名，但写真实版本号可让 `dsh plugin` 的
+ * pnpm 操作在人工介入时不至于困惑。
  */
 export function patchDshManifest(ctx) {
   const rel = "@deepseek-ai/dsh/package.json";
   const manifest = JSON.parse(ctx.read(rel));
   manifest.dependencies ??= {};
-  if (manifest.dependencies["kxxy-host"] !== void 0) {
-    return "kxxy-host 已在 @deepseek-ai/dsh 的 dependencies 中，跳过";
+
+  const wanted = [
+    ["kxxy-host", "0.1.0"],
+    ["dsh-web-mobile", "3.1.0"],
+  ];
+  const added = [];
+  for (const [name, version] of wanted) {
+    if (manifest.dependencies[name] !== void 0) continue;
+    manifest.dependencies[name] = version;
+    added.push(name);
   }
-  manifest.dependencies["kxxy-host"] = "0.1.0";
+  if (added.length === 0) {
+    return `${wanted.map(([n]) => n).join(" / ")} 已在 @deepseek-ai/dsh 的 dependencies 中，跳过`;
+  }
   ctx.write(rel, `${JSON.stringify(manifest, null, 2)}\n`);
-  return "kxxy-host → 注册进 @deepseek-ai/dsh 的 dependencies（installation scope）";
+  return `${added.join(" / ")} → 注册进 @deepseek-ai/dsh 的 dependencies（installation scope）`;
 }
 
 export function applyAllPatches(root, termuxRead) {

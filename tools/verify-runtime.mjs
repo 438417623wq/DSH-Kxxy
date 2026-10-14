@@ -95,13 +95,17 @@ const NEED = [
   "lib/node_modules/node-pty/package.json",
   "lib/node_modules/node-pty/lib/index.js",
   "lib/node_modules/node-pty/prebuilds/android-arm64/dsh_pty_node.node",
-  // 移动端 UI 适配层：窄屏重排官方设置面板 + 左侧栏覆盖式抽屉。
-  // 纯静态资产，独立于插件入口标记（见 RuntimeInstaller 锚点 9）
-  "lib/node_modules/kxxy-host/web/mobile.css",
-  "lib/node_modules/kxxy-host/web/mobile.js",
-  // office 预览链（锚点 10）：LibreOffice wasm 引擎 + 单文件 CJK 字体。
+  // 内置的第三方移动端 UI 插件（锚点 10）：整包随 runtime 发布，由
+  // `dsh-client-modules` 扫 Loader entries 发现。缺了它手机上是官方桌面
+  // 布局，不报错、不留日志。
+  "lib/node_modules/dsh-web-mobile/package.json",
+  "lib/node_modules/dsh-web-mobile/lib/client.js",
+  "lib/node_modules/dsh-web-mobile/lib/index.js",
+  "lib/node_modules/dsh-web-mobile/cordis.patch.yml",
+  "lib/node_modules/dsh-web-mobile/plugin.version",
+  // office 预览链（锚点 9）：LibreOffice wasm 引擎 + 单文件 CJK 字体。
   // 两者都是「新增资产」而 RUNTIME_VERSION 从未变过 —— 缺了它们老设备
-  // 前九锚点全过、跳过重装，Office 预览永远报「Office 预览不可用」。
+  // 前面的锚点全过、跳过重装，Office 预览永远报「Office 预览不可用」。
   "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.wasm",
   "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.data",
   "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.cjs",
@@ -109,9 +113,10 @@ const NEED = [
   "lib/node_modules/kxxy-host/fonts/office-assets.version",
   "lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf",
   "lib/node_modules/kxxy-host/fonts/NotoSansSC-Bold.ttf",
-  // 构建期补丁集版本标记（锚点 11）。前十个锚点探的全是自有资产，而补丁改的
-  // 是上游文件（documentpreview 的 client.js / client.pdf.js、libreoffice-kit、
-  // dsh-office-to-pdf …），它们没有版本标记可探 —— 补丁是否落地只能靠它判定。
+  // 构建期补丁集版本标记（锚点 11）。前面的锚点探的全是自有资产与内置插件，
+  // 而补丁改的是上游文件（documentpreview 的 client.js / client.pdf.js、
+  // libreoffice-kit、dsh-office-to-pdf …），它们没有版本标记可探 ——
+  // 补丁是否落地只能靠它判定。
   "lib/node_modules/kxxy-host/patchset.version",
   "kxxy-runtime.json",
 ];
@@ -312,35 +317,58 @@ for (const n of NEED) {
   }
 }
 
-// ---------------------------------------------------------------- 移动端适配层版本标记
-// 独立于锚点 8：适配层是纯静态资产，只改它时插件入口 lib/index.js 的标记不动，
-// 锚点 8 会判「已是最新」而跳过重装，真机表现为新布局完全没生效。
-// 两份文件共用一个编号，必须都与 RuntimeInstaller.MOBILE_UI_MARKER 一致。
+// ---------------------------------------------------------------- 内置移动端插件版本标记
+// 锚点 10：dsh-web-mobile 是随 runtime 发的**第三方整包**。它既不进
+// @deepseek-ai 文件计数（锚点 4），也不属于 kxxy-host（锚点 5/8），缺了它
+// 手机上是官方桌面布局 —— 不报错、不留日志，属于最难排查的一类。
+// 这里断言：标记文件内容与 RuntimeInstaller.MOBILE_PLUGIN_MARKER 一致，
+// 且插件确实写进了 `@deepseek-ai/dsh` 的 dependencies（否则 dsh-app-boot 的
+// installation scope 解析不出它，文件都在却永远不激活）。
 {
-  const markerNeed = /MOBILE_UI_MARKER\s*=\s*"([^"]+)"/.exec(
-    readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
+  const kotlin = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8",
   );
-  if (markerNeed === null) {
-    console.log("移动端适配层版本标记：✗ RuntimeInstaller.kt 未定义 MOBILE_UI_MARKER");
+  const markerNeed = /MOBILE_PLUGIN_MARKER\s*=\s*"([^"]+)"/.exec(kotlin);
+  const entry = byName.get("lib/node_modules/dsh-web-mobile/plugin.version");
+  if (!entry) {
+    console.log("移动端插件版本标记：✗ 条目缺失");
+    missing += 1;
+  } else if (markerNeed === null) {
+    console.log("移动端插件版本标记：✗ RuntimeInstaller.kt 未定义 MOBILE_PLUGIN_MARKER");
     missing += 1;
   } else {
-    for (const rel of [
-      "lib/node_modules/kxxy-host/web/mobile.css",
-      "lib/node_modules/kxxy-host/web/mobile.js",
-    ]) {
-      const e = byName.get(rel);
-      if (!e) {
-        console.log(`移动端适配层版本标记：✗ ${rel} 条目缺失`);
-        missing += 1;
-        continue;
-      }
-      const head = readLocal(e).toString("utf8").slice(0, 256);
-      if (!head.includes(markerNeed[1])) {
-        console.log(`移动端适配层版本标记：✗ ${rel} 头部不含 ${markerNeed[1]}`);
-        missing += 1;
-      } else {
-        console.log(`移动端适配层版本标记：✓ ${rel.split("/").pop()} = ${markerNeed[1]}`);
-      }
+    const head = readLocal(entry).toString("utf8").slice(0, 256);
+    if (!head.includes(markerNeed[1])) {
+      console.log(`移动端插件版本标记：✗ 标记文件不含 ${markerNeed[1]}`);
+      missing += 1;
+    } else {
+      console.log(`移动端插件版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+
+  // 客户端半区的存在性：package.json 声明了 dsh.client 就必须能解析出
+  // `./client` 入口，否则 dsh-client-modules 在 resolveMeta 阶段直接抛
+  // `declares dsh.client but exports no "./client" bundle`，整个 boot 失败。
+  const clientEntry = byName.get("lib/node_modules/dsh-web-mobile/lib/client.js");
+  if (clientEntry) {
+    const head = readLocal(clientEntry).toString("utf8").slice(0, 200);
+    if (!head.includes("__ModuleLoader__")) {
+      console.log("移动端插件客户端半区：✗ lib/client.js 不是模块系统注册形态");
+      missing += 1;
+    } else {
+      console.log("移动端插件客户端半区：✓ lib/client.js 注册进 __ModuleLoader__");
+    }
+  }
+
+  // installation scope 注册：patchDshManifest 负责写这一行。
+  const dshManifest = byName.get("lib/node_modules/@deepseek-ai/dsh/package.json");
+  if (dshManifest) {
+    const deps = JSON.parse(readLocal(dshManifest).toString("utf8")).dependencies ?? {};
+    if (deps["dsh-web-mobile"] === void 0) {
+      console.log("移动端插件注册：✗ @deepseek-ai/dsh 的 dependencies 里没有 dsh-web-mobile（补丁未生效）");
+      missing += 1;
+    } else {
+      console.log(`移动端插件注册：✓ dsh-web-mobile@${deps["dsh-web-mobile"]}`);
     }
   }
 }

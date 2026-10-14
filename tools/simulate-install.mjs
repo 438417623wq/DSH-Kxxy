@@ -76,19 +76,23 @@ const PTY_NODE_MARKER = "kxxy-pty-node@1";
 const HOST_PLUGIN_MARKER = "kxxy-host@5";
 
 /**
- * 与 RuntimeInstaller.MOBILE_UI_MARKER 保持一致（锚点 9）。
+ * 与 RuntimeInstaller.MOBILE_PLUGIN_MARKER 保持一致（锚点 10）。
  *
- * 适配层是纯静态资产（mobile.css + mobile.js），只改它时插件入口
- * lib/index.js 的标记不动，锚点 8 会判「已是最新」而跳过重装 —— 真机上
- * 表现为「新写的移动端布局完全没生效」。两份文件共用一个编号。
+ * 内置的第三方移动端插件 dsh-web-mobile 是随 runtime 打包的整包，既不进
+ * `@deepseek-ai` 计数（锚点 4），也不属于 kxxy-host（锚点 5/8）。缺了它的
+ * 表现是「手机上仍是官方桌面布局」——不报错、不留日志。标记由
+ * build-runtime.mjs 写成包根目录下的 `plugin.version`。
  */
-const MOBILE_UI_MARKER = "kxxy-mobile-ui@3";
+const MOBILE_PLUGIN_MARKER = "kxxy-mobile-plugin@1";
+const MOBILE_PLUGIN_ENTRY = "lib/node_modules/dsh-web-mobile/package.json";
+const MOBILE_PLUGIN_CLIENT = "lib/node_modules/dsh-web-mobile/lib/client.js";
+const MOBILE_PLUGIN_MARKER_FILE = "lib/node_modules/dsh-web-mobile/plugin.version";
 
 /**
- * 与 RuntimeInstaller.OFFICE_LAYER_MARKER 保持一致（锚点 10）。
+ * 与 RuntimeInstaller.OFFICE_LAYER_MARKER 保持一致（锚点 9）。
  *
  * LibreOffice wasm 引擎与单文件 CJK 字体是随 runtime 发的「新增资产」，
- * 而 RUNTIME_VERSION 从未变过 —— 老设备升级 APK 时前九个锚点全部通过，
+ * 而 RUNTIME_VERSION 从未变过 —— 老设备升级 APK 时前面的锚点全部通过，
  * isComplete() 判真并跳过重装，设备上永远没有这两份文件，Office 预览
  * 一直报「Office 预览不可用」。标记写在独立小文件里（TTF 头部不能动）。
  */
@@ -104,11 +108,11 @@ const OFFICE_FONT_FILES = [
 /**
  * 与 RuntimeInstaller.PATCHSET_MARKER 保持一致（锚点 11）。
  *
- * 前十个锚点探的全是自有资产，而绝大多数补丁改的是**上游文件**
+ * 前面的锚点探的全是自有资产与内置插件，而绝大多数补丁改的是**上游文件**
  * （documentpreview 的 client.js / client.pdf.js、libreoffice-kit、
  * dsh-office-to-pdf …），它们没有任何可探的版本标记。真机事故：补上
  * zip / epub provider、重建 runtime 与 APK 装机后，设备上
- * `grep -c kxxyArchiveApply` 仍是 0 —— 前十个锚点全通过，isComplete()
+ * `grep -c kxxyArchiveApply` 仍是 0 —— 前面的锚点全通过，isComplete()
  * 判真，补丁根本没解出来。标记由 build-runtime.mjs 写在 kxxy-host 目录下。
  */
 const PATCHSET_MARKER = "kxxy-patchset@1";
@@ -325,8 +329,8 @@ for (const full of walk(target)) {
 }
 console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755`);
 
-// ---------------------------------------------------------------- isComplete（十锚点）
-console.log("[6] isComplete 十锚点（含兼容层、PTY 绑定、宿主插件、移动端适配层与 office 资产）：");
+// ---------------------------------------------------------------- isComplete（十一锚点）
+console.log("[6] isComplete 十一锚点（含兼容层、PTY 绑定、宿主插件、office 资产、内置移动端插件与构建期补丁集）：");
 const anchors = [
   ["锚点 1 dsh 引擎入口", join(target, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js")],
   ["锚点 2 SONAME 别名 libreadline.so.8", join(target, "lib/libreadline.so.8")],
@@ -347,20 +351,22 @@ const anchors = [
   // 锚点 8：宿主插件本体。锚点 5 的 package.json 从 v0.1.0 起内容未变，
   // 光判它存在会让「改了 host.js 却只重装 APK」的设备一直跑旧插件。
   ["锚点 8 宿主插件入口", join(target, "lib/node_modules/kxxy-host/lib/index.js")],
-  // 锚点 9：移动端 UI 适配层。纯静态资产，只改它时插件入口标记不动，
-  // 锚点 8 会判「已是最新」而跳过重装，真机表现为新布局完全没生效。
-  ["锚点 9 移动端适配样式", join(target, "lib/node_modules/kxxy-host/web/mobile.css")],
-  ["锚点 9 移动端适配脚本", join(target, "lib/node_modules/kxxy-host/web/mobile.js")],
-  // 锚点 10：office 预览链。wasm 引擎与 CJK 字体是随 runtime 发的「新增
-  // 资产」，RUNTIME_VERSION 从未变过 ⇒ 老设备前九锚点全过、跳过重装，
+  // 锚点 9：office 预览链。wasm 引擎与 CJK 字体是随 runtime 发的「新增
+  // 资产」，RUNTIME_VERSION 从未变过 ⇒ 老设备前面的锚点全过、跳过重装，
   // 设备上永远没有这两份文件，Office 预览一直报「Office 预览不可用」。
-  ["锚点 10 office 资产标记", join(target, OFFICE_LAYER_MARKER_FILE)],
-  ["锚点 10 LibreOffice wasm 引擎", join(target, OFFICE_WASM_ENGINE)],
-  ...OFFICE_FONT_FILES.map((f, i) => [`锚点 10 CJK 字体 ${i + 1}`, join(target, f)]),
-  // 锚点 11：构建期补丁集版本。前十个锚点探的全是自有资产，而补丁改的是
-  // 上游文件（documentpreview 的 client.js / client.pdf.js、libreoffice-kit、
-  // dsh-office-to-pdf …），它们没有版本标记可探 —— 补丁落地与否只能靠这个
-  // 构建期写入的小文件判定。
+  ["锚点 9 office 资产标记", join(target, OFFICE_LAYER_MARKER_FILE)],
+  ["锚点 9 LibreOffice wasm 引擎", join(target, OFFICE_WASM_ENGINE)],
+  ...OFFICE_FONT_FILES.map((f, i) => [`锚点 9 CJK 字体 ${i + 1}`, join(target, f)]),
+  // 锚点 10：内置的第三方移动端插件 dsh-web-mobile。它既不进 @deepseek-ai
+  // 计数（锚点 4），也不属于 kxxy-host（锚点 5/8）；缺了它的表现是「手机上
+  // 仍是官方桌面布局」——不报错、不留日志，属于最难排查的一类。
+  ["锚点 10 移动端插件 package.json", join(target, MOBILE_PLUGIN_ENTRY)],
+  ["锚点 10 移动端插件客户端半区", join(target, MOBILE_PLUGIN_CLIENT)],
+  ["锚点 10 移动端插件标记", join(target, MOBILE_PLUGIN_MARKER_FILE)],
+  // 锚点 11：构建期补丁集版本。前面的锚点探的全是自有资产与内置插件，而补丁
+  // 改的是上游文件（documentpreview 的 client.js / client.pdf.js、
+  // libreoffice-kit、dsh-office-to-pdf …），它们没有版本标记可探 —— 补丁落地
+  // 与否只能靠这个构建期写入的小文件判定。
   ["锚点 11 补丁集标记", join(target, PATCHSET_MARKER_FILE)],
 ];
 for (const [label, f] of anchors) {
@@ -415,27 +421,34 @@ for (const [label, f] of anchors) {
   }
 }
 {
-  // 锚点 9 的第二段判定：移动端适配层版本标记（css 与 js 共用一个编号，
-  // 两份都必须匹配 —— 只升一份会导致「样式更新了、脚本还是旧的」这种半新状态）。
-  for (const [label, rel] of [
-    ["样式", "lib/node_modules/kxxy-host/web/mobile.css"],
-    ["脚本", "lib/node_modules/kxxy-host/web/mobile.js"],
-  ]) {
-    const f = join(target, rel);
-    if (!existsSync(f)) continue;   // 缺失已由上面的 anchors 循环报过
-    const head = readFileSync(f, "utf8").slice(0, 256);
-    if (!head.includes(MOBILE_UI_MARKER)) fail(`锚点 9 ${label}版本标记过期：头部不含 ${MOBILE_UI_MARKER}`);
-    else ok(`锚点 9 ${label}版本标记匹配（${MOBILE_UI_MARKER}）`);
-  }
-}
-{
-  // 锚点 10 的第二段判定：office 资产标记文件内容（RuntimeInstaller 只做
+  // 锚点 9 的第二段判定：office 资产标记文件内容（RuntimeInstaller 只做
   // contains 匹配，这里同样）。wasm 主体与字体的存在性已由 anchors 循环判过。
   const marker = join(target, OFFICE_LAYER_MARKER_FILE);
   if (existsSync(marker)) {
     const head = readFileSync(marker, "utf8").slice(0, 256);
-    if (!head.includes(OFFICE_LAYER_MARKER)) fail(`锚点 10 版本标记过期：office-assets.version 不含 ${OFFICE_LAYER_MARKER}`);
-    else ok(`锚点 10 office 资产标记匹配（${OFFICE_LAYER_MARKER}）`);
+    if (!head.includes(OFFICE_LAYER_MARKER)) fail(`锚点 9 版本标记过期：office-assets.version 不含 ${OFFICE_LAYER_MARKER}`);
+    else ok(`锚点 9 office 资产标记匹配（${OFFICE_LAYER_MARKER}）`);
+  }
+}
+{
+  // 锚点 10 的第二段判定：内置移动端插件的标记文件内容。
+  const marker = join(target, MOBILE_PLUGIN_MARKER_FILE);
+  if (existsSync(marker)) {
+    const head = readFileSync(marker, "utf8").slice(0, 256);
+    if (!head.includes(MOBILE_PLUGIN_MARKER)) fail(`锚点 10 版本标记过期：plugin.version 不含 ${MOBILE_PLUGIN_MARKER}`);
+    else ok(`锚点 10 移动端插件标记匹配（${MOBILE_PLUGIN_MARKER}）`);
+  }
+  // 锚点 10 的第三段判定：插件必须在 `@deepseek-ai/dsh` 的 dependencies 里。
+  //
+  // 这是 `dsh-client-modules` 能发现它的**前提**：它遍历的是 Loader entries，
+  // 而 entry 由 `dsh-app-boot` 的 installation scope 解析出来。补丁
+  // patchDshManifest 负责写这一行；漏写时插件一切文件都在，只是永远不激活，
+  // 表现与「没打包」完全一样。
+  const dshManifest = join(target, "lib/node_modules/@deepseek-ai/dsh/package.json");
+  if (existsSync(dshManifest)) {
+    const deps = JSON.parse(readFileSync(dshManifest, "utf8")).dependencies ?? {};
+    if (deps["dsh-web-mobile"] === void 0) fail("锚点 10 @deepseek-ai/dsh 的 dependencies 里没有 dsh-web-mobile（补丁未生效）");
+    else ok(`锚点 10 插件已注册进 installation scope（dsh-web-mobile@${deps["dsh-web-mobile"]}）`);
   }
 }
 {

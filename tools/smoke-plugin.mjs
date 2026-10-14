@@ -64,8 +64,8 @@ const webServer = {
    * dsh-host-webserver `:220 tapIndex` / `:339 applyIndexTaps`）。
    * 这里按官方语义登记 transform，并返回注销函数。
    *
-   * 当前有 **两个** tap：兼容层（injectCompat）与移动端适配样式
-   * （injectMobileCss），注册顺序即执行顺序。
+   * 当前只有一个 tap：兼容层（injectCompat，内含 compat.js 与 modern.js）。
+   * 自研移动端适配层的注入 tap 已随 AdaptLayer 一起移除。
    */
   tapIndex(transform) {
     if (typeof transform !== 'function') throw new Error('tapIndex 需要函数')
@@ -149,10 +149,12 @@ for (const p of prefixes.keys()) {
 //   2) 插件 CSS 用了 Chrome 108+ 的 dvh 单位，旧 WebView 的 CSS 解析器把整条
 //      height 声明丢弃，目录选择对话框塌成 0 高，列表整片空白。
 console.log(`  index taps：${indexTaps.length}`)
-if (indexTaps.length !== 2) fail(`应恰好注册 2 个 index tap（兼容层 + 移动端适配层），实为 ${indexTaps.length}`)
-else ok('已注册 index 兼容层 tap 与移动端适配 tap')
+// 只剩一个 tap：兼容层与它同 tap 注入的现代内建补齐层（同一函数产出两段
+// <script>，见 lib/index.js 的 injectCompat）。自研移动端适配层已移除。
+if (indexTaps.length !== 1) fail(`应恰好注册 1 个 index tap（兼容层 + 现代内建补齐层），实为 ${indexTaps.length}`)
+else ok('已注册 index 兼容层 tap（含现代内建补齐层）')
 
-if (indexTaps.length === 2) {
+if (indexTaps.length === 1) {
   const html = '<!doctype html><html><head><title>t</title>'
     + '<script type="module" src="./assets/index-abc.js"></script></head>'
     + '<body><div id="root"></div></body></html>'
@@ -269,153 +271,13 @@ if (indexTaps.length === 2) {
   if (out.split('data-kxxy-modern').length - 1 !== 1) fail('单次 tap 注入了多份现代内建补齐层')
   else ok('现代内建补齐层单次 tap 只注入一份')
 
-  // ── 移动端 UI 适配层 ─────────────────────────────────────────────
-  // 与兼容层的时序要求相反：兼容层必须**早于**入口 module（API 要在求值前
-  // 就位），而适配样式必须**晚于**官方样式表（同权重规则才不会被覆盖回去），
-  // 所以它插在 </head> 之前。
-  const atMobile = out.indexOf('data-kxxy-mobile>')
-  if (atMobile < 0) fail('index tap 未注入移动端适配样式')
-  else ok('index tap 注入了移动端适配样式')
-  if (atMobile < atEntry) fail('移动端样式早于入口 module（应在 </head> 前，晚于官方样式表）')
-  else ok(`移动端样式位于文档后段（mobile@${atMobile} entry@${atEntry}）`)
-  if (atMobile < atCompat) fail('移动端样式早于兼容层（注册顺序应保持 兼容层 → 移动端适配层）')
-  else ok('注册顺序正确（兼容层先，移动端适配层后）')
-  // 样式内容必须真的带上了：窄屏媒体查询、面板锚点、以及 flex-basis 那个坑
-  // 的修复（flex:0 0 auto 与 height 必须同时出现，只写 height 会被顶掉）。
-  for (const need of [
-    '@media (max-width: 767px)',
-    '[data-shortcut-modal="settings"]',
-    '[class*="navList"]',
-    '[class*="_themeCube"]',
-  ]) {
-    if (!out.includes(need)) fail(`移动端样式缺少关键规则：${need}`)
-  }
-  ok('移动端样式含媒体查询 / 面板锚点 / tab 条 / 外观卡片规则')
-  const cubeRule = /\[class\*="_themeCube"\][^}]*\}/.exec(out)
-  if (cubeRule === null) fail('移动端样式未定义 themeCube 规则')
-  else if (!/flex:\s*0 0 auto/.test(cubeRule[0]) || !/height:\s*52px/.test(cubeRule[0])) {
-    fail('themeCube 规则必须同时写 flex:0 0 auto 与 height（flex-basis 优先于 height）')
-  } else ok('themeCube 规则含 flex:0 0 auto + height（flex-basis 坑已规避）')
-  if (out.split('data-kxxy-mobile>').length - 1 !== 1) fail('单次 tap 注入了多份移动端样式')
-  else ok('移动端样式单次只注入一份')
-
-  // ── 左侧栏抽屉（mobile.css ⑪/⑫ + mobile.js）──────────────────────
-  // 三条硬约束，缺一条真机上就会复现事故：
-  //   1) grid 列宽必须 !important —— 官方把列宽写在 React inline style 上
-  //   2) 侧栏必须 absolute 而非 fixed —— 祖先链上有 z-index:40 的 static 容器，
-  //      fixed 层会输掉层叠竞争，表现为「测量正确但整块不可见」
-  //   3) centerCol 必须显式 grid-column:2 —— 侧栏脱流后 grid 自动重排会把
-  //      主内容放到第 1 列（0px 宽），不指定就压成 0 宽
-  const railOpenRule = /\[class\*="BynINW_frame"\]\.kxxy-rail-open\s*\{[^}]*\}/.exec(out)
-  if (railOpenRule === null) fail('移动端样式未定义 .kxxy-rail-open 的 grid 规则')
-  else if (!/grid-template-columns:[^;]*!important/.test(railOpenRule[0])) {
-    fail('.kxxy-rail-open 的 grid-template-columns 必须带 !important（官方 inline style 无它则胜出）')
-  } else ok('.kxxy-rail-open 用 !important 覆盖 React inline grid')
-  const railColRule = /\[class\*="BynINW_frame"\]\.kxxy-rail-open\s*>\s*\[class\*="sidebarCol"\]\s*\{[^}]*\}/.exec(out)
-  if (railColRule === null) fail('移动端样式未定义抽屉态 sidebarCol 规则')
-  else if (!/position:\s*absolute/.test(railColRule[0])) {
-    fail('抽屉必须用 position:absolute（fixed 会输给祖先链上的 z-index:40 容器）')
-  } else if (/position:\s*fixed/.test(railColRule[0])) {
-    fail('抽屉不得使用 position:fixed')
-  } else ok('抽屉用 absolute 覆盖（避开 fixed 的层叠竞争）')
-  if (!/\.kxxy-rail-open\s*>\s*\[class\*="centerCol"\]\s*\{[^}]*grid-column:\s*2/.test(out)) {
-    fail('抽屉态必须给 centerCol 显式 grid-column:2（侧栏脱流后会重排到 0px 的第 1 列）')
-  } else ok('抽屉态显式把 centerCol 放回第 2 列')
-  if (!out.includes('kxxy-rail-open::after')) fail('移动端样式缺少抽屉遮罩 ::after')
-  else ok('抽屉含遮罩层（点击收起）')
-
-  // ── 左侧栏完全隐藏（mobile.css ⑫ + mobile.js）────────────────────
-  // 用户要求：用官方原本那个按钮，点它就把整栏完全收进去。
-  // 这里最容易踩的三个坑，逐条钉死：
-  const railHiddenGrid = /\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*\{[^}]*\}/.exec(out)
-  if (railHiddenGrid === null) fail('移动端样式未定义 .kxxy-rail-hidden 的 grid 规则')
-  else if (!/grid-template-columns:[^;]*!important/.test(railHiddenGrid[0])) {
-    fail('.kxxy-rail-hidden 的 grid-template-columns 必须带 !important')
-  } else ok('.kxxy-rail-hidden 用 !important 覆盖 React inline grid')
-
-  const railHiddenCol = /\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\{[^}]*\}/.exec(out)
-  if (railHiddenCol === null) fail('移动端样式未定义隐藏态 sidebarCol 规则')
-  else {
-    // ① 绝不能用 display:none 实现隐藏 —— 官方开合按钮在列内，整棵子树退出
-    //    渲染后按钮一起消失，用户永久失去唯一入口。必须 visibility。
-    if (/display:\s*none/.test(railHiddenCol[0])) {
-      fail('隐藏态不得用 display:none（会连官方开合按钮一起吞掉，用户再也打不开侧栏）')
-    }
-    // ② 反过来还必须**显式写 display:block**：设备上跑旧 runtime 时引擎会把旧版
-    //    mobile.css（@2 用 display:none）一起内联进来，两条规则并存时旧的那条
-    //    仍然胜出，症状是按钮定位全对却渲染成 0x0。
-    else if (!/display:\s*block/.test(railHiddenCol[0])) {
-      fail('隐藏态 sidebarCol 必须显式 display:block（否则并存的旧版样式表会用 display:none 拆台）')
-    } else ok('隐藏态 sidebarCol 用 visibility 隐藏且显式 display:block')
-  }
-
-  if (!/\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\*\s*\{[^}]*visibility:\s*hidden/.test(out)) {
-    fail('隐藏态缺少「sidebarCol 全后代 visibility:hidden」规则（图标栏会残留）')
-  } else ok('隐藏态整列后代 visibility:hidden（图标栏视觉消失）')
-
-  // ③ 按钮与其**后代**都必须设回 visible。visibility 是可继承属性，只把按钮
-  //    自己设回 visible 救不回被显式声明为 hidden 的 svg/span —— 症状是
-  //    getBoundingClientRect() 正确（36x36@10,18）却什么也画不出来。
-  const toggleVis = /\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\[class\*="toggle"\][^{]*\{[^}]*visibility:\s*visible/.exec(out)
-  if (toggleVis === null) fail('隐藏态未把官方开合按钮设回 visible（用户将失去唯一入口）')
-  else ok('隐藏态保留官方开合按钮为可见入口')
-  const toggleStar = /\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\[class\*="toggle"\]\s*,\s*\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\[class\*="toggle"\]\s*\*/.exec(out)
-  if (toggleStar === null) {
-    fail('隐藏态必须把按钮的后代（svg/span）也设回 visible，否则按钮 rect 正确但画不出来')
-  } else ok('隐藏态按钮后代一并设回 visible（否则图标被祖先规则吞掉）')
-
-  const toggleFixed = /\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="sidebarCol"\]\s*\[class\*="toggle"\]\s*\{[^}]*position:\s*fixed/.exec(out)
-  if (toggleFixed === null) {
-    fail('隐藏态按钮必须 position:fixed 浮回左上角（列宽已压 0，留在流内会被压成 0 宽）')
-  } else ok('隐藏态按钮用 fixed 浮回左上角原位')
-
-  // ④ tabStrip 的归属必须按它自己的类名匹配，**不能**写成
-  //    `> [class*="centerCol"] [class*="tabStrip"]` —— 实测 tabStrip 挂在第三列
-  //    （rightbarCol）的子树下，centerCol 只有一个 display:contents 的直接子元素，
-  //    写成 centerCol 后代选择器会 0 命中，48px 让位永远不生效。
-  if (/\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s*>\s*\[class\*="centerCol"\]\s*\[class\*="tabStrip"\]/.test(out)) {
-    fail('tabStrip 让位规则不得挂在 centerCol 后代下（实测 tabStrip 不在 centerCol 内，会 0 命中）')
-  } else if (!/\[class\*="BynINW_frame"\]\.kxxy-rail-hidden\s+\[class\*="tabStrip"\]\s*\{[^}]*padding-left/.test(out)) {
-    fail('隐藏态缺少 tabStrip 左内边距让位规则（官方 tab 条会压在悬浮按钮底下）')
-  } else ok('隐藏态给 tabStrip 让出左侧空间（按 tabStrip 自身类名匹配）')
-
-  const atMobileJs = out.indexOf('data-kxxy-mobile-js')
-  if (atMobileJs < 0) fail('index tap 未注入移动端适配脚本')
-  else ok('index tap 注入了移动端适配脚本')
-  if (atMobileJs < atMobile) fail('移动端脚本早于样式（样式必须先就位，否则改 class 时会闪一帧未重排布局）')
-  else ok(`移动端脚本晚于样式（js@${atMobileJs} css@${atMobile}）`)
-  for (const need of [
-    "var OPEN_CLASS = 'kxxy-rail-open'",
-    'gridTemplateColumns',
-    'matchMedia',
-    'addListener',
-  ]) {
-    if (!out.includes(need)) fail(`移动端脚本缺少实现：${need}`)
-  }
-  ok('移动端脚本含切类 / inline grid 判档 / 窄屏媒体查询监听')
-  // 判档必须读 inline style：我们自己会用 !important 把 computed 压成 0px，
-  // 读 computed 会永远得到「已折叠」，抽屉永不打开。
-  if (/getComputedStyle\([^)]*\)\.gridTemplateColumns/.test(out)) {
-    fail('移动端脚本不得用 computed 的 gridTemplateColumns 判档（会被自己的 !important 骗到）')
-  } else ok('移动端脚本用 inline gridTemplateColumns 判档（不受自身 !important 影响）')
-  // WebView 104 没有 MediaQueryList.addEventListener，必须留 addListener 兜底分支。
-  if (!/addListener/.test(out)) fail('移动端脚本缺少 WebView 104 的 addListener 兜底')
-  else ok('移动端脚本兼容 WebView 104 的 MediaQueryList 旧 API')
-  if (out.split('data-kxxy-mobile-js').length - 1 !== 1) fail('单次 tap 注入了多份移动端脚本')
-  else ok('移动端脚本单次只注入一份')
-
-  // 版本标记必须与 RuntimeInstaller.MOBILE_UI_MARKER 一致，否则老设备
-  // 升级后锚点 8 判不出过期，会带着旧适配层跳过重装。
-  const mobileMarker = /kxxy-mobile-ui@(\d+)/.exec(out)
-  if (mobileMarker === null) fail('移动端适配层缺少版本标记 kxxy-mobile-ui@N')
-  else {
-    const kotlin2 = readFileSync(join(HERE, '..', 'android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt'), 'utf8')
-    const mobileKotlinMarker = /MOBILE_UI_MARKER\s*=\s*"([^"]+)"/.exec(kotlin2)
-    if (mobileKotlinMarker === null) fail('RuntimeInstaller.kt 未定义 MOBILE_UI_MARKER')
-    else if (mobileKotlinMarker[1] !== mobileMarker[0]) {
-      fail(`移动端适配层版本标记不一致：mobile.css=${mobileMarker[0]} RuntimeInstaller=${mobileKotlinMarker[1]}`)
-    } else ok(`移动端适配层版本标记一致（${mobileMarker[0]}）`)
-  }
+  // ── 移动端适配：已交给内置的第三方插件 dsh-web-mobile ──────────────
+  // 自研的 mobile.css / mobile.js 注入（以及安卓侧的 AdaptLayer）已全部移除，
+  // 恢复官方原本 UI。窄屏适配由随 runtime 打包的 dsh-web-mobile 客户端半区
+  // 承担，它走标准客户端插件通道（package.json 的 dsh.client 声明 + Loader
+  // entry），不经过本插件的 index tap —— 这里没有可断言的注入产物。
+  // 该插件是否真的进了 zip、是否注册进了 installation scope，由
+  // verify-runtime.mjs 的「内置移动端插件」检查段负责。
 }
 
 // ── 真实 HTTP 分发 ────────────────────────────────────────────────

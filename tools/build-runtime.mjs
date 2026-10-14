@@ -472,6 +472,36 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
 const PATCHSET_MARKER = "kxxy-patchset@1";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
+/**
+ * 移动端 UI 插件（第三方 dsh-web-mobile）的构建期来源。
+ *
+ * 为什么内置而不让用户自己装：插件市场那条路要求 profile 目录能跑 pnpm 联网
+ * 安装，而设备上的引擎是离线装配的（`lib/node_modules` 全部来自 runtime.zip），
+ * profile 的 `package.json` 里 `dependencies` 是空对象。内置 = 构建期把它塞进
+ * `lib/node_modules/`，与 kxxy-host 同一条路。
+ *
+ * 版本锁 3.1.0：客户端半区是按 dsh 0.2.0-rc.2 的插槽契约写的，升级宿主或升级
+ * 插件都必须重跑真机验收（它的 `dsh.client.inject` 名单里有 8 个官方客户端包，
+ * 任何一个改名都会让整条 entry 激活失败 ⇒ 白屏）。
+ */
+const MOBILE_PLUGIN_PKG = {
+  url: "https://registry.npmmirror.com/dsh-web-mobile/-/dsh-web-mobile-3.1.0.tgz",
+  file: "dsh-web-mobile-3.1.0.tgz",
+  sha256: "6881c6d0d806606765c4700b8c1797211f1522be17372ea07182799363a640fb",
+  zipBase: "lib/node_modules/dsh-web-mobile/",
+};
+
+/**
+ * 移动端插件的版本标记（锚点 10 的判据），与
+ * `RuntimeInstaller.MOBILE_PLUGIN_MARKER` 逐字一致。
+ *
+ * 为什么不直接探 package.json 里的 `"version": "3.1.0"`：那样标记就与包版本
+ * 绑死了，而我们需要的是「构建脚本认为的插件资产变了」这个信号 —— 换包版本、
+ * 改裁剪清单、甚至只换 tarball 来源都该让设备重装一次。
+ */
+const MOBILE_PLUGIN_MARKER = "kxxy-mobile-plugin@1";
+const MOBILE_PLUGIN_MARKER_FILE = "plugin.version";
+
 /** 下载（带缓存与 sha256 校验）并解开一个 npm tarball。 */
 async function fetchTgz(pkg) {
   const dest = join(OFFICE_CACHE, pkg.file);
@@ -562,6 +592,76 @@ async function bundleOfficeAssets(asarPart) {
   console.log(`      + ${markerPath}（${OFFICE_FONTS_MARKER}）`);
 
   return { wasmCount, fontCount };
+}
+
+/**
+ * 把第三方移动端 UI 插件（dsh-web-mobile）整包塞进 asarPart。
+ *
+ * 与 `bundleOfficeAssets` 同一手法、不同的理由：wasm 包是因为 `"os": ["linux"]`
+ * 被 `isPlatformSpecific` 挡掉；这个包则是因为它**根本不在依赖闭包里** ——
+ * 闭包只由 Termux deb 的 stage 与 `app.asar` 两处拼出来，第三方 npm 包两头
+ * 都没有。所以只能构建期下载。
+ *
+ * 整包照搬（不做裁剪）：解包后一共 4.16 MiB / 209 条目，相对 555 MiB 的
+ * runtime 可以忽略；而裁剪 `lib/types/` 或 `src/` 会在插件升级、或有人用
+ * `exports` 的 `types` 条件做校验时变成难查的缺文件。**npm 装什么，这里就装
+ * 什么**，语义最清楚。
+ */
+async function bundleMobilePlugin(asarPart) {
+  console.log("[6.6/8] 打包移动端 UI 插件 dsh-web-mobile");
+
+  const files = await fetchTgz(MOBILE_PLUGIN_PKG);
+  let count = 0;
+  for (const e of files) {
+    if (e.type !== "0") continue;
+    if (!e.path.startsWith("package/")) continue;
+    const rel = e.path.slice("package/".length);
+    const zipPath = MOBILE_PLUGIN_PKG.zipBase + rel;
+    if (asarPart.has(zipPath)) throw new Error(`移动端插件条目与既有条目冲突：${zipPath}`);
+    asarPart.set(zipPath, { data: e.data, mode: 0o644 });
+    count += 1;
+  }
+
+  /*
+   * 必须逐字校验客户端半区与宿主半区都在。
+   *
+   * `dsh-client-modules` 发现插件的路径是：Loader entry 的 name → 包根
+   * `package.json` 的 `dsh.client` → `exports["./client"]`。三段里任何一段缺了，
+   * 表现都是**这一条 entry 静默不激活**（不是报错）：手机上看不到抽屉、看不到
+   * 输入框左侧的文件按钮，而官方桌面布局一切正常，logcat 里也没有一行线索。
+   * 所以在构建期硬失败，比在设备上猜要便宜得多。
+   */
+  const pkgEntry = files.find((e) => e.path === "package/package.json");
+  if (!pkgEntry) throw new Error("移动端插件包里找不到 package.json");
+  const pkgJson = JSON.parse(pkgEntry.data.toString("utf8"));
+  if (pkgJson.name !== "dsh-web-mobile") {
+    throw new Error(`移动端插件包名漂移：${pkgJson.name}`);
+  }
+  if (pkgJson.dsh?.client?.platform !== "web") {
+    throw new Error(`移动端插件未声明 dsh.client.platform === "web"：${JSON.stringify(pkgJson.dsh)}`);
+  }
+  const clientRel = pkgJson.exports?.["./client"];
+  const clientPath = typeof clientRel === "string" ? clientRel : clientRel?.default;
+  if (typeof clientPath !== "string") {
+    throw new Error(`移动端插件的 exports["./client"] 不是字符串：${JSON.stringify(clientRel)}`);
+  }
+  const clientZipPath = `${MOBILE_PLUGIN_PKG.zipBase}${clientPath.replace(/^\.\//, "")}`;
+  if (!asarPart.has(clientZipPath)) {
+    throw new Error(`移动端插件声明了 ${clientPath}，但包里没有这个文件`);
+  }
+  console.log(
+    `      + ${MOBILE_PLUGIN_PKG.zipBase}（${count} 文件，${pkgJson.name}@${pkgJson.version}）`,
+  );
+
+  const markerPath = `${MOBILE_PLUGIN_PKG.zipBase}${MOBILE_PLUGIN_MARKER_FILE}`;
+  if (asarPart.has(markerPath)) throw new Error(`移动端插件标记与既有条目冲突：${markerPath}`);
+  asarPart.set(markerPath, {
+    data: Buffer.from(`${MOBILE_PLUGIN_MARKER}\n`, "utf8"),
+    mode: 0o644,
+  });
+  console.log(`      + ${markerPath}（${MOBILE_PLUGIN_MARKER}）`);
+
+  return count;
 }
 
 async function main() {
@@ -726,6 +826,9 @@ async function main() {
   // office 预览链：wasm 引擎 + 单文件 CJK 字体（见 bundleOfficeAssets 注释）。
   // 必须放在 mergeEntries 之后：它们只进 asarPart，不参与 stage 冲突检查。
   await bundleOfficeAssets(asarPart);
+
+  // 移动端 UI 插件（第三方 dsh-web-mobile，见 bundleMobilePlugin 注释）。
+  await bundleMobilePlugin(asarPart);
 
   /*
    * 补丁集版本标记（锚点 11）。

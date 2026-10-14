@@ -202,8 +202,6 @@ class MainActivity : Activity() {
                 super.onPageFinished(view, url)
                 Log.i(TAG, "page finished: $url")
                 currentPath = pathOf(url)
-                // 方案 R：注入移动端适配层（触控尺寸 / 输入框字号 / safe-area / 去 hover）
-                AdaptLayer.inject(view)
             }
 
             /**

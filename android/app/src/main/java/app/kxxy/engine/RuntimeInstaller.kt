@@ -247,28 +247,10 @@ class RuntimeInstaller(private val ctx: Context) {
             return false
         }
 
-        // 锚点 9：移动端 UI 适配层（mobile.css + mobile.js）在位且为当前版本。
+        // 锚点 9：office 预览链（LibreOffice wasm 引擎 + 单文件 CJK 字体）。
         //
-        // 独立于锚点 8：适配层是纯静态资产，只改它时插件入口 lib/index.js 的
-        // 标记不动，锚点 8 会判「已是最新」而跳过重装 —— 真机上表现为「新写的
-        // 移动端布局完全没生效」。两份文件都要在，且都带同一个版本标记。
-        if (!File(root, MOBILE_UI_CSS).isFile || !File(root, MOBILE_UI_SCRIPT).isFile) {
-            Log.w(TAG, "runtime probe: mobile ui layer missing, forcing reinstall")
-            return false
-        }
-        if (!markerIsCurrent(root, MOBILE_UI_CSS, MOBILE_UI_MARKER)) {
-            Log.w(TAG, "runtime probe: mobile ui stylesheet outdated, forcing reinstall")
-            return false
-        }
-        if (!markerIsCurrent(root, MOBILE_UI_SCRIPT, MOBILE_UI_MARKER)) {
-            Log.w(TAG, "runtime probe: mobile ui script outdated, forcing reinstall")
-            return false
-        }
-
-        // 锚点 10：office 预览链（LibreOffice wasm 引擎 + 单文件 CJK 字体）。
-        //
-        // 这两份都是「新增资产」：老设备升级 APK 时 runtime 版本戳不变，前九
-        // 个锚点全通过 ⇒ isComplete() 判真 ⇒ 新资产永远不落地。真机踩过：手工
+        // 这两份都是「新增资产」：老设备升级 APK 时 runtime 版本戳不变，前面
+        // 的锚点全通过 ⇒ isComplete() 判真 ⇒ 新资产永远不落地。真机踩过：手工
         // push 的 wasm 包与字体在下次自愈重装后被整体删除，Office 预览回到
         // 「Office 预览不可用」。
         //
@@ -289,17 +271,33 @@ class RuntimeInstaller(private val ctx: Context) {
             }
         }
 
+        // 锚点 10：移动端 UI 插件（dsh-web-mobile）在位。
+        //
+        // 它是随 runtime 打包的第三方客户端插件（`dsh.client.platform === "web"`），
+        // 由 `dsh-client-modules` 扫 Loader entries 发现。缺了它的表现是
+        // 「手机上没有抽屉/全宽会话」——官方桌面布局原样呈现，不报错、不留日志，
+        // 属于最难排查的一类。判 package.json 而不是判 client.js：后者的文件名
+        // 由包自己决定（当前是 lib/client.js，但不保证不变）。
+        if (!File(root, MOBILE_PLUGIN_ENTRY).isFile || !File(root, MOBILE_PLUGIN_CLIENT).isFile) {
+            Log.w(TAG, "runtime probe: dsh-web-mobile plugin missing, forcing reinstall")
+            return false
+        }
+        if (!markerIsCurrent(root, MOBILE_PLUGIN_MARKER_FILE, MOBILE_PLUGIN_MARKER)) {
+            Log.w(TAG, "runtime probe: dsh-web-mobile plugin outdated, forcing reinstall")
+            return false
+        }
+
         // 锚点 11：构建期补丁集版本。
         //
-        // 前十个锚点探的全是**自有资产**（compat.js / modern.js / node-pty /
-        // kxxy-host / mobile.* / office 字体），而绝大多数补丁改的是**上游文件**
-        // —— documentpreview 的 client.js 与 client.pdf.js、libreoffice-kit、
-        // dsh-office-to-pdf …… 这些文件没有任何版本标记可探。
+        // 前面的锚点探的全是**自有资产**（compat.js / modern.js / node-pty /
+        // kxxy-host / office 字体 / dsh-web-mobile），而绝大多数补丁改的是
+        // **上游文件** —— documentpreview 的 client.js 与 client.pdf.js、
+        // libreoffice-kit、dsh-office-to-pdf …… 这些文件没有任何版本标记可探。
         //
         // 真机事故：给 documentpreview 补上 zip / epub 两个 provider、重建
         // runtime.zip 与 APK、装机重启后，设备上 `grep -c kxxyArchiveApply`
         // 仍是 0，logcat 里只有一句 `runtime already installed and complete`。
-        // 前十个锚点全部通过 ⇒ isComplete() 判真 ⇒ 新补丁根本没解出来。
+        // 前面的锚点全部通过 ⇒ isComplete() 判真 ⇒ 新补丁根本没解出来。
         //
         // 标记由 build-runtime.mjs 写在 kxxy-host 目录下（自有插件的地盘，
         // 不与上游文件抢路径）。改动 patches.mjs 里任何补丁、或增删补丁时，
@@ -746,20 +744,26 @@ class RuntimeInstaller(private val ctx: Context) {
         private const val HOST_PLUGIN_MARKER = "kxxy-host@5"
 
         /**
-         * 移动端 UI 适配层版本标记（锚点 9），写在 kxxy-host/web/mobile.css
-         * 与 mobile.js 首行（两份文件共用一个编号）。
+         * 移动端 UI 插件（第三方 dsh-web-mobile）版本标记（锚点 10）。
          *
-         * 独立于锚点 8 的原因：锚点 8 只探 lib/index.js，而适配层是纯静态
-         * 资产 —— 只改 mobile.css / mobile.js 时插件入口的标记不动，老设备
-         * 会带着旧适配层跳过重装，用户看到的是「新功能没生效」。两份文件都
-         * 必须存在且标记一致，改动其中任何一份都要同步递增编号。
+         * 为什么需要独立锚点：它是**随 runtime 打包的第三方包**，既不进
+         * `@deepseek-ai` 计数（锚点 4），也不属于 kxxy-host（锚点 5/8）。缺了它
+         * 的表现是「手机上仍是官方桌面布局」——不报错、不留日志，最难排查。
+         *
+         * 标记写成包根目录下的独立小文件（`plugin.version`），由
+         * build-runtime.mjs 写入（与那里的 MOBILE_PLUGIN_MARKER 逐字一致）。
+         * 不写在 package.json 里：那个文件要交给 `dsh-client-modules` 解析，
+         * 多一个未知字段虽然无害，但把它留给上游更省心。升级插件版本时，
+         * 两个常量必须一起递增。
          */
-        private const val MOBILE_UI_CSS = "lib/node_modules/kxxy-host/web/mobile.css"
-        private const val MOBILE_UI_SCRIPT = "lib/node_modules/kxxy-host/web/mobile.js"
-        private const val MOBILE_UI_MARKER = "kxxy-mobile-ui@3"
+        private const val MOBILE_PLUGIN_ENTRY = "lib/node_modules/dsh-web-mobile/package.json"
+        private const val MOBILE_PLUGIN_CLIENT = "lib/node_modules/dsh-web-mobile/lib/client.js"
+        private const val MOBILE_PLUGIN_MARKER_FILE =
+            "lib/node_modules/dsh-web-mobile/plugin.version"
+        private const val MOBILE_PLUGIN_MARKER = "kxxy-mobile-plugin@1"
 
         /**
-         * office 预览链版本标记（锚点 10），由构建期写入
+         * office 预览链版本标记（锚点 9），由构建期写入
          * `kxxy-host/fonts/office-assets.version`（与 build-runtime.mjs 的
          * OFFICE_FONTS_MARKER 逐字一致）。
          *

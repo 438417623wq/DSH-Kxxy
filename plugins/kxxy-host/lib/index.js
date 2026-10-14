@@ -171,72 +171,6 @@ function injectCompat(html) {
 }
 
 /**
- * 移动端 UI 适配层（样式 + 脚本），惰性读取后常驻。
- *
- * 见 web/mobile.css 与 web/mobile.js 头部说明。官方设置面板是 800px 双栏
- * 桌面布局，窄屏下塌成 175px 内容区，中文逐字竖排、模型卡片按钮溢出；
- * 官方左侧栏展开时是「硬挤第二列」，411px 下主内容只剩 131px。本层只做
- * 窄屏重排，CSS 全部规则包在 `@media (max-width: 767px)` 内，桌面视口下
- * 不产生任何影响。
- *
- * 走 inline `<style>`/`<script>` 而非外链：少一次往返、无 FOUC，且与
- * compat.js 的注入方式一致。样式表必须在官方样式**之后**求值才能覆盖，
- * 而 inline style 在 head 末尾天然满足（官方 CSS 由 <link> 在 head 前部引入）。
- */
-let cachedMobileCss = null
-
-function mobileCss() {
-  if (cachedMobileCss === null) {
-    try {
-      const raw = readFileSync(join(WEB_DIR, 'mobile.css'), 'utf8')
-      // inline style 内不得出现 `</style`，否则会提前闭合标签
-      cachedMobileCss = raw.replace(/<\/style/gi, '<\\/style')
-    } catch {
-      cachedMobileCss = ''
-    }
-  }
-  return cachedMobileCss
-}
-
-let cachedMobileScript = null
-
-function mobileScript() {
-  if (cachedMobileScript === null) {
-    try {
-      const raw = readFileSync(join(WEB_DIR, 'mobile.js'), 'utf8')
-      // inline script 内不得出现 `</script`，否则会提前闭合标签
-      cachedMobileScript = raw.replace(/<\/script/gi, '<\\/script')
-    } catch {
-      cachedMobileScript = ''
-    }
-  }
-  return cachedMobileScript
-}
-
-/**
- * 把移动端适配层插到 `</head>` 之前。
- *
- * 锚点选 `</head>` 而不是 `<head>` 开标签：样式必须晚于官方样式表出现，
- * 否则同权重规则会被官方覆盖回去。找不到 `</head>` 时退化为直接追加到
- * 文档开头 —— 移动端规则都带 !important，位置退让不会让它们失效。
- *
- * 脚本与样式放在同一个 tap 里：两者是同一个功能的两半，拆成两个 tap 只会
- * 让「顺序」变成一个需要额外维护的隐式契约（样式必须在脚本改 class 之前
- * 就位，否则会闪一帧未重排的布局）。
- */
-function injectMobileUi(html) {
-  const css = mobileCss()
-  const js = mobileScript()
-  let markup = ''
-  if (css !== '') markup += `<style data-kxxy-mobile>${css}</style>`
-  if (js !== '') markup += `<script data-kxxy-mobile-js>${js}</script>`
-  if (markup === '') return html
-  const at = html.toLowerCase().lastIndexOf('</head>')
-  if (at < 0) return `${markup}${html}`
-  return `${html.slice(0, at)}${markup}${html.slice(at)}`
-}
-
-/**
  * 判定请求是否来自可信浏览器。
  *
  * 复用官方 authorization 服务的判定（若可用）；不可用时退化为
@@ -770,11 +704,6 @@ export function apply(ctx) {
     // 31 恢复到 292，但 retry 仍继续）。
     const disposeCompat = ctx.webServer.tapIndex(injectCompat)
 
-    // ── 移动端 UI 适配层：窄屏重排官方设置面板 + 左侧栏抽屉 ─────────────
-    // 与兼容层同理，必须走 tapIndex 而不是 onPageFinished 里 evaluateJavascript
-    // —— 后者会让页面先以桌面布局渲染一帧再跳变（可见闪烁），且晚于首屏绘制。
-    const disposeMobile = ctx.webServer.tapIndex(injectMobileUi)
-
     // ── 静态资源：/kxxy/assets/* ─────────────────────────────────────
     // ⚠️ path 不能带尾斜杠：WebServer.match() 的判据是
     //     `pathname === prefix || pathname.startsWith(`${prefix}/`)`
@@ -1012,14 +941,13 @@ export function apply(ctx) {
       handler: renderPage,
     })
 
-    ctx.logger?.info?.('[kxxy-host] mounted: /kxxy (page), /kxxy/assets (prefix), /kxxy/api (prefix), index compat + mobile tap')
+    ctx.logger?.info?.('[kxxy-host] mounted: /kxxy (page), /kxxy/assets (prefix), /kxxy/api (prefix), index compat tap')
 
     return () => {
       disposePageSlash()
       disposePage()
       disposeApi()
       disposeAssets()
-      disposeMobile()
       disposeCompat()
     }
   })

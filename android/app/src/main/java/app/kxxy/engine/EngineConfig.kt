@@ -278,6 +278,8 @@ object EngineConfig {
         - insert:
             - id: kxxy-host
               name: kxxy-host
+            - id: dsh-web-mobile
+              name: dsh-web-mobile
     """.trimIndent() + "\n"
 
     /** 确保覆盖层文件存在且内容最新（幂等，内容比对后才写）。 */
