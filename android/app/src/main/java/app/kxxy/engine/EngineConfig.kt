@@ -278,8 +278,6 @@ object EngineConfig {
         - insert:
             - id: kxxy-host
               name: kxxy-host
-            - id: dsh-web-mobile
-              name: dsh-web-mobile
     """.trimIndent() + "\n"
 
     /** 确保覆盖层文件存在且内容最新（幂等，内容比对后才写）。 */
@@ -294,6 +292,80 @@ object EngineConfig {
 
     /** `$HOME/.bashrc`（用户 shell 初始化，非 runtime 资产，升级不触碰）。 */
     fun userShellInitFile(ctx: Context): File = File(dshHome(ctx), ".bashrc")
+
+    /** 官方 profile 目录（`$HOME/profiles/<name>/`；本宿主只用 `web`）。 */
+    fun profileDir(ctx: Context): File = File(dshHome(ctx), "profiles/web")
+
+    /** profile 的 `package.json`：官方插件页「已安装」列表的唯一数据源。 */
+    fun profileManifestFile(ctx: Context): File = File(profileDir(ctx), "package.json")
+
+    /**
+     * 把内置的移动端插件登记进 profile manifest，使其出现在官方插件页。
+     *
+     * 为什么必须写这个文件：官方「插件」页（`dsh-client-ui-plugin-manager`）的
+     * 「已安装」分组只认 `pluginManager.listBundles()` 的返回，而那个方法把
+     * `installed` 判成 **`.dependencies` 里有这个名字**、把 `enabled` 判成
+     * **`dsh.profile.bundles` 里有这个名字**。只往 overlay 里 `insert` 一个
+     * Loader entry 是不够的 —— 那样插件能跑，但页面上完全不显示，用户会以为
+     * 没装上。只有写进 profile，插件页才会给出「已安装」卡片与启停开关。
+     *
+     * 为什么不能交给上游：`dsh-app-boot` 的 `initProfile` 只在文件**不存在**时
+     * 写模板，设备上 profile 早已存在，永远不会被改写，所以只能由宿主补写。
+     *
+     * 覆盖规则：**读-改-写，只做「确保存在」**。用户通过插件页自行安装的插件
+     * 会写进同一个 `.dependencies`，绝不能整体覆盖 —— 那会把用户装的插件抹掉。
+     *
+     * 幂等：序列化结果与原文本一致时不写盘。
+     */
+    fun ensureProfileManifest(ctx: Context) {
+        runCatching {
+            val f = profileManifestFile(ctx)
+            val original = if (f.isFile) f.readText().replace("\uFEFF", "") else null
+            val json = if (original.isNullOrBlank()) {
+                org.json.JSONObject()
+                    .put("name", "dsh-profile-web")
+                    .put("private", true)
+                    .put("dependencies", org.json.JSONObject())
+                    .put(
+                        "dsh",
+                        org.json.JSONObject().put(
+                            "profile",
+                            org.json.JSONObject().put(
+                                "bundles",
+                                org.json.JSONArray()
+                                    .put("@deepseek-ai/dsh-base")
+                                    .put("@deepseek-ai/dsh-web-app"),
+                            ),
+                        ),
+                    )
+            } else {
+                org.json.JSONObject(original)
+            }
+
+            val dependencies = json.optJSONObject("dependencies") ?: org.json.JSONObject()
+            if (!dependencies.has(MOBILE_PLUGIN_NAME)) {
+                dependencies.put(MOBILE_PLUGIN_NAME, MOBILE_PLUGIN_VERSION)
+            }
+            json.put("dependencies", dependencies)
+
+            val dsh = json.optJSONObject("dsh") ?: org.json.JSONObject()
+            val profile = dsh.optJSONObject("profile") ?: org.json.JSONObject()
+            val bundles = profile.optJSONArray("bundles") ?: org.json.JSONArray()
+            var present = false
+            for (i in 0 until bundles.length()) {
+                if (bundles.optString(i) == MOBILE_PLUGIN_NAME) present = true
+            }
+            if (!present) bundles.put(MOBILE_PLUGIN_NAME)
+            profile.put("bundles", bundles)
+            dsh.put("profile", profile)
+            json.put("dsh", dsh)
+
+            val text = json.toString(2) + "\n"
+            if (text == original) return
+            f.parentFile?.mkdirs()
+            f.writeText(text)
+        }
+    }
 
     /**
      * 给官方终端补上「显示当前目录」的默认提示符。
@@ -353,4 +425,13 @@ object EngineConfig {
 
     /** 首行标记前缀，用于识别「这个 .bashrc 是我们写的」，避免覆盖用户自定义。 */
     private const val USER_SHELL_INIT_TAG = "# kxxy-shell@"
+
+    /**
+     * 内置移动端插件的包名与声明版本（见 build-runtime.mjs 的 MOBILE_PLUGIN_PKG）。
+     *
+     * 版本只用于写进 profile 的 `dependencies` —— 真实代码来自 runtime.zip 里那份
+     * 已解包的 `lib/node_modules/dsh-web-mobile`，不依赖 profile 目录做任何安装。
+     */
+    private const val MOBILE_PLUGIN_NAME = "dsh-web-mobile"
+    private const val MOBILE_PLUGIN_VERSION = "3.1.0"
 }

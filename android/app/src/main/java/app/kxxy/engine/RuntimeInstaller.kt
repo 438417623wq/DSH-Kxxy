@@ -58,7 +58,7 @@ class RuntimeInstaller(private val ctx: Context) {
     /**
      * 幂等安装。已安装且完整时立即返回。
      *
-     * 完整性判定用**八锚点探针**而非单一版本戳 —— 参考项目 m1.13 事故：
+     * 完整性判定用**十一锚点探针**而非单一版本戳 —— 参考项目 m1.13 事故：
      * 覆盖升级后 `@deepseek-ai` 目录只剩空壳（JS 文件未落地）但版本戳已写成功，
      * 于是「引擎存在 + 版本匹配」直接跳装，导致 MODULE_NOT_FOUND 反复重启。
      */
@@ -151,7 +151,7 @@ class RuntimeInstaller(private val ctx: Context) {
     }
 
     /**
-     * 九锚点完整性探针。
+     * 十一锚点完整性探针。
      *
      * 任一锚点缺失即认为需要重装。刻意不只看版本戳 —— 见方法注释上方的 m1.13 事故。
      */
@@ -704,7 +704,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 光判「文件存在」会让它们带着不含新补丁的旧兼容层跳过重装，症状
          * 静默复现。改动 compat.js 时必须同步递增此处的编号。
          */
-        private const val COMPAT_LAYER_MARKER = "kxxy-webview-compat@4"
+        private const val COMPAT_LAYER_MARKER = "kxxy-webview-compat@5"
 
         /** 兼容层脚本路径，锚点 6 与 [compatLayerIsCurrent] 共用。 */
         private const val COMPAT_LAYER_FILE = "lib/node_modules/kxxy-host/web/compat.js"

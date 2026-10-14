@@ -1,9 +1,12 @@
 /**
- * `plugins/kxxy-host/web/compat.js` 里 CSS 补丁的离线单测（缺陷 S / W）。
+ * `plugins/kxxy-host/web/compat.js` 里 CSS 补丁的离线单测（缺陷 S / W / AB）。
  *
- * 覆盖两段：
+ * 覆盖三段：
  *   [1] `dvh → vh`（Chrome 108+）—— 目录选择对话框列表空白。
  *   [2] `@scope` 展开（Chrome 118+）—— 侧边栏预览 .xlsx / .csv 时表格塌成单列。
+ *   [3] `:has()` 改写为标记属性（Chrome 105+）—— 内置移动端插件
+ *       `dsh-web-mobile` 的 301 处 `:has()` 全部被解析器整条丢弃，设置面板
+ *       于是维持桌面两栏布局（「权限」「语言」被挤成一字一行）。
  *
  * 做法：用 `vm` 造一个最小 DOM 沙箱（`document.querySelectorAll('style')` 返回
  * 我们塞进去的假节点），把**真实的 compat.js** 灌进去执行 —— compat.js 在求值
@@ -205,6 +208,76 @@ console.log("\n[5] 真实形态：excel 预览的 449 条规则全部被加前�
   );
   check("html 选择器也被加前缀（@scope 语义如此）", out.includes("[data-excel-preview] html::-webkit-scrollbar-button"), true);
 }
+
+console.log("\n[6] :has() 改写为标记属性（Chrome 105+）");
+// 真机形态：内置移动端插件把设置面板的适配规则全部锚在一个 :has() 门控上。
+// WebView 104 的不支持方式是「整条规则被解析器丢弃」（不是选择器不匹配），
+// 所以修法只能是文本层改写 —— 把 :has() 换成属性选择器，再用 MutationObserver
+// 在真实 DOM 上维护这个属性。
+check(
+  "尾随 :has() 换成属性选择器",
+  patch("div:has(span){color:red}"),
+  'div[data-kxxy-has~="h0"]{color:red}',
+);
+check(
+  "子代前导 :has() 同样改写",
+  patch("a:has(> b){color:red}"),
+  'a[data-kxxy-has~="h0"]{color:red}',
+);
+check(
+  ":not(:has()) 连 :not() 一起换成语义等价的否定",
+  patch("a:not(:has(b)){color:red}"),
+  'a:not([data-kxxy-has~="h0"]){color:red}',
+);
+check(
+  "同一复合选择器里的多个 :has() 各得一个标记",
+  patch(".a:has(b):has(c){color:red}"),
+  '.a[data-kxxy-has~="h0"][data-kxxy-has~="h1"]{color:red}',
+);
+check(
+  "不同复合选择器之间按出现顺序编号",
+  patch(".a:has(b) .c:has(d){color:red}"),
+  '.a[data-kxxy-has~="h0"] .c[data-kxxy-has~="h1"]{color:red}',
+);
+// ★ 真机决定性形态：内置插件设置面板的门控。标记按实参特异性重复，
+//   否则「[aria-modal=true] + 标记」的权重低于原「[aria-modal=true] + 后代后代按钮」。
+check(
+  "设置面板门控（真机形态）按特异性重复标记",
+  patch(
+    '[aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])):not([data-shortcut-modal="shortcuts"]){color:red}',
+  ),
+  '[aria-modal="true"][data-kxxy-has~="h0"][data-kxxy-has~="h0"]:not([data-kxxy-has~="h1"]):not([data-shortcut-modal="shortcuts"]){color:red}',
+);
+check(
+  "@media 内的 :has() 也被改写",
+  patch("@media (min-width:1px){ .a:has(b){color:red} }"),
+  '@media (min-width:1px){ .a[data-kxxy-has~="h0"]{color:red} }',
+);
+check(
+  ":is() 内部的 :has() 逐段改写",
+  patch(":is(.a:has(b), .c){color:red}"),
+  ':is(.a[data-kxxy-has~="h0"], .c){color:red}',
+);
+check(
+  "不含 :has() 的规则原样保留",
+  patch("p{color:blue}"),
+  "p{color:blue}",
+);
+check(
+  "@keyframes 内部原样保留（关键字里无 :has）",
+  patch("@keyframes k{ from{opacity:0} }"),
+  "@keyframes k{ from{opacity:0} }",
+);
+check(
+  "改写后不再含 :has(（幂等的前提）",
+  patch("div:has(span){color:red}").includes(":has("),
+  false,
+);
+check(
+  "第二次跑不变（此时已只有属性选择器）",
+  patch(patch("div:has(span){color:red}")),
+  'div[data-kxxy-has~="h0"]{color:red}',
+);
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);

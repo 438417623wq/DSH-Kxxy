@@ -347,6 +347,10 @@ class EngineSupervisor(private val ctx: Context) {
         // 官方终端以 `bash --rcfile <临时文件> -i` 启动，该 rcfile 首行会
         // source ~/.bashrc —— 这是唯一能给出「显示当前目录」提示符的挂点。
         EngineConfig.ensureUserShellInit(ctx)
+        // 内置的移动端插件只有写进 profile manifest，官方「插件」页才会把它
+        // 列进「已安装」并给出启停开关（overlay 里 insert 的 Loader entry
+        // 能跑但不显示，见 EngineConfig.ensureProfileManifest 的说明）。
+        EngineConfig.ensureProfileManifest(ctx)
     }
 
     /**
