@@ -65,7 +65,9 @@ dsh-kxxy/
 │   ├── lib/index.js              路由 + API
 │   └── web/                      管理页 HTML/CSS/JS（含 compat.js 兼容层）
 │       ├── compat.js             旧 ROM WebView 兼容层（缺陷 I/J/R/W/AC/AD）
-│       └── modern.js             现代内建补齐层（页面 + blob worker/iframe）
+│       ├── modern.js             现代内建补齐层（页面 + blob worker/iframe）
+│       └── （只有 index.html + host.css + host.js + theme.css；
+│             v0.1.0 的 harness-*.html 设计稿快照已删，见 `assemble.mjs` 的过滤）
 ├── tools/                        构建与验证工具链
 │   ├── fetch-runtime.mjs         拉取 Termux aarch64 deb 包
 │   ├── build-runtime.mjs         装配 runtime.zip（8 个阶段）
@@ -146,8 +148,8 @@ cd android
 | 6 | 注入 | corepack 包装器 + `kxxy-host` 插件 + 悬空 LINK 清扫 |
 | 6.5 | 打包引擎资产 | LibreOffice wasm 引擎（49 文件，剥离 `os` 字段）+ 两份 CJK 字体 |
 | 6.6 | 打包移动端插件 | 第三方 `dsh-web-mobile`（209 文件）整包塞进 `lib/node_modules/`（它进「已安装」列表靠的是启动时 `EngineConfig.ensureProfileManifest` 写 profile manifest，见缺陷 AB） |
-| 7 | 合并 | 目录 3657 / 文件 30325 / LINK 1560（未压缩 1.43 GiB） |
-| 8 | 写出 | 条目 35,543，zip 557.96 MiB |
+| 7 | 合并 | 目录 3657 / 文件 30321 / LINK 1560（未压缩 1.43 GiB） |
+| 8 | 写出 | 条目 35,539，zip 557.88 MiB |
 
 ### 17 个兼容补丁
 
@@ -173,7 +175,7 @@ cd android
 
 ---
 
-## 五、移植过程中发现并修掉的 30 个真实缺陷
+## 五、移植过程中发现并修掉的 33 个真实缺陷
 
 这些都是**只在真机/端到端路径上才会暴露**的问题，构建全绿时完全看不出来：
 
@@ -210,6 +212,10 @@ cd android
 | AC | 旧 ROM WebView 不支持 `:has()`（Chrome 105） | 内置插件 `dsh-web-mobile` 的样式表在真机上被解析器**成片丢弃** —— 278,723 字符的表只解析出 **39 条**顶层规则，设置面板仍是桌面两栏布局、「权限」「语言」「字号大小」逐字竖排，症状与缺陷 O 一模一样，极易误判成「插件根本没装上」 | 真机探针：`CSS.supports('selector(div:has(span))')` 为 **false**，注入三条规则只有不带 `:has()` 的那条存活；插件表里 `:has(` 出现 **301** 次，遍历 CSSOM 得到的 `selectorText` 含 `:has(` 的规则 **0 条**。修复：在 `compat.js` 里把 `:has(X)` 于 **CSS 文本层**改写为属性选择器 `[data-kxxy-has~="hN"]`（按实参特异性重复若干次以补齐权重），再用 `MutationObserver` 在真实 DOM 上维护标记 —— 由子代/兄弟/后代三种前导分别精确求值（`E:has(A B)` ⇔ E 是匹配 `A B` 元素的祖先；`E:has(> A B)` 再用 `:scope >` 验证；`+`/`~` 走 `previousElementSibling`；`:not(:has(X))` 必须精确故一律回落到 `matches()` 过滤）；递归进 `@media`/`@supports`/`@layer`/`@container`，`@keyframes`/`@font-face` 内部原样保留。修后真机复测：`rewrittenTags=17`、插件表 `remainHas` 从 **301 降到 22**、注入标记 **339 个**、**27 个元素**带标记、CSSOM 里 **189 条**规则恢复生效，设置面板变成移动端布局。**中途踩的最深的坑**：垫片里调用的 `matchParen` **从未定义**（全文 5 处调用、0 处定义），首次调用即抛 `ReferenceError`，而 `patchAllStyles()` 没有任何异常隔离 ⇒ 异常冒泡把 `observeStyles()` 一起带崩，**整层 CSS 改写（包括 v0.1.6 已验收过的 `dvh` 与 `@scope`）全部静默失效**；补上 `matchParen` 并给 `patchStyleTag` 加 `try/catch` 后才恢复。三条可复用教训：① 探针必须 `setTimeout` **延时**（15 s / 30 s）才看得到插件 append 之后的样式表，同步探针读到 `styleTags=0` 是假阴性；② 一个未定义标识符足以让整层适配静默失效，「改了没效果」要先去查有没有异常，而不是先怀疑选择器写错；③ Android WebView 未开 `setWebContentsDebuggingEnabled`、`onConsoleMessage` 又收不到未捕获异常 ⇒ **logcat 干净不能证明没有 JS 报错** |
 
 | AD | 内置插件的 CSS 锚点锁死在宿主**旧代** class hash 上 | 对话界面右上角**多出一个侧栏图标** —— 插件自己的「文件浏览」按钮与宿主的「打开右侧边栏」按钮**重叠绘制**成一个「文件夹 + 双栏框」的怪图标；「开始」空态页顶栏本该有的三枚按钮**全部消失**。用户 m19951（逐字）：「你看对话界面右上角，我给你发的图片是正常的渲染，怎么现在给到的结果会多一个侧边栏图标呢，还有第二个人界面也不对，是不是插件没完全挂载啊」，随后 m20235 给出正确判据：「这个是我让你内置的插件，按道理插件只要完全生效，这些问题是不会出现的」 | 新版官方前端给每个 CSS module 生成**随机 hash 前缀**（本次为 `Dc7zOa_`），而 `dsh-web-mobile` 是按某一代宿主构建的，选择器里写死了那一代的 hash —— 真机实测插件样式表 **451 条规则里 320 条** `selectorText` 在 DOM 上零命中。其中要命的是插件用来**隐藏宿主 headerCorner** 的那条 `… header:has([class*="_headerLeading"]) [class*="wSkVaW_titleRow"] > [class*="_headerCorner"] { display: none !important }`（`layout.css.ts:2027-2035`，注释明确写着「新宿主把右侧栏入口放进了 titleRow 的 headerCorner，和插件的文件按钮是同一个面板的两个入口」，其**上一代写法** `wSkVaW_titleRow` 与真机的 `Dc7zOa_titleRow` 不匹配 ⇒ 整条失效 ⇒ 宿主按钮没被隐藏，与插件按钮叠在一起）。插件作者自己也知道这批锚点「代际脆弱」——`docs/upstream/compat-contracts.json` 里 28 条契约每条都标了 owner 包名与 `lazy` 标记，另备了一批结构化 marker 作兜底。**为什么不能改成「补样式」**：用户要的是「插件完全生效」，手工补规则只能治眼前这一处，宿主再升级一次又要补；正解是**把插件写死的旧代 hash 在运行时归一化到宿主当前代**。修复：`compat.js` 新增第 4 段（在 `dvh` / `@scope` / `:has(` **之前**）—— `hashScan` 从插件样式表收集旧锚点的**后缀集合**，`hashLivePrefixes` 只从 `style[data-plugin^="@deepseek-ai/"]` 的**宿主样式表**（带完整类名清单，比当前 DOM 全）取候选代，**后缀集合被候选完整包含且候选唯一**才建立映射（模糊宁可不映射 —— 真机上 `QsffPG_root` 有 23 个候选，按设计放弃），随后 `hashRewrite` 把 `[class*="OLD_` 与 `.OLD_` 两种写法一并替换。映射建立后主动调一次 `patchAllStyles()`，并挂 300 ms 去抖的 `MutationObserver`（`attributeFilter: ['class']`，上限 40 轮）跟随宿主渐进渲染。**两个关键细节**：① `hashLivePrefixes()` 必须只认 `@deepseek-ai/` 前缀的样式表 —— 插件自己那张表也带 hash，混进来会把锚点「并到同代」；② 判据用**唯一超集**而非最大交集 —— 只按交集打分会让 `_root` / `_label` 这类常见后缀成群误配。**定位手法（可复用）**：症状是「多出一个图标 / 少了一排图标」，第一直觉会去查插件是不是没挂载；正确的第一步是**把「插件样式表里有多少条规则在 DOM 上零命中」打出来**（探针遍历 `style[data-plugin]` 的 `cssRules` 逐个 `document.querySelector(selectorText)`），再对每条零命中规则提取 `[class*="H_s"]` 里的 `H_s`，按「后缀集合 ⊆ 宿主某个模块的前缀后缀集合」反查 owner 包 —— 一眼就能看出是**整代 hash 全都对不上**，而不是某条选择器写错 |
+
+| AE | 控制台扩展页的信息架构自相矛盾，且展开态每 5 秒被抹掉 | ① 页顶挂着「镜像源加速」卡，而本页扩展**全部**来自 APK 内置包池（每张卡都写着「内置包池 · 零联网」）—— 用户原话：「现在好像完全内置了，上方那个，镜像源加速为我去除……现在没有下载入口，但是又有这个镜像源，这不是很冲突吗？」；②「已激活」分组点开后再看，自己折叠回去了 —— 用户原话：「我展开以后，他会自动折叠，你点击这个展开，他又自动折叠，这不行」 | ② 是纯状态管理 bug：`renderExtensions()` 开头就 `dom.extensionsList.innerHTML = ''` 重建整个 DOM，而 `startPolling()` 每 `POLL_INTERVAL = 5000` ms 调一次 `fetchExtensions()`，展开态只存在 DOM 的 `class="collapsed"` 上 ⇒ 最多 5 秒就被重置。修复：模块级 `const expandedGroups = new Set()` 记住展开的分组 key，渲染时按它决定是否加 `collapsed`，点击时同步增删，并用 `title.classList.toggle('expanded', …)` 驱动 CSS 里的 `▸/▾` 箭头。① 不是 bug 而是**放错了位置**：镜像源的真实用途是给官方插件页的「+ 添加插件」（`ctx.remote.pluginManager.installBundle`）下载第三方插件时加速，它服务的是**对话页**而不是内置扩展页。修法：把整张卡（连同 `#mirror-results`，**id 一个不改**，`host.js` 的 `initMirrorActions`/`fetchMirror` 零改动）搬到「设置」页，扩展页原位换成一句 `.builtin-note-card` 说明「全部内置 · 零联网，要装第三方插件请去对话页侧栏 →「插件」→「+ 添加插件」」。**为什么不是按字面「删除」**：用户原话给了「去除，或者……给我添加一个下载入口」二选一，而下载入口官方**早就有**（`dsh-client-ui-plugin-manager` 的 `installSpecLabel: "包名或地址"` / `installSpecPlaceholder: "例如 dsh-plugin-whale-pet"`），只是它在对话页侧栏而不在控制台 —— 直接删掉镜像源会让那个入口失去加速能力，所以保留能力、消除误导 |
+| AF | 控制台「终端」页是伪终端（只是 `engine.log` 的尾巴查看器） | 页面上有 `.terminal-container`、`.terminal-bar`、`.terminal-viewport`、六个快捷键按钮，看起来像终端，实际只能看日志、不能输入 —— 用户原话：「这个控制台的终端界面好像完全没用呀，直接为我去除」 | 该视图的全部能力是 `fetchLog()` 的 `GET /kxxy/api/log` 轮询 + `initTerminalActions()` 的 `term-key` 按钮（`POST /kxxy/api/action {action:'term-key'}`，往引擎 PTY 写一个键），**没有任何输入通道**。真终端在对话页侧栏（官方 `sidebar-terminal`），控制台这个页签只会让人以为「终端坏了」。修复：整体删除 —— `index.html` 的 `data-view="terminal"` 整段与底部 tabbar 的对应按钮、`host.js` 的 `renderAnsi`/`fetchLog`/`scrollTerminalToBottom`/`initTerminalActions`/`prefersReducedMotion` 与 `dom` 表里的五个引用、`host.css` 的整段终端样式（含 16 条 `--term-*` 变量）与 `.shell-diag-card`。**顺带清掉一个只服务于该页签的隐患**：原 `renderShellDiagnostics()` 在发现 `localStorage['dsh.terminal.shell']` 是失效值时，会弹 toast 让用户「到终端页一键清除」—— 页签没了就没有这个入口了，改成 `repairShellCache()` **静默自愈**：判据仍是「值必须在引擎根下且 basename 是已知 shell」，不满足就直接 `removeItem` 并提示已自动清理 |
+| AG | 权限卡的长徽章把标题列挤成逐字竖排 | Root 卡的文字**一行一个字**竖直排列（「经 / su / 整 / 体 / 提 / 权 / 启 / 动 / 引 / 擎」），Shizuku 卡却正常 | `.priv-card-head` 是 `display:flex` 且**不换行**，`.priv-badge` 又是 `flex-shrink: 0; white-space: nowrap` ⇒ 徽章宽度完全不可压缩。Shizuku 徽章「不可用 · 未检测到 Shizuku 管理器」在 412px 竖屏下勉强放得下，Root 徽章「不可用 · 未检测到可用的 su（需 Magisk / KernelSU）」更长 ⇒ 徽章把 `.priv-titles` 挤到 `min-width: 0` 允许的最小宽度，中文于是逐字换行成一列。修复：`.priv-card-head` 加 `flex-wrap: wrap`，`.priv-titles` 改 `flex: 1 1 60%; min-width: 8em`，`.priv-badge` 改 `flex-shrink: 1; max-width: 100%; white-space: normal; overflow-wrap: anywhere` —— 徽章先尝试与标题同行，放不下就整块掉到下一行。**合成复现为什么失败、真机探针为什么成功**（可复用教训）：用无头 Chrome 按 412px 宽复现时，旧 CSS 只量到 `titlesW=130.6`，**复现不出竖排** —— 因为合成页面里 `.priv-card` 直接是 `body` 的子元素、吃满了整屏宽度；真机上它嵌在 `.view-pane > .card > .priv-cards` 三层 padding 里，可用宽度只有 **350.2px**。改在真机页面里注入探针（`probe-priv.js`，先切到设置视图再量，因为非激活视图是 `display:none` 会量到 0）才拿到决定性对照：旧 CSS `titlesW=0, titlesH=527, vertical=true`，新 CSS `titlesW=285.2, titlesH=56, vertical=false`。**教训：布局类缺陷的合成复现必须复刻真实容器的宽度链路，否则「复现不出」会被误读成「不是这个原因」** |
 
 **关于缺陷 Q 的额外结论（终端功能本身是好的）**：`dsh.terminal.shell` 这个键**已被官方废弃** —— 在四个运行时 bundle（`sidebar-terminal` / `client.terminal` / `terminal-bash` / `terminal`）里对 `/terminal\.shell/` 与 `/localStorage/` 的命中数**都是 0**；官方新建终端走 `webTerminals.selectShell(path)` → 开 tab 时把 `shellPath` 作为参数传下去（`terminal-bash` 的默认值是 `DEFAULT_BASH_SHELL = "/bin/bash"`，可被 `config.shellPath` 覆盖，而该配置由引擎侧注入）。所以那张卡显示的 `bin/cmd` 只是**历史遗留值**，不影响终端；真机上终端本身工作正常（`bash-5.3$` 提示符、`uname -a` 正常），即缺陷 K 的修复仍然有效。对照实验也证明**官方终端天然跟随主题**：浅色下 `.xterm-viewport` 背景透明、文字 `rgb(15,17,21)`，官方 `sidebar-terminal` 插件全部用 `var(--dsw-alias-*)` 官方 token。
 

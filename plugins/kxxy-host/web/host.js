@@ -48,11 +48,6 @@
     devtools: '开发工具'
   };
 
-  // 检测减少动效偏好
-  const prefersReducedMotion = () => {
-    return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  };
-
   // ==========================================
   // DOM 元素引用
   // ==========================================
@@ -90,19 +85,11 @@
     btnExtBatchRemove: document.getElementById('btn-ext-batch-remove'),
     categoryChips: document.querySelectorAll('.category-chip'),
 
-    // 终端视图元素
-    terminalViewport: document.getElementById('terminal-viewport'),
-    terminalCodeStream: document.getElementById('terminal-code-stream'),
-    btnTermClear: document.getElementById('btn-term-clear'),
-    btnTermRefresh: document.getElementById('btn-term-refresh'),
-    termKeys: document.querySelectorAll('.term-key'),
-
     // 设置视图元素
     privCards: document.getElementById('priv-cards'),
     privModeDescription: document.getElementById('priv-mode-description'),
     btnPrivApply: document.getElementById('btn-priv-apply'),
     appearanceList: document.getElementById('appearance-list'),
-    shellDiagBody: document.getElementById('shell-diag-body'),
     permList: document.getElementById('perm-list'),
     toggleForeground: document.getElementById('toggle-foreground'),
     toggleWatchdog: document.getElementById('toggle-watchdog'),
@@ -171,28 +158,6 @@
     if (n <= 0) return '';
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
     return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  }
-
-  function renderAnsi(text) {
-    if (!text) return '';
-    let escaped = escapeHtml(text);
-
-    // 标准 ANSI 常用颜色码转换
-    escaped = escaped
-      .replace(/\x1b\[31m([\s\S]*?)\x1b\[0m/g, '<span style="color:var(--accent-red)">$1</span>')
-      .replace(/\x1b\[32m([\s\S]*?)\x1b\[0m/g, '<span class="ansi-green">$1</span>')
-      .replace(/\x1b\[33m([\s\S]*?)\x1b\[0m/g, '<span class="ansi-yellow">$1</span>')
-      .replace(/\x1b\[36m([\s\S]*?)\x1b\[0m/g, '<span class="ansi-cyan">$1</span>')
-      .replace(/\x1b\[\d+(?:;\d+)*m/g, ''); // 移除剩余 ANSI 代码
-
-    // 关键字语义词法高亮
-    escaped = escaped
-      .replace(/(\[dsh(?:-[a-zA-Z0-9]+)?\]|\[agent\])/g, '<span class="ansi-cyan">$1</span>')
-      .replace(/(\[boot\]|\bWARN(?:ING)?\b)/g, '<span class="ansi-yellow">$1</span>')
-      .replace(/(\[http\]|\bSUCCESS\b|\bOK\b)/g, '<span class="ansi-green">$1</span>')
-      .replace(/(\bERR(?:OR)?\b|\bFAIL(?:ED)?\b|\[error\])/gi, '<span style="color:var(--accent-red)">$1</span>');
-
-    return escaped;
   }
 
   function getExtBadgeInfo(id) {
@@ -291,11 +256,6 @@
             pane.classList.remove('active');
           }
         });
-
-        // 切换到终端视图时自动滚动到底部
-        if (targetView === 'terminal') {
-          scrollTerminalToBottom();
-        }
       });
     });
   }
@@ -379,9 +339,10 @@
       if (dom.privCards) {
         renderPrivCards(engine);
       }
-      // 6) 系统权限卡片 + 终端 shell 诊断
+      // 6) 系统权限卡片
       renderPermissions(engine);
-      renderShellDiagnostics(runtime.engineRoot);
+      // 终端 shell 缓存自愈（原「终端」页已删，这里静默处理）
+      repairShellCache(runtime.engineRoot);
     } catch {
       // 错误已在 apiGet 中通过 showToast 提示
     }
@@ -429,7 +390,7 @@
   }
 
   /**
-   * 终端 shell 诊断卡（三轮②）。
+   * 终端 shell 缓存的静默自愈（原「终端」页的诊断卡已随该页删除）。
    *
    * ⚠ 关于 `dsh.terminal.shell` 这个键：它**已被官方前端废弃**。
    * 在运行时 bundle 里逐文件统计（sidebar-terminal / client.terminal /
@@ -437,88 +398,34 @@
    * 的命中数都是 0 —— 官方当前版本根本不读这个键。官方新建终端走的是
    * `webTerminals.selectShell(path)` → 打开 tab 时把 `shellPath` 作为参数传下去。
    *
-   * 所以这张卡的定位是「历史遗留缓存的清理入口」，不是「终端故障的唯一解释」。
-   * 早期版本的判据只有 `cached.startsWith(engineRoot + '/')`，于是引擎 bin 目录下的
-   * **任何**可执行文件都算「有效」—— 实测设备上缓存着 `…/engine/bin/cmd`
-   * （那是 Android 的 `cmd` 服务工具，`cmd --help` 报 "Can't find service"，
-   * 完全不是 shell），卡片却显示「✓ 缓存有效」，误导用户以为终端没问题/问题在此。
-   * 现在判据收紧到「必须是已知 shell 的可执行文件名」。
+   * 但早期版本写过这个键，而失效值会让「新建终端」持续失败。实测设备上曾缓存
+   * `…/engine/bin/cmd`（Android 的 `cmd` 服务工具，`cmd --help` 报
+   * "Can't find service"，完全不是 shell）。以前靠用户点卡片清除；现在改为
+   * 打开控制台时直接判定并自动清掉，用户无感。
    */
   const SHELL_CACHE_KEY = 'dsh.terminal.shell';
   /** 引擎 bin/ 下真正的 shell（实测清单：ash 4320B / bash 880416B / dash 117040B / sh 117040B）。 */
   const KNOWN_SHELLS = ['bash', 'sh', 'dash', 'ash', 'zsh', 'fish'];
-  let shellWarnShown = false;
 
-  function shellCacheState(engineRoot) {
+  function repairShellCache(engineRoot) {
     let cached = null;
     try {
       cached = localStorage.getItem(SHELL_CACHE_KEY);
     } catch {
-      cached = null;
+      return; // 隐私模式等场景下 localStorage 不可用，直接跳过
     }
-    if (!cached) return { cached: null, valid: null, reason: '未缓存（新建终端将使用引擎默认 shell）' };
-    if (!engineRoot) return { cached, valid: null, reason: '引擎根目录未知，无法校验' };
-    const inEngine = cached.startsWith(engineRoot + '/');
+    if (!cached) return;
+
+    const inEngine = engineRoot ? cached.startsWith(engineRoot + '/') : false;
     const base = cached.slice(cached.lastIndexOf('/') + 1).toLowerCase();
-    const isShell = KNOWN_SHELLS.includes(base);
-    const valid = inEngine && isShell;
-    return {
-      cached,
-      valid,
-      reason: valid
-        ? '缓存指向引擎自带的 shell'
-        : !inEngine
-          ? '缓存路径不在引擎目录内（多半是 SHELL 修复前留下的旧路径）'
-          : `缓存指向的不是 shell（${base}），新建终端会失败`,
-    };
-  }
+    if (inEngine && KNOWN_SHELLS.includes(base)) return; // 缓存有效，不动
 
-  function renderShellDiagnostics(engineRoot) {
-    if (!dom.shellDiagBody) return;
-    const st = shellCacheState(engineRoot);
-    dom.shellDiagBody.innerHTML = '';
-    const div = document.createElement('div');
-    div.className = 'setting-row';
-
-    if (st.cached === null) {
-      div.innerHTML = `
-        <div class="setting-info">
-          <span class="setting-title">✓ 未缓存 shell</span>
-          <span class="setting-desc">新建终端将使用引擎自带的 bash（${escapeHtml(engineRoot || '<engineRoot>' )}/bin/bash）</span>
-        </div>
-      `;
-    } else if (st.valid === true) {
-      div.innerHTML = `
-        <div class="setting-info">
-          <span class="setting-title">✓ ${escapeHtml(st.reason)}</span>
-          <span class="setting-desc code-font">${escapeHtml(st.cached)}</span>
-        </div>
-      `;
-    } else {
-      div.innerHTML = `
-        <div class="setting-info">
-          <span class="setting-title" style="color:var(--accent-red)">⚠ ${escapeHtml(st.reason)}</span>
-          <span class="setting-desc code-font">${escapeHtml(st.cached)}</span>
-          <span class="setting-desc">这是早期版本留下的缓存；不清除的话「新建终端」会一直用它并失败。</span>
-        </div>
-      `;
-      const btn = el('<button class="button button-warning button-sm">清除缓存</button>');
-      btn.addEventListener('click', () => {
-        try {
-          localStorage.removeItem(SHELL_CACHE_KEY);
-        } catch { /* 隐私模式等场景 */ }
-        showToast('已清除终端 shell 缓存，回到对话界面重新打开/新建终端即可', 'success');
-        renderShellDiagnostics(engineRoot);
-      });
-      div.appendChild(btn);
+    try {
+      localStorage.removeItem(SHELL_CACHE_KEY);
+    } catch {
+      return;
     }
-    dom.shellDiagBody.appendChild(div);
-
-    // 进入控制台后提示一次（不强制清除）
-    if (st.valid === false && !shellWarnShown) {
-      shellWarnShown = true;
-      showToast('检测到终端 shell 缓存失效（新建终端会失败的常见原因），请到「终端」页一键清除', 'warning');
-    }
+    showToast('已自动清理失效的终端 shell 缓存（旧值会让新建终端失败）', 'success');
   }
 
   /**
@@ -603,6 +510,16 @@
   /** 当前渲染的条目（id → item），供全选/批量操作使用。 */
   let renderedItems = [];
 
+  /**
+   * 折叠分组的展开态（groupKey → true 表示用户展开过）。
+   *
+   * ⚠ 必须存在模块级：`renderExtensions` 每次都会把整个列表 `innerHTML = ''`
+   * 重建，而 `fetchExtensions` 每 5 秒被轮询调一次 —— 展开态若只存在 DOM 的
+   * class 上，用户点开「已激活」后最多 5 秒就会被重建回 `collapsed`，
+   * 表现为「展开了又自己折叠回去」。这里记住用户意图，渲染时恢复。
+   */
+  const expandedGroups = new Set();
+
   function renderExtensions(data) {
     if (!dom.extensionsList) return;
     const items = Array.isArray(data.items) ? data.items : [];
@@ -648,10 +565,18 @@
 
       const body = document.createElement('div');
       body.className = 'ext-group-body';
-      if (group.collapsible) body.classList.add('collapsed');
-      // 已激活组：点标题展开/收起（其余组保持常开）
+      // 已激活组：默认折叠，但恢复用户上次的展开态（见 expandedGroups 注释）
       if (group.collapsible) {
-        title.addEventListener('click', () => body.classList.toggle('collapsed'));
+        if (!expandedGroups.has(group.key)) body.classList.add('collapsed');
+        title.classList.add('clickable');
+        if (!body.classList.contains('collapsed')) title.classList.add('expanded');
+        title.addEventListener('click', () => {
+          body.classList.toggle('collapsed');
+          const nowExpanded = !body.classList.contains('collapsed');
+          if (nowExpanded) expandedGroups.add(group.key);
+          else expandedGroups.delete(group.key);
+          title.classList.toggle('expanded', nowExpanded);
+        });
       }
 
       group.items.forEach(ext => body.appendChild(renderExtCard(ext, group.collapsible)));
@@ -947,7 +872,7 @@
   }
 
   // ==========================================
-  // 4. 镜像源：真实测速 + 真实切换
+  // 4. 镜像源：真实测速 + 真实切换（卡片已移到「设置」页，逻辑不变）
   // ==========================================
   async function fetchMirror() {
     try {
@@ -1024,70 +949,10 @@
   }
 
   // ==========================================
-  // 5. 终端日志系统 (fetch('/kxxy/api/log'))
-  // ==========================================
-  async function fetchLog() {
-    if (!dom.terminalCodeStream) return;
-    try {
-      const data = await apiGet('/kxxy/api/log');
-      if (data && typeof data.tail === 'string') {
-        dom.terminalCodeStream.innerHTML = renderAnsi(data.tail) || '<span style="color:var(--text-muted)">（暂无日志输出）</span>';
-        scrollTerminalToBottom();
-      }
-    } catch {
-      // 终端日志拉取失败静默通知
-    }
-  }
-
-  function scrollTerminalToBottom() {
-    if (!dom.terminalViewport) return;
-    const reduce = prefersReducedMotion();
-    dom.terminalViewport.scrollTo({
-      top: dom.terminalViewport.scrollHeight,
-      behavior: reduce ? 'auto' : 'smooth'
-    });
-  }
-
-  function initTerminalActions() {
-    if (dom.btnTermClear && dom.terminalCodeStream) {
-      dom.btnTermClear.addEventListener('click', () => {
-        dom.terminalCodeStream.textContent = '';
-        showToast('终端显示已清空', 'info');
-      });
-    }
-
-    if (dom.btnTermRefresh) {
-      dom.btnTermRefresh.addEventListener('click', async () => {
-        dom.btnTermRefresh.textContent = '刷新中';
-        await fetchLog();
-        dom.btnTermRefresh.textContent = '刷新';
-        showToast('日志已刷新', 'success');
-      });
-    }
-
-    dom.termKeys.forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const key = btn.getAttribute('data-key');
-        if (key === 'clear') {
-          if (dom.terminalCodeStream) dom.terminalCodeStream.textContent = '';
-          showToast('终端已清空', 'info');
-        } else {
-          // 真通道：后端把按键写进 stdin.request，原生层写进引擎 PTY（约 1 秒延迟）
-          try {
-            await apiPost('/kxxy/api/action', { action: 'term-key', key });
-          } catch {
-            // 容错
-          }
-        }
-      });
-    });
-  }
-
-  // ==========================================
-  // 6. 动作按钮与交互控制
+  // 5. 动作按钮与交互控制
   // ==========================================
   // ==========================================
-  // 5. 权限等级：模式卡片组（三轮③）
+  // 权限等级：模式卡片组（三轮③）
   // ==========================================
 
   /** 当前选中的模式（null = 未选择，按钮禁用）。 */
@@ -1283,7 +1148,7 @@
     if (dom.btnQuickRefresh) {
       dom.btnQuickRefresh.addEventListener('click', async () => {
         showToast('正在刷新状态...', 'info');
-        await Promise.all([fetchState(), fetchLog(), fetchExtensions(), fetchMirror()]);
+        await Promise.all([fetchState(), fetchExtensions(), fetchMirror()]);
         showToast('数据已更新', 'success');
       });
     }
@@ -1367,10 +1232,8 @@
   function startPolling() {
     if (pollTimer) return;
     fetchState();
-    fetchLog();
     pollTimer = setInterval(() => {
       fetchState();
-      fetchLog();
       // 扩展列表一并刷新（有安装任务时 renderExtensions 会自动跳过）
       fetchExtensions();
     }, POLL_INTERVAL);
@@ -1404,7 +1267,6 @@
 
     initTabSwitch();
     initCategoryFilter();
-    initTerminalActions();
     initActionButtons();
     initMirrorActions();
     initBatchActions();

@@ -73,7 +73,7 @@ const PTY_NODE_MARKER = "kxxy-pty-node@1";
  * 于是「改了 host.js / lib/index.js 却只重装 APK」的设备一直跑旧插件，
  * 且七锚点全通过、永不重装。标记写在插件入口 lib/index.js 首行。
  */
-const HOST_PLUGIN_MARKER = "kxxy-host@5";
+const HOST_PLUGIN_MARKER = "kxxy-host@6";
 
 /**
  * 与 RuntimeInstaller.MOBILE_PLUGIN_MARKER 保持一致（锚点 10）。

@@ -395,8 +395,13 @@ export function readClosureInto(asar, closure, out) {
  * 里（见 patches.mjs 的 patchDshManifest），它就会以 scope="installation" 进入
  * `resolution.entries`，此后**任何** profile 层的 import 都会被拦截到它。
  *
- * 排除 `_preview.html`：那是设计稿预览页（用 iframe 拼四个 harness-*.html），
- * 不参与运行时，留在包里只会让 verify 的条目数对不上设计。
+ * 排除 `_preview.html` 与 `harness-*.html`：设计稿阶段的产物，已于 v0.2.0
+ * 从仓库删除（`_preview.html` 用 iframe 拼四个 `harness-*.html`，那四个各自
+ * 内嵌一份**冻结的** host.js / host.css 副本，永远不会被 `/kxxy` 路由引用）。
+ * 留着它们只会让「改了 host.js 但设备上还是老界面」这类排查变得困难 ——
+ * 改一处、看另一处。真机产物只需 index.html。
+ *
+ * 这里仍保留过滤，是为了防止有人把旧快照从 git 历史里捡回来又忘了它不生效。
  */
 export function readPluginFiles(pluginDir, out, zipBase = ZIP_NM) {
   const skip = new Set(["_preview.html"]);
@@ -412,6 +417,7 @@ export function readPluginFiles(pluginDir, out, zipBase = ZIP_NM) {
         continue;
       }
       if (!st.isFile() || skip.has(name)) continue;
+      if (/^harness-.*\.html$/.test(name)) continue;
       const zipPath = `${base}${rel}`;
       if (out.has(zipPath)) throw new Error(`插件条目与既有条目冲突：${zipPath}`);
       out.set(zipPath, { data: readFileSync(full), mode: 0o644 });

@@ -32,36 +32,9 @@ body {
 
   /* 顶栏/底栏的半透明底（跟随主题；老 WebView 不支持 color-mix，给两套字面量） */
   --bg-overlay: rgba(249, 250, 251, 0.86);
-
-  /* 终端配色（浅色）。
-     ⚠ 终端必须跟随主题，不能像早期版本那样硬编码深底：
-     容器底写死 #151517 而内部文字/按钮用语义变量（--text-secondary、
-     --bg-card 等），浅色主题下这些变量翻成「深灰字、白底」，画在深底上
-     就出现两个刺眼症状——终端里嵌一张纯白诊断卡、快捷键按钮白底浅灰字
-     几乎不可读。官方终端本身就是主题自适应的（实测浅色下 viewport 背景
-     透明、文字 rgb(15,17,21)），这里对齐它。 */
-  --term-surface: var(--dsw-static-neutral-bluish-50, #f9fafb);
-  --term-chrome: var(--dsw-static-neutral-bluish-100, #ebeef2);
-  --term-viewport: #ffffff;
-  --term-fg: var(--dsw-static-neutral-bluish-1000, #0f1115);
-  --term-key-bg: #ffffff;
-  --term-key-fg: var(--dsw-static-neutral-bluish-700, #61666b);
-  --term-border: var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.10));
-  --term-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
 }
 body[data-ds-dark-theme] {
   --bg-overlay: rgba(21, 21, 23, 0.88);
-
-  /* 终端配色（深色）：取值与改动前的硬编码值完全一致，
-     夜间模式的观感逐像素不变。 */
-  --term-surface: var(--dsw-static-neutral-bluish-950, #151517);
-  --term-chrome: var(--dsw-static-neutral-bluish-900, #1b1b1c);
-  --term-viewport: #101012;
-  --term-fg: #D1D5DB;
-  --term-key-bg: var(--dsw-static-neutral-bluish-875, #232324);
-  --term-key-fg: var(--dsw-static-neutral-bluish-300, #cfd3d6);
-  --term-border: rgba(255, 255, 255, 0.12);
-  --term-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
 }
 
 :root {
@@ -728,7 +701,44 @@ html, body {
   color: var(--text-muted);
 }
 
-/* 扩展视图：镜像源指示卡 */
+/* 扩展视图：内置说明卡
+   （扩展页原先是「镜像源加速」卡，但本页扩展全部来自 APK 内置包池、
+     零联网，镜像源在这里没有任何作用 —— 现已移到设置视图的「插件下载源」。） */
+.builtin-note-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  background-color: var(--bg-elevated);
+}
+
+.builtin-note-icon {
+  font-size: 20px;
+  line-height: 1.2;
+  flex-shrink: 0;
+}
+
+.builtin-note-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.builtin-note-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.builtin-note-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+/* 插件下载源卡片（设置视图） */
 .mirror-card {
   display: flex;
   align-items: center;
@@ -1096,6 +1106,24 @@ html, body {
   user-select: none;
 }
 
+/* 可折叠分组的展开指示：折叠时朝右、展开时朝下。
+   注意与 host.js 的 expandedGroups 配合 —— 展开态是 JS 记忆的，
+   这里只负责画箭头，不参与状态判定。 */
+.ext-group-title.clickable::after {
+  content: '▸';
+  font-size: 11px;
+  color: var(--text-muted);
+  transition: transform var(--transition-fast);
+}
+
+.ext-group-title.clickable.expanded::after {
+  content: '▾';
+}
+
+.ext-group-title.clickable:active {
+  color: var(--text-primary);
+}
+
 .ext-group-count {
   font-size: 11px;
   color: var(--text-muted);
@@ -1228,26 +1256,6 @@ html, body {
   background: linear-gradient(90deg, rgba(65, 118, 230, 0.10), transparent);
 }
 
-/* 终端 shell 诊断卡（三轮②）
-   ⚠ 这张卡位于 .terminal-container 内部（DOM 上夹在 terminal-bar 与
-   terminal-viewport 之间）。容器已跟随主题，但卡片自身是 .card（底色
-   --bg-card、圆角、padding），如果贴着容器边缘会显得像「嵌进去的一块补丁」——
-   早期版本正是这样，浅色下表现为「深色终端里一张纯白卡片」。
-   这里给它四周留白并抬高一层，使其读作「终端内部的独立面板」。 */
-.shell-diag-card {
-  margin: 10px 10px 0;
-  background-color: var(--bg-elevated);
-}
-
-.shell-diag-card .setting-row {
-  padding-bottom: 0;
-  border-bottom: none;
-}
-
-.shell-diag-card .setting-desc {
-  word-break: break-all;
-}
-
 /* 权限模式卡片组（三轮③） */
 .priv-cards {
   display: flex;
@@ -1281,8 +1289,15 @@ html, body {
   cursor: not-allowed;
 }
 
+/* 权限卡片头：图标 + 标题列 + 状态徽章
+   ⚠ 徽章文案长度差异极大 —— Shizuku 卡是「不可用 · 未检测到 Shizuku 管理器」，
+   Root 卡是「不可用 · 未检测到可用的 su（需 Magisk / KernelSU）」。徽章一旦
+   `flex-shrink: 0` + `white-space: nowrap`，在 412px 宽的竖屏上就会独占整行，
+   把 `.priv-titles` 挤到只剩一个字的宽度，中文于是逐字换行成一列竖排。
+   这里允许换行：徽章先尝试与标题同行，放不下就整块掉到下一行。 */
 .priv-card-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   gap: 10px;
 }
@@ -1294,8 +1309,8 @@ html, body {
 }
 
 .priv-titles {
-  flex: 1;
-  min-width: 0;
+  flex: 1 1 60%;
+  min-width: 8em;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1314,7 +1329,8 @@ html, body {
 }
 
 .priv-badge {
-  flex-shrink: 0;
+  flex-shrink: 1;
+  max-width: 100%;
   font-size: 10px;
   font-family: var(--font-mono);
   padding: 2px 8px;
@@ -1322,7 +1338,8 @@ html, body {
   border: 1px solid var(--border-subtle);
   color: var(--text-muted);
   background: var(--bg-card);
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .priv-badge.badge-ok {
@@ -1412,163 +1429,8 @@ html, body {
   opacity: 0.5;
 }
 
-/* 终端视图 */
-.terminal-container {
-  /* 跟随主题（见 body 段的 --term-* 变量）。
-     早期版本在这里写死 #151517 并注释「终端惯例」，但内部文字与按钮用的是
-     语义变量，浅色主题下就变成「深底 + 深灰字/白底按钮」的错配。 */
-  background-color: var(--term-surface);
-  border: 1px solid var(--term-border);
-  border-radius: var(--radius-lg);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  box-shadow: var(--term-shadow);
-}
-
-.terminal-bar {
-  height: 38px;
-  background-color: var(--term-chrome);
-  border-bottom: 1px solid var(--border-subtle);
-  padding: 0 12px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.terminal-bar-left {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.terminal-bar-right {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.terminal-traffic {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  display: inline-block;
-}
-
-.terminal-traffic.red,
-.red {
-  background-color: #FF5F56;
-}
-
-.terminal-traffic.yellow,
-.yellow {
-  background-color: #FFBD2E;
-}
-
-.terminal-traffic.green,
-.green {
-  background-color: #27C93F;
-}
-
-.terminal-title {
-  font-size: 11px;
-  font-family: var(--font-mono);
-  color: var(--text-muted);
-  margin-left: 6px;
-}
-
-.term-tool-btn {
-  background: transparent;
-  border: 1px solid var(--border-subtle);
-  color: var(--text-secondary);
-  border-radius: 4px;
-  font-size: 11px;
-  padding: 3px 8px;
-  cursor: pointer;
-  min-height: 28px;
-  transition: all var(--transition-fast);
-}
-
-.term-tool-btn:active {
-  background-color: rgba(255, 255, 255, 0.1);
-  color: var(--text-primary);
-}
-
-.terminal-viewport {
-  height: 280px;
-  max-height: 380px;
-  overflow-y: auto;
-  padding: 12px;
-  background-color: var(--term-viewport);
-  overscroll-behavior: contain;
-}
-
-.terminal-code,
-.terminal-code-stream {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--term-fg);
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-
 .code-font {
   font-family: var(--font-mono);
-}
-
-/* 终端 ANSI 语法色彩 */
-.ansi-green {
-  color: var(--accent-green);
-}
-
-.ansi-yellow {
-  color: var(--accent-orange);
-}
-
-.ansi-cyan {
-  color: var(--accent-cyan);
-}
-
-.terminal-shortcuts {
-  display: flex;
-  gap: 6px;
-  padding: 8px 10px;
-  background-color: var(--term-chrome);
-  border-top: 1px solid var(--border-subtle);
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-
-.terminal-shortcuts::-webkit-scrollbar {
-  display: none;
-}
-
-.term-key {
-  flex-shrink: 0;
-  height: 32px;
-  min-width: 44px;
-  padding: 0 10px;
-  background-color: var(--term-key-bg);
-  border: 1px solid var(--border-subtle);
-  border-radius: 6px;
-  color: var(--term-key-fg);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 500;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: all var(--transition-fast);
-  user-select: none;
-}
-
-.term-key:active {
-  background-color: var(--accent-blue);
-  color: #FFFFFF;
-  border-color: var(--accent-blue);
-  transform: scale(0.95);
 }
 
 /* 设置视图：分段控件 */

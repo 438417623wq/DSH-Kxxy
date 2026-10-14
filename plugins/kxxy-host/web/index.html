@@ -28,7 +28,7 @@
           </div>
           <div class="brand-text">
             <h1 class="header-title">DSH Kxxy 控制台</h1>
-            <span class="header-version">v1.4.2-android</span>
+            <span class="header-version">v0.2.0-android</span>
           </div>
         </div>
 
@@ -330,20 +330,16 @@
 
       <!-- 2. 扩展视图 -->
       <section class="view-pane" data-view="extensions" id="view-extensions">
-        <!-- 镜像源状态栏（真实数据：/kxxy/api/mirror；假数据「清华源 38ms」已删） -->
-        <div class="card mirror-card">
-          <div class="mirror-left">
-            <span class="mirror-icon" aria-hidden="true">🌐</span>
-            <div class="mirror-info">
-              <span class="mirror-title">镜像源加速：<strong class="mirror-active-source" id="current-mirror-name">读取中…</strong></span>
-              <span class="mirror-sub" id="mirror-sub">点击「测速」获取各源真实延迟</span>
-            </div>
+        <!-- 说明：本页扩展全部来自 APK 内置离线包池 —— 激活/卸载都是本地解包，
+             既不联网也用不到 npm 镜像源。镜像源已随之移到「设置」页。
+             第三方插件的真正下载入口在对话页侧栏「插件」页的「+ 添加插件」。 -->
+        <div class="card builtin-note-card">
+          <span class="builtin-note-icon" aria-hidden="true">📦</span>
+          <div class="builtin-note-info">
+            <span class="builtin-note-title">全部内置 · 零联网</span>
+            <span class="builtin-note-sub">本页扩展都随 APK 预装在引擎里，激活与卸载均为本地解包。要安装第三方插件，请到对话页侧栏 →「插件」→「+ 添加插件」。</span>
           </div>
-          <button class="button button-subtle button-sm" id="btn-switch-mirror">测速</button>
         </div>
-
-        <!-- 测速结果（点击应用切换，切换后提示重启引擎） -->
-        <div class="mirror-results" id="mirror-results"></div>
 
         <!-- 已内置说明（④ 全能精选档：构建链 220 包直接预装在 runtime.zip 里） -->
         <div class="card builtin-card" id="builtin-summary" style="display:none"></div>
@@ -362,57 +358,7 @@
         </div>
       </section>
 
-      <!-- 3. 终端视图 -->
-      <section class="view-pane" data-view="terminal" id="view-terminal">
-        <div class="terminal-container">
-          <!-- 终端标题栏 -->
-          <div class="terminal-bar">
-            <div class="terminal-bar-left">
-              <span class="terminal-traffic red"></span>
-              <span class="terminal-traffic yellow"></span>
-              <span class="terminal-traffic green"></span>
-              <span class="terminal-title">dsh-engine.log (tty0)</span>
-            </div>
-            <div class="terminal-bar-right">
-              <button class="term-tool-btn" id="btn-term-clear" title="清空界面">清屏</button>
-              <button class="term-tool-btn" id="btn-term-refresh" title="重新获取日志">刷新</button>
-            </div>
-          </div>
-
-          <!-- 终端 shell 诊断（三轮②：同源 localStorage 缓存的失效 shell 会让
-               「新建终端」持续失败，这里检测并提供一键清除。
-               注意 dsh.terminal.shell 这个键官方已废弃（bundle 里 0 命中），
-               所以本卡是「历史遗留缓存的清理入口」，不是终端故障的唯一解释） -->
-          <div class="card shell-diag-card">
-            <div class="card-title-row">
-              <div class="card-title-group">
-                <h3 class="card-title">终端 Shell 缓存</h3>
-                <span class="card-subtitle">官方当前版本已不读该缓存；这里是早期遗留值的清理入口</span>
-              </div>
-            </div>
-            <div id="shell-diag-body">
-              <div class="setting-info"><span class="setting-title">加载中…</span></div>
-            </div>
-          </div>
-
-          <!-- 终端显示区域（真实引擎日志由轮询填充；旧版写死的假启动日志已删） -->
-          <div class="terminal-viewport" id="terminal-viewport">
-            <pre class="terminal-code" id="terminal-code-stream"><span style="color:var(--text-muted)">正在加载引擎日志…</span></pre>
-          </div>
-
-          <!-- 终端底部快捷键操作栏 -->
-          <div class="terminal-shortcuts">
-            <button class="term-key" data-key="ctrl-c">Ctrl+C</button>
-            <button class="term-key" data-key="tab">Tab</button>
-            <button class="term-key" data-key="up">↑</button>
-            <button class="term-key" data-key="down">↓</button>
-            <button class="term-key" data-key="esc">Esc</button>
-            <button class="term-key" data-key="clear">Clear</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- 4. 设置视图 -->
+      <!-- 3. 设置视图 -->
       <section class="view-pane" data-view="settings" id="view-settings">
         <!-- 外观（读写官方 ui-theme 偏好：控制台与对话界面同步生效） -->
         <div class="card block-card">
@@ -533,6 +479,29 @@
           </div>
         </div>
 
+        <!-- 插件下载源（原在「扩展」页，但那里全是离线包池、用不到镜像；
+             真正会联网下载的是对话页侧栏「插件」页的「+ 添加插件」，故移到这里） -->
+        <div class="card block-card">
+          <div class="card-title-group">
+            <h3 class="card-title">插件下载源</h3>
+            <span class="card-subtitle">对话页侧栏「插件」→「+ 添加插件」下载第三方插件时使用的 npm 镜像</span>
+          </div>
+
+          <div class="card mirror-card">
+            <div class="mirror-left">
+              <span class="mirror-icon" aria-hidden="true">🌐</span>
+              <div class="mirror-info">
+                <span class="mirror-title">镜像源加速：<strong class="mirror-active-source" id="current-mirror-name">读取中…</strong></span>
+                <span class="mirror-sub" id="mirror-sub">点击「测速」获取各源真实延迟</span>
+              </div>
+            </div>
+            <button class="button button-subtle button-sm" id="btn-switch-mirror">测速</button>
+          </div>
+
+          <!-- 测速结果（点击应用切换，切换后提示重启引擎） -->
+          <div class="mirror-results" id="mirror-results"></div>
+        </div>
+
         <!-- 危险操作区 -->
         <div class="card block-card danger-zone-card">
           <div class="card-title-group">
@@ -596,16 +565,6 @@
             </svg>
           </div>
           <span class="tab-label">扩展</span>
-        </button>
-
-        <button class="tab-item" data-target="terminal">
-          <div class="tab-icon">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="4 17 10 11 4 5"/>
-              <line x1="12" y1="19" x2="20" y2="19"/>
-            </svg>
-          </div>
-          <span class="tab-label">终端</span>
         </button>
 
         <button class="tab-item" data-target="settings">

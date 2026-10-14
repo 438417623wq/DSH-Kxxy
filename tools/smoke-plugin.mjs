@@ -387,33 +387,30 @@ console.log('\n[2] GET /kxxy/assets/host.css')
   else {
     ok(`200 ${r.type}，${r.text.length} 字节`)
 
-    // ── 终端配色必须跟随主题（浅色错配是真实缺陷）────────────────────
-    // 早期版本把终端容器/标题栏/视口/快捷键栏的背景写死成深色
-    // （#151517 / #1b1b1c / #101012），而内部文字与按钮用的是语义变量
-    // （--text-secondary / --bg-card 等）。浅色主题下这些变量翻成
-    // 「深灰字、白底」，画在深底上就出现两个刺眼症状：
-    //   ① 终端里嵌一张纯白「终端 Shell 诊断」卡；
-    //   ② 快捷键按钮白底浅灰字，几乎不可读。
-    // 修法是引入 --term-* 一组变量，两套主题各给一份取值。
+    // ── 已删除的「终端」视图不得复活 ──────────────────────────────────
+    // 控制台原来有个 data-view="terminal" 的页签，实际只是 engine.log 的
+    // 尾巴查看器（外加六个写 PTY 的 term-key 按钮），用户判定无用、要求
+    // 整块去除。这里守住三处：视图段、页签按钮、以及那一整段终端专属样式。
+    // 留着它们的表现不是报错，而是「页签点进去一片空白」。
     const css = r.text
-    // 只禁「直接当背景/前景用」的写法；这些色值仍合法地出现在
-    // var() 的兜底位与注释里（例如 --term-surface: var(--dsw-…, #151517)）。
-    const direct = /(background-color|background|color)\s*:\s*#(151517|1b1b1c|101012|D1D5DB)\b/i.exec(css)
-    if (direct !== null) {
-      fail(`host.css 仍把 ${direct[2]} 直接用作 ${direct[1]}（应改用 --term-* 变量，否则浅色主题下错配）`)
-    } else ok('终端区不再直接硬编码深色底色/前景')
-    for (const v of ['--term-surface', '--term-chrome', '--term-viewport', '--term-fg', '--term-key-bg', '--term-key-fg']) {
-      if (!css.includes(v)) fail(`host.css 缺少终端主题变量 ${v}`)
-    }
-    // 两套主题都必须给出取值：浅色在 body 段、深色在 body[data-ds-dark-theme] 段。
-    const darkBlock = /body\[data-ds-dark-theme\]\s*\{([\s\S]*?)\n\}/.exec(css)
-    if (darkBlock === null) fail('host.css 找不到 body[data-ds-dark-theme] 段')
-    else if (!darkBlock[1].includes('--term-surface')) {
-      fail('深色段未定义 --term-surface（深色终端会落到浅色值）')
-    } else ok('终端配色改用 --term-* 变量，两套主题各一份取值')
-    if (!/\.term-key\s*\{[^}]*background-color:\s*var\(--term-key-bg\)/.test(css)) {
-      fail('.term-key 未使用 --term-key-bg（浅色下会白底浅灰字不可读）')
-    } else ok('.term-key 底色跟随主题')
+    if (css.includes('.terminal-container') || css.includes('.terminal-viewport')) {
+      fail('host.css 仍有终端视图样式（视图已删除）')
+    } else ok('终端视图样式已随视图一并删除')
+
+    // ── 扩展分组展开态必须跨轮询存活 ─────────────────────────────────
+    // fetchExtensions() 每 5 秒被 startPolling 调用一次，而 renderExtensions
+    // 每次都把 innerHTML 清空重建。展开态若只存在 DOM 的 class 上，用户点开
+    // 「已激活」后最多 5 秒就被折叠回去——正是用户报的「我展开它又自动折叠」。
+    // 修法是把状态提到模块级 Set（expandedGroups），这里断言两边都在。
+    const hostJs = (await get('/kxxy/assets/host.js')).text
+    if (!/const expandedGroups = new Set\(\)/.test(hostJs)) {
+      fail('host.js 缺少 expandedGroups —— 扩展分组的展开态会被 5 秒轮询重置')
+    } else if (!/expandedGroups\.add\(group\.key\)/.test(hostJs)
+      || !/expandedGroups\.delete\(group\.key\)/.test(hostJs)) {
+      fail('expandedGroups 未在点击处理里写入/清除，展开态仍不持久')
+    } else if (!/if \(!expandedGroups\.has\(group\.key\)\) body\.classList\.add\('collapsed'\)/.test(hostJs)) {
+      fail('renderExtensions 未按 expandedGroups 恢复折叠态，重建后仍会折回去')
+    } else ok('扩展分组展开态由模块级 expandedGroups 记忆，跨轮询存活')
   }
 }
 
