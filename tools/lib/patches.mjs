@@ -765,6 +765,54 @@ function patchDocumentPreviewArchiveProviders(ctx) {
 }
 
 /**
+ * 给文档预览客户端补上 video / audio 两个 provider。
+ *
+ * 为什么必须打：上游 8 个内置 provider 没有一个处理音视频，而 mp4/mov/avi/mkv/
+ * webm/flv/wmv/m4v/mp3/wav/flac/ogg/m4a/aac/wma/opus 恰好是
+ * `UNVIEWABLE_BINARY_EXTENSIONS` 数组**开头**的一批，判据链走到
+ * `matched.length === 0 && unviewable` 就返回空候选，渲染「该格式文件暂时无法
+ * 预览」。桌面版同样如此，是上游能力缺口。
+ *
+ * 为什么用 `renderer` 模式：`bytes-complete` 要把整个文件经
+ * `remote.workspaceFiles.readBytes` 拉进内存，受 `config.maxFileBytes`
+ * （默认 32 MiB）限制，一个几秒的视频就超限报 `workspace-file/too-large`。
+ * renderer 模式不传字节，body 只把 `<video src>` 指向宿主 `/kxxy/media`
+ * （见 kxxy-host 的流式路由，带 Range/206），由浏览器媒体栈自己取、自己 seek。
+ *
+ * 注入位置与安全性：片段（`tools/prebuilt/documentpreview-media/providers.js`）
+ * 拼进模块作用域的 `exports.apply = apply;` 之前，可以直接用上游已经
+ * `require` 好的 `react` 局部变量；随后在 `apply(ctx)` 末尾追加
+ * `kxxyMediaApply(ctx);`。
+ *
+ * ★顺序依赖：收尾锚点 `kxxyArchiveApply(ctx);` 是**归档补丁自己插进去的**，
+ * 所以本函数必须在 `patchDocumentPreviewArchiveProviders` **之后**调用。
+ * `applyAllPatches` 的数组顺序保证了这一点；写反了会在构建期抛「未找到锚点」。
+ *
+ * 为便于离线预演（`_recon/dryrun-media-patch.mjs` 用真实 asar 单文件跑一遍），
+ * 这里 `export` 出去 —— 生产入口仍是 `applyAllPatches`。
+ */
+export function patchDocumentPreviewMediaProviders(ctx) {
+  const rel = "@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无文档预览客户端）";
+  const fragment = prebuilt("documentpreview-media/providers.js").toString("utf8").trimEnd();
+  must(
+    fragment.includes("function kxxyMediaApply("),
+    "文档预览音视频 provider —— 片段缺少 kxxyMediaApply 入口",
+  );
+  must(
+    !fragment.includes("</script"),
+    "文档预览音视频 provider —— 片段含 </script，内联进 bundle 会截断脚本",
+  );
+
+  const tail = "\t\t//#endregion\n\t\texports.apply = apply;";
+  const call = "\t\t\tkxxyArchiveApply(ctx);\n";
+  let patched = replaceOnce(ctx.read(rel), tail, `${fragment}\n${tail}`, "文档预览客户端模块尾部（音视频）");
+  patched = replaceOnce(patched, call, `${call}\t\t\tkxxyMediaApply(ctx);\n`, "文档预览 apply() 的音视频收尾调用");
+  ctx.write(rel, patched);
+  return "文档预览客户端 → 新增 video / audio 两个媒体 provider";
+}
+
+/**
  * 上游 web bundle 里 `if (execArgv.includes('--expose-internals')) return req(id)`
  * 的 fallback 说明 --expose-internals 是官方认可路径；这里只做一次断言，
  * 确认 EngineProcess.kt 传的 flag 与补丁假设一致。
@@ -839,6 +887,7 @@ export function applyAllPatches(root, termuxRead) {
     patchOfficeToPdfFormats(ctx),
     patchDocumentPreviewOfficeExtensions(ctx),
     patchDocumentPreviewArchiveProviders(ctx),
+    patchDocumentPreviewMediaProviders(ctx),
     patchDshManifest(ctx),
   ];
   return results;

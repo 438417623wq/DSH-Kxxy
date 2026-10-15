@@ -373,6 +373,88 @@ for (const n of NEED) {
   }
 }
 
+// ---------------------------------------------------------------- 构建期补丁真的落到 bundle 里
+// 锚点 11 只证明 `patchset.version` 这个**标记文件**在、且与 Kotlin 一致，
+// 它不证明补丁内容真的写进了上游 bundle。真机事故正是这样发生的：标记文件
+// 在、所有锚点都过、isComplete() 判真跳过重装，而设备上的 documentpreview
+// 仍是未打补丁的旧文件。
+//
+// 这里直接开 zip 里的上游 bundle 数特征函数：文件在、但特征串不在，说明
+// 构建期 `applyAllPatches` 没跑到（或锚点漂了被静默跳过），必须报出来。
+{
+  const BUNDLE_CHECKS = [
+    {
+      entry: "lib/node_modules/@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.js",
+      // 归档预览（zip / epub）与音视频预览各自的入口 + 收尾调用。
+      needles: [
+        ["function kxxyArchiveApply(", "归档 provider 片段"],
+        ["function kxxyMediaApply(", "音视频 provider 片段"],
+        ["kxxyArchiveApply(ctx);", "归档 provider 收尾调用"],
+        ["kxxyMediaApply(ctx);", "音视频 provider 收尾调用"],
+        ["/kxxy/media?path=", "音视频指向宿主媒体路由"],
+      ],
+    },
+  ];
+  for (const { entry, needles } of BUNDLE_CHECKS) {
+    const file = byName.get(entry);
+    if (!file) {
+      console.log(`\n上游补丁痕迹：✗ ${entry} 缺失，跳过`);
+      continue;
+    }
+    const text = readLocal(file).toString("utf8");
+    const absent = needles.filter(([needle]) => !text.includes(needle));
+    if (absent.length > 0) {
+      for (const [, label] of absent) {
+        console.log(`上游补丁痕迹：✗ ${label} 不在 ${entry.split("/").pop()} 里（补丁未生效）`);
+      }
+      missing += absent.length;
+    } else {
+      console.log(`\n上游补丁痕迹：✓ 归档与音视频 provider 均已写进 ${entry.split("/").pop()}（${needles.length} 项特征齐备）`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- 音视频 provider 后缀覆盖
+// 「视频打不开」这类缺陷在 HTTP 层完全看不出异常 —— 页面 200、bundle 200，
+// 只有用户点开文件才看到「该格式文件暂时无法预览」。这里断言 provider 认领
+// 的后缀集合与上游 UNVIEWABLE_BINARY_EXTENSIONS 开头那批音视频后缀一致，
+// 避免以后有人改常量时漏掉几个格式。
+{
+  const entry = byName.get(
+    "lib/node_modules/@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.js",
+  );
+  if (entry) {
+    const text = readLocal(entry).toString("utf8");
+    // 上游把音视频列在黑名单**开头**，这批后缀必须全部被 provider 认领。
+    const EXPECTED = [
+      "mp4", "mov", "avi", "mkv", "webm", "flv", "wmv", "m4v",
+      "mp3", "wav", "flac", "ogg", "m4a", "aac", "wma", "opus",
+    ];
+    const videoExt = /KXXY_MEDIA_VIDEO_EXT = \[([^\]]*)\]/.exec(text);
+    const audioExt = /KXXY_MEDIA_AUDIO_EXT = \[([^\]]*)\]/.exec(text);
+    if (videoExt === null || audioExt === null) {
+      console.log("音视频后缀覆盖：✗ 找不到 KXXY_MEDIA_VIDEO_EXT / KXXY_MEDIA_AUDIO_EXT");
+      missing += 1;
+    } else {
+      const claimed = new Set(
+        `${videoExt[1]},${audioExt[1]}`
+          .split(",")
+          .map((s) => s.trim().replace(/^["']|["']$/g, "").toLowerCase())
+          .filter((s) => s !== ""),
+      );
+      const uncovered = EXPECTED.filter((ext) => !claimed.has(ext));
+      if (uncovered.length > 0) {
+        console.log(`音视频后缀覆盖：✗ 上游黑名单里有 ${uncovered.join(" / ")} 未被任何 provider 认领`);
+        missing += 1;
+      } else {
+        const n = videoExt[1].split(",").filter((s) => s.trim() !== "").length;
+        const m = audioExt[1].split(",").filter((s) => s.trim() !== "").length;
+        console.log(`音视频后缀覆盖：✓ 上游黑名单音视频${EXPECTED.length}项全覆盖（视频 ${n} + 音频 ${m}）`);
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------- manifest
 const mf = byName.get("kxxy-runtime.json");
 if (!mf) throw new Error("缺 kxxy-runtime.json");

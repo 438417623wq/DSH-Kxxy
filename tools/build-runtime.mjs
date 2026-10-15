@@ -469,7 +469,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 「补丁集变了 ⇒ 设备必然重装一次」。代价是一次几百 MB 的重装，
  * 而漏判的代价是设备上静默复现已经修过的缺陷。
  */
-const PATCHSET_MARKER = "kxxy-patchset@1";
+const PATCHSET_MARKER = "kxxy-patchset@2";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

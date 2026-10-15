@@ -16,7 +16,7 @@
  */
 
 import { createServer, request as httpRequest } from 'node:http'
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { join, dirname } from 'node:path'
@@ -613,12 +613,197 @@ console.log('\n[12b] 可信回环来源应放行（对照组，证明上面拒�
   else ok('200（回环 Host 放行）')
 }
 
-console.log('\n[13] disposer 卸载后路由消失')
+console.log('\n[14] /kxxy/media（音视频流式路由）')
+{
+  // 为什么单独测这条路由：它是**唯一**能让 `<video>` 播起来的通道。上游
+  // `/api/file` 有三处硬伤（20 MiB 图片附件上限、无 Range/206、全量进内存），
+  // 而这三处都能在 HTTP 层用断言钉住 —— 一旦有人把路由改回「整文件回」，
+  // 这里立刻红，不必等到真机上视频转圈才发现。
+  const MEDIA_DIR = mkdtempSync(join(tmpdir(), 'kxxy-media-'))
+  const mediaPath = join(MEDIA_DIR, 'clip.mp4')
+  // 512 KiB 可辨识内容：足以验证分段偏移与长度，又不拖慢测试。
+  const payload = Buffer.alloc(512 * 1024)
+  for (let i = 0; i < payload.length; i += 1) payload[i] = i % 251
+  writeFileSync(mediaPath, payload)
+  const q = `/kxxy/media?path=${encodeURIComponent(mediaPath)}`
+
+  // ① 全量取：必须是 200 + 正确 MIME + Accept-Ranges + 字节完全一致。
+  const full = await raw(q)
+  if (full.status !== 200) fail(`全量请求应为 200，实为 ${full.status}`)
+  else ok('200 全量')
+
+  // 用 raw 拿 header（fetch 的 get() 只回 text）
+  const headRes = await new Promise((resolve, reject) => {
+    const r = httpRequest(
+      { host: '127.0.0.1', port: server.address().port, path: q, method: 'GET' },
+      (res) => {
+        const chunks = []
+        res.on('data', (c) => chunks.push(c))
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }))
+      },
+    )
+    r.on('error', reject)
+    r.end()
+  })
+  if (headRes.headers['content-type'] !== 'video/mp4') {
+    fail(`content-type 应为 video/mp4，实为 ${headRes.headers['content-type']}`)
+  } else ok('content-type = video/mp4（不是 octet-stream，否则浏览器拒播）')
+  if (headRes.headers['accept-ranges'] !== 'bytes') {
+    fail(`缺 accept-ranges: bytes（实为 ${headRes.headers['accept-ranges']}）—— <video> 将无法 seek`)
+  } else ok('accept-ranges: bytes（seek 的前提）')
+  if (headRes.body.length !== payload.length) {
+    fail(`全量长度应为 ${payload.length}，实为 ${headRes.body.length}`)
+  } else if (!headRes.body.equals(payload)) fail('全量内容与源文件不一致')
+  else ok(`全量 ${payload.length} 字节逐字节一致`)
+
+  // ② Range 请求：必须 206 + content-range，且切片内容与源一致。
+  const RANGE_FROM = 100000
+  const RANGE_TO = 100255
+  const part = await new Promise((resolve, reject) => {
+    const r = httpRequest(
+      {
+        host: '127.0.0.1',
+        port: server.address().port,
+        path: q,
+        method: 'GET',
+        headers: { range: `bytes=${RANGE_FROM}-${RANGE_TO}` },
+      },
+      (res) => {
+        const chunks = []
+        res.on('data', (c) => chunks.push(c))
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }))
+      },
+    )
+    r.on('error', reject)
+    r.end()
+  })
+  if (part.status !== 206) fail(`Range 请求应为 206，实为 ${part.status}（无 206 则 <video> 不能 seek）`)
+  else ok('206 Partial Content')
+  const expectedRange = `bytes ${RANGE_FROM}-${RANGE_TO}/${payload.length}`
+  if (part.headers['content-range'] !== expectedRange) {
+    fail(`content-range 应为 "${expectedRange}"，实为 "${part.headers['content-range']}"`)
+  } else ok(`content-range = ${expectedRange}`)
+  if (part.body.length !== RANGE_TO - RANGE_FROM + 1) {
+    fail(`Range 体长应为 ${RANGE_TO - RANGE_FROM + 1}，实为 ${part.body.length}`)
+  } else if (!part.body.equals(payload.subarray(RANGE_FROM, RANGE_TO + 1))) {
+    fail('Range 内容与源文件对应区间不一致（偏移算错了）')
+  } else ok('Range 内容与源文件对应区间逐字节一致')
+
+  // ③ 后缀形态 `bytes=-N`：浏览器探测容器尾部常用。
+  const tailRes = await new Promise((resolve, reject) => {
+    const r = httpRequest(
+      {
+        host: '127.0.0.1',
+        port: server.address().port,
+        path: q,
+        method: 'GET',
+        headers: { range: 'bytes=-16' },
+      },
+      (res) => {
+        const chunks = []
+        res.on('data', (c) => chunks.push(c))
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }))
+      },
+    )
+    r.on('error', reject)
+    r.end()
+  })
+  if (tailRes.status !== 206 || tailRes.body.length !== 16) {
+    fail(`bytes=-16 应为 206 且 16 字节，实为 ${tailRes.status} / ${tailRes.body.length}`)
+  } else if (!tailRes.body.equals(payload.subarray(payload.length - 16))) {
+    fail('bytes=-16 取到的不是文件末尾 16 字节')
+  } else ok('bytes=-16 取到文件末尾 16 字节')
+
+  // ④ 越界 Range：必须 416 + `bytes */size`，而不是 200 全量或 500。
+  const overRes = await new Promise((resolve, reject) => {
+    const r = httpRequest(
+      {
+        host: '127.0.0.1',
+        port: server.address().port,
+        path: q,
+        method: 'GET',
+        headers: { range: `bytes=${payload.length + 10}-` },
+      },
+      (res) => {
+        res.resume()
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers }))
+      },
+    )
+    r.on('error', reject)
+    r.end()
+  })
+  if (overRes.status !== 416) fail(`越界 Range 应为 416，实为 ${overRes.status}`)
+  else if (overRes.headers['content-range'] !== `bytes */${payload.length}`) {
+    fail(`416 应带 content-range: bytes */${payload.length}`)
+  } else ok('416 + content-range: bytes */<size>')
+
+  // ⑤ HEAD：拿元数据但不回体（媒体栈探测第一步）。
+  const headOnly = await new Promise((resolve, reject) => {
+    const r = httpRequest(
+      { host: '127.0.0.1', port: server.address().port, path: q, method: 'HEAD' },
+      (res) => {
+        const chunks = []
+        res.on('data', (c) => chunks.push(c))
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, len: Buffer.concat(chunks).length }))
+      },
+    )
+    r.on('error', reject)
+    r.end()
+  })
+  if (headOnly.status !== 200) fail(`HEAD 应为 200，实为 ${headOnly.status}`)
+  else if (headOnly.len !== 0) fail(`HEAD 不应回体，实回 ${headOnly.len} 字节`)
+  else if (headOnly.headers['content-length'] !== String(payload.length)) {
+    fail(`HEAD 的 content-length 应为 ${payload.length}，实为 ${headOnly.headers['content-length']}`)
+  } else ok('HEAD 200 + content-length，零字节体')
+
+  // ⑥ 安全边界：非绝对路径、目录、缺失文件、非 GET。
+  const rel = await get('/kxxy/media?path=relative.mp4')
+  if (rel.status !== 400) fail(`相对路径应 400，实为 ${rel.status}`)
+  else ok('相对路径 → 400 absolute path required')
+
+  const missing = await get(`/kxxy/media?path=${encodeURIComponent(join(MEDIA_DIR, 'nope.mp4'))}`)
+  if (missing.status !== 404) fail(`缺失文件应 404，实为 ${missing.status}`)
+  else ok('缺失文件 → 404')
+
+  const dir = await get(`/kxxy/media?path=${encodeURIComponent(MEDIA_DIR)}`)
+  if (dir.status !== 404) fail(`目录应 404，实为 ${dir.status}`)
+  else ok('目录 → 404（不能列出目录）')
+
+  const badMethod = await raw(q, { method: 'POST' })
+  if (badMethod.status !== 405) fail(`POST 应 405，实为 ${badMethod.status}`)
+  else ok('POST → 405 + allow 头')
+
+  // ⑦ 也要走可信来源判定（媒体同样是「本机文件读取」，不能比 /kxxy/api 松）。
+  const evilHost = await new Promise((resolve, reject) => {
+    const r = httpRequest(
+      {
+        host: '127.0.0.1',
+        port: server.address().port,
+        path: q,
+        method: 'GET',
+        headers: { host: 'evil.example.com:3080' },
+      },
+      (res) => {
+        res.resume()
+        res.on('end', () => resolve({ status: res.statusCode }))
+      },
+    )
+    r.on('error', reject)
+    r.end()
+  })
+  if (evilHost.status !== 403) fail(`非回环 Host 应 403，实为 ${evilHost.status}`)
+  else ok('非回环 Host → 403（与 /kxxy/api 同等严格）')
+}
+
+console.log('\n[15] disposer 卸载后路由消失')
 {
   dispose()
   const r = await get('/kxxy')
   if (r.status !== 404) fail(`卸载后应为 404，实为 ${r.status}`)
   else ok('卸载后 /kxxy → 404')
+  const m = await get('/kxxy/media?path=/etc/hosts')
+  if (m.status !== 404) fail(`卸载后媒体路由应为 404，实为 ${m.status}`)
+  else ok('卸载后 /kxxy/media → 404（媒体路由也随 disposer 注销）')
   if (indexTaps.length !== 0) fail(`卸载后 index tap 未注销（剩 ${indexTaps.length} 个）`)
   else ok('卸载后 index tap 已注销（兼容层 + 移动端样式）')
 }

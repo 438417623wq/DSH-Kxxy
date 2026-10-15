@@ -1,4 +1,4 @@
-/* kxxy-host@7 */
+/* kxxy-host@8 */
 /**
  * kxxy-host — DSH Kxxy 宿主管理页插件。
  *
@@ -31,8 +31,8 @@
  * @module kxxy-host
  */
 
-import { readFileSync, existsSync, readdirSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { readFileSync, existsSync, readdirSync, statSync, writeFileSync, mkdirSync, createReadStream } from 'node:fs'
+import { join, dirname, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import * as extinstall from './extinstall.mjs'
@@ -94,6 +94,54 @@ function contentTypeFor(path) {
   const dot = path.lastIndexOf('.')
   if (dot < 0) return 'application/octet-stream'
   return CONTENT_TYPES[path.slice(dot)] ?? 'application/octet-stream'
+}
+
+/**
+ * 音视频后缀 → MIME 映射。
+ *
+ * 为什么不用上游 `/api/file`：那条路由的 `Content-Type` 来自引擎的 mime 表，
+ * 本身没问题，但它有两处硬伤（见 media 路由的注释）：20 MiB 上限、无 Range。
+ * 这里自己映射，顺带把「WebView 104 根本不支持的容器」也标出来 —— 让
+ * 前端能在播放前就给出「格式不受支持」而不是让 `<video>` 抛一个
+ * 用户看不懂的 `MEDIA_ELEMENT_ERROR: Format error`。
+ */
+const MEDIA_TYPES = {
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.webm': 'video/webm',
+  '.ogv': 'video/ogg',
+  '.mov': 'video/quicktime',
+  '.mkv': 'video/x-matroska',
+  '.avi': 'video/x-msvideo',
+  '.wmv': 'video/x-ms-wmv',
+  '.flv': 'video/x-flv',
+  '.mpg': 'video/mpeg',
+  '.mpeg': 'video/mpeg',
+  '.ts': 'video/mp2t',
+  '.3gp': 'video/3gpp',
+  '.mp3': 'audio/mpeg',
+  '.m4a': 'audio/mp4',
+  '.aac': 'audio/aac',
+  '.wav': 'audio/wav',
+  '.flac': 'audio/flac',
+  '.ogg': 'audio/ogg',
+  '.oga': 'audio/ogg',
+  '.opus': 'audio/ogg',
+  '.weba': 'audio/webm',
+  '.mka': 'audio/x-matroska',
+  '.wma': 'audio/x-ms-wma',
+  '.aif': 'audio/aiff',
+  '.aiff': 'audio/aiff',
+  '.au': 'audio/basic',
+  '.amr': 'audio/amr',
+  '.mid': 'audio/midi',
+  '.midi': 'audio/midi',
+}
+
+function mediaTypeFor(path) {
+  const dot = path.lastIndexOf('.')
+  if (dot < 0) return null
+  return MEDIA_TYPES[path.slice(dot).toLowerCase()] ?? null
 }
 
 /**
@@ -737,6 +785,128 @@ export function apply(ctx) {
       },
     })
 
+    // ── 媒体流：/kxxy/media?path=<绝对路径> ──────────────────────────
+    //
+    // 为什么不直接用上游的 /api/file（缺陷 AI 的根因）：
+    //   1. 它的上限取自 `ctx.attachments.imageLimits.maxImageBytes`（默认 20 MiB），
+    //      一个 5 秒的手机视频就能超；超了直接 413，前端只看到一片空白。
+    //   2. 它把整个文件 `readBytes` 进内存再 `new Response(bytes.slice())`，
+    //      既没有 Range/206 也没有流式 —— `<video>` 拿不到 206 就无法 seek，
+    //      而且一个 2 GB 的片子会直接把引擎 OOM。
+    // 本路由做三件事：按 Range 切片流式回、始终给 `Accept-Ranges: bytes`、
+    // 按后缀给准确的 Content-Type（上游 mime 表对 .mkv/.opus 之类会退化成
+    // application/octet-stream，浏览器便拒绝播放）。
+    //
+    // 安全边界：仅回环可信请求（isTrustedRequest），且只接受绝对路径。
+    // 引擎进程本身以 app uid 运行，能读的文件与官方 /api/file 完全一致，
+    // 不额外放宽。
+    const disposeMedia = ctx.webServer.register({
+      kind: 'prefix',
+      path: '/kxxy/media',
+      handler: async (req, res) => {
+        if (!isTrustedRequest(ctx, req)) {
+          res.writeHead(403)
+          res.end('forbidden')
+          return
+        }
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          res.writeHead(405, { allow: 'GET, HEAD' })
+          res.end('method not allowed')
+          return
+        }
+
+        let target = ''
+        try {
+          target = new URL(String(req.url ?? ''), 'http://127.0.0.1').searchParams.get('path') ?? ''
+        } catch {
+          target = ''
+        }
+        // 必须是绝对路径：相对路径会按引擎的工作目录解析，等于给网页一个
+        // 「猜引擎 cwd」的入口。用 `isAbsolute` 而不是 `startsWith('/')`，
+        // 这样冒烟测试在 Windows 构建机上跑同一套判据（Android 上 posix
+        // 语义就是 `startsWith('/')`，两者对生产行为无差别）。
+        if (target === '' || target.includes('\0') || !isAbsolute(target)) {
+          res.writeHead(400)
+          res.end('absolute path required')
+          return
+        }
+
+        let stat = null
+        try {
+          stat = statSync(target)
+        } catch {
+          stat = null
+        }
+        if (stat === null || !stat.isFile()) {
+          res.writeHead(404)
+          res.end('file not found')
+          return
+        }
+
+        const mediaType = mediaTypeFor(target)
+        const headers = {
+          'content-type': mediaType ?? contentTypeFor(target),
+          'cache-control': 'private, no-store',
+          // nosniff 会阻止浏览器「猜」类型 —— 对音视频是必要的保护，
+          // 因为我们必须给准 Content-Type 才能播。
+          'x-content-type-options': 'nosniff',
+          'accept-ranges': 'bytes',
+        }
+
+        // Range 解析：只支持单段 `bytes=a-b`（`<video>` 的 seek 就是这个形态）。
+        // 多段 Range 一律按「不支持」退化成全量 200 —— 浏览器会自行接受。
+        const rangeHeader = String(req.headers?.range ?? '')
+        let start = 0
+        let end = stat.size - 1
+        let partial = false
+        const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim())
+        if (match !== null && (match[1] !== '' || match[2] !== '')) {
+          if (match[1] === '') {
+            // 后缀形态 `bytes=-N`：最后 N 字节
+            const suffix = Number(match[2])
+            start = Math.max(0, stat.size - suffix)
+          } else {
+            start = Number(match[1])
+            if (match[2] !== '') end = Math.min(end, Number(match[2]))
+          }
+          if (start > end || start >= stat.size) {
+            res.writeHead(416, { 'content-range': `bytes */${stat.size}` })
+            res.end()
+            return
+          }
+          partial = true
+        }
+
+        const length = end - start + 1
+        if (partial) headers['content-range'] = `bytes ${start}-${end}/${stat.size}`
+        headers['content-length'] = String(length)
+        res.writeHead(partial ? 206 : 200, headers)
+
+        if (req.method === 'HEAD') {
+          res.end()
+          return
+        }
+
+        // 空文件（或 Range 恰好落在末尾之后）没有可读范围：`createReadStream` 收到
+        // `end: -1` 会抛 ERR_OUT_OF_RANGE，这里直接收尾。
+        if (length <= 0) {
+          res.end()
+          return
+        }
+
+        // 流式回，不整文件进内存。
+        const stream = createReadStream(target, { start, end })
+        stream.on('error', () => {
+          // 头已发出，只能掐断连接让客户端看到「加载失败」而不是挂死。
+          res.destroy()
+        })
+        // 客户端提前断开（用户切走、seek）时立刻释放 fd，否则连续 seek
+        // 会耗尽描述符。
+        res.on('close', () => stream.destroy())
+        stream.pipe(res)
+      },
+    })
+
     // ── 管理 API：/kxxy/api/* ───────────────────────────────────────
     // 同样不能带尾斜杠，理由见上面的 assets 路由。
     const disposeApi = ctx.webServer.register({
@@ -941,12 +1111,13 @@ export function apply(ctx) {
       handler: renderPage,
     })
 
-    ctx.logger?.info?.('[kxxy-host] mounted: /kxxy (page), /kxxy/assets (prefix), /kxxy/api (prefix), index compat tap')
+    ctx.logger?.info?.('[kxxy-host] mounted: /kxxy (page), /kxxy/assets (prefix), /kxxy/media (prefix), /kxxy/api (prefix), index compat tap')
 
     return () => {
       disposePageSlash()
       disposePage()
       disposeApi()
+      disposeMedia()
       disposeAssets()
       disposeCompat()
     }

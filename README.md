@@ -62,7 +62,7 @@ dsh-kxxy/
 │       └── java/app/kxxy/        Kotlin 源码 11 个文件
 ├── plugins/kxxy-host/            Cordis 插件（宿主管理页）
 │   ├── cordis.patch.yml          挂载声明
-│   ├── lib/index.js              路由 + API
+│   ├── lib/index.js              路由 + API（/kxxy、/kxxy/assets、/kxxy/media、/kxxy/api）
 │   └── web/                      管理页 HTML/CSS/JS（含 compat.js 兼容层）
 │       ├── compat.js             旧 ROM WebView 兼容层（缺陷 I/J/R/W/AC/AD）
 │       ├── modern.js             现代内建补齐层（页面 + blob worker/iframe）
@@ -81,7 +81,10 @@ dsh-kxxy/
 │   ├── test-compat-css.mjs       compat.js CSS 补丁单测（dvh / @scope / :has() / hash 归一化）
 │   ├── test-modern.mjs           modern.js 补齐层单测（104 行为沙箱 + blob 作用域）
 │   ├── test-archive-providers.mjs 归档 provider 单测（zip 中央目录 + epub OPF）
-│   ├── prebuilt/                 自研原生产物（Android arm64）
+│   ├── test-media-providers.mjs 媒体 provider 单测（video/audio 槽位与状态机）
+│   ├── prebuilt/                 自研原生产物（Android arm64）与注入片段
+│   │   ├── documentpreview-archive/  zip / epub provider 注入片段
+│   │   └── documentpreview-media/    video / audio provider 注入片段
 │   └── lib/                      装配/补丁/打包库
 └── .cache/                       构建缓存（debs / stage，可删）
 ```
@@ -107,7 +110,7 @@ $gradle = "C:\Users\XiaoXin\.gradle\wrapper\dists\gradle-8.10.2-bin\a04bxjujx95o
 # 1.5) 解 stage（poolextract/build-runtime 依赖它；Python 3.12 标准库解 data.tar.xz）
 & "C:\Users\XiaoXin\AppData\Local\Programs\Python\Python312\python.exe" tools/lib/debextract.py --debs .cache\debs --out .cache\stage
 
-# 2) 装配 runtime.zip（从 app.asar 抽取 dsh 依赖树 + 打 17 个兼容补丁 + 打包 LibreOffice wasm、CJK 字体与移动端插件）
+# 2) 装配 runtime.zip（从 app.asar 抽取 dsh 依赖树 + 打 18 个兼容补丁 + 打包 LibreOffice wasm、CJK 字体与移动端插件）
 & $node tools/build-runtime.mjs
 
 # 2.5) 构建扩展包池（J/K 组边际闭包 → assets/ext-pool/*.tar.gz + 扩展目录 extensions.json）
@@ -144,14 +147,14 @@ cd android
 | 3 | 路径归一化 | 1121 个脚本的 `com.termux` 绝对路径改写成 `@DSH_ROOT@`；剔除 39 个死解释器脚本 |
 | — | 目录链接展开 | `lib/clang/latest`(316) / `lib/icu/current`(2) / `lib/terminfo`(40) 是目录型链接，必须逐成员展开 |
 | 4 | 闭包解析 | 从 asar 递归 **524 个包**；**按包实例建模**（含嵌套 node_modules） |
-| 5 | 兼容补丁 | 17 个补丁（见下） |
+| 5 | 兼容补丁 | 18 个补丁（见下） |
 | 6 | 注入 | corepack 包装器 + `kxxy-host` 插件 + 悬空 LINK 清扫 |
 | 6.5 | 打包引擎资产 | LibreOffice wasm 引擎（49 文件，剥离 `os` 字段）+ 两份 CJK 字体 |
 | 6.6 | 打包移动端插件 | 第三方 `dsh-web-mobile`（209 文件）整包塞进 `lib/node_modules/`（它进「已安装」列表靠的是启动时 `EngineConfig.ensureProfileManifest` 写 profile manifest，见缺陷 AB） |
 | 7 | 合并 | 目录 3657 / 文件 30321 / LINK 1560（未压缩 1.43 GiB） |
-| 8 | 写出 | 条目 35,539，zip 557.88 MiB |
+| 8 | 写出 | 条目 35,539，zip 557.89 MiB |
 
-### 17 个兼容补丁
+### 18 个兼容补丁
 
 | 补丁 | 原因 |
 |---|---|
@@ -171,11 +174,12 @@ cd android
 | `office-to-pdf-formats` | 扩展名白名单补 `odt` / `ods` / `odp`（底层引擎本就支持 ODF） |
 | `document-preview-office-extensions` | 客户端 office provider 的 `extensions` 同步补 `odt` / `ods` / `odp` |
 | `document-preview-archive-providers` | 注入 zip / epub 两个归档 provider（缺陷 Z，官方两个格式都没有渲染器） |
+| `document-preview-media-providers` | 注入 video / audio 两个媒体 provider（缺陷 AI，官方把 16 个音视频后缀列进 `UNVIEWABLE_BINARY_EXTENSIONS` 直接判「无法预览」） |
 | `dsh-manifest` | 把 `kxxy-host` 与内置的 `dsh-web-mobile` 写进 `@deepseek-ai/dsh` 的 dependencies（installation scope，否则 `dsh-client-modules` 扫不到那条 Loader entry） |
 
 ---
 
-## 五、移植过程中发现并修掉的 34 个真实缺陷
+## 五、移植过程中发现并修掉的 35 个真实缺陷
 
 这些都是**只在真机/端到端路径上才会暴露**的问题，构建全绿时完全看不出来：
 
@@ -218,6 +222,8 @@ cd android
 | AG | 权限卡的长徽章把标题列挤成逐字竖排 | Root 卡的文字**一行一个字**竖直排列（「经 / su / 整 / 体 / 提 / 权 / 启 / 动 / 引 / 擎」），Shizuku 卡却正常 | `.priv-card-head` 是 `display:flex` 且**不换行**，`.priv-badge` 又是 `flex-shrink: 0; white-space: nowrap` ⇒ 徽章宽度完全不可压缩。Shizuku 徽章「不可用 · 未检测到 Shizuku 管理器」在 412px 竖屏下勉强放得下，Root 徽章「不可用 · 未检测到可用的 su（需 Magisk / KernelSU）」更长 ⇒ 徽章把 `.priv-titles` 挤到 `min-width: 0` 允许的最小宽度，中文于是逐字换行成一列。修复：`.priv-card-head` 加 `flex-wrap: wrap`，`.priv-titles` 改 `flex: 1 1 60%; min-width: 8em`，`.priv-badge` 改 `flex-shrink: 1; max-width: 100%; white-space: normal; overflow-wrap: anywhere` —— 徽章先尝试与标题同行，放不下就整块掉到下一行。**合成复现为什么失败、真机探针为什么成功**（可复用教训）：用无头 Chrome 按 412px 宽复现时，旧 CSS 只量到 `titlesW=130.6`，**复现不出竖排** —— 因为合成页面里 `.priv-card` 直接是 `body` 的子元素、吃满了整屏宽度；真机上它嵌在 `.view-pane > .card > .priv-cards` 三层 padding 里，可用宽度只有 **350.2px**。改在真机页面里注入探针（`probe-priv.js`，先切到设置视图再量，因为非激活视图是 `display:none` 会量到 0）才拿到决定性对照：旧 CSS `titlesW=0, titlesH=527, vertical=true`，新 CSS `titlesW=285.2, titlesH=56, vertical=false`。**教训：布局类缺陷的合成复现必须复刻真实容器的宽度链路，否则「复现不出」会被误读成「不是这个原因」** |
 
 | AH | 删页签时漏改底栏列数，留下一个空列 | 底栏右侧多出一块很显眼的空白 —— 用户原话：「现在不是三个板块吗？概览扩展设置为什么之前删除的板块导致右下方有一个很明显的空白？」 | 缺陷 AF 删掉「终端」页时改了三处（HTML 的视图段、HTML 的页签按钮、`host.js` 的五个引用），**漏了第四处**：`.tabbar-inner` 的 `grid-template-columns: repeat(4, 1fr)` 是照着当时四个页签写死的。页签从四个变三个后，网格仍是四列，第四列没有子元素 ⇒ 底栏右侧空出整整四分之一。修复：改成 `grid-auto-flow: column` + `grid-auto-columns: 1fr`，列数由子元素个数决定，以后再增删页签都不会留下空列。**教训（与缺陷 AF 同源）**：这类「删掉一块东西」的改动，真正要清理的是**所有引用它的地方**，而 CSS 里的布局参数最容易漏 —— 它不在 JS 的调用图里，grep 页签 id 也搜不到。同一个删除动作实际涉及四处：视图段、页签按钮、JS 逻辑、**布局网格**。这个 bug 不报错、HTTP 层完全看不出异常、只有肉眼能发现，所以在 `smoke-plugin.mjs` 里补了两条断言把它钉死：① 解析 `index.html` 的 `data-target` 与 `data-view`，数量不等或页签指向不存在的视图就报错；② `.tabbar-inner` 出现 `grid-template-columns: repeat(N,` 就报错，且必须存在 `grid-auto-flow: column` |
+
+| AI | 视频与音频完全没有渲染器，点开只显示「该格式文件暂时无法预览」 | 文件树里 12 种视频（`3gp/avi/flv/m4v/mkv/mov/mp4/mpg/ogv/ts/webm/wmv`）与 17 种音频全部只有 unsupported 空态 —— 用户原话：「查看我现在的手机界面，视频跟音频无法打开，无法预览，给我优化一下」 | 这是**上游能力缺口**（与缺陷 Z 同类，桌面版同样没有），不是 Android 特有：`dsh-client-ui-sidebar-documentpreview` 的 `documentPreviews.register` 只注册了 text / markdown / html / image / pdf / code / office 七种，而 `UNVIEWABLE_BINARY_EXTENSIONS`（65 项）**开头 16 项就是音视频**（`mp4, mov, avi, mkv, webm, flv, wmv, m4v, mp3, wav, flac, ogg, m4a, aac, wma, opus`）⇒ 无候选 + 命中黑名单 ⇒ `candidates` 返回空数组 ⇒ 直接渲染 unsupported 空态。修复分两半：**① 宿主侧新增 `/kxxy/media` 流式路由**（官方 `/api/file` 无 Range/206、全量读进内存、上限复用的是**图片附件上限 20 MiB**，对视频偏小）；**② 客户端注入 video / audio 两个 provider**（`tools/prebuilt/documentpreview-media/providers.js`，与归档 provider 同构）。**WebView 104 解码能力实测**（探针 `[kxxy-media]`）：`video/mp4; codecs="avc1.42E01E"` / `vp8` / `vp9` / `audio/mpeg` / `audio/aac` / `audio/flac` / `ogg; codecs="opus"` 等 13 项 `probably`，`video/mp4` / `video/webm` / `audio/wav` 等 10 项 `maybe`，`mkv/avi/wmv/flv/mpeg/mp2t/quicktime/aiff/midi/amr` 等 17 项 `no` ⇒ **缺的不是解码器，是 provider**。**真实播放验证**：2,848,208 B 的 `sample-5s.mp4` 走 `/kxxy/media` 得 `video-OK dur=5.759 rs=1 seekable=1`。真机验收：`real-sample.mp4` 出播放器（`0:00 / 0:05` + 进度条 + 音量 + 全屏 + 倍速菜单），`silence.mp3` 出音频控件（`0:00 / 0:02`）。**为什么不走 `bytes-complete`**：那条路要先全量下载进内存（受 20 MiB 上限约束）才出画面；新 provider 用 `loading: "renderer"` 模式 —— 该模式**不需要任何字节加载，provider 声明即被自动触发**，只需拿到 `version` 后调一次 `request.loaded(version)` 让 `hasContent` 为真，`<video src>` 直接指向流式 URL。**失败文案必须分开**：`MediaError.code === 4`（`MEDIA_ERR_SRC_NOT_SUPPORTED`）与「文件损坏」是两回事，前者报「当前系统的浏览器内核不支持 `{ext}` 格式」+ 转码提示，后者报错误码；混在一起会让用户对着不支持的容器反复重试 |
 
 **关于缺陷 Q 的额外结论（终端功能本身是好的）**：`dsh.terminal.shell` 这个键**已被官方废弃** —— 在四个运行时 bundle（`sidebar-terminal` / `client.terminal` / `terminal-bash` / `terminal`）里对 `/terminal\.shell/` 与 `/localStorage/` 的命中数**都是 0**；官方新建终端走 `webTerminals.selectShell(path)` → 开 tab 时把 `shellPath` 作为参数传下去（`terminal-bash` 的默认值是 `DEFAULT_BASH_SHELL = "/bin/bash"`，可被 `config.shellPath` 覆盖，而该配置由引擎侧注入）。所以那张卡显示的 `bin/cmd` 只是**历史遗留值**，不影响终端；真机上终端本身工作正常（`bash-5.3$` 提示符、`uname -a` 正常），即缺陷 K 的修复仍然有效。对照实验也证明**官方终端天然跟随主题**：浅色下 `.xterm-viewport` 背景透明、文字 `rgb(15,17,21)`，官方 `sidebar-terminal` 插件全部用 `var(--dsw-alias-*)` 官方 token。
 
@@ -325,22 +331,24 @@ about:blank 再回来**（无发起者的跨站导航不带 Strict cookie → 40
 
 ---
 
-## 六、验证体系（九层）
+## 六、验证体系（十层）
 
 | 脚本 | 验证什么 | 为什么需要它 |
 |---|---|---|
-| `verify-runtime.mjs` | zip 结构（条目数 / LINK 注释 / 占位符残留 / 版本标记 / ELF 校验 / 字体 sfnt 魔数） | 产物完整性 |
+| `verify-runtime.mjs` | zip 结构（条目数 / LINK 注释 / 占位符残留 / 版本标记 / ELF 校验 / 字体 sfnt 魔数）**+ 打开 zip 里真实的 documentpreview `client.js` 断言注入片段真的写进去了、且上游音视频黑名单 16 项全被 provider 认领** | 产物完整性。后两条是补上来的：锚点判定只证明 `patchset.version` 标记文件在、与 Kotlin 常量一致，**不证明补丁内容真的落进 bundle** —— 真机出过一次「标记在、全锚点过、`isComplete()` 判真跳过重装，而设备上仍是未打补丁的旧文件」 |
 | `simulate-install.mjs` | 复刻 `RuntimeInstaller` 的 7 步解包与十一锚点判定 | 结构对 ≠ 设备上能装出可启动的树 |
 | `smoke-plugin.mjs` | 复刻官方 `WebServer` 路由契约起真实 HTTP，并断言兼容层/现代内建补齐层的关键实现在场、版本标记与 Kotlin 常量一致 | 文件铺对了 ≠ 插件能挂起来 |
 | `check-bundle.mjs` | 用**真实** `dsh-app-boot` 走解析链 | 插件能跑 ≠ DSH 能发现它 |
-| `test-pty-patch.mjs` | 17 个补丁的离线单测（自带 fixture，不依赖仓库外文件） | 补丁改错了构建照样全绿，只有点开终端才炸 |
+| `test-pty-patch.mjs` | 18 个补丁的离线单测（自带 fixture，不依赖仓库外文件） | 补丁改错了构建照样全绿，只有点开终端才炸 |
 | `test-compat-url.mjs` | 在「WebView 104 行为沙箱」里跑真实 `compat.js`，断言 URL 补丁的 25 组取值与 8 组回归 | `smoke-plugin` 只能验「实现在场」，验不了语义边界（特殊协议、空 authority、userinfo/port）—— 而边界恰恰最容易改坏 |
 | `test-compat-css.mjs` | 断言 `dvh → vh`、`@scope` 展开器、`:has()` 标记改写与插件 hash 锚点代际归一化共 45 组取值（含嵌套 `@media`/`@supports`/`@layer`、`@keyframes` 内部原样保留、真机设置面板门控形态、哈希映射的「唯一超集才采纳」边界） | 三段器都是纯文本重写，一个括号配平错误或一个标识符未定义就会让**整层**样式改写失效（缺陷 AC 的 `matchParen` 事故） |
 | `test-modern.mjs` | 每个用例一个**独立 vm realm** 的「104 沙箱」，跑真实 `modern.js`，断言补齐结果 + `URL.createObjectURL` 对 script/html 两类 blob 的前置注入 + 幂等 | 补齐层最危险的失败模式是「本地全绿、真机只显示渲染进程无法继续」—— 补齐源码要被 `Function.prototype.toString()` 搬进 worker 执行，引用本文件作用域里任何变量都不会在本地报错 |
 | `test-archive-providers.mjs` | 在 `vm` 沙箱里跑 `tools/prebuilt/documentpreview-archive/providers.js`，断言 ZIP 中央目录解析（含 ZIP64、目录项、加密位）、`kxxyInflateRaw`、EPUB OPF/spine 解析、内联资源与预算控制 | 归档 provider 是**注入进 26 万字符扁平 bundle 作用域**的片段，本地没有模块边界兜底；ZIP 解析器的边界（EOCD 扫描窗口、ZIP64 扩展字段顺序）只有单测能覆盖 |
+| `test-media-providers.mjs` | 在自建 hooks 运行时里跑 `tools/prebuilt/documentpreview-media/providers.js`：13+17 个后缀覆盖、src 构造（loopback 走 `/kxxy/media`、`dsh-app://` 退回 `api/file`）、失败归因（code 4 报 unsupported / 其它报错误码）、`loaded` 上报幂等、三态兜底（unavailable / noPath / loading）、注册形状（1 字典 + 2 provider + 2 槽位 + 5 effect） | 媒体 body 有 5 条互相独立的分支（元数据未到 / 无绝对路径 / 加载中 / 就绪 / 失败），少写一条就变成**永远转圈**且不报任何错；`renderer` 模式还要求恰好上报一次 `loaded`，否则 `hasContent` 不为真、body 根本不渲染 |
 
 外加**端到端实测**：用宿主 node 直接跑装配产物，验证
 `/`（官方前端 + token 认证）、`/kxxy`（管理页）、`/kxxy/api/*`（API）、
+`/kxxy/media`（媒体流）、
 以及边界行为（恶意 Host 403、目录穿越 400、未知端点 404）。
 
 ---
@@ -351,6 +359,7 @@ about:blank 再回来**（无发起者的跨站导航不带 Strict cookie → 40
 |---|---|
 | Office 文档预览 | **已可用**（缺陷 X）—— 走 LibreOffice wasm 后端，doc/docx/odt/xls/xlsx/ods/ppt/pptx/odp 九种格式都能转 PDF。代价是包体：wasm 引擎 145 MiB + 两份 CJK 字体 21 MiB 使 runtime.zip 从 497 MiB 涨到 555 MiB、APK 从 1,545 MiB 涨到 1,604 MiB；转换在设备上约 4–5 s、峰值 RSS 约 400–715 MiB。**首次转换有冷启动**（wasm 模块加载约 1.4 s） |
 | 归档 / 电子书预览 | **已可用**（缺陷 Z）—— zip 列条目 + 点开预览文本条目；epub 按 OPF spine 拼出可滚动单页。**限制**：zip 单条目解压上限 16 MiB、epub 内联资源总预算 24 MiB；只支持 `stored` 与 `deflate`（`deflate64` / `bzip2` / `lzma` 等少见方式会报「不支持的压缩方式」）；加密 zip 明确拒绝；**纯前端解压，不做流式**，打开超大 zip 会把整个文件读进内存 |
+| 视频 / 音频预览 | **已可用**（缺陷 AI）—— 新增 `/kxxy/media` 流式路由（支持单段 `Range` / 206 / `HEAD`，正确 MIME，无 20 MiB 上限）+ video / audio 两个 provider。**限制**：容器支持取决于 ROM 自带的 WebView（本机 104 实测能解 H.264/MP4、VP8/VP9 WebM、MP3、AAC、FLAC、Opus/Vorbis；**不能解** mkv / avi / wmv / flv / mpg / ts / 3gp / theora / aiff / midi / amr，点开会明确提示「内核不支持该格式，通常需要先转成 mp4 或 webm」而不是空转）。设备侧 **ffmpeg 二进制不可用**（Termux 的 ffmpeg 缺 `libbinder_ndk.so` 等 linker 依赖），所以不能靠转码兜底 |
 | 沙箱隔离 | Android 无 landlock/seatbelt，固定 `danger-full-access` |
 | 无障碍服务 | 未实现（参考项目有 1,495 行，方案 T 下属可选后置） |
 | 语音输入 | 未实现 |

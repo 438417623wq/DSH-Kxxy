@@ -741,7 +741,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 旧插件跳过重装。改动 plugins/kxxy-host/ 下任何文件后递增编号。
          */
         private const val HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js"
-        private const val HOST_PLUGIN_MARKER = "kxxy-host@7"
+        private const val HOST_PLUGIN_MARKER = "kxxy-host@8"
 
         /**
          * 移动端 UI 插件（第三方 dsh-web-mobile）版本标记（锚点 10）。
@@ -805,7 +805,7 @@ class RuntimeInstaller(private val ctx: Context) {
          *
          * 改动 patches.mjs 里任何补丁、或增删补丁时，必须同步递增此编号。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@1"
+        private const val PATCHSET_MARKER = "kxxy-patchset@2"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /** 读版本标记时探测的头部字节数；标记都写在首行，取小值即可。 */

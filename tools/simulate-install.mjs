@@ -73,7 +73,7 @@ const PTY_NODE_MARKER = "kxxy-pty-node@1";
  * 于是「改了 host.js / lib/index.js 却只重装 APK」的设备一直跑旧插件，
  * 且七锚点全通过、永不重装。标记写在插件入口 lib/index.js 首行。
  */
-const HOST_PLUGIN_MARKER = "kxxy-host@7";
+const HOST_PLUGIN_MARKER = "kxxy-host@8";
 
 /**
  * 与 RuntimeInstaller.MOBILE_PLUGIN_MARKER 保持一致（锚点 10）。
@@ -115,7 +115,7 @@ const OFFICE_FONT_FILES = [
  * `grep -c kxxyArchiveApply` 仍是 0 —— 前面的锚点全通过，isComplete()
  * 判真，补丁根本没解出来。标记由 build-runtime.mjs 写在 kxxy-host 目录下。
  */
-const PATCHSET_MARKER = "kxxy-patchset@1";
+const PATCHSET_MARKER = "kxxy-patchset@2";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 const EXECUTABLE_NAMES = new Set(["rg", "esbuild", "node", "sharp", "swc", "dprint", "biome"]);
 const SONAME_ALIASES = [
