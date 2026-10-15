@@ -1671,8 +1671,14 @@ html, body {
   width: 100%;
   max-width: 480px;
   height: var(--tabbar-height);
+  /* ⚠ 这里**不能**写死列数。原先写的是 `repeat(4, 1fr)`，与当时的四个页签
+     （概览/扩展/终端/设置）对齐；删掉「终端」页后只剩三个页签，第四列空着
+     —— 底部导航右侧就多出一块很显眼的空白。
+     改用 `grid-auto-flow: column` + `grid-auto-columns: 1fr`：列数由子元素
+     个数决定，以后再增删页签都不会留下空列。 */
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
   align-items: center;
 }
 

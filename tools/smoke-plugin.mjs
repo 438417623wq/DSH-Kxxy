@@ -377,6 +377,22 @@ console.log('[1] GET /kxxy（宿主管理页）')
       ok(`导航链接是绝对路径：${ref}（由官方前端提供，不在本插件路由内）`)
     }
   }
+
+  // ── 底部页签数必须与视图数一致 ──────────────────────────────────────
+  // 删掉「终端」视图时漏改了一处：`.tabbar-inner` 写死 `repeat(4, 1fr)`，
+  // 只剩三个页签后第四列空着，底栏右侧多出一块很显眼的空白。这不是报错，
+  // 只能靠肉眼发现，所以在这里钉死「页签 ↔ 视图」一一对应。
+  const tabTargets = [...r.text.matchAll(/class="tab-item[^"]*"\s+data-target="([^"]+)"/g)].map((m) => m[1])
+  const viewNames = [...r.text.matchAll(/class="view-pane[^"]*"\s+data-view="([^"]+)"/g)].map((m) => m[1])
+  if (tabTargets.length === 0 || viewNames.length === 0) {
+    fail('解析不出页签或视图（index.html 的 class/data-* 写法变了？）')
+  } else if (tabTargets.length !== viewNames.length) {
+    fail(`底部页签 ${tabTargets.length} 个，视图 ${viewNames.length} 个，数量不一致`)
+  } else {
+    const missing = tabTargets.filter((t) => !viewNames.includes(t))
+    if (missing.length > 0) fail(`页签指向不存在的视图：${missing.join(', ')}`)
+    else ok(`底部页签与视图一一对应（${tabTargets.length} 个：${tabTargets.join(' / ')}）`)
+  }
 }
 
 console.log('\n[2] GET /kxxy/assets/host.css')
@@ -396,6 +412,18 @@ console.log('\n[2] GET /kxxy/assets/host.css')
     if (css.includes('.terminal-container') || css.includes('.terminal-viewport')) {
       fail('host.css 仍有终端视图样式（视图已删除）')
     } else ok('终端视图样式已随视图一并删除')
+
+    // ── 底栏列数不得写死 ──────────────────────────────────────────────
+    // 同一次删除留下的另一半问题：`.tabbar-inner` 原写 `repeat(4, 1fr)`，
+    // 页签从四个变三个后第四列空着。改成 grid-auto-flow 由子元素个数决定。
+    const tabbarBlock = css.match(/\.tabbar-inner\s*\{[^}]*\}/)
+    if (!tabbarBlock) {
+      fail('host.css 找不到 .tabbar-inner 规则')
+    } else if (/grid-template-columns\s*:\s*repeat\(\s*\d+/.test(tabbarBlock[0])) {
+      fail('.tabbar-inner 又写死了列数；增删页签会留下空列')
+    } else if (!/grid-auto-flow\s*:\s*column/.test(tabbarBlock[0])) {
+      fail('.tabbar-inner 未使用 grid-auto-flow，列数不随页签个数自适应')
+    } else ok('底栏列数由页签个数决定（未写死）')
 
     // ── 扩展分组展开态必须跨轮询存活 ─────────────────────────────────
     // fetchExtensions() 每 5 秒被 startPolling 调用一次，而 renderExtensions
