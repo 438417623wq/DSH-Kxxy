@@ -28,7 +28,7 @@
           </div>
           <div class="brand-text">
             <h1 class="header-title">DSH Kxxy 控制台</h1>
-            <span class="header-version">v0.3.0-android</span>
+            <span class="header-version">v0.3.2-android</span>
           </div>
         </div>
 
@@ -444,62 +444,25 @@
           </div>
         </div>
 
-        <!-- 宿主信息卡片 -->
-        <div class="card block-card">
-          <div class="card-title-group">
-            <h3 class="card-title">宿主环境参数</h3>
-            <span class="card-subtitle">编译构建与系统运行库信息</span>
+        <!-- 关于：点击弹出信息弹窗（原「宿主环境参数」卡片的内容已移入弹窗） -->
+        <div class="card block-card about-entry-card" id="about-entry" role="button" tabindex="0" aria-haspopup="dialog">
+          <div class="about-entry-head">
+            <div class="about-entry-logo" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <path d="M12 2L3 7V17L12 22L21 17V7L12 2Z" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M12 22V12" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M21 7L12 12L3 7" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <circle cx="12" cy="12" r="3" style="fill:var(--accent-cyan)" />
+              </svg>
+            </div>
+            <div class="about-entry-text">
+              <h3 class="card-title">关于</h3>
+              <span class="card-subtitle">DSH Kxxy 控制台 · 作者 开心小元</span>
+            </div>
+            <svg class="about-entry-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M9 5L16 12L9 19" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
           </div>
-
-          <div class="info-table">
-            <div class="info-row">
-              <span class="info-key">Target SDK</span>
-              <span class="info-val">28 (Android 9.0 · W^X 保护兼容)</span>
-            </div>
-            <div class="info-row">
-              <span class="info-key">Min SDK</span>
-              <span class="info-val">26 (Android 8.0 Oreo)</span>
-            </div>
-            <div class="info-row">
-              <span class="info-key">Node.js 版本</span>
-              <span class="info-val" id="info-node-ver">v20.11.1 (LTS/Iron)</span>
-            </div>
-            <div class="info-row">
-              <span class="info-key">pnpm 版本</span>
-              <span class="info-val" id="info-pnpm-ver">v8.15.4</span>
-            </div>
-            <div class="info-row">
-              <span class="info-key">应用包名</span>
-              <span class="info-val">app.kxxy</span>
-            </div>
-            <div class="info-row">
-              <span class="info-key">执行目录</span>
-              <span class="info-val code-font">/data/user/0/app.kxxy/files</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- 插件下载源（原在「扩展」页，但那里全是离线包池、用不到镜像；
-             真正会联网下载的是对话页侧栏「插件」页的「+ 添加插件」，故移到这里） -->
-        <div class="card block-card">
-          <div class="card-title-group">
-            <h3 class="card-title">插件下载源</h3>
-            <span class="card-subtitle">对话页侧栏「插件」→「+ 添加插件」下载第三方插件时使用的 npm 镜像</span>
-          </div>
-
-          <div class="card mirror-card">
-            <div class="mirror-left">
-              <span class="mirror-icon" aria-hidden="true">🌐</span>
-              <div class="mirror-info">
-                <span class="mirror-title">镜像源加速：<strong class="mirror-active-source" id="current-mirror-name">读取中…</strong></span>
-                <span class="mirror-sub" id="mirror-sub">点击「测速」获取各源真实延迟</span>
-              </div>
-            </div>
-            <button class="button button-subtle button-sm" id="btn-switch-mirror">测速</button>
-          </div>
-
-          <!-- 测速结果（点击应用切换，切换后提示重启引擎） -->
-          <div class="mirror-results" id="mirror-results"></div>
         </div>
 
         <!-- 危险操作区 -->
@@ -529,6 +492,72 @@
         </div>
       </section>
     </main>
+
+    <!-- 关于弹窗：遮罩点击 / 关闭按钮 / Esc 都能关。
+         id 全部沿用原「宿主环境参数」卡片（info-node-ver 仍由 fetchState 实时写入 Node 版本），
+         所以移进弹窗后动态信息照常刷新。 -->
+    <div class="kxxy-dialog-backdrop" id="about-dialog" data-open="false">
+      <div class="kxxy-dialog" role="dialog" aria-modal="true" aria-labelledby="about-dialog-title">
+        <div class="kxxy-dialog-head">
+          <div class="about-entry-logo" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+              <path d="M12 2L3 7V17L12 22L21 17V7L12 2Z" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M12 22V12" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M21 7L12 12L3 7" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <circle cx="12" cy="12" r="3" style="fill:var(--accent-cyan)" />
+            </svg>
+          </div>
+          <div class="kxxy-dialog-titles">
+            <h3 class="kxxy-dialog-title" id="about-dialog-title">DSH Kxxy 控制台</h3>
+            <span class="kxxy-dialog-version" id="about-dialog-version">v0.3.2-android</span>
+          </div>
+          <button class="kxxy-dialog-close" type="button" id="btn-about-close" aria-label="关闭">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+
+        <div class="kxxy-dialog-body">
+          <div class="about-author">
+            <span class="about-author-label">作者</span>
+            <span class="about-author-name">开心小元</span>
+          </div>
+
+          <div class="about-section-title">宿主环境参数</div>
+          <div class="info-table">
+            <div class="info-row">
+              <span class="info-key">Target SDK</span>
+              <span class="info-val">28 (Android 9.0 · W^X 保护兼容)</span>
+            </div>
+            <div class="info-row">
+              <span class="info-key">Min SDK</span>
+              <span class="info-val">26 (Android 8.0 Oreo)</span>
+            </div>
+            <div class="info-row">
+              <span class="info-key">Node.js 版本</span>
+              <span class="info-val" id="info-node-ver">v20.11.1 (LTS/Iron)</span>
+            </div>
+            <div class="info-row">
+              <span class="info-key">pnpm 版本</span>
+              <span class="info-val" id="info-pnpm-ver">v8.15.4</span>
+            </div>
+            <div class="info-row">
+              <span class="info-key">应用包名</span>
+              <span class="info-val">app.kxxy</span>
+            </div>
+            <div class="info-row">
+              <span class="info-key">执行目录</span>
+              <span class="info-val code-font">/data/user/0/app.kxxy/files</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="kxxy-dialog-foot">
+          <button class="button button-subtle button-block" type="button" id="btn-about-dismiss">关闭</button>
+        </div>
+      </div>
+    </div>
 
     <!-- 批量操作条（勾选卡片后浮出，吸附在底栏导航之上） -->
     <div class="ext-batch-bar" id="ext-batch-bar" hidden>

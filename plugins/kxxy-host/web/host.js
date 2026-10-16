@@ -2,10 +2,14 @@
  * DSH Kxxy Host Dashboard - Core Client Logic
  * Standard ES2020 Implementation without external dependencies
  *
- * 五项改进方案落地版：
- *   · 扩展中心渲染真实目录（包池 × 安装状态），「获取」走 202 + jobId 轮询
- *   · 镜像源真实测速（POST /kxxy/api/mirror/test）与真实切换（/apply）
- *   · 重启引擎 / 导出日志 / 权限 / 开关 / 终端快捷键全部走真分派表
+ * 功能分布：
+ *   · 概览：引擎状态 / 运行时完整性检查 / 宿主环境指标
+ *   · 扩展：扩展中心渲染真实目录（包池 × 安装状态），「获取」走 202 + jobId 轮询
+ *   · 设置：外观 / 系统权限 / 权限等级 / 守护开关 / 关于弹窗
+ *   · 重启引擎 / 导出日志 / 权限 / 开关全部走真分派表
+ *
+ * 注：镜像源测速与切换的 UI 已从控制台移除（后端仍保留），
+ *     原「终端」页也已移除（它只是 engine.log 尾巴查看器）。
  */
 
 (() => {
@@ -71,10 +75,6 @@
     btnQuickRefresh: document.getElementById('btn-quick-refresh'),
 
     // 扩展视图元素
-    currentMirrorName: document.getElementById('current-mirror-name'),
-    mirrorSub: document.getElementById('mirror-sub'),
-    mirrorResults: document.getElementById('mirror-results'),
-    btnSwitchMirror: document.getElementById('btn-switch-mirror'),
     extensionsList: document.getElementById('extensions-list'),
     builtinSummary: document.getElementById('builtin-summary'),
     extBatchBar: document.getElementById('ext-batch-bar'),
@@ -96,6 +96,11 @@
     toggleLan: document.getElementById('toggle-lan'),
     infoNodeVer: document.getElementById('info-node-ver'),
     infoPnpmVer: document.getElementById('info-pnpm-ver'),
+    aboutEntry: document.getElementById('about-entry'),
+    aboutDialog: document.getElementById('about-dialog'),
+    aboutDialogVersion: document.getElementById('about-dialog-version'),
+    btnAboutClose: document.getElementById('btn-about-close'),
+    btnAboutDismiss: document.getElementById('btn-about-dismiss'),
     btnRestartEngine: document.getElementById('btn-restart-engine'),
     btnExportLogs: document.getElementById('btn-export-logs'),
 
@@ -872,80 +877,54 @@
   }
 
   // ==========================================
-  // 4. 镜像源：真实测速 + 真实切换（卡片已移到「设置」页，逻辑不变）
+  // 4. 关于弹窗：入口卡点击 → 弹出信息（作者 + 宿主环境参数）
   // ==========================================
-  async function fetchMirror() {
-    try {
-      const m = await apiGet('/kxxy/api/mirror');
-      if (!m) return;
-      if (dom.currentMirrorName && m.name) {
-        dom.currentMirrorName.textContent = m.name;
-      }
-      if (dom.mirrorSub) {
-        dom.mirrorSub.textContent = '点击「测速」获取各源真实延迟';
-      }
-    } catch {
-      // 错误已提示
+  // 原「镜像源」卡片已按需求从控制台移除（后端 /kxxy/api/mirror* 与 lib/mirror.mjs
+  // 仍保留：镜像源本身是「对话页侧栏 → 插件 → + 添加插件」那个入口在用的，
+  // 只是控制台不再暴露测速/切换 UI）。
+  // 原「宿主环境参数」卡片的内容整体移进了这个弹窗。
+
+  /** 打开「关于」弹窗（版本号从页头同步，避免两处各写一份）。 */
+  function openAboutDialog() {
+    if (!dom.aboutDialog) return;
+    const headerVersion = document.querySelector('.header-version');
+    if (dom.aboutDialogVersion && headerVersion) {
+      dom.aboutDialogVersion.textContent = headerVersion.textContent.trim();
     }
+    dom.aboutDialog.setAttribute('data-open', 'true');
   }
 
-  function initMirrorActions() {
-    if (!dom.btnSwitchMirror) return;
-    dom.btnSwitchMirror.addEventListener('click', async () => {
-      dom.btnSwitchMirror.disabled = true;
-      dom.btnSwitchMirror.textContent = '测速中...';
-      if (dom.mirrorResults) dom.mirrorResults.innerHTML = '';
-      try {
-        const res = await apiPost('/kxxy/api/mirror/test', {});
-        renderMirrorResults((res && res.results) || []);
-      } catch {
-        // 错误已提示
-      } finally {
-        dom.btnSwitchMirror.disabled = false;
-        dom.btnSwitchMirror.textContent = '测速';
+  function closeAboutDialog() {
+    if (!dom.aboutDialog) return;
+    dom.aboutDialog.setAttribute('data-open', 'false');
+  }
+
+  function initAboutDialog() {
+    if (!dom.aboutEntry || !dom.aboutDialog) return;
+
+    dom.aboutEntry.addEventListener('click', openAboutDialog);
+    // 键盘可达（卡片是 role="button" tabindex="0"）
+    dom.aboutEntry.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openAboutDialog();
       }
     });
-  }
 
-  function renderMirrorResults(results) {
-    if (!dom.mirrorResults) return;
-    dom.mirrorResults.innerHTML = '';
-    if (!results.length) {
-      dom.mirrorResults.innerHTML = '<div class="mirror-row"><span class="mirror-ms">测速失败</span></div>';
-      return;
-    }
-    const sorted = [...results].sort((a, b) => (a.ms ?? 1e9) - (b.ms ?? 1e9));
-    sorted.forEach(m => {
-      const row = document.createElement('div');
-      row.className = 'mirror-row';
-      const msText = m.ms === null || m.ms === undefined ? '超时' : `${m.ms} ms`;
-      row.innerHTML = `
-        <span class="mirror-row-name">${escapeHtml(m.name)}</span>
-        <span class="mirror-ms">${escapeHtml(msText)}</span>
-      `;
-      const applyBtn = el('<button class="button button-subtle button-sm">应用</button>');
-      if (m.ms === null) applyBtn.disabled = true;
-      applyBtn.addEventListener('click', () => applyMirror(m));
-      row.appendChild(applyBtn);
-      dom.mirrorResults.appendChild(row);
+    if (dom.btnAboutClose) dom.btnAboutClose.addEventListener('click', closeAboutDialog);
+    if (dom.btnAboutDismiss) dom.btnAboutDismiss.addEventListener('click', closeAboutDialog);
+
+    // 点遮罩关闭（点弹窗本体不关）
+    dom.aboutDialog.addEventListener('click', (e) => {
+      if (e.target === dom.aboutDialog) closeAboutDialog();
     });
-  }
 
-  async function applyMirror(m) {
-    try {
-      const res = await apiPost('/kxxy/api/mirror/apply', { id: m.id });
-      if (dom.currentMirrorName && res.mirror && res.mirror.name) {
-        dom.currentMirrorName.textContent = res.mirror.name;
+    // Esc 关闭：只在弹窗打开时拦截，避免影响页面其它按键
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && dom.aboutDialog.getAttribute('data-open') === 'true') {
+        closeAboutDialog();
       }
-      showToast(`${m.name} 已写入 npmrc。重启引擎后对引擎生效`, 'success');
-      // 一键重启（restart-engine 现在是真通道：原生层 1~2 秒内消费）
-      if (confirm('镜像源已写入。是否立即重启引擎使其生效？')) {
-        await apiPost('/kxxy/api/action', { action: 'restart-engine' });
-        showToast('重启请求已提交，引擎将在 1~2 秒内重启', 'success');
-      }
-    } catch {
-      // 错误已提示
-    }
+    });
   }
 
   // ==========================================
@@ -1148,7 +1127,7 @@
     if (dom.btnQuickRefresh) {
       dom.btnQuickRefresh.addEventListener('click', async () => {
         showToast('正在刷新状态...', 'info');
-        await Promise.all([fetchState(), fetchExtensions(), fetchMirror()]);
+        await Promise.all([fetchState(), fetchExtensions()]);
         showToast('数据已更新', 'success');
       });
     }
@@ -1268,14 +1247,13 @@
     initTabSwitch();
     initCategoryFilter();
     initActionButtons();
-    initMirrorActions();
+    initAboutDialog();
     initBatchActions();
     initLifecycle();
 
     // 启动初始拉取
     startPolling();
     fetchExtensions();
-    fetchMirror();
   }
 
   if (document.readyState === 'loading') {

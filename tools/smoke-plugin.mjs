@@ -393,6 +393,27 @@ console.log('[1] GET /kxxy（宿主管理页）')
     if (missing.length > 0) fail(`页签指向不存在的视图：${missing.join(', ')}`)
     else ok(`底部页签与视图一一对应（${tabTargets.length} 个：${tabTargets.join(' / ')}）`)
   }
+
+  // ── 「关于」入口卡与弹窗必须成对存在 ────────────────────────────────
+  // 设置页的「关于」卡是纯前端：点击 → 弹窗 data-open="true"。
+  // 三处（入口卡 / 弹窗根 / 关闭按钮）任缺一个，表现都是「点了没反应」，
+  // 不报错、HTTP 层也看不出异常。
+  for (const id of ['about-entry', 'about-dialog', 'btn-about-close', 'btn-about-dismiss']) {
+    if (!r.text.includes(`id="${id}"`)) fail(`index.html 缺少 #${id}（关于卡/弹窗不完整）`)
+  }
+  // 弹窗里必须还有 Node 版本节点：它由 fetchState 实时写入，
+  // 移进弹窗后若 id 丢了，「宿主环境参数」就变成永远不会更新的静态文案。
+  if (!r.text.includes('id="info-node-ver"')) {
+    fail('index.html 缺少 #info-node-ver（移入弹窗后 Node 版本不再刷新）')
+  }
+  // 镜像源 UI 已按需求整体移除
+  if (/id="(?:current-mirror-name|mirror-sub|mirror-results|btn-switch-mirror)"/.test(r.text)) {
+    fail('index.html 仍有镜像源卡片 DOM（该板块已要求移除）')
+  }
+  if (!/关于[\s\S]{0,200}开心小元/.test(r.text)) {
+    fail('关于卡里找不到作者署名「开心小元」')
+  }
+  ok('关于入口卡 + 弹窗 + 作者署名齐备，镜像源 UI 已移除')
 }
 
 console.log('\n[2] GET /kxxy/assets/host.css')
@@ -412,6 +433,14 @@ console.log('\n[2] GET /kxxy/assets/host.css')
     if (css.includes('.terminal-container') || css.includes('.terminal-viewport')) {
       fail('host.css 仍有终端视图样式（视图已删除）')
     } else ok('终端视图样式已随视图一并删除')
+
+    // ── 已移除的「插件下载源」卡片不得复活 ────────────────────────────
+    // 该卡片最初放在「扩展」页（与「全部内置」矛盾），v0.2.0 移到设置页，
+    // 用户随后要求整体移除。宿主后端 /kxxy/api/mirror* 仍在（镜像源本身是
+    // 对话页「+ 添加插件」在用的），这里只要求控制台不再暴露 UI。
+    if (/\.mirror-(?:card|row|results|icon|title|sub|ms|left|info)\b/.test(css)) {
+      fail('host.css 仍有镜像源卡片样式（UI 已移除）')
+    } else ok('镜像源卡片样式已随 UI 一并移除')
 
     // ── 底栏列数不得写死 ──────────────────────────────────────────────
     // 同一次删除留下的另一半问题：`.tabbar-inner` 原写 `repeat(4, 1fr)`，
@@ -446,7 +475,26 @@ console.log('\n[3] GET /kxxy/assets/host.js')
 {
   const r = await get('/kxxy/assets/host.js')
   if (r.status !== 200) fail(`状态码 ${r.status}`)
-  else ok(`200 ${r.type}，${r.text.length} 字节`)
+  else {
+    ok(`200 ${r.type}，${r.text.length} 字节`)
+
+    // 关于弹窗的交互逻辑必须真绑上（不然入口卡只是个不能点的装饰）
+    if (!/function initAboutDialog\(\)/.test(r.text)) {
+      fail('host.js 缺少 initAboutDialog')
+    } else if (!/dom\.aboutEntry\.addEventListener\('click', openAboutDialog\)/.test(r.text)) {
+      fail('入口卡没绑 click，点了不会弹窗')
+    } else if (!/dom\.aboutDialog\.setAttribute\('data-open', 'true'\)/.test(r.text)) {
+      fail('openAboutDialog 没写 data-open')
+    } else if (!/initAboutDialog\(\)/.test(r.text.replace(/function initAboutDialog\(\)/, ''))) {
+      fail('init() 里没有调用 initAboutDialog，弹窗永远不会绑定')
+    } else ok('关于弹窗交互已绑定（入口点击 / 关闭按钮 / 遮罩 / Esc）')
+
+    // 页面报错过的老坑：删了 DOM 却留着 JS 引用，getElementById 返回 null
+    // 后一旦被解引用就整段崩。这里断言镜像源的 JS 逻辑已随 UI 一起清掉。
+    if (/function initMirrorActions|function fetchMirror|function renderMirrorResults|function applyMirror/.test(r.text)) {
+      fail('host.js 仍残留镜像源逻辑（DOM 已删除，引用会是 null）')
+    } else ok('镜像源 JS 逻辑已随 UI 一并移除')
+  }
 }
 
 console.log('\n[4] GET /kxxy/assets/../lib/index.js（目录穿越应被白名单挡住）')

@@ -738,43 +738,168 @@ html, body {
   overflow-wrap: anywhere;
 }
 
-/* 插件下载源卡片（设置视图） */
-.mirror-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 14px;
+/* 「关于」入口卡（设置视图）—— 点击弹出信息弹窗。
+   原「宿主环境参数」卡片与「插件下载源」卡片的位置：前者内容已移入弹窗，
+   后者按需求整体移除（镜像源的后端仍在，但控制台不再暴露入口）。 */
+.about-entry-card {
+  cursor: pointer;
+  transition: border-color .15s ease, background-color .15s ease;
+}
+
+.about-entry-card:active {
   background-color: var(--bg-elevated);
 }
 
-.mirror-left {
+.about-entry-head {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
 }
 
-.mirror-icon {
-  font-size: 20px;
+.about-entry-logo {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
 }
 
-.mirror-info {
+.about-entry-text {
   display: flex;
   flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
-.mirror-title {
-  font-size: 13px;
+.about-entry-text .card-title {
+  margin: 0;
+}
+
+.about-entry-chevron {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+/* 关于弹窗 */
+.kxxy-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  /* 190 而不是 200：.toast-container 是 200，弹窗打开时的 toast 仍要能盖在上面 */
+  z-index: 190;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background-color: rgba(0, 0, 0, .45);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.kxxy-dialog-backdrop[data-open="false"] {
+  display: none;
+}
+
+.kxxy-dialog {
+  width: 100%;
+  max-width: 380px;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--radius-lg);
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, .32);
+  overflow: hidden;
+}
+
+.kxxy-dialog-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.kxxy-dialog-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.kxxy-dialog-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.kxxy-dialog-version {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.kxxy-dialog-close {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  background-color: transparent;
+  color: var(--text-secondary);
+}
+
+.kxxy-dialog-close:active {
+  background-color: var(--bg-elevated);
+}
+
+.kxxy-dialog-body {
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.about-author {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  border-radius: 10px;
+  background-color: var(--bg-elevated);
+}
+
+.about-author-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.about-author-name {
+  font-size: 14px;
+  font-weight: 600;
   color: var(--text-primary);
 }
 
-.mirror-active-source {
-  color: var(--accent-blue);
+.about-section-title {
+  font-size: 12px;
   font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
 }
 
-.mirror-sub {
-  font-size: 11px;
-  color: var(--text-muted);
+.kxxy-dialog-foot {
+  padding: 12px 16px 16px;
+  border-top: 1px solid var(--border-subtle);
 }
 
 /* 分类标签横排 */
@@ -994,50 +1119,6 @@ html, body {
   height: 44px;
   min-height: var(--touch-min);
   border-radius: var(--radius-md);
-}
-
-.btn-switch-mirror {
-  white-space: nowrap;
-}
-
-/* 镜像源测速结果列表（真实数据渲染） */
-.mirror-results {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 12px;
-}
-
-.mirror-results:empty {
-  display: none;
-}
-
-.mirror-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  background-color: var(--bg-card);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-}
-
-.mirror-row-name {
-  flex: 1;
-  font-size: 13px;
-  color: var(--text-primary);
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.mirror-ms {
-  font-size: 12px;
-  font-family: var(--font-mono);
-  color: var(--accent-green);
-  min-width: 64px;
-  text-align: right;
 }
 
 /* 「已内置」说明条（④ 档预装摘要） */
