@@ -15,9 +15,14 @@ captures/
 hs_err_pid*.log
 replay_pid*.log
 
+# ---- Python 字节码（tools/lib/poolextract.py 等被 fetch-extensions.mjs 调用时生成）----
+__pycache__/
+*.pyc
+
 # ---- 运行时装配产物 ----
-# runtime.zip 是 tools/build-runtime.mjs 的产物（④ 全能精选档 497 MiB / 35250 条目），
-# 由本机 DSH 桌面版的 app.asar + Termux .deb 装配而成，不属于源码。
+# runtime.zip 是 tools/build-runtime.mjs 的产物（④ 全能精选档 591 MiB / 42042 条目，
+# 含 LibreOffice wasm 引擎、CJK 字体、中文语言包与 TeX Live 宏包树），
+# 由本机 DSH 桌面版的 app.asar + Termux .deb + CTAN 装配而成，不属于源码。
 # 需要它的人请按 README「三、构建」自行生成。
 android/app/src/main/assets/runtime.zip
 

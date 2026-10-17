@@ -6,6 +6,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.file.Files
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
@@ -68,6 +69,11 @@ class RuntimeInstaller(private val ctx: Context) {
         if (isComplete(root)) {
             Log.i(TAG, "runtime already installed and complete")
             onProgress.onProgress(1f)
+            // 可执行位规则会随版本演进，而它**不是**锚点能表达的资产变更：
+            // 文件全都在、标记也匹配，只是某几个文件的 mode 不够。所以这条
+            // 修复单独走「每次启动都跑一次」的幂等路径（缺陷 AW）。
+            ensureJvmExecBits(root)
+            ensureTexFormats(root)
             ensureExtensionPool(root)
             return
         }
@@ -81,7 +87,7 @@ class RuntimeInstaller(private val ctx: Context) {
         // （参考项目 v1.2.21 事故：root.deleteRecursively() 把用户下载的扩展全删了）
         for (top in index.topLevelDirs) {
             val target = File(root, top)
-            if (target.exists()) target.deleteRecursively()
+            if (target.exists()) deleteTreeSafely(target)
         }
 
         extract(root, index.linkTargets, onProgress)
@@ -89,6 +95,8 @@ class RuntimeInstaller(private val ctx: Context) {
         rewriteRootPlaceholder(root, index.manifest)
         materialiseSonameAliases(root)
         restoreExecBits(root)
+        ensureJvmExecBits(root)
+        ensureTexFormats(root)
         writeStamp(root)
 
         // bin/ 与 lib/ 被整体替换，扩展中心装进 engine/{bin,lib} 的链接/副本
@@ -307,6 +315,41 @@ class RuntimeInstaller(private val ctx: Context) {
             return false
         }
 
+        // 锚点 12：Tesseract 简体中文语言包。
+        // 与锚点 9 同型（新增资产 + 版本戳不变 ⇒ 不加锚点老设备永不重装）。
+        // 只判标记文件不够：标记 26 B、写入必然成功，而 2.4 MiB 的
+        // .traineddata 中途被截断是完全可能的（存储不足）—— 截断的语言包
+        // 能让 `ls` 显示存在，直到用户真去识别中文才炸。所以主体单独判体积。
+        if (!markerIsCurrent(root, TESSDATA_MARKER_FILE, TESSDATA_MARKER)) {
+            Log.w(TAG, "runtime probe: tessdata marker outdated, forcing reinstall")
+            return false
+        }
+        val chiSim = File(root, TESSDATA_LANGUAGE_FILE)
+        if (!chiSim.isFile) {
+            Log.w(TAG, "runtime probe: chi_sim.traineddata missing, forcing reinstall")
+            return false
+        }
+        if (chiSim.length() < MIN_TRAINEDDATA_BYTES) {
+            Log.w(TAG, "runtime probe: chi_sim.traineddata truncated (${chiSim.length()} B)")
+            return false
+        }
+
+        // 锚点 13：TeX Live 宏包树。
+        // 同锚点 12 的道理，这里再加一层：宏包树是 5900 个文件、87 MiB，解到
+        // 一半失败留下的半棵树仍能让 `pdftex --version` 正常，但 `pdflatex`
+        // 会在找 article.cls / plain.tex 时失败。所以逐个探三个标志性文件的体积。
+        if (!markerIsCurrent(root, TEXLIVE_MARKER_FILE, TEXLIVE_MARKER)) {
+            Log.w(TAG, "runtime probe: texlive marker outdated, forcing reinstall")
+            return false
+        }
+        for (rel in TEXLIVE_CORE_FILES) {
+            val f = File(root, rel)
+            if (!f.isFile || f.length() == 0L) {
+                Log.w(TAG, "runtime probe: texlive core file missing/empty: $rel")
+                return false
+            }
+        }
+
         return true
     }
 
@@ -496,13 +539,11 @@ class RuntimeInstaller(private val ctx: Context) {
     }
 
     /**
-     * 把构建期占位符 `@DSH_ROOT@` 换成真实的引擎根目录。
+     * 把构建期占位符（`@DSH_ROOT@` 等五条）换成设备上的真实目录。
      *
-     * 只改 manifest 列出的 179 个脚本 —— 构建期已扫出「哪些文件含 Termux
-     * prefix」，这里没必要再读一遍 12,443 个条目（其中 98 MiB 是压缩数据）。
-     *
-     * 替换后做一次残留校验：清单是构建期产物，若脚本集合与清单不同步，
-     * 宁可在这里吵出来，也不要等到设备上 `bad interpreter` 才发现。
+     * 只改 manifest 列出的那批脚本（1122 条）—— 构建期已扫出「哪些文件含
+     * Termux prefix」，这里没必要再读一遍 42,043 个条目（其中 590 MiB 是
+     * 压缩数据）。
      */
     private fun rewriteRootPlaceholder(root: File, manifest: JSONObject?) {
         val placeholder = manifest?.optString("rootPlaceholder").orEmpty().ifEmpty { ROOT_PLACEHOLDER }
@@ -513,11 +554,34 @@ class RuntimeInstaller(private val ctx: Context) {
         }
 
         val real = root.absolutePath
-        val placeholderBytes = placeholder.toByteArray(Charsets.ISO_8859_1)
-        val realBytes = real.toByteArray(Charsets.ISO_8859_1)
+
+        // 规则表：五条占位符全部要回填，缺一条就会在设备上留字面量。
+        //
+        // 为什么不止 @DSH_ROOT@：构建期 `PATH_REWRITES` 把 Termux 的四棵树分别
+        // 换成了独立占位符（见 build-runtime.mjs 与 tools/lib/poolextract.py，
+        // 两边逐字一致）。`/data/data/com.termux/files/usr` → @DSH_ROOT@，
+        // `/data/data/com.termux/files/home` → @DSH_HOME@，
+        // `/data/data/com.termux/cache` → @DSH_TMP@，
+        // `/data/data/com.termux/files` → @DSH_FILES@，
+        // `/data/data/com.termux` → @DSH_DATA@。
+        // 后两条只为 perl 的 `Config_heavy.pl` 而存在（它把 `-Dsysroot` 写成
+        // 不带 `/usr` 的裸前缀）。实测当前 runtime.zip 里有 2 个文件残留
+        // @DSH_HOME@（`var/service/ftpd/run`、proot_distro 的 METADATA），
+        // 若只回填 @DSH_ROOT@，它们会被原样写到设备上。
+        val filesDir = ctx.filesDir.absolutePath
+        val rules = listOf(
+            placeholder to real,
+            HOME_PLACEHOLDER to EngineConfig.dshHome(ctx).absolutePath,
+            TMP_PLACEHOLDER to EngineConfig.tmpDir(ctx).absolutePath,
+            FILES_PLACEHOLDER to filesDir,
+            DATA_PLACEHOLDER to (ctx.filesDir.parentFile?.absolutePath ?: filesDir),
+        ).map { (ph, value) ->
+            ph.toByteArray(Charsets.ISO_8859_1) to value.toByteArray(Charsets.ISO_8859_1)
+        }
 
         var rewritten = 0
         var missing = 0
+        var touchedFiles = 0
         for (i in 0 until paths.length()) {
             val rel = paths.optString(i)
             if (rel.isEmpty()) continue
@@ -528,17 +592,25 @@ class RuntimeInstaller(private val ctx: Context) {
             }
             try {
                 val data = f.readBytes()
-                val out = replaceAll(data, placeholderBytes, realBytes)
+                var out = data
+                for ((needle, value) in rules) {
+                    out = replaceAll(out, needle, value)
+                }
                 if (out !== data) {
                     f.writeBytes(out)
                     rewritten++
                 }
+                touchedFiles++
             } catch (e: Exception) {
                 Log.w(TAG, "root rewrite failed for $rel: ${e.message}")
             }
         }
 
-        Log.i(TAG, "rewriteRootPlaceholder: $rewritten rewritten, $missing missing (root=$real)")
+        Log.i(
+            TAG,
+            "rewriteRootPlaceholder: $rewritten/$touchedFiles rewritten, $missing missing " +
+                "(${rules.size} rules, root=$real)",
+        )
     }
 
     /** 字节级子串替换。用 ISO-8859-1 语义逐字节比对，避免 UTF-8 解码损坏二进制。 */
@@ -569,6 +641,48 @@ class RuntimeInstaller(private val ctx: Context) {
             return i
         }
         return -1
+    }
+
+    /**
+     * 递归删除，**不跟随符号链接**。
+     *
+     * 为什么不能用 `File.deleteRecursively()`：它是 walkBottomUp + `listFiles()`，
+     * 而 `listFiles()` 对「指向目录的软链」会返回该目录下的真实条目 —— 于是
+     * walk 直接下钻进链接目标，删掉的是 `extensions/<id>/…` 里的真实内容，
+     * 而不是链接本身。
+     *
+     * 而扩展装配恰恰会在 `bin/ lib/ etc/ share/` 下留这类目录软链
+     * （`engine/bin/texlive -> extensions/texlive/bin/texlive`）。
+     * 实测事故（layout 2 时代的设备）：texlive 的 411 个 TeX 引擎、rust 的
+     * `lib/rustlib`、gdb 的 `share/guile` 全部被整片删除，且自愈路径 relinkAll
+     * 也救不回来（清单里的 src 已不存在）。
+     *
+     * 所以这里用 `Files.readAttributes(..., NOFOLLOW_LINKS)` 先判是不是链接：
+     * 是链接就**只删链接本身**（`File.delete()` 删链接不删目标），是目录才下钻。
+     */
+    private fun deleteTreeSafely(target: File) {
+        val path = target.toPath()
+        val isLink = try {
+            Files.isSymbolicLink(path)
+        } catch (e: Exception) {
+            Log.w(TAG, "deleteTreeSafely: lstat failed for $target: ${e.message}")
+            false
+        }
+
+        // 软链（含指向目录的软链）一律只删链接本体，绝不下钻。
+        if (isLink) {
+            if (!target.delete()) Log.w(TAG, "deleteTreeSafely: cannot unlink $target")
+            return
+        }
+
+        if (target.isDirectory) {
+            val children = target.listFiles()
+            if (children != null) {
+                for (child in children) deleteTreeSafely(child)
+            }
+        }
+
+        if (!target.delete()) Log.w(TAG, "deleteTreeSafely: cannot delete $target")
     }
 
     /**
@@ -658,7 +772,153 @@ class RuntimeInstaller(private val ctx: Context) {
                 .forEach { if (it.setExecutable(true, false)) changed++ }
         }
 
+        // ⚠️ JVM 的 `lib/jspawnhelper` 必须单独置位（不在任何 `bin/` 路径段下）。
+        //
+        // 它是 HotSpot 的 posix_spawn 辅助程序：JDK 在需要 fork 但不想付
+        // fork 整进程代价的路径上直接 exec 这个 ELF（Gradle 起 daemon 就走它）。
+        // 仓库里随 zip 存的是 `-rw-------`（12504 B），没有可执行位 ⇒ 子进程
+        // 启动即 `Failed to exec spawn helper: pid: … exit code: 127`。
+        //
+        // 真机症状极具误导性（缺陷 AW）：`java -version` 与 kotlinc **完全正常**，
+        // 只有 Gradle 挂 —— 因为 gradle 的 daemon 是用 posix_spawn 起的，报错是
+        // `Could not start '…/bin/java'`，看起来像 java 不可执行。
+        // A/B：`chmod +x lib/jspawnhelper` 之后同一个 gradle 立刻 BUILD SUCCESSFUL。
+        //
+        // 判据写成「lib/jvm 下 ELF 且无扩展名」而不是写死路径：目录名带 deb
+        // 版本号（`java-21-openjdk` / 将来可能 `java-17-openjdk`），而
+        // jspawnhelper 在 `lib/` 下、名字也没有后缀。这样顺带覆盖 `lib/jexec`
+        // 这类同型文件，且不会误伤 `.so`（有扩展名）与 `modules`（非 ELF 头）。
+        if (jvm.isDirectory) {
+            jvm.walkTopDown()
+                .maxDepth(MAX_SCAN_DEPTH)
+                .filter { it.isFile }
+                .filter { f -> f.name.indexOf('.') < 0 && isElfOrScript(f) }
+                .forEach { if (it.setExecutable(true, false)) changed++ }
+        }
+
         Log.i(TAG, "restoreExecBits: $changed file(s) made executable")
+    }
+
+    /**
+     * JVM 可执行位的**幂等补漏**，每次启动都跑。
+     *
+     * 为什么不能只写在 [restoreExecBits] 里：那条路径只在「重装 runtime」时
+     * 执行，而老设备上资产是全的、锚点全过 —— `isComplete()` 判真 ⇒ 永不重装
+     * ⇒ 这条修复永远到不了设备（与缺陷 AV 同型的「自愈够不到」）。
+     *
+     * 而它又**不适合**做成锚点：锚点判定的是「资产在不在」，这里资产都在，
+     * 差的是文件 mode —— `setExecutable` 之后连 mtime 都不变。所以走「每次
+     * 启动补一次」：成本是遍历 `lib/jvm` 的 stat + 对候选读 4 字节，命中即返回。
+     */
+    private fun ensureJvmExecBits(root: File) {
+        val jvm = File(root, "lib/jvm")
+        if (!jvm.isDirectory) return
+        var fixed = 0
+        runCatching {
+            jvm.walkTopDown()
+                .maxDepth(MAX_SCAN_DEPTH)
+                .filter { it.isFile && it.name.indexOf('.') < 0 }
+                .filter { !it.canExecute() && isElfOrScript(it) }
+                .forEach { if (it.setExecutable(true, false)) fixed++ }
+        }.onFailure { Log.w(TAG, "ensureJvmExecBits failed: ${it.message}") }
+        if (fixed > 0) Log.i(TAG, "ensureJvmExecBits: $fixed file(s) re-chmod'ed")
+    }
+
+    /**
+     * 生成 TeX Live 的格式文件（`.fmt`），缺则补、有则跳（缺陷 AY 收尾）。
+     *
+     * 为什么安装期做、而不是留给设备上的 `mktexfmt`：TeX Live 的 `fmtutil.pl` /
+     * `mktexfmt` 全是 perl 脚本，内部用 `system("kpsewhich … >$nul 2>&1")`
+     * 这种**带重定向的字符串形式**，在 Android 上 perl 的 `system` 直接返回 -1
+     * （`Config{sh}` 正常、`bin/sh` 是正常 ELF、反引号可用、list-form
+     * `system("sh","-c",…)` 也 rc=0 —— 只有字符串形式带重定向失败）。于是
+     * `mktexfmt pdflatex.fmt` 永远报 `inifile pdflatex.ini … not found`，
+     * 哪怕 `kpsewhich pdflatex.ini` 明明能命中。
+     *
+     * 设备上手工 `-ini` 只需 11~12 秒/个，三条命令都 rc=0。这里照抄同一组
+     * 参数，用 `-output-directory` 直接落到 `$TEXMFVAR/web2c/`。**为什么是
+     * 用户树**：`TEXFORMATS` 里 `$TEXMFSYSVAR` 带 `!!` 前缀（只查 `ls-R`
+     * 不扫目录），而 `$TEXMFVAR` 不带 —— 落这里一个索引都不需要，设备上
+     * 也就不用跑 `mktexlsr`（那个同样是 perl）。真机 A/B 已验证：清空所有
+     * `ls-R`、只留 `$TEXMFVAR/web2c/` 下的三个格式文件，三件套照样全过。
+     *
+     * 幂等：三个 `.fmt` 都在就整体跳过，所以每次启动只是 3 次 `exists()`。
+     * 全程 runCatching —— TeX 装不了不该拖垮引擎启动（其余工具都还能用）。
+     */
+    private fun ensureTexFormats(root: File) {
+        val var_ = EngineConfig.texmfVar(ctx)
+        val web2c = File(var_, "web2c")
+
+        // 先看缓存：三个格式齐了就直接返回。注意 `xelatex.fmt` 有 4.4 MB，
+        // 光看存在性就够 —— 生成到一半被杀会留下半截文件，所以顺带查大小。
+        val wanted = TEX_FORMATS.associateWith { File(web2c, "$it.fmt") }
+        if (wanted.values.all { it.isFile && it.length() >= MIN_FMT_BYTES }) return
+
+        val bin = File(root, "bin")
+        if (!File(bin, "pdftex").isFile || !File(bin, "xetex").isFile) {
+            Log.w(TAG, "ensureTexFormats: pdftex/xetex 缺失，跳过格式生成")
+            return
+        }
+
+        web2c.mkdirs()
+        var made = 0
+        for ((name, fmt) in wanted) {
+            if (fmt.isFile && fmt.length() >= MIN_FMT_BYTES) continue
+            val engine = if (name == "xelatex") "xetex" else "pdftex"
+            // `latex` 的 ini 要用 `'*latex.ini'` 形式传：latex.ini 把 * 当输入文件，
+            // 没有前导星号时 pdftex 会去读 `latex.ini` 里的 `\input` 而不是当格式源。
+            val ini = if (name == "latex") "*latex.ini" else "$name.ini"
+            val argv = mutableListOf(
+                File(bin, engine).absolutePath,
+                "-ini",
+                "-jobname=$name",
+                "-progname=$name",
+                "-output-directory=${web2c.absolutePath}",
+            )
+            // pdflatex 与 latex 都必须带 -etex / -translate-file（TeX Live 的
+            // fmtutil.cnf 里就是这么写的）；xelatex 只带 -etex。
+            if (name != "xelatex") argv.add("-translate-file=cp227.tcx")
+            if (name != "latex") argv.add("-etex")
+            argv.add(ini)
+
+            val started = System.currentTimeMillis()
+            val rc = runCatching {
+                val pb = ProcessBuilder(argv)
+                // 环境必须与引擎进程一致：TEXMFROOT / TEXMFCNF / TEXMFVAR 少一个
+                // 都会让 kpsewhich 找不到 ini，进而 rc!=0。
+                pb.environment().clear()
+                pb.environment().putAll(
+                    EngineConfig.buildEnv(ctx, EngineConfig.DEFAULT_PORT, "normal")
+                        .mapNotNull { line ->
+                            val i = line.indexOf('=')
+                            if (i <= 0) null else line.substring(0, i) to line.substring(i + 1)
+                        }
+                        .toMap()
+                )
+                pb.directory(var_)
+                pb.redirectErrorStream(true)
+                // 不用 `Redirect.DISCARD`：那是 Java 9+ 的 API，Android 上
+                // 到 API 34 才有（编译期能过、低版本运行期 NoSuchMethodError）。
+                // 落到一个临时文件，跑完随中间文件一起删。
+                pb.redirectOutput(File(web2c, "$name.out"))
+                pb.start().waitFor()
+            }.onFailure { Log.w(TAG, "ensureTexFormats($name) failed: ${it.message}") }
+                .getOrDefault(-1)
+
+            val cost = System.currentTimeMillis() - started
+            if (rc == 0 && fmt.isFile && fmt.length() >= MIN_FMT_BYTES) {
+                made++
+                Log.i(TAG, "ensureTexFormats: $name.fmt ${fmt.length()} B (${cost}ms)")
+            } else {
+                Log.w(TAG, "ensureTexFormats: $name 失败 rc=$rc (${cost}ms)")
+            }
+            // 顺手清掉 -ini 留下的中间文件，不然 $TEXMFVAR/web2c 会堆 log/aux。
+            runCatching {
+                listOf("$name.log", "texsys.aux", "texsys.cfg", "$name.aux", "$name.out")
+                    .forEach { File(web2c, it).delete() }
+            }
+        }
+        if (made > 0) Log.i(TAG, "ensureTexFormats: $made format(s) generated")
     }
 
     /** 前 4 字节 `\x7fELF` 或前 2 字节 `#!` 才算可执行候选。 */
@@ -690,6 +950,34 @@ class RuntimeInstaller(private val ctx: Context) {
 
         /** 构建期占位符，与 build-runtime.mjs 的 ROOT_PLACEHOLDER 一致。 */
         private const val ROOT_PLACEHOLDER = "@DSH_ROOT@"
+
+        /**
+         * Termux 的 `$HOME`（`/data/data/com.termux/files/home`）。
+         *
+         * 构建期 `PATH_REWRITES` 把它换成这个占位符，App 侧回填成
+         * `EngineConfig.dshHome(ctx)`。实测 runtime.zip 里仍有两个脚本引用它：
+         * `var/service/ftpd/run` 与 proot_distro 的 METADATA。
+         *
+         * 值必须与 `tools/build-runtime.mjs` 的 `HOME_PLACEHOLDER` 逐字一致 ——
+         * `tools/verify-runtime.mjs` 的「占位符常量自洽」检查会核对两侧字面值。
+         */
+        private const val HOME_PLACEHOLDER = "@DSH_HOME@"
+
+        /** Termux 的 `$TMPDIR`（`/data/data/com.termux/cache`），回填成 `EngineConfig.tmpDir(ctx)`。 */
+        private const val TMP_PLACEHOLDER = "@DSH_TMP@"
+
+        /**
+         * 「files 的上级」= `/data/data/com.termux`，回填成 `ctx.filesDir.parentFile`。
+         *
+         * 只给 perl 的 `Config_heavy.pl` 用：它把 `-Dsysroot` 写成不带 `/usr`
+         * 的裸前缀，三条长规则一条都匹配不到（`/data/data/com.termux/files/usr`、
+         * `/data/data/com.termux/files/home`、`/data/data/com.termux/cache`
+         * 都以 `/data/data/com.termux/` 开头但更长，先匹配长的即可）。
+         */
+        private const val DATA_PLACEHOLDER = "@DSH_DATA@"
+
+        /** `/data/data/com.termux/files`，同样只给 `Config_heavy.pl` 一类裸前缀用。 */
+        private const val FILES_PLACEHOLDER = "@DSH_FILES@"
 
         /** 与 CI/构建期写入 MANIFEST 的版本号一致。 */
         const val RUNTIME_VERSION = "v0.1.0-arm64"
@@ -741,7 +1029,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 旧插件跳过重装。改动 plugins/kxxy-host/ 下任何文件后递增编号。
          */
         private const val HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js"
-        private const val HOST_PLUGIN_MARKER = "kxxy-host@10"
+        private const val HOST_PLUGIN_MARKER = "kxxy-host@12"
 
         /**
          * 移动端 UI 插件（第三方 dsh-web-mobile）版本标记（锚点 10）。
@@ -808,10 +1096,87 @@ class RuntimeInstaller(private val ctx: Context) {
         private const val PATCHSET_MARKER = "kxxy-patchset@2"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
+        /**
+         * Tesseract 简体中文语言包标记（锚点 12）。
+         *
+         * 为什么必须有：Termux 的 `tesseract` 包只带 `eng.traineddata`，索引里
+         * 也没有任何 `tesseract-lang*` 包 —— 中文识别能力只能靠随 runtime
+         * 内置。它与 office 资产同型：**新增资产** + [RUNTIME_VERSION] 从未变过
+         * ⇒ 老设备前面十一个锚点全过、跳过重装，`tesseract -l chi_sim` 永远报错。
+         *
+         * 标记写成独立小文件而不塞进 language 包：`.traineddata` 是二进制格式，
+         * 首部不能动。标记与 tools/build-runtime.mjs 的 TESSDATA_MARKER 逐字一致。
+         */
+        private const val TESSDATA_MARKER = "kxxy-tessdata@1"
+        private const val TESSDATA_MARKER_FILE = "lib/node_modules/kxxy-host/tessdata.version"
+
+        /** 语言包主体；约 2.4 MiB，光有标记文件不足以证明它完整落地。 */
+        private const val TESSDATA_LANGUAGE_FILE = "share/tessdata/chi_sim.traineddata"
+
+        /**
+         * TeX Live 宏包树标记（锚点 13）。
+         *
+         * 为什么必须有：Termux 的 `texlive-bin` deb 只发**引擎**（pdftex/xetex/
+         * luatex + kpathsea），`tex/latex`/`tex/plain`/`tlpkg` 全是 0 条 ——
+         * 宏包树由构建期从 CTAN 取 scheme-basic 打进 runtime。真机上表现为
+         * `command -v pdflatex` 什么都没有、`texlinks` 报
+         * `config file 'fmtutil.cnf' not found`、`pdftex` 连 `plain.tex` 都找不到。
+         *
+         * 与锚点 12 同型：新增资产 + 版本戳不变 ⇒ 不加锚点老设备永不重装。
+         * 标记与 tools/build-runtime.mjs 的 TEXLIVE_MARKER 逐字一致。
+         */
+        private const val TEXLIVE_MARKER = "kxxy-texlive@2"
+        private const val TEXLIVE_MARKER_FILE = "lib/node_modules/kxxy-host/texlive.version"
+
+        /**
+         * 宏包树的标志性文件：
+         * `article.cls` 是 latex 类、`plain.tex` 是 plain 格式的源、`TLConfig.pm`
+         * 在 `tlpkg/` 下（tlmgr 的 Perl 库，`latex/base` 与 `tlpkg` 是两个
+         * 独立顶层，只探其中一个会漏掉「解到一半」）。宏包树 5900 个文件，
+         * 写入中途失败（存储不足）会留下半棵树 —— 半棵树照样能过
+         * `pdftex --version`，所以必须逐个探体积。
+         */
+        private val TEXLIVE_CORE_FILES = listOf(
+            "share/texlive/2026.0/texmf-dist/tex/latex/base/article.cls",
+            "share/texlive/2026.0/texmf-dist/tex/plain/base/plain.tex",
+            "share/texlive/2026.0/tlpkg/TeXLive/TLConfig.pm",
+        )
+
         /** 读版本标记时探测的头部字节数；标记都写在首行，取小值即可。 */
         private const val COMPAT_MARKER_PROBE_BYTES = 256
 
         private const val MAX_SCAN_DEPTH = 6
+
+        /**
+         * `chi_sim.traineddata` 的下限体积。
+         *
+         * tessdata_fast 的简体中文包是 2,438,400 B 左右。取 1 MiB 作下限：
+         * 截断到一半（1.2 MiB）仍能过，但明显的半截文件（几百 KB）会拦下 ——
+         * 这个值只防「解压中途失败」，不是精确校验，故留足余量。
+         */
+        private const val MIN_TRAINEDDATA_BYTES = 1_000_000L
+
+        /**
+         * 安装期要生成的 TeX 格式文件名（不含 `.fmt` 后缀）。
+         *
+         * 只做这三个：`pdflatex`（主流）、`latex`（DVI 路线，jdvips 类工具链
+         * 需要）、`xelatex`（CJK 与 OTF 字体）。`lualatex` 没做 —— 闭包里没有
+         * `luatex` 二进制（scheme-basic 不含），补了也没法生成。
+         *
+         * 设备上实测每个 11~12 秒，三个合计约 35 秒，只在首次安装/格式缺失时
+         * 跑一次。生成参数见 [ensureTexFormats]。
+         */
+        private val TEX_FORMATS = listOf("pdflatex", "latex", "xelatex")
+
+        /**
+         * `.fmt` 的下限体积。
+         *
+         * 设备上真值：`pdflatex.fmt` 2,264,217 B、`latex.fmt` 2,264,136 B、
+         * `xelatex.fmt` 4,488,398 B。取 1 MiB 作下限只为拦「生成到一半被杀」
+         * 留下的半截文件（-ini 跑到一半确实会留下几百 KB 的残file），
+         * 不是精确校验，故留足余量。
+         */
+        private const val MIN_FMT_BYTES = 1_000_000L
 
         /**
          * 预估未压缩总量（字节），仅用于进度条分母。

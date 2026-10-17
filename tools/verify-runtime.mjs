@@ -118,6 +118,15 @@ const NEED = [
   // libreoffice-kit、dsh-office-to-pdf …），它们没有版本标记可探 ——
   // 补丁是否落地只能靠它判定。
   "lib/node_modules/kxxy-host/patchset.version",
+  // Tesseract 简体中文语言包（锚点 12）。Termux 的 tesseract 包只带
+  // eng.traineddata，索引里也没有任何 tesseract-lang* 包 —— 中文识别能力
+  // 只能靠随 runtime 内置。缺了它的表现是 `tesseract -l chi_sim` 直接报错。
+  "lib/node_modules/kxxy-host/tessdata.version",
+  "share/tessdata/chi_sim.traineddata",
+  "lib/node_modules/kxxy-host/texlive.version",
+  "share/texlive/2026.0/texmf-dist/tex/latex/base/article.cls",
+  "share/texlive/2026.0/texmf-dist/tex/plain/base/plain.tex",
+  "share/texlive/2026.0/tlpkg/TeXLive/TLConfig.pm",
   "kxxy-runtime.json",
 ];
 const byName = new Map(entries.map((e) => [e.name, e]));
@@ -251,6 +260,99 @@ for (const n of NEED) {
       missing += 1;
     } else {
       console.log(`补丁集版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- 中文语言包版本标记
+// 锚点 12：与 office 资产同型 —— 新增资产 + runtime 版本戳从未变过 ⇒ 不加锚点
+// 老设备会跳过重装。这里断言标记文件与 RuntimeInstaller.TESSDATA_MARKER 一致，
+// 并复核语言包主体确实是 tessdata 格式（截断或下到 HTML 错误页都能「存在」）。
+{
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  const markerNeed = /TESSDATA_MARKER\s*=\s*"([^"]+)"/.exec(kt);
+  const markerFile = /TESSDATA_MARKER_FILE\s*=\s*"([^"]+)"/.exec(kt);
+  const langFile = /TESSDATA_LANGUAGE_FILE\s*=\s*"([^"]+)"/.exec(kt);
+  const entry = markerFile === null ? void 0 : byName.get(markerFile[1]);
+  if (markerNeed === null || markerFile === null || langFile === null) {
+    console.log("中文语言包标记：✗ RuntimeInstaller.kt 未定义 TESSDATA_MARKER/MARKER_FILE/LANGUAGE_FILE");
+    missing += 1;
+  } else if (!entry) {
+    console.log(`中文语言包标记：✗ 条目缺失 ${markerFile[1]}`);
+    missing += 1;
+  } else {
+    const head = readLocal(entry).toString("utf8").slice(0, 256);
+    if (!head.includes(markerNeed[1])) {
+      console.log(`中文语言包标记：✗ 标记文件不含 ${markerNeed[1]}`);
+      missing += 1;
+    } else {
+      console.log(`中文语言包标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+  const langEntry = langFile === null ? void 0 : byName.get(langFile[1]);
+  if (langEntry) {
+    const buf = readLocal(langEntry);
+    const magic = `${buf[0].toString(16).padStart(2, "0")} ${buf[1].toString(16).padStart(2, "0")} ${buf[2].toString(16).padStart(2, "0")} ${buf[3].toString(16).padStart(2, "0")}`;
+    if (magic !== "18 00 00 00") {
+      console.log(`中文语言包主体：✗ 魔数 ${magic}（期望 18 00 00 00，tessdata_fast 格式）`);
+      missing += 1;
+    } else if (buf.length < 1_000_000) {
+      console.log(`中文语言包主体：✗ 体积异常 ${buf.length} B（期望约 2.4 MiB）`);
+      missing += 1;
+    } else {
+      console.log(`中文语言包主体：✓ tessdata 格式 ${buf.length} B`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- TeX Live 宏包树标记
+// 锚点 13：Termux 的 texlive-bin deb 只发引擎，`tex/latex`/`tex/plain`/`tlpkg` 全为
+// 0 条 —— 宏包树由构建期从 CTAN 取 scheme-basic 打进 runtime。这里断言标记文件与
+// RuntimeInstaller.TEXLIVE_MARKER 一致，并复核三个标志性文件确实在位（宏包树是
+// 5900 个文件，写入中途失败会留下半棵树，而半棵树照样能过 `pdftex --version`）。
+{
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  const markerNeed = /TEXLIVE_MARKER\s*=\s*"([^"]+)"/.exec(kt);
+  const markerFile = /TEXLIVE_MARKER_FILE\s*=\s*"([^"]+)"/.exec(kt);
+  const coreBlock = /TEXLIVE_CORE_FILES\s*=\s*listOf\(([\s\S]*?)\)/.exec(kt);
+  const core = coreBlock === null
+    ? []
+    : [...coreBlock[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  const entry = markerFile === null ? void 0 : byName.get(markerFile[1]);
+  if (markerNeed === null || markerFile === null || core.length === 0) {
+    console.log("TeX Live 宏包树标记：✗ RuntimeInstaller.kt 未定义 TEXLIVE_MARKER/MARKER_FILE/CORE_FILES");
+    missing += 1;
+  } else if (!entry) {
+    console.log(`TeX Live 宏包树标记：✗ 条目缺失 ${markerFile[1]}`);
+    missing += 1;
+  } else {
+    const head = readLocal(entry).toString("utf8").slice(0, 256);
+    if (!head.includes(markerNeed[1])) {
+      console.log(`TeX Live 宏包树标记：✗ 标记文件不含 ${markerNeed[1]}`);
+      missing += 1;
+    } else {
+      console.log(`TeX Live 宏包树标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+    }
+  }
+  for (const rel of core) {
+    const e = byName.get(rel);
+    if (!e) {
+      console.log(`TeX Live 宏包树主体：✗ 条目缺失 ${rel}`);
+      missing += 1;
+      continue;
+    }
+    const size = readLocal(e).length;
+    if (size === 0) {
+      console.log(`TeX Live 宏包树主体：✗ ${rel} 是空文件`);
+      missing += 1;
+    } else {
+      console.log(`TeX Live 宏包树主体：✓ ${rel.split("/").pop()}（${size} B）`);
     }
   }
 }
@@ -462,6 +564,98 @@ const mfData = readLocal(mf);
 const manifest = JSON.parse(mfData.toString("utf8"));
 console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${manifest.entries} ` +
   `links=${manifest.linkEntries} placeholderPaths=${manifest.placeholderPaths?.length} removed=${manifest.removedPaths?.length}`);
+
+// ---------------------------------------------------------------- 占位符常量自洽
+//
+// 为什么需要：占位符规则表在 Kotlin 侧是**引用名**，在 build-runtime.mjs 侧是
+// **定义值**。两边靠「逐字相同」维系，但没有编译期关联 —— 真机上出现过
+// `rewriteRootPlaceholder` 的规则表引用了 HOME_PLACEHOLDER / TMP_PLACEHOLDER /
+// FILES_PLACEHOLDER / DATA_PLACEHOLDER 四个**从未定义**的常量，Kotlin 编译期
+// 直接报 Unresolved reference（和缺陷 O 的 matchParen、缺陷 AI 的 linkExact 同型：
+// 引用了不存在的标识符）。这里做静态自洽检查 —— 凡是形如 `X_PLACEHOLDER` 的
+// 标识符，只要在 RuntimeInstaller.kt 里出现过，就必须有 `const val` 定义；
+// 两边同名的必须有相同的字面值。
+{
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  const build = readFileSync(join(HERE, "..", "tools/build-runtime.mjs"), "utf8");
+
+  const defined = new Map();
+  for (const m of kt.matchAll(/const\s+val\s+([A-Z][A-Z0-9_]*_PLACEHOLDER)\s*=\s*"([^"]*)"/g)) {
+    defined.set(m[1], m[2]);
+  }
+  // 剔除定义行本身，只看「被引用」的标识符。
+  const referenced = new Set();
+  for (const m of kt.matchAll(/\b([A-Z][A-Z0-9_]*_PLACEHOLDER)\b/g)) referenced.add(m[1]);
+
+  const undefinedRefs = [...referenced].filter((n) => !defined.has(n));
+
+  const buildDefs = new Map();
+  for (const m of build.matchAll(/const\s+([A-Z][A-Z0-9_]*_PLACEHOLDER)\s*=\s*"([^"]*)"/g)) {
+    buildDefs.set(m[1], m[2]);
+  }
+  const mismatched = [];
+  for (const [name, value] of defined) {
+    if (buildDefs.has(name) && buildDefs.get(name) !== value) {
+      mismatched.push(`${name}: Kotlin=${value} build=${buildDefs.get(name)}`);
+    }
+  }
+  const buildOnly = [...buildDefs.keys()].filter((n) => !defined.has(n));
+
+  if (undefinedRefs.length > 0 || mismatched.length > 0 || buildOnly.length > 0) {
+    console.log("占位符常量自洽：✗");
+    for (const n of undefinedRefs) console.log(`  引用了未定义的常量：${n}`);
+    for (const s of mismatched) console.log(`  两侧字面值不一致：${s}`);
+    for (const n of buildOnly) console.log(`  仅 build-runtime.mjs 有定义：${n}`);
+    missing += 1;
+  } else {
+    console.log(`占位符常量自洽：✓ ${defined.size} 条（Kotlin 与 build-runtime.mjs 逐字一致，无未定义引用）`);
+  }
+}
+
+// ---------------------------------------------------------------- 递归删除不跟随软链
+//
+// 为什么需要：runtime 重装时的「精确顶层替换」会删掉 zip 里出现过的顶层目录。
+// Kotlin 的 `File.deleteRecursively()` 是 walkBottomUp + listFiles()，对「指向
+// 目录的软链」会**跟随进去** —— 删掉的是链接目标（`extensions/<id>/…`）里的
+// 真实内容，而不是软链本身。而扩展装配恰恰会在 `bin/ lib/ etc/ share/` 下留下
+// 这类目录软链（`engine/bin/texlive -> extensions/texlive/bin/texlive`）。
+//
+// 实测事故（layout 2 时代的设备）：texlive 的 411 个 TeX 引擎、rust 的
+// `lib/rustlib`、gdb 的 `share/guile` 全部被整片删除，且自愈路径 relinkAll 也
+// 救不回来（清单里的 src 已不存在）。这里做静态检查：RuntimeInstaller.kt 里
+// 不得对顶层目录直接调用 deleteRecursively，必须有 deleteTreeSafely 且被使用。
+{
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  const problems = [];
+  if (!/private\s+fun\s+deleteTreeSafely\s*\(/.test(kt)) {
+    problems.push("缺少 deleteTreeSafely 定义");
+  }
+  if (!/Files\.isSymbolicLink\(/.test(kt)) {
+    problems.push("deleteTreeSafely 未用 Files.isSymbolicLink 判链接（可能仍会跟随软链）");
+  }
+  // 顶层替换那一段必须是 deleteTreeSafely(target)
+  const topLoop = kt.match(/for\s*\(top in index\.topLevelDirs\)[\s\S]{0,400}?\n\s*}/);
+  if (!topLoop) {
+    problems.push("找不到 topLevelDirs 的删除循环");
+  } else if (!/deleteTreeSafely\(/.test(topLoop[0])) {
+    problems.push("顶层替换仍在直接删除（应改为 deleteTreeSafely）");
+  } else if (/deleteRecursively\(/.test(topLoop[0])) {
+    problems.push("顶层替换仍含 deleteRecursively");
+  }
+  if (problems.length > 0) {
+    console.log("递归删除安全：✗");
+    for (const p of problems) console.log(`  ${p}`);
+    missing += 1;
+  } else {
+    console.log("递归删除安全：✓ 顶层替换用 deleteTreeSafely（不跟随符号链接）");
+  }
+}
 
 // ---------------------------------------------------------------- 占位符核对
 console.log("\n占位符抽查（应出现 @DSH_ROOT@ 且不含 com.termux）：");

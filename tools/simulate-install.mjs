@@ -73,7 +73,7 @@ const PTY_NODE_MARKER = "kxxy-pty-node@1";
  * 于是「改了 host.js / lib/index.js 却只重装 APK」的设备一直跑旧插件，
  * 且七锚点全通过、永不重装。标记写在插件入口 lib/index.js 首行。
  */
-const HOST_PLUGIN_MARKER = "kxxy-host@10";
+const HOST_PLUGIN_MARKER = "kxxy-host@12";
 
 /**
  * 与 RuntimeInstaller.MOBILE_PLUGIN_MARKER 保持一致（锚点 10）。
@@ -117,6 +117,32 @@ const OFFICE_FONT_FILES = [
  */
 const PATCHSET_MARKER = "kxxy-patchset@2";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
+
+/**
+ * 与 RuntimeInstaller.TESSDATA_MARKER 保持一致（锚点 12）。
+ *
+ * Termux 的 `tesseract` 包只带 eng.traineddata，索引里也没有任何
+ * tesseract-lang* 包 —— 中文识别能力在 Termux 生态里不存在，只能构建期
+ * 从 tessdata_fast 取。与 office 资产同型：新增资产 + RUNTIME_VERSION 不变。
+ */
+const TESSDATA_MARKER = "kxxy-tessdata@1";
+const TESSDATA_MARKER_FILE = "lib/node_modules/kxxy-host/tessdata.version";
+const TESSDATA_LANGUAGE_FILE = "share/tessdata/chi_sim.traineddata";
+
+/**
+ * 与 RuntimeInstaller.TEXLIVE_MARKER 保持一致（锚点 13）。
+ *
+ * Termux 的 `texlive-bin` deb 只发引擎（pdftex/xetex/luatex + kpathsea），
+ * `tex/latex`/`tex/plain`/`tlpkg` 全为 0 条 —— 宏包树由构建期从 CTAN 取
+ * scheme-basic 打进 runtime。缺了它 `pdftex t.tex` 连 plain TeX 都跑不了。
+ */
+const TEXLIVE_MARKER = "kxxy-texlive@2";
+const TEXLIVE_MARKER_FILE = "lib/node_modules/kxxy-host/texlive.version";
+const TEXLIVE_CORE_FILES = [
+  "share/texlive/2026.0/texmf-dist/tex/latex/base/article.cls",
+  "share/texlive/2026.0/texmf-dist/tex/plain/base/plain.tex",
+  "share/texlive/2026.0/tlpkg/TeXLive/TLConfig.pm",
+];
 const EXECUTABLE_NAMES = new Set(["rg", "esbuild", "node", "sharp", "swc", "dprint", "biome"]);
 const SONAME_ALIASES = [
   ["lib/libreadline.so.8", "lib/libreadline.so.8.3"],
@@ -313,14 +339,19 @@ for (const full of walk(target)) {
   const isElf = head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46;
   const isScript = head[0] === 0x23 && head[1] === 0x21;
   // 与 RuntimeInstaller.restoreExecBits 的三段策略保持一致：
-  // bin/ + usr/bin/ + libexec/ 全量；lib/jvm/**/bin/（openjdk-21 布局）；
+  // bin/ + usr/bin/ + libexec/ 全量；lib/jvm 下两级（openjdk-21 布局）；
   // node_modules 内按路径与名单。
+  //
+  // `lib/jvm` 的判据与 Kotlin 侧逐字相同：`/bin/` 路径段 **或者** 无扩展名的
+  // 文件。后者专为 `lib/jspawnhelper` 而设 —— 它在 `lib/` 下而不是 `bin/` 下，
+  // 没有它 Gradle 起不了 daemon（缺陷 AW），而 `java -version` 一切正常，
+  // 所以这条漏了几乎是无声的。
   if (
     (isElf || isScript) &&
     (rel.startsWith("bin/") ||
       rel.startsWith("usr/bin/") ||
       rel.startsWith("libexec/") ||
-      (rel.startsWith("lib/jvm/") && rel.includes("/bin/")) ||
+      (rel.startsWith("lib/jvm/") && (rel.includes("/bin/") || !base.includes("."))) ||
       EXECUTABLE_NAMES.has(base))
   ) {
     chmodSync(full, 0o755);
@@ -328,6 +359,23 @@ for (const full of walk(target)) {
   }
 }
 console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755`);
+
+/*
+ * lib/jspawnhelper 必须真的被置位（缺陷 AW 的回归断言）。
+ *
+ * 为什么要单独断言而不只看总数：`restoreExecBits` 的命中是个大集合，
+ * 上面 chmodded.length 从 1620 变成 1621 完全看不出来。而 jspawnhelper
+ * 漏掉的后果极隐蔽 —— 真机上 `java -version`、`kotlinc` 全部正常，只有
+ * Gradle 报 `Could not start '…/bin/java'`（看起来像 java 不可执行）。
+ */
+{
+  const helpers = chmodded.filter((r) => r.startsWith("lib/jvm/") && r.endsWith("/lib/jspawnhelper"));
+  if (helpers.length === 0) {
+    fail("lib/jvm/**/lib/jspawnhelper 未被置为可执行（Gradle 会起不了 daemon，见缺陷 AW）");
+  } else {
+    ok(`spawn helper 已置位（${helpers.length} 个：${helpers[0]}）`);
+  }
+}
 
 // ---------------------------------------------------------------- isComplete（十一锚点）
 console.log("[6] isComplete 十一锚点（含兼容层、PTY 绑定、宿主插件、office 资产、内置移动端插件与构建期补丁集）：");
@@ -368,6 +416,14 @@ const anchors = [
   // libreoffice-kit、dsh-office-to-pdf …），它们没有版本标记可探 —— 补丁落地
   // 与否只能靠这个构建期写入的小文件判定。
   ["锚点 11 补丁集标记", join(target, PATCHSET_MARKER_FILE)],
+  // 锚点 12：Tesseract 简体中文语言包。与锚点 9 同型（新增资产 + 版本戳不变
+  // ⇒ 不加锚点老设备永不重装）。Termux 生态里根本没有中文包，只能随 runtime 发。
+  ["锚点 12 中文语言包标记", join(target, TESSDATA_MARKER_FILE)],
+  ["锚点 12 中文语言包主体", join(target, TESSDATA_LANGUAGE_FILE)],
+  // 锚点 13：TeX Live 宏包树。Termux 的 texlive-bin deb 只发引擎，
+  // tex/latex、tex/plain、tlpkg 全为 0 条 —— 宏包树由构建期从 CTAN 打进 runtime。
+  ["锚点 13 宏包树标记", join(target, TEXLIVE_MARKER_FILE)],
+  ...TEXLIVE_CORE_FILES.map((f, i) => [`锚点 13 宏包树主体 ${i + 1}`, join(target, f)]),
 ];
 for (const [label, f] of anchors) {
   if (!existsSync(f)) fail(`${label} 缺失：${f.slice(target.length + 1)}`);

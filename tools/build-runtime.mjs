@@ -502,6 +502,53 @@ const MOBILE_PLUGIN_PKG = {
 const MOBILE_PLUGIN_MARKER = "kxxy-mobile-plugin@1";
 const MOBILE_PLUGIN_MARKER_FILE = "plugin.version";
 
+/**
+ * Tesseract 简体中文语言包（锚点 12 的判据），与
+ * `RuntimeInstaller.TESSDATA_MARKER` 逐字一致。
+ *
+ * 为什么必须外部获取：对 Termux 的 3011 个包名全量 grep `tessdata` /
+ * `traineddata` **零命中**，也没有任何 `tesseract-lang*` 包 —— `tesseract`
+ * 包只带 `eng.traineddata`。中文识别能力在 Termux 生态里根本不存在。
+ *
+ * 为什么取 `tessdata_fast` 而不是标准版或 best 版：
+ *   - 标准版 `chi_sim.traineddata` 40 MiB+，best 版更大；
+ *   - fast 版 2,469,156 B（2.35 MiB），识别质量对「截图取字 / 扫描件 OCR」
+ *     这类场景完全够用，而体积差 17 倍。
+ *
+ * 为什么从 `raw.githubusercontent` 取：`github.com/.../blob/...` 返回的是
+ * HTML 页面（带 `<html>` 头），下载后文件"存在"但 tesseract 会报格式错 ——
+ * raw 域名才给原始字节。sha256 是第二道防线：审稿期换 CDN、仓库改 tag
+ * 都能立刻发现。
+ */
+const TESSDATA_URL =
+  "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/chi_sim.traineddata";
+const TESSDATA_FILE = "chi_sim.traineddata";
+const TESSDATA_SHA256 = "a5fcb6f0db1e1d6d8522f39db4e848f05984669172e584e8d76b6b3141e1f730";
+const TESSDATA_ZIP_BASE = "share/tessdata/";
+const TESSDATA_MARKER = "kxxy-tessdata@1";
+const TESSDATA_MARKER_FILE = "lib/node_modules/kxxy-host/tessdata.version";
+
+/**
+ * TeX Live 宏包树的构建期来源与标记（锚点 13 的判据），与
+ * `RuntimeInstaller.TEXLIVE_MARKER` 逐字一致。
+ *
+ * 为什么宏包树要构建期搬、而不是指望设备上的 texlive-bin：
+ * Termux 的 `texlive-bin` deb **只发引擎**（pdftex / xetex / luatex +
+ * kpathsea 库），`tex/latex`、`tex/plain`、`tlpkg` 全为 0 条 —— 真机上
+ * `pdftex t.tex` 直接报 `I can't find the format file 'pdftex.fmt'!`，
+ * 连 plain TeX 都跑不了。宏包树由 `tools/fetch-texlive.py` 从 CTAN 取
+ * `scheme-basic` 闭包（118 包 / 5,894 文件 / 83.84 MiB）落到
+ * `.cache/texlive-macros/share/texlive/<年份>/`，本阶段只负责搬进 zip。
+ *
+ * 为什么标记要独立：与 office 资产、tessdata 完全同型 —— **新增资产**，
+ * 而 [RUNTIME_VERSION] 从未变过。老设备升级 APK 时前十二个锚点全通过，
+ * `isComplete()` 判真并跳过重装，宏包树永远不落地。
+ */
+const TEXLIVE_MACROS_SRC = join(PROJECT, ".cache", "texlive-macros", "share", "texlive");
+const TEXLIVE_YEAR = "2026.0";
+const TEXLIVE_MARKER = "kxxy-texlive@2";
+const TEXLIVE_MARKER_FILE = "lib/node_modules/kxxy-host/texlive.version";
+
 /** 下载（带缓存与 sha256 校验）并解开一个 npm tarball。 */
 async function fetchTgz(pkg) {
   const dest = join(OFFICE_CACHE, pkg.file);
@@ -662,6 +709,219 @@ async function bundleMobilePlugin(asarPart) {
   console.log(`      + ${markerPath}（${MOBILE_PLUGIN_MARKER}）`);
 
   return count;
+}
+
+/**
+ * 把 Tesseract 简体中文语言包塞进 asarPart（阶段 6.7，锚点 12）。
+ *
+ * 落点在 `share/tessdata/` 而不是 `lib/node_modules/`：`EngineConfig` 注入的
+ * `TESSDATA_PREFIX=<root>/share/tessdata`，tesseract 只认这个变量指向的目录，
+ * 它不会去 node_modules 里找语言包。
+ *
+ * 与 `bundleOfficeAssets` 的另一处不同：这里**只有一份文件**，所以不复用
+ * `fetchTgz`（那是解 npm tarball 的），直接用 `downloadTo` + sha256 校验。
+ */
+async function bundleTessdata(asarPart) {
+  console.log("[6.7/8] 打包 Tesseract 简体中文语言包");
+
+  const dest = join(OFFICE_CACHE, TESSDATA_FILE);
+  const state = await downloadTo(TESSDATA_URL, dest);
+  const buf = readFileSync(dest);
+  const got = sha256Hex(buf);
+  if (got !== TESSDATA_SHA256) {
+    throw new Error(
+      `${TESSDATA_FILE} 校验失败：期望 sha256 ${TESSDATA_SHA256}，实得 ${got}（${human(buf.length)}）。` +
+        `删除 ${dest} 后重试。`,
+    );
+  }
+
+  /*
+   * 魔数必须是 `18 00 00 00`。
+   *
+   * 这是 tessdata 的格式标识（第一个 int32 是文件格式版本 0x18 = 24 号格式，
+   * 由 `TessdataManager::Serialize` 写出）。加这道断言的理由很实际：这一步
+   * 走网络，而 `raw.githubusercontent.com` 在受限网络下可能返回一个 HTML
+   * 错误页 —— 那种响应**长度不为 0**，只判体积会放过它，直到用户去识别
+   * 中文时才在 tesseract 内部报一个与下载毫无关系的错。
+   */
+  const magic = `${buf[0].toString(16).padStart(2, "0")} ${buf[1].toString(16).padStart(2, "0")} ` +
+    `${buf[2].toString(16).padStart(2, "0")} ${buf[3].toString(16).padStart(2, "0")}`;
+  if (magic !== "18 00 00 00") {
+    throw new Error(
+      `${TESSDATA_FILE} 不是 tessdata 格式：首 4 字节 ${magic}（期望 18 00 00 00）。` +
+        `多半是下到了 HTML 错误页或 404 占位，删除 ${dest} 后重试。`,
+    );
+  }
+
+  const zipPath = `${TESSDATA_ZIP_BASE}${TESSDATA_FILE}`;
+  if (asarPart.has(zipPath)) throw new Error(`语言包条目与既有条目冲突：${zipPath}`);
+  asarPart.set(zipPath, { data: buf, mode: 0o644 });
+  console.log(`      + ${zipPath}（${human(buf.length)}，${state === "cached" ? "缓存" : "下载"}）`);
+
+  const markerPath = TESSDATA_MARKER_FILE;
+  if (asarPart.has(markerPath)) throw new Error(`语言包标记与既有条目冲突：${markerPath}`);
+  asarPart.set(markerPath, {
+    data: Buffer.from(`${TESSDATA_MARKER}\n`, "utf8"),
+    mode: 0o644,
+  });
+  console.log(`      + ${markerPath}（${TESSDATA_MARKER}）`);
+}
+
+/**
+ * 把 TeX Live 宏包树整棵搬进 asarPart（阶段 6.8，锚点 13）。
+ *
+ * 数据源是 `tools/fetch-texlive.py` 的产物（`.cache/texlive-macros/share/texlive/<年份>/`），
+ * 不是网络：那份闭包要跑几十次 CTAN 请求、几分钟才凑齐，构建脚本每次重下
+ * 不合理。本阶段只做「读盘 → 塞进 asarPart」，缺缓存就报错并给出生成命令。
+ *
+ * 为什么必须整棵搬（含 `tlpkg/`、`release-texlive.txt` 这些看起来没用的）：
+ * `fmtutil` / `texlinks` / `tlmgr` 全都是 Perl 脚本，它们 `use TeXLive::TLConfig`
+ * —— 那个模块在 `tlpkg/` 下。少了 `tlpkg/` 的表现是 `texlinks` 报
+ * `Can't locate mktexlsr.pl in @INC`，与「宏包树缺失」看起来是两回事。
+ *
+ * 关于 `ls-R` 与收窄的 `language.dat`：这两个**不是**本阶段生成的，而是
+ * `fetch-texlive.py` 的 `write_ls_r()` / `make_hyphenation_minimal()` 在解包后
+ * 就写进缓存树的。本阶段照搬即可 —— 但要在下面各断言一次，因为它们决定了
+ * `pdflatex` 能不能真正跑起来（见缺陷 AR / AY）：
+ *   - 没有 `ls-R`：`texmf.cnf` 把树标成 `!!`（只查数据库不扫目录），
+ *     `kpsewhich article.cls` 什么都搜不到；
+ *   - `language.dat` 没收窄：`pdftex -ini` 读到第一个缺失的断词文件就
+ *     `! Emergency stop.`，`pdflatex.fmt` 永远生成不出来。
+ */
+async function bundleTexliveMacros(asarPart) {
+  console.log("[6.8/8] 打包 TeX Live 宏包树");
+
+  const root = join(TEXLIVE_MACROS_SRC, TEXLIVE_YEAR);
+  if (!existsSync(root)) {
+    throw new Error(
+      `TeX Live 宏包树缓存不存在：${root}\n` +
+        `先生成：python tools/fetch-texlive.py（约 5 分钟，取 scheme-basic 闭包）`,
+    );
+  }
+
+  // 先断言两个决定性文件，再开始搬 5894 个文件 —— 搬完才发现缺，白等几分钟。
+  const lsR = join(root, "texmf-dist", "ls-R");
+  if (!existsSync(lsR)) {
+    throw new Error(
+      `宏包树缺 ls-R：${lsR}\n` +
+        `它是 kpsewhich 的文件名索引，缺了 pdflatex 连 article.cls 都找不到。` +
+        `重跑 python tools/fetch-texlive.py（write_ls_r 会补上）。`,
+    );
+  }
+  const langDat = join(root, "texmf-dist", "tex", "generic", "config", "language.dat");
+  if (existsSync(langDat)) {
+    const text = readFileSync(langDat, "utf8");
+    // 收窄版的标志：只剩闭包里真实存在的几条。完整版引 226 个语言，
+    // 而闭包只带 hyphen.tex / hyph-en-*.tex —— 行数是最省事的判据。
+    const entries = text.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith("%")).length;
+    if (entries > 10) {
+      throw new Error(
+        `language.dat 未收窄（${entries} 条，期望 <= 10）：${langDat}\n` +
+          `完整版引用 226 个断词文件，而 scheme-basic 闭包只带英文的 —— ` +
+          `pdftex -ini 会在第一个缺失文件上 Emergency stop，pdflatex.fmt 生成不出来。\n` +
+          `重跑 python tools/fetch-texlive.py（make_hyphenation_minimal 会收窄）。`,
+      );
+    }
+    console.log(`      language.dat 已收窄（${entries} 条）`);
+  }
+  console.log(`      ls-R ${human(statSync(lsR).size)}`);
+
+  /*
+   * 再断言两处「pdflatex 出 PDF 的决定性产物」，理由同上面两条：
+   *   - 没有 `fonts/map/pdftex/updmap/pdftex.map`：pdflatex 编到第一个字就
+   *     `!pdfTeX error: pdflatex (file cmbx12): Font cmbx12 at 720 not found`，
+   *     连一页 PDF 都产不出（真机实测）。updmap-sys 在设备上跑不通，只能
+   *     构建期拼好。
+   *   - `dvipdfmx.cfg` 里若还是 `p  a4`：`xelatex` 报
+   *     `xdvipdfmx:fatal: Unrecognized paper format: a4` 直接失败，且
+   *     命令行 `-p` 完全无效，只能改 cfg。
+   */
+  const pdftexMap = join(root, "texmf-dist", "fonts", "map", "pdftex", "updmap", "pdftex.map");
+  if (!existsSync(pdftexMap)) {
+    throw new Error(
+      `宏包树缺 pdftex.map：${pdftexMap}\n` +
+        `它是 Type1 字体映射表，缺了 pdflatex 会去现搓 PK 位图然后\n` +
+        `  !pdfTeX error: pdflatex (file cmbx12): Font cmbx12 at 720 not found\n` +
+        `重跑 python tools/fetch-texlive.py（build_pdftex_map 会拼上）。`,
+    );
+  }
+  console.log(`      pdftex.map ${human(statSync(pdftexMap).size)}`);
+
+  const dvipdfmxCfg = join(root, "texmf-dist", "dvipdfmx", "dvipdfmx.cfg");
+  if (existsSync(dvipdfmxCfg)) {
+    const cfg = readFileSync(dvipdfmxCfg, "latin1");
+    if (/^\s*p\s+a4\s*$/m.test(cfg)) {
+      throw new Error(
+        `dvipdfmx.cfg 仍写着 \`p  a4\`：${dvipdfmxCfg}\n` +
+          `真机上 xdvipdfmx 对纸名 a4 直接致命退出（命令行 -p 也无效）：\n` +
+          `  xdvipdfmx:fatal: Unrecognized paper format: a4\n` +
+          `重跑 python tools/fetch-texlive.py（fix_dvipdfmx_paper 会换成\n` +
+          `  p  595.28pt,841.89pt —— 同样的 A4，但走纯数值解析）。`,
+      );
+    }
+  }
+
+  /*
+   * 还有一处**不在缓存树里、但设备上必需**的产物：`web2c/` 下的 `mktex*`
+   * 脚本（mktexnam / mktexdir / mktexpk …）的可执行位。zip 里它们是 0600，
+   * 解包后 pdflatex 想生成 PK 字体就会报 `Permission denied`。
+   * 这里把可执行位写进条目 mode，由 RuntimeInstaller.restoreExecBits 之外的
+   * 路径也能生效（mode 直接落盘）。
+   */
+  const web2cDir = join(root, "texmf-dist", "web2c");
+  let mktexCount = 0;
+
+  const base = `share/texlive/${TEXLIVE_YEAR}/`;
+  let count = 0;
+  let bytes = 0;
+
+  /*
+   * 递归遍历。用显式栈而不是递归函数：宏包树有 180 多个目录，深度不大，
+   * 但显式栈让「跳过目录」这类逻辑（`.git`、临时文件）写在一处更清楚。
+   *
+   * 符号链接在缓存树里不该出现（fetch-texlive.py 是解 tar.xz，tar 里的
+   * 软链会被解开成普通文件或真实链接）。这里仍按 `isFile()` 过滤：
+   * 指向目录的链接若不跟随，会被当成文件读而失败 —— 宁可跳过也不中断，
+   * 但要在最后计数里体现出来，不然「少了几百个文件」会静默发生。
+   */
+  const stack = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    for (const name of readdirSync(dir)) {
+      const abs = join(dir, name);
+      const st = statSync(abs);
+      if (st.isDirectory()) {
+        stack.push(abs);
+        continue;
+      }
+      if (!st.isFile()) continue;
+      // 相对路径统一用 `/`：zip 内路径必须是 posix 分隔符，Windows 上
+      // path.relative 会给反斜杠，直接拼进 zipPath 会变成扁平文件名。
+      const rel = abs.slice(root.length + 1).split("\\").join("/");
+      const zipPath = base + rel;
+      if (asarPart.has(zipPath)) throw new Error(`宏包树条目与既有条目冲突：${zipPath}`);
+      const data = readFileSync(abs);
+      // `web2c/mktex*` 是 pdflatex 生成 PK 字体时要 exec 的 shell 脚本，
+      // 必须是 0755；tar.xz 里本来带可执行位，但 Windows 缓存树丢掉了。
+      const isExec = /^texmf-dist\/web2c\/mktex[\w.-]*$/.test(rel);
+      if (isExec) mktexCount += 1;
+      asarPart.set(zipPath, { data, mode: isExec ? 0o755 : 0o644 });
+      count += 1;
+      bytes += data.length;
+    }
+  }
+
+  if (count === 0) throw new Error(`宏包树是空的：${root}`);
+  if (mktexCount > 0) console.log(`      web2c/mktex* 置 0755（${mktexCount} 个）`);
+  console.log(`      + ${base}（${count} 文件，${human(bytes)}）`);
+
+  const markerPath = TEXLIVE_MARKER_FILE;
+  if (asarPart.has(markerPath)) throw new Error(`宏包树标记与既有条目冲突：${markerPath}`);
+  asarPart.set(markerPath, {
+    data: Buffer.from(`${TEXLIVE_MARKER}\n`, "utf8"),
+    mode: 0o644,
+  });
+  console.log(`      + ${markerPath}（${TEXLIVE_MARKER}）`);
 }
 
 async function main() {
@@ -829,6 +1089,12 @@ async function main() {
 
   // 移动端 UI 插件（第三方 dsh-web-mobile，见 bundleMobilePlugin 注释）。
   await bundleMobilePlugin(asarPart);
+
+  // Tesseract 简体中文语言包（见 bundleTessdata 注释）。
+  await bundleTessdata(asarPart);
+
+  // TeX Live 宏包树（见 bundleTexliveMacros 注释）。
+  await bundleTexliveMacros(asarPart);
 
   /*
    * 补丁集版本标记（锚点 11）。

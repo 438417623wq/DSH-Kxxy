@@ -16,6 +16,23 @@ import { dirname, join } from "node:path";
 const UA = "dsh-kxxy-runtime-builder/1.0";
 
 /**
+ * 强制**不做内容编码协商**。
+ *
+ * 为什么必须有：这两个助手用的是 `node:http(s)`，它们**不会**自动解压响应体；
+ * 而 Node 的 `fetch`（undici）会自动带上 `accept-encoding: gzip, deflate` 并解压。
+ * 服务端一旦按压缩表示回应，`Content-Length` / `Content-Range` 报的就是
+ * **压缩后**的长度，可我们拿到手的是原始字节 —— 用 Range 分段拉时段的边界
+ * 全错，拼出来的文件是半截的，而且 `downloadTo` 的「大小 == Content-Length」
+ * 自检还会**通过**。
+ *
+ * 实测：`tessdata_fast/chi_sim.traineddata` 走 jsdelivr 时响应头报
+ * `Content-Length: 1700263`，实际解码后是 `2469156` —— 差 30%，
+ * 正是这条被悄悄引入的 gzip 表示。原始站（raw.githubusercontent）的头与
+ * 实体一致，所以那个源没暴露问题。加了这个头之后两边行为统一。
+ */
+const NO_ENCODING = { "accept-encoding": "identity" };
+
+/**
  * 带重试的 GET，返回 Buffer。npmmirror/Termux 偶发 TLS 断连，必须重试。
  *
  * ⚠️ 除了 socket 空闲超时（req.setTimeout，对端慢滴滴几字节就会复位），
@@ -30,7 +47,7 @@ export async function fetchBuffer(url, { retries = 4, timeoutMs = 180_000, hardT
       return await new Promise((resolve, reject) => {
         let settled = false;
         const mod = url.startsWith("https:") ? https : http;
-        const req = mod.get(url, { headers: { "user-agent": UA } }, (res) => {
+        const req = mod.get(url, { headers: { "user-agent": UA, ...NO_ENCODING } }, (res) => {
           if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
             res.resume();
             settled = true;
@@ -239,7 +256,7 @@ function fetchChunk(url, from, to, hardTimeoutMs) {
     const mod = url.startsWith("https:") ? https : http;
     const req = mod.get(
       url,
-      { headers: { "user-agent": UA, ...(range ? { range } : {}) } },
+      { headers: { "user-agent": UA, ...NO_ENCODING, ...(range ? { range } : {}) } },
       (res) => {
         if (res.statusCode === 416) {
           res.resume();

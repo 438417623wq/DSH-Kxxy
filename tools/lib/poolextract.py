@@ -20,7 +20,11 @@ LZMA2 解码器（与 debextract.py 同一约束）；Python 的 lzma + tarfile 
                    后缀刻意用 .pool 而不是 .tar.gz —— aapt2 会在资产合并阶段把 .gz
                    解包并剥掉后缀，APK 里的条目名会变成 <id>.tar，破坏设备端按名
                    查包池的逻辑。中性后缀 + noCompress 才能字节保真进 APK。
-  --report JSON    [{id, files, totalBytes}]，fetch-extensions.mjs 据此合成目录
+                   文本文件内容里的 Termux 前缀在此换成 @DSH_ROOT@ / @DSH_HOME@ /
+                   @DSH_TMP@ 占位符（见 PLACEHOLDER_REWRITES 与问题.txt【1】），
+                   并在包内附一份 .pool-manifest.json 列出被改写的文件，
+                   供设备端 extinstall.mjs 安装时回填真实路径。
+  --report JSON    [{id, files, totalBytes, placeholderFiles}]，fetch-extensions.mjs 据此合成目录
 
 用法：
   python poolextract.py --debs <deb目录> --spec <pool-spec.json> \
@@ -35,6 +39,47 @@ import sys
 import tarfile
 
 TERMUX_PREFIX = "./data/data/com.termux/files/usr/"
+
+# ---------------------------------------------------------------------------
+# 内容中的 Termux 前缀重写（问题.txt【1】）
+#
+# 背景：runtime stage 一直在做这件事（tools/build-runtime.mjs 的
+# normaliseStageFiles + RuntimeInstaller 的 rewriteRootPlaceholder），而
+# **包池从来没有**。于是扩展装到设备上之后，脚本里写死的
+# `/data/data/com.termux/files/usr/...` 全部指向不存在的目录 —— 真机症状是
+# `--list-langs` 报 `No such file or directory ["/data/data/com.termux/..."]`、
+# pkgconfig 的 prefix 落空、perl/golang 的各种 share 路径找不到。
+#
+# 做法与 runtime 侧完全一致：**构建期换成占位符、设备端安装时回填**。
+# 不能在构建期就写死真实路径 —— 那是 app 私有目录，包名一变（或换设备）
+# 就全错；必须让设备在自己安装的那一刻用 `context.filesDir` 算出来。
+#
+# 三个占位符与 tools/build-runtime.mjs 的 ROOT/HOME/TMP_PLACEHOLDER 逐字相同，
+# 设备端的 RuntimeInstaller.ROOT_PLACEHOLDER 也是同一个串。
+PLACEHOLDER_REWRITES = (
+    (b"/data/data/com.termux/files/usr", b"@DSH_ROOT@"),
+    (b"/data/data/com.termux/files/home", b"@DSH_HOME@"),
+    (b"/data/data/com.termux/cache", b"@DSH_TMP@"),
+    # 更短的父目录形态。必须放在最后三条：前面的规则都带更长后缀，
+    # 顺序反了会把 `/data/data/com.termux/files/usr` 截成 `@DSH_FILES@/usr`。
+    #
+    # 为什么需要它们：perl 的 `Config_heavy.pl` 把 sysroot 写成
+    # `-Dsysroot=-I/data/data/com.termux/files`（**不带 /usr**），三条长规则
+    # 一条都匹配不到 —— 这是重打 pool 后仅剩的 3 个残留（autotools / perl /
+    # exiftool 各带一份同一个文件）。
+    (b"/data/data/com.termux/files", b"@DSH_FILES@"),
+    (b"/data/data/com.termux", b"@DSH_DATA@"),
+)
+POOL_MANIFEST = ".pool-manifest.json"
+
+# 只改文本。三类明确跳过：
+#   · ELF（魔数 \x7fELF）—— 路径串也出现在里面（DT_RUNPATH / strings），
+#     但占位符比原串短，改动长度会让节偏移与重定位表整体错位；
+#     而且 RUNPATH 的优先级低于 LD_LIBRARY_PATH，留着那条无效路径无害。
+#   · ar 静态库（!<arch>\n）—— 成员偏移与符号索引都按字节算，同理不能动。
+#   · 任何含 NUL 字节的数据 —— 文本配置/脚本不会有 NUL，有就是二进制。
+ELF_MAGIC = b"\x7fELF"
+AR_MAGIC = b"!<arch>\n"
 
 # 与 tools/lib/stage.mjs 的 PRUNE_DIRS / PRUNE_EXT 保持一致的子集：
 # 纯文档在包池里同样没有价值（include/ 与 .a 必须保留 —— 工具链要编译）。
@@ -53,6 +98,27 @@ def is_pruned(path):
         path.startswith(PRUNE_DIRS)
         or path.endswith(PRUNE_EXT)
     )
+
+
+def rewrite_prefixes(data):
+    """把内容里的 Termux 前缀换成占位符。
+
+    @returns (new_bytes, changed) —— 未命中时原样返回且 changed=False。
+    """
+    if not data:
+        return data, False
+    if data[:4] == ELF_MAGIC or data[:8] == AR_MAGIC:
+        return data, False
+    # NUL 字节 = 二进制（PNG/JPEG/加密数据/编译产物…）。文本配置里出现 NUL
+    # 的唯一情形是编码异常，此时改动字节只会让它更坏。
+    if b"\x00" in data:
+        return data, False
+
+    out = data
+    for needle, repl in PLACEHOLDER_REWRITES:
+        if needle in out:
+            out = out.replace(needle, repl)
+    return (out, True) if out is not data else (data, False)
 
 
 def read_ar_members(blob):
@@ -220,9 +286,13 @@ def main():
 
         out_path = os.path.join(args.out, f"{ext_id}.pool")
         total_bytes = 0
+        placeholder_paths = []
         with tarfile.open(out_path, "w:gz", format=tarfile.GNU_FORMAT, compresslevel=6) as out:
             for path in sorted(merged):
                 data, mode = merged[path]
+                data, changed = rewrite_prefixes(data)
+                if changed:
+                    placeholder_paths.append(path)
                 info = tarfile.TarInfo(path)
                 info.size = len(data)
                 # 只保留「属主可执行」这一语义位，其余归一到 0644/0755，
@@ -232,10 +302,40 @@ def main():
                 out.addfile(info, io.BytesIO(data))
                 total_bytes += len(data)
 
-        report.append({"id": ext_id, "files": len(merged), "totalBytes": total_bytes})
+            # 改写清单：设备端装完扩展后按它逐条做占位符 → 真实路径的回填。
+            # 为什么把清单放进 pool 而不是返回给调用方：安装可能在任何一次
+            # 运行时发生（用户点「获取」），构建期的 report 那时早已不在设备上；
+            # 只有随包一起走的清单才能让安装器自给自足。
+            manifest = json.dumps(
+                {
+                    "extId": ext_id,
+                    "placeholders": {
+                        "@DSH_ROOT@": "root",
+                        "@DSH_HOME@": "home",
+                        "@DSH_TMP@": "tmp",
+                        "@DSH_FILES@": "files",
+                        "@DSH_DATA@": "data",
+                    },
+                    "files": placeholder_paths,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            info = tarfile.TarInfo(POOL_MANIFEST)
+            info.size = len(manifest)
+            info.mode = 0o644
+            info.mtime = 0
+            out.addfile(info, io.BytesIO(manifest))
+
+        report.append({
+            "id": ext_id,
+            "files": len(merged),
+            "totalBytes": total_bytes,
+            "placeholderFiles": len(placeholder_paths),
+        })
         print(
             f"      {ext_id}: {len(merged)} 文件 / {total_bytes / 1048576:.1f} MiB"
-            f"（跳过 {skipped} 条）→ {out_path}"
+            f"（跳过 {skipped} 条，改写路径 {len(placeholder_paths)} 个）→ {out_path}"
         )
 
     with open(args.report, "w", encoding="utf-8") as fh:

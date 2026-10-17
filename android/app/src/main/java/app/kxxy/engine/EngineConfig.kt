@@ -137,6 +137,22 @@ object EngineConfig {
     /** 引擎工作目录（会话 cwd）。 */
     fun workspaces(ctx: Context): File = File(dshHome(ctx), "workspaces")
 
+    /**
+     * TeX Live 的**用户树** `$TEXMFVAR`（缺陷 AY 的最后一块拼图）。
+     *
+     * 为什么要自己指定而不是让 kpathsea 用默认值：TeX Live 的默认值是
+     * `$HOME/.texlive<年份>/texmf-var`，年份（当前 `2026`）随发行版变，
+     * App 侧不该去猜。显式设成固定目录后可写死，也不必解析 `texlive.cnf`。
+     * 真机实测：设 `TEXMFVAR` 后 `kpsewhich --var-value=TEXMFVAR` 逐字回显，
+     * 生成到这里的 `pdflatex.fmt` 也能被干净目录里的 `pdflatex` 找到。
+     *
+     * 它与 `$TEXMFSYSVAR`（`<root>/share/texlive/<年份>/texmf-var`，系统树）
+     * 的区别是**这个不带 `!!` 前缀** —— `TEXFORMATS` 里凡是带 `!!` 的树只查
+     * `ls-R` 索引、不扫目录，所以系统树放格式必须同时有 `texmf-var/ls-R`；
+     * 用户树是逐次扫目录的，**一个索引都不需要**（真机 A/B 已验证）。
+     */
+    fun texmfVar(ctx: Context): File = File(dshHome(ctx), ".texlive/texmf-var")
+
     /** 证书目录。 */
     fun tlsDir(ctx: Context): File = File(engineRoot(ctx), "etc/tls")
 
@@ -155,6 +171,146 @@ object EngineConfig {
         File(engineRoot(ctx), "lib/node_modules/kxxy-host/fonts")
 
     /**
+     * 自带的 OpenJDK 主目录（`<root>/lib/jvm/<name>`），找不到返回 null。
+     *
+     * 为什么不写死 `java-21-openjdk`：目录名由 deb 包版本决定，换一条 Termux
+     * 源就可能变成 `java-17-openjdk`。判据用「存在 bin/java 可执行文件」，
+     * 这样目录名怎么变都能命中。
+     *
+     * 为什么必须做这一步（问题.txt【3】）：OpenJDK 装在 `lib/jvm/.../bin` 下，
+     * 既没链进 `<root>/bin` 也没设 `JAVA_HOME`，于是 `java` 根本不在 PATH 上 ——
+     * kotlinc / gradle 全靠 `command -v java` 或 `$JAVA_HOME/bin/java` 找它，
+     * 两处都落空就报「No such file or directory」。
+     */
+    fun javaHome(ctx: Context): File? {
+        val jvmRoot = File(engineRoot(ctx), "lib/jvm")
+        if (!jvmRoot.isDirectory) return null
+        return jvmRoot.listFiles()
+            ?.filter { it.isDirectory && File(it, "bin/java").isFile }
+            ?.sortedBy { it.name }
+            ?.firstOrNull()
+    }
+
+    /**
+     * Guile 的 Scheme 源搜索路径（问题.txt【5】，gdb 依赖它）。
+     *
+     * 首选 `<root>/share/guile/3.0` —— extinstall 的合并视图会把 gdb 扩展的
+     * `share/guile` 摊到引擎根，与 FONTCONFIG_PATH / TESSDATA_PREFIX 同路。
+     * 合并视图尚未建立时（扩展刚装好、插件还没跑过 relink）回落到扩展目录，
+     * 免得 gdb 在这个窗口里 abort。两个都没有就返回首选值 —— 让 guile 自己
+     * 报错比给一个空路径更好排查。
+     */
+    private fun guileLoadPath(root: File): String {
+        val merged = File(root, "share/guile/3.0")
+        val inExt = File(root, "extensions/gdb/share/guile/3.0")
+        return when {
+            merged.isDirectory -> merged.absolutePath
+            inExt.isDirectory -> inExt.absolutePath
+            else -> merged.absolutePath
+        }
+    }
+
+    /**
+     * Perl 的模块搜索路径（问题.txt【1】【6】）。
+     *
+     * 真机症状：`perl -Mstrict -e 1` 报
+     * `Can't locate strict.pm in @INC … (@INC entries checked:
+     * /data/data/com.termux/files/usr/lib/perl5/5.42.2/…)`
+     * —— 连 `strict` 这个核心 pragma 都找不到。@INC 里的**每一条**都是
+     * Termux 前缀（`/data/data/com.termux/…`），一条都不存在。
+     *
+     * 根因：perl 把编译期的 `$PREFIX` 编译进了 `@INC` 与 `Config.pm`，
+     * 而 `/data/data/com.termux/files/usr` 在安卓引擎里不存在。perl 的
+     * `@INC` 编译期条目无法用文件回填修掉（那是 C 字符串），只能靠
+     * `PERL5LIB` 在其**前面**插入真实路径。
+     *
+     * 布局是 `<root>/lib/perl5/[site_perl/]<版本>[/<arch>]`，版本号随 perl 包
+     * 升级而变（当前 5.42.2），所以这里扫目录而不是写死。
+     *
+     * ⚠️ 只收「版本目录」与「版本目录下的架构目录」，**不要**把版本目录里的
+     * 每个模块目录（`App/`、`Archive/`、`B/`…）都塞进来 —— 首版就是这么写的，
+     * 结果 PERL5LIB 变成 60 多条、几 KB 长（真机 `/proc/<pid>/environ` 实测）。
+     *
+     * 架构目录的判据是**名字**：perl 的 `$Config{archname}` 形如
+     * `aarch64-android`，与模块目录（`App`、`CPAN`、`Compress`…）的区别很明确 ——
+     * 恰好一个小写字母数字段、一个连字符、再一个小写字母数字段。
+     * （用「含 .so」判断会漏掉它：`.so` 都在 `aarch64-android/CORE/` 里。）
+     */
+    private val perlArchName = Regex("^[a-z0-9_]+-[a-z0-9_]+$")
+
+    private fun perlLibPath(root: File): String {
+        val base = File(root, "lib/perl5")
+        if (!base.isDirectory) return base.absolutePath
+        val dirs = linkedSetOf<File>()
+        for (root5 in listOf(base, File(base, "site_perl"))) {
+            val versions = root5.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name } ?: continue
+            for (version in versions) {
+                dirs += version
+                version.listFiles()
+                    ?.filter { it.isDirectory && perlArchName.matches(it.name) }
+                    ?.sortedBy { it.name }
+                    ?.forEach { dirs += it }
+            }
+            dirs += root5
+        }
+        return dirs.joinToString(":") { it.absolutePath }
+    }
+
+    /**
+     * kpathsea 的配置文件搜索路径（问题.txt【4】）。
+     *
+     * 真机症状：`kpsewhich` 与 `pdftex` 都报
+     * `warning: kpathsea: configuration file texmf.cnf not found in these
+     * directories: /data/user/0/app.kxxy/…/extensions/texlive/bin/texlive:…`
+     * —— 它把 `texmf.cnf` 找遍了**可执行文件所在目录**的上下级，一个都没有。
+     *
+     * 根因：TeX Live 的 `texmf.cnf` 装在
+     * `share/texlive/<年份>/texmf-dist/web2c/texmf.cnf`，而 kpathsea 默认
+     * 只从 `$TETEXDIR`/自身目录/编译期前缀那一串里找 —— Termux 的原生安装
+     * 靠 `$PREFIX/share/texlive/…` 命中，搬到 extensions/ 后全落空。
+     *
+     * 设置 `TEXMFCNF` 后 kpsewhich 立刻能报出正确的 `TEXMFROOT`。年份目录
+     * 随 TeX Live 版本变（当前 `2026.0`），所以扫目录而不是写死。
+     */
+    private fun texmfCnfPath(root: File): String {
+        val base = File(root, "share/texlive")
+        val fallback = File(base, "2026.0/texmf-dist/web2c")
+        val found = base.listFiles()
+            ?.filter { it.isDirectory }
+            ?.sortedBy { it.name }
+            ?.map { File(it, "texmf-dist/web2c") }
+            ?.firstOrNull { it.isDirectory }
+        return (found ?: fallback).absolutePath
+    }
+
+    /**
+     * `TEXMFROOT` —— TeX Live 的「树根」，`texmf.cnf` 里的 `$TEXMFDIST`、
+     * `$TEXMFSYSVAR`、`$TEXMFLOCAL` 全都相对它展开（缺陷 AY）。
+     *
+     * **它是那三处 TeX 故障里最隐蔽的一处**：不设它时 kpathsea 把
+     * `TEXMFROOT` 解析成 `$SELFAUTOPARENT`（可执行文件的祖父目录），
+     * 于是变成 `<root>/extensions/texlive` —— 而宏包树根本不在那儿，
+     * 一切「文件找不到」的报错都指向一个**语法正确但不存在**的路径：
+     *
+     *   · `kpsewhich fmtutil.cnf` 空 ⇒ texlinks 报 `config file not found`；
+     *   · `kpsewhich article.cls` 空 ⇒ fmtutil 报 `inifile not found`；
+     *   · `tlmgr` 报 `Can't locate TeXLive/TLConfig.pm`（`tlpkg/` 也在这棵树下）。
+     *
+     * 与 [texmfCnfPath] 同源：宏包树被我们摊到 `share/texlive/<年份>/`，
+     * 而它的布局是 `texmf-dist/` 与 `tlpkg/` **同级**在根下。
+     * 年份随版本变，扫目录不写死。
+     */
+    private fun texmfRoot(root: File): String {
+        val base = File(root, "share/texlive")
+        val fallback = File(base, "2026.0")
+        val found = base.listFiles()
+            ?.filter { it.isDirectory }
+            ?.sortedBy { it.name }
+            ?.firstOrNull { File(it, "texmf-dist").isDirectory }
+        return (found ?: fallback).absolutePath
+    }
+
+    /**
      * 构造引擎进程的完整环境变量数组。
      *
      * ⚠️ 这是**完整替换**而非增量：原生层用 `execve(cmd, argv, envp)`，
@@ -168,21 +324,49 @@ object EngineConfig {
         val home = dshHome(ctx)
         val tmp = tmpDir(ctx)
 
-        val path = listOf(
-            File(root, "bin").absolutePath,
-            File(root, "usr/bin").absolutePath,
-            "/system/bin",
-            "/system/xbin",
-        ).joinToString(":")
+        // ⚠️ 这里曾经拼进 `<root>/usr/bin` 与 `<root>/usr/lib`，而引擎根下根本
+        // 没有 `usr/` 目录（runtime 的顶层是 bin/lib/etc/var/share/libexec/include）
+        // —— 那是 Termux 前缀 `$PREFIX/usr` 的残留写法。PATH/LD_LIBRARY_PATH 里的
+        // 死路径本身不报错，但会让 `command -v` 类诊断误导排查方向（问题.txt【7】）。
+        val javaHome = javaHome(ctx)
 
-        val ldPath = listOf(
-            File(root, "lib").absolutePath,
-            File(root, "usr/lib").absolutePath,
-        ).joinToString(":")
+        val path = buildList {
+            add(File(root, "bin").absolutePath)
+            // OpenJDK 不在 <root>/bin 下，必须显式加进去，否则 kotlinc / gradle
+            // 的 `command -v java` 与 `$JAVA_HOME/bin/java` 两条路都落空。
+            javaHome?.let { add(File(it, "bin").absolutePath) }
+            add("/system/bin")
+            add("/system/xbin")
+        }.joinToString(":")
+
+        val ldPath = File(root, "lib").absolutePath
+
+        // 引擎自带的头文件目录（问题.txt【5】）。
+        //
+        // 实测：这个 clang 的默认系统头搜索路径**只有** `<root>/lib/clang/21/include`
+        // 一项（`cc -E -Wp,-v` 输出），连 `stdio.h` 都找不到 —— Termux 的 libc 头装在
+        // `<root>/include`，而它是靠包的 specs/wrapper 加进去的，脱离 Termux 的
+        // `$PREFIX` 布局后那层配置失效。所以必须由环境变量补上。
+        //
+        // `aarch64-linux-android/` 是 NDK 那份（`asm/types.h` 只在这里，
+        // 而 `<root>/include/linux/types.h` 第 9 行就 `#include <asm/types.h>`）。
+        val includeDirs = listOf(File(root, "include"), File(root, "include/aarch64-linux-android"))
+            .filter { it.isDirectory }
+            .joinToString(":") { it.absolutePath }
 
         val env = mutableListOf(
             "PATH=$path",
             "LD_LIBRARY_PATH=$ldPath",
+            // 链接期库搜索路径（问题.txt【5】）。
+            //
+            // 为什么非它不可：cc 的链接驱动把 LIBRARY_PATH 展开成 `-L`，而
+            // **rustc 不认 RUSTFLAGS**（那个变量只对 cargo 生效）。rustc 的链接行
+            // 里写死 `-lunwind`，而 `libunwind` 在 rustlib 目录下只有 `.rlib`/`.rmeta`，
+            // 真身在 `<root>/lib/libunwind.a`。真机实测：不加就是
+            // `ld.lld: error: unable to find library -lunwind`，加了直接编译通过。
+            "LIBRARY_PATH=$ldPath",
+            "CPATH=$includeDirs",
+            "C_INCLUDE_PATH=$includeDirs",
             "PREFIX=${root.absolutePath}",
             "HOME=${home.absolutePath}",
             "DSH_HOME=${home.absolutePath}",
@@ -202,6 +386,83 @@ object EngineConfig {
             "ANDROID_DATA=/data",
             "ANDROID_ROOT=/system",
             "ANDROID_STORAGE=/storage",
+            // 扩展装到 extensions/<id>/ 后，各工具的配置文件与资源仍在自己的目录里，
+            // 而它们编译期记下的路径是 Termux 的单一前缀（$PREFIX/etc、$PREFIX/share）。
+            // extinstall 会把每个扩展的 etc/ 与 share/ 逐项软链进引擎根的 etc/ 与
+            // share/（见 buildViews），所以这里指回引擎根即可（问题.txt【6】）。
+            "FONTCONFIG_PATH=${File(root, "etc/fonts").absolutePath}",
+            "TESSDATA_PREFIX=${File(root, "share/tessdata").absolutePath}",
+            // perl 的 @INC 修复（问题.txt【1】）。没有它，任何 `use strict` 的
+            // perl 脚本都直接 BEGIN failed —— 包括 TeX Live 的 fmtutil.pl /
+            // mktexfmt / tlmgr（它们全是 perl 脚本），于是「装了 TeX Live 却
+            // 生成不了格式文件、编不出任何文档」。
+            "PERL5LIB=${perlLibPath(root)}",
+            // kpathsea 的 texmf.cnf 定位（问题.txt【4】）。没有它，pdftex 会去
+            // 可执行文件所在目录上下级找 texmf.cnf、遍寻不获后回落到编译期前缀，
+            // 最终 `I can't find the format file 'pdftex.fmt'!`。
+            "TEXMFCNF=${texmfCnfPath(root)}",
+            // TeX Live 的树根（缺陷 AY）。没有它，`$TEXMFDIST` 等一律被解析成
+            // `<root>/extensions/texlive/...`（可执行文件的祖父目录）—— 一个
+            // 语法正确但不存在的路径，于是 kpsewhich 什么都找不到，而报错文案
+            // 看起来像「宏包没打包」。真机三处症状全由它派生：texlinks 报
+            // `fmtutil.cnf not found`、fmtutil 报 `inifile not found`、
+            // tlmgr 报 `Can't locate TeXLive/TLConfig.pm`。
+            "TEXMFROOT=${texmfRoot(root)}",
+            // TeX Live 的用户树（缺陷 AY 的收尾）。指到固定目录有两个作用：
+            //   ① 设备上第一次用 pdflatex 时，格式文件（.fmt）就装在这里 —— 它
+            //      不带 `!!` 前缀，kpathsea 会扫目录，因此**不需要 ls-R 索引**；
+            //   ② 格式由 [RuntimeInstaller.ensureTexFormats] 在安装期生成，
+            //      不依赖设备上的 mktexfmt（那个走 perl 的 system("sh …")，
+            //      在 Android 上必然失败 —— 见缺陷 AY 的第五处）。
+            "TEXMFVAR=${texmfVar(ctx).absolutePath}",
+            // gdb 的 Guile 扩展（问题.txt【5】）。
+            //
+            // 真机症状：`gdb --version` 直接 SIGABRT（退出码 134），栈是
+            // `ext_lang_initialization` → `scm_i_init_guile` → `scm_load_startup_files`
+            // → `scm_misc_error` → `abort`。根因是 libguile 编译期把 Scheme 源的
+            // 搜索前缀写死成 Termux 的 `/data/data/com.termux/files/usr/share/guile`，
+            // 而真实源码在扩展目录里；启动时读不到 `ice-9/boot-9.scm` 就抛错。
+            //
+            // 路径取 `<root>/share/guile/3.0`：extinstall 的合并视图已经把各扩展的
+            // `share/` 递归合并进引擎根，所以 gdb 装好后这里就是它的源码树 —— 与
+            // FONTCONFIG_PATH / TESSDATA_PREFIX 走的是同一条路。扩展目录作为兜底，
+            // 覆盖「刚装好但合并视图还没建立」的窗口。
+            "GUILE_LOAD_PATH=${guileLoadPath(root)}",
+            // 关掉自动编译。真机对照实测（同一设备、同一份 gdb，各跑两次）：
+            //   AUTO_COMPILE=0 → 225 s / 238 s（纯解释，缓存目录 0 个 .go）
+            //   AUTO_COMPILE=1 → 1837 s / 1494 s（冷/热，只写出 4–5 个 .go）
+            // 带它慢 6–8 倍，而且几乎不落缓存（369 个 .scm 只编译出个位数），
+            // 每次启动都在重复同一份白工。关掉是纯粹的收益。
+            //
+            // ⚠️ 曾经的测量陷阱：早期探针写成 `gdb --version | head -1`，head
+            // 读完一行就关管道、gdb 收 SIGPIPE 提前退出，自动编译循环被中断，
+            // 于是「缓存目录一个 .go 都没有」被误读成「自动编译不落盘」。
+            // 判断这类代价必须重定向到文件，**绝不接管道**。
+            "GUILE_AUTO_COMPILE=0",
+            // 合并视图把扩展的 share/ 与 etc/ 摊到了引擎根，凡是按 XDG 找资源的
+            // 工具（fontconfig、gdk-pixbuf、shared-mime-info、GLib schema）都能
+            // 因此命中 —— 这些包在 Termux 下本来就靠 `$PREFIX/share` 生效。
+            "XDG_DATA_DIRS=${File(root, "share").absolutePath}:/usr/share",
+            "XDG_CONFIG_DIRS=${File(root, "etc/xdg").absolutePath}:/etc/xdg",
+            // ImageMagick 的配置文件目录（问题.txt【6】第三层）。
+            //
+            // 合并视图已经把 `<ext>/etc/ImageMagick-7` 软链到 `<root>/etc/ImageMagick-7`，
+            // 但 magick 找这个目录**不看 $PREFIX**：它只按内置的 Termux 前缀与
+            // `$MAGICK_CONFIGURE_PATH` 找，找不到就 `UnableToOpenConfigureFile colors.xml`
+            // 一路告警（真机实测：软链在位、`etc/ImageMagick-7/colors.xml` 读得到，
+            // 不加这个变量仍然告警；加上就干净）。真机 8x8 出图 A/B 通过。
+            "MAGICK_CONFIGURE_PATH=${File(root, "etc/ImageMagick-7").absolutePath}",
+            // Ghostscript 的初始化文件目录（问题.txt【6】第二层，**同一个坑的另一半**）。
+            //
+            // `gs -h` 报的 search path 第一位就是编译期写死的
+            // `/data/data/com.termux/files/usr/share/ghostscript/Resource/Init`；
+            // 合并视图把真身摊到 `<root>/share/ghostscript/Resource/Init`（gs_init.ps
+            // 在那儿，实测存在），但它不在 gs 的任何搜索路径上 ⇒ 启动即
+            // `Can't find initialization file gs_init.ps`，退出码却仍是 0
+            // （**静默失败**，只出一份空 PDF）。加上 GS_LIB 后 pdfwrite 出真 PDF 2433 B。
+            "GS_LIB=${File(root, "share/ghostscript/Resource/Init").absolutePath}:" +
+                "${File(root, "share/ghostscript/lib").absolutePath}:" +
+                "${File(root, "share/ghostscript/Resource/Font").absolutePath}",
             // Termux 编译期 gitconfig 指向不存在的 Termux 前缀
             "GIT_CONFIG_NOSYSTEM=1",
             // 包管理器镜像（corepack/npm/pnpm 在 runtime 内无 .npmrc）
@@ -216,6 +477,39 @@ object EngineConfig {
             "KXXY_ENGINE_ROOT=${root.absolutePath}",
             "KXXY_STATE_FILE=${File(root, STATE_FILE_NAME).absolutePath}",
         )
+
+        // JAVA_HOME：kotlinc 与 gradle 都优先读它，比 PATH 更硬。
+        if (javaHome != null) env += "JAVA_HOME=${javaHome.absolutePath}"
+
+        // JVM 的 user.home / java.io.tmpdir 是**编译期写死的 C 字符串**
+        // （`/data/data/com.termux/files/home` 与 `.../usr/tmp/`），跟 perl 的 @INC
+        // 同一类残留，改文件改不掉、只能从环境变量盖（问题.txt【1】的 Java 侧）。
+        // 真机取证：`java -XshowSettings:properties` 报 `user.home=/data/data/com.termux/files/home`、
+        // `java.io.tmpdir=/data/data/com.termux/files/usr/tmp/`，两个目录都不存在。
+        //
+        // 后果链（问题.txt【3】【4】的第二层）：
+        //   · Gradle 的 native-platform 在 `$user.home/.gradle` 下建临时探针文件，
+        //     父目录不存在 ⇒ `IOException: No such file or directory` ⇒
+        //     `Failed to load native library 'libnative-platform.so' for Linux aarch64`
+        //     ⇒ `Could not initialize native services`，**连 `gradle --version` 都不出**；
+        //   · jansi（kotlinc 的终端着色库）往 `java.io.tmpdir` 解 .so，报
+        //     `.../com.termux/files/usr/tmp/jansi-*.so.lck (No such file or directory)`。
+        //
+        // A/B 真机实测（同一个 java、同一个 gradle 9.8.1）：
+        //   基线（现状）                        → rc=1  Could not initialize native services
+        //   只加 java.io.tmpdir                 → rc=1  Could not initialize native services
+        //   只加 GRADLE_USER_HOME               → rc=1  createVirtualFileSystem 失败
+        //   **两个都加**                        → rc=0  真的编出 A.class
+        //   不设 GRADLE_USER_HOME、只靠 -Duser.home → 也能过（两者等价，任选其一）
+        // 所以这里两个都给：GRADLE_USER_HOME 显式钉死缓存根，JAVA_TOOL_OPTIONS 覆盖
+        // 任意 JVM 进程（kotlinc / d8 / apksigner 也一并受益）。用空格拼成一条值而不是
+        // 两条导出，是因为 JAVA_TOOL_OPTIONS 本身就是「由 JVM 自行按空格拆分」的变量。
+        val jvmOpts = buildList {
+            add("-Djava.io.tmpdir=${tmp.absolutePath}")
+            add("-Duser.home=${home.absolutePath}")
+        }.joinToString(" ")
+        env += "JAVA_TOOL_OPTIONS=$jvmOpts"
+        env += "GRADLE_USER_HOME=${File(home, ".gradle").absolutePath}"
 
         // Termux 编译的 node 把 OpenSSL 目录硬编码为 /data/data/com.termux/...，
         // 设备共存真实 Termux 时会命中 EACCES 导致 node 启动即退，必须显式指回自带目录。

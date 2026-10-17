@@ -344,6 +344,13 @@ class EngineSupervisor(private val ctx: Context) {
         EngineConfig.dshHome(ctx).mkdirs()
         EngineConfig.tmpDir(ctx).mkdirs()
         EngineConfig.workspaces(ctx).mkdirs()
+        // Gradle 的 GRADLE_USER_HOME 默认取 `$user.home/.gradle`，而 JVM 的
+        // user.home 是编译期写死的 Termux 路径（见 EngineConfig.buildEnv 的注释）。
+        // 我们已用 -Duser.home + GRADLE_USER_HOME 双保险指回来，这里再把目录
+        // 预建出来：native-platform 会在其下建临时探针文件，父目录缺失时报的
+        // 是 `Failed to load native library 'libnative-platform.so'`，
+        // 与「库真的缺了」同症状，极易误判（缺陷 AW）。
+        File(EngineConfig.dshHome(ctx), ".gradle").mkdirs()
         // 官方终端以 `bash --rcfile <临时文件> -i` 启动，该 rcfile 首行会
         // source ~/.bashrc —— 这是唯一能给出「显示当前目录」提示符的挂点。
         EngineConfig.ensureUserShellInit(ctx)

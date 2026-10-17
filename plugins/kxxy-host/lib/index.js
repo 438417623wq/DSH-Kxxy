@@ -1,4 +1,4 @@
-/* kxxy-host@10 */
+/* kxxy-host@12 */
 /**
  * kxxy-host — DSH Kxxy 宿主管理页插件。
  *
@@ -743,6 +743,31 @@ export function apply(ctx) {
     const rebuilt = extinstall.relinkAll(root0)
     if (rebuilt > 0) {
       ctx.logger?.info?.(`[kxxy-host] relinkAll: ${rebuilt} extension(s) relinked after runtime upgrade`)
+    }
+
+    // ── 布局迁移：把旧代码装的扩展重新装配一遍 ────────────────────────
+    //
+    // 为什么必须做：扩展目录是用户态资产，`RuntimeInstaller` 的自愈从不碰
+    // `extensions/`，所以「代码修好了但设备上还是旧布局」会长期存在 ——
+    // 真机实测 texlive 重装后 `bin/` 从 1218 涨到 1629（+411 个 TeX 引擎、
+    // 这才让 pdftex/xelatex 真的可调用），而其余扩展仍缺 `lib/rustlib`、
+    // `etc/fonts`、且 perl 的 Config_heavy.pl 还写着 Termux 前缀。
+    //
+    // 串行、后台、不阻塞启动：包池就在设备上，不必重新下载，但解包 13–250 MB
+    // 仍要时间。startInstall 自带 installChain 串行与重复安装保护。
+    try {
+      const stale = extinstall.staleExtensions(root0)
+      if (stale.length > 0) {
+        const catalog = extinstall.readCatalog()
+        ctx.logger?.info?.(`[kxxy-host] 装配布局升级：${stale.length} 个扩展待重装（${stale.join(', ')}）`)
+        for (const id of stale) {
+          const item = catalog?.items?.find((i) => i.id === id) ?? {}
+          const started = extinstall.startInstall(root0, id, item)
+          if (started.error) ctx.logger?.warn?.(`[kxxy-host] ${id} 重装未能启动：${started.error}`)
+        }
+      }
+    } catch (e) {
+      ctx.logger?.warn?.(`[kxxy-host] staleExtensions 检查失败：${String(e?.message ?? e)}`)
     }
 
     // ── WebView 兼容层：注入到官方前端 index.html 的 <head> ────────────
