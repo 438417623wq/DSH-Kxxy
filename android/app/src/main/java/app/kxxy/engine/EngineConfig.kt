@@ -211,6 +211,104 @@ object EngineConfig {
     }
 
     /**
+     * Emacs 的版本目录（`<root>/share/emacs/<版本>`），缺陷 BA。
+     *
+     * 版本号（当前 `31.1`）随包升级而变，所以扫 `share/emacs/` 取**字典序最大**
+     * 的那个 —— 与 [guileLoadPath] 的「合并视图优先、扩展目录兜底」同一套路。
+     * 合并视图尚未建立时回落到 `extensions/emacs/share/emacs/`。
+     *
+     * ⚠️ 必须**只认纯版本号形态的目录名**。真机踩过：`share/emacs/` 下除了
+     * `31.1` 还有一个 `site-lisp`，而按字典序 `"site-lisp" > "31.1"`（`s` > `3`），
+     * 于是取到 `share/emacs/site-lisp`，`EMACSDATA` 指向不存在的
+     * `share/emacs/site-lisp/etc`，emacs 直接报
+     * `Emacs will not function correctly without the character map files.` +
+     * `The EMACSDATA environment variable is set.  Maybe it has the wrong value?`
+     * 并 rc=1。判据用「首字符是数字」而不是「全部是数字和点」，因为版本可能
+     * 带后缀（`31.1-rc1`）；但必须排除 `site-lisp`/`etc` 这类非版本目录。
+     *
+     * 全都没有就返回合并视图的猜测路径：让 emacs 自己报错比给空字符串好排查
+     * （空串会被 emacs 当成「用编译期默认值」，反而看不出问题）。
+     */
+    private fun emacsVersionDir(root: File): File {
+        for (base in listOf(File(root, "share/emacs"), File(root, "extensions/emacs/share/emacs"))) {
+            if (!base.isDirectory) continue
+            val versions = base.listFiles { f -> f.isDirectory }
+                ?.map { it.name }
+                ?.filter { it.isNotEmpty() && it[0].isDigit() }
+                ?.sorted()
+            if (!versions.isNullOrEmpty()) return File(base, versions.last())
+        }
+        return File(root, "share/emacs/31.1")
+    }
+
+    /** Emacs 的 `etc/`（charsets、DOC、HELLO…）。对应 `EMACSDATA` / `EMACSDOC`。 */
+    private fun emacsDataDir(root: File): String = File(emacsVersionDir(root), "etc").absolutePath
+
+    /**
+     * Emacs 的 `load-path` 初值，对应 `EMACSLOADPATH`。
+     *
+     * 顺序照搬 emacs 自己的默认值：`lisp` → `site-lisp` → `lisp/leim`（输入法）。
+     * `site-lisp` 排在 `leim` 前面是有意的 —— 用户自己装的包应当优先于内置
+     * 输入法目录被找到。
+     *
+     * **最前面多插一条 Kxxy 自己的目录**（[emacsSiteLoadDir]），里面只有一个
+     * 安装期生成的 `site-load.el`：它把 `source-directory` 改成真实存在的
+     * `<root>/share/emacs/<版本>/`，并让 `emacs-repository-get-version` /
+     * `-get-branch` 直接返回 nil。没有它，每次启动（含 `--batch`）都会刷两条
+     * `Error running git rev-parse: (file-missing "Setting current directory" …
+     * "/data/data/com.termux/files/usr/share/emacs/31.1/")` —— 因为
+     * `loadup.el:463` 在 `(and (eq system-type 'android) (not (pdumper-stats)))`
+     * 成立时会去那个不存在的 Termux 源码目录里问 git。
+     *
+     * 为什么用 `site-load.el` 而不是改 `share/` 里的文件：`loadup.el:411` 的
+     * `(load "site-load" t)` 走的是普通 `load`，会沿 `load-path` 找到我们这条；
+     * 而 `share/emacs/<版本>/lisp/` 是 runtime.zip 的产物，重建 runtime 会被
+     * 覆盖掉，用户树里的文件才活得久。
+     */
+    private fun emacsLoadPath(root: File, ctx: Context): String {
+        val v = emacsVersionDir(root)
+        return listOf(
+            emacsSiteLoadDir(ctx),
+            File(v, "lisp"),
+            File(v, "site-lisp"),
+            File(v, "lisp/leim"),
+        ).joinToString(":") { it.absolutePath }
+    }
+
+    /**
+     * Kxxy 给 Emacs 准备的 `site-load.el` 所在目录（`<home>/.emacs.d/kxxy`）。
+     *
+     * 放在 `$HOME` 下而不是引擎树里：引擎树是 runtime.zip 的产物，重装/升级
+     * 会整棵重建，而 `$HOME` 是用户数据，跨版本保留。
+     */
+    fun emacsSiteLoadDir(ctx: Context): File = File(dshHome(ctx), ".emacs.d/kxxy")
+
+    /**
+     * Emacs 的架构相关 libexec 目录，对应 **`EMACSPATH`**。
+     *
+     * 布局是 `libexec/emacs/<版本>/<arch>/`，`<arch>` 形如 `aarch64-linux-android`。
+     * 这里扫目录取第一个（正常只有一个）；没有就返回合并视图的猜测路径。
+     *
+     * 变量名是 `EMACSPATH` 而不是 `EMACSLIBEXEC` —— 真机 A/B 定死：
+     * 只有 `EMACSPATH` 能让 emacs 31.1 的 `exec-path`/`exec-directory` 指向这里，
+     * `EMACSLIBEXEC` 对它**完全无效**（设了等于没设，`arch-warn` 仍是 1）。
+     * 二进制里被 `getenv` 的 EMACS* 名字只有五个：`EMACSDATA` / `EMACSDOC` /
+     * `EMACSLOADPATH` / `EMACSPATH` / `EMACS_FONT_LOG`（`EMACS_IGNORE_TIMERFD`）。
+     */
+    private fun emacsLibExecDir(root: File): String {
+        val version = emacsVersionDir(root).name
+        for (base in listOf(
+            File(root, "libexec/emacs/$version"),
+            File(root, "extensions/emacs/libexec/emacs/$version"),
+        )) {
+            if (!base.isDirectory) continue
+            val arch = base.listFiles { f -> f.isDirectory }?.firstOrNull()
+            if (arch != null) return arch.absolutePath
+        }
+        return File(root, "libexec/emacs/$version/aarch64-linux-android").absolutePath
+    }
+
+    /**
      * Perl 的模块搜索路径（问题.txt【1】【6】）。
      *
      * 真机症状：`perl -Mstrict -e 1` 报
@@ -439,6 +537,33 @@ object EngineConfig {
             // 于是「缓存目录一个 .go 都没有」被误读成「自动编译不落盘」。
             // 判断这类代价必须重定向到文件，**绝不接管道**。
             "GUILE_AUTO_COMPILE=0",
+            // Emacs 的四个数据路径（问题修复.txt 里最后一项，缺陷 BA）。
+            //
+            // 真机症状：`emacs --version` 能出版本号，但每次都先刷三条警告 ——
+            //   Warning: arch-dependent data dir '/data/data/com.termux/files/usr/libexec/emacs/31.1/aarch64-linux-android/': No such file or directory
+            //   Warning: arch-independent data dir '/data/data/com.termux/files/usr/share/emacs/31.1/etc/': No such file or directory
+            //   Warning: Lisp directory '/data/data/com.termux/files/usr/share/emacs/31.1/lisp': No such file or directory
+            // 而 `--batch` 更直接死掉：`Error: file-missing ("Loading charset map" …
+            // "8859-2")` + `Emacs will not function correctly without the character
+            // map files.` —— 因为 charsets 目录里的 `.map` 被 `PRUNE_EXT` 误裁了
+            // （见 tools/lib/stage.mjs，那一半是构建期修的；这里修的是路径）。
+            //
+            // 根因：这三个路径是 Emacs 编译期写进 C 字符串的 `$prefix` 派生值，
+            // 和 JVM 的 `user.home`、perl 的 `@INC` 完全同型 —— 文件回填改不掉。
+            // 只能靠环境变量在其**前面**插入真实路径。四个变量各有分工：
+            //   EMACSDATA     → etc/（charsets/、DOC、HELLO…）
+            //   EMACSLOADPATH → lisp/ + site-lisp/ + lisp/leim（输入法）
+            //   EMACSPATH     → libexec/emacs/<版本>/<arch>/（hexl、movemail、rcs2log）
+            //   EMACSDOC      → etc/（`C-h F` 查 docstring 用）
+            // 路径取 `<root>/share/emacs/<版本>`：extinstall 的合并视图已把
+            // emacs 扩展的 `share/` 摊到引擎根，与 GUILE_LOAD_PATH 同路。
+            //
+            // 版本号（当前 31.1）随包升级而变，所以扫目录而不是写死 —— 与
+            // [guileLoadPath]、[perlIncDirs] 的做法一致。
+            "EMACSDATA=${emacsDataDir(root)}",
+            "EMACSLOADPATH=${emacsLoadPath(root, ctx)}",
+            "EMACSPATH=${emacsLibExecDir(root)}",
+            "EMACSDOC=${emacsDataDir(root)}",
             // 合并视图把扩展的 share/ 与 etc/ 摊到了引擎根，凡是按 XDG 找资源的
             // 工具（fontconfig、gdk-pixbuf、shared-mime-info、GLib schema）都能
             // 因此命中 —— 这些包在 Termux 下本来就靠 `$PREFIX/share` 生效。

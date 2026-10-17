@@ -286,6 +286,37 @@ export const POOL_MANIFEST = '.pool-manifest.json'
  * 所以升到 3 强制全体重新装配一次，把丢失的内容从 pool 里补回来。
  */
 export const LAYOUT_VERSION = 3
+
+/**
+ * 包池文件的体积指纹（扩展 id → 安装时那个 pool 的字节数）。
+ *
+ * 为什么 `layout` 不够：布局版本只随**装配代码**变，而 pool 的**内容**是随
+ * APK 变的。真机事故（缺陷 BA 的第二层）：emacs 的字符集映射 `*.map` 曾被
+ * `PRUNE_EXT` 误裁，修好后新 APK 里的 `emacs.pool` 从 53,391,296 B 长到
+ * 54,413,123 B，`RuntimeInstaller.ensureExtensionPool` 也如实把新文件拷到了
+ * 设备上 —— 但 `extensions/emacs` 里仍是旧池解出来的 4,239 个文件（charsets
+ * 只剩一个 README），`layout` 仍是 3，于是 `staleExtensions` 判它「已最新」，
+ * 缺陷在设备上原样复现。判据必须包含「池本身变了没有」。
+ *
+ * 只比字节数、不比内容哈希：1 GiB 级的池在启动路径上做全量哈希不可接受，
+ * 而池是由 deb 重新打包的，内容一变体积几乎必然变。代价是「改了内容但体积
+ * 恰好不变」探测不到 —— 那种情况需要用户手动在扩展中心重装。
+ *
+ * @returns {number} 池文件字节数；池不存在时为 0
+ */
+export function poolSignature(root, id) {
+  if (!root) return 0
+  for (const name of [`${id}.pool`, `${id}.tar.gz`]) {
+    try {
+      const st = statSync(join(poolDir(root), name))
+      if (st.isFile()) return st.size
+    } catch {
+      // 换下一个后缀
+    }
+  }
+  return 0
+}
+
 /**
  * 占位符 → 引擎实际的目录。与构建期 poolextract.py 的映射表逐字对应。
  *
@@ -480,7 +511,18 @@ export function buildViews(root, id, extDir) {
   // layout 戳在这里打，而不是在 runInstall 里补 —— 凡是走到 buildViews 的
   // 路径（安装、将来的重装配工具）写出的清单都自带版本，漏一个就会让
   // staleExtensions 永远判它「落后」而无限重装。
-  return { extId: id, bins, libs, views, linkedAt: Date.now(), layout: LAYOUT_VERSION }
+  //
+  // `poolBytes` 同理必须在这里打：它记录「这次装配用的是多大的池」，池被
+  // 新 APK 换掉之后（见 poolSignature 的注释）staleExtensions 靠它发现。
+  return {
+    extId: id,
+    bins,
+    libs,
+    views,
+    linkedAt: Date.now(),
+    layout: LAYOUT_VERSION,
+    poolBytes: poolSignature(root, id),
+  }
 }
 
 /**
@@ -884,12 +926,25 @@ export function staleExtensions(root) {
       const linksFile = join(extRoot, entry.name, '.links.json')
       if (!existsSync(linksFile)) continue
       let layout = 0
+      let recordedBytes = 0
       try {
-        layout = Number(JSON.parse(readFileSync(linksFile, 'utf8')).layout) || 0
+        const links = JSON.parse(readFileSync(linksFile, 'utf8'))
+        layout = Number(links.layout) || 0
+        recordedBytes = Number(links.poolBytes) || 0
       } catch {
         layout = 0
       }
-      if (layout < LAYOUT_VERSION) stale.push(entry.name)
+      if (layout < LAYOUT_VERSION) {
+        stale.push(entry.name)
+        continue
+      }
+      // 池内容变了（新 APK 换了包）→ 装配出来的目录已经和池对不上。
+      // `recordedBytes === 0` 是「这份 .links.json 由还没记 poolBytes 的旧代码
+      // 写的」，一律当落后处理；否则比对当前池体积。
+      const nowBytes = poolSignature(root, entry.name)
+      if (nowBytes > 0 && recordedBytes !== nowBytes) {
+        stale.push(entry.name)
+      }
     }
   } catch {
     return []

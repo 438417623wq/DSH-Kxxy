@@ -438,6 +438,43 @@ console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755
   ok(`ensureNoShadowingStubs 已就位并挂了 ${calls} 条路径`);
 }
 
+/*
+ * Emacs 的 site-load.el 也必须是「每次启动幂等生成」（缺陷 BA 收尾）。
+ *
+ * 它抹的是 `loadup.el:463` 在无 dump 时对 `source-directory`（编译期写死的
+ * Termux 前缀）发起的 git 探测 —— 每次 `emacs --batch` 都刷两行
+ * `Error running git rev-parse: (file-missing "Setting current directory" …)`。
+ * 和桩库同理：老设备 `isComplete()` 判真 ⇒ 不重装 ⇒ 文件永远不生成。
+ */
+{
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  if (!/private\s+fun\s+ensureEmacsSiteLoad\s*\(/.test(kt)) {
+    fail("缺少 ensureEmacsSiteLoad 定义（老设备不重装，emacs 每次启动都会刷 git 报错）");
+  }
+  const calls = (kt.match(/ensureEmacsSiteLoad\(root\)/g) || []).length;
+  if (calls < 2) {
+    fail(`ensureEmacsSiteLoad 只在 ${calls} 处被调用（应同时挂「已完整」与「重装」两条路径）`);
+  }
+  // 真正消音的是这两个 defalias；只改 source-directory 不够（真机 A/B：git 报错数不变）
+  if (!/emacs-repository-get-version/.test(kt) || !/emacs-repository-get-branch/.test(kt)) {
+    fail("site-load.el 必须同时 defalias 掉 emacs-repository-get-version 与 -get-branch");
+  }
+  const cfg = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/EngineConfig.kt"),
+    "utf8",
+  );
+  if (/"EMACSLIBEXEC=/.test(cfg)) {
+    fail("EngineConfig 仍在导出 EMACSLIBEXEC（emacs 不认这个名字，真机 A/B 已证）");
+  }
+  if (!/"EMACSPATH=\$\{emacsLibExecDir\(root\)\}"/.test(cfg)) {
+    fail("EngineConfig 必须导出 EMACSPATH（emacs 31.1 真正 getenv 的变量名）");
+  }
+  ok(`ensureEmacsSiteLoad 已就位并挂了 ${calls} 条路径，EMACSPATH 正确`);
+}
+
 // ---------------------------------------------------------------- isComplete（十一锚点）
 console.log("[6] isComplete 十一锚点（含兼容层、PTY 绑定、宿主插件、office 资产、内置移动端插件与构建期补丁集）：");
 const anchors = [

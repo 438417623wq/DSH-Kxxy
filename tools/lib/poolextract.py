@@ -83,6 +83,11 @@ AR_MAGIC = b"!<arch>\n"
 
 # 与 tools/lib/stage.mjs 的 PRUNE_DIRS / PRUNE_EXT 保持一致的子集：
 # 纯文档在包池里同样没有价值（include/ 与 .a 必须保留 —— 工具链要编译）。
+#
+# `.map` **不在**这里（缺陷 BA）：扩展池里带 `.map` 的只有 emacs（131 个字符集
+# 映射表，2.8 MiB）与 texlive-bin（3 个字体映射），缺了前者 emacs 连 --batch 都
+# 起不来（`Loading charset map ... "8859-2"` + `Emacs will not function correctly
+# without the character map files.`），缺了后者 dvipdfmx 找不到 CID 字体。
 PRUNE_DIRS = (
     "share/doc/",
     "share/man/",
@@ -90,7 +95,7 @@ PRUNE_DIRS = (
     "share/et/",
     "libexec/installed-tests/",
 )
-PRUNE_EXT = (".la", ".md", ".ps1", ".cmd", ".map")
+PRUNE_EXT = (".la", ".md", ".ps1", ".cmd")
 
 
 def is_pruned(path):

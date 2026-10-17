@@ -4,8 +4,8 @@
  *
  * 用法：node tools/verify-runtime.mjs [zip 路径]
  */
-import { readFileSync } from "node:fs";
-import { inflateRawSync } from "node:zlib";
+import { existsSync, readFileSync } from "node:fs";
+import { gunzipSync, inflateRawSync } from "node:zlib";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -688,6 +688,65 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
     missing += 1;
   } else {
     console.log("桩库剔除：✓ libbinder_ndk.so 已剔除，其余 4 个桩库保留");
+  }
+}
+
+// ---------------------------------------------------------------- 字符集映射
+//
+// 为什么需要：`PRUNE_EXT` 里曾有一条 `.map`（本意是裁 JS sourcemap），但扩展池里
+// 带 `.map` 的只有两个包，而且全是要用的数据文件 —— emacs 的
+// `share/emacs/<版本>/etc/charsets/*.map`（131 个 / 2.8 MiB，字符集映射表）和
+// texlive-bin 的 3 个字体映射。缺了前者，`emacs --batch` 直接报
+// `Error: file-missing ("Loading charset map" "No such file or directory" "8859-2")`
+// + `Emacs will not function correctly without the character map files.`，
+// 连版本号都打不全（缺陷 BA）。
+//
+// 检查对象是 ext-pool 里的 emacs.pool（不是 runtime.zip）—— 扩展池是独立产物，
+// 由 tools/fetch-extensions.mjs 生成。
+{
+  const poolDir = join(HERE, "..", "android", "app", "src", "main", "assets", "ext-pool");
+  const emacsPool = join(poolDir, "emacs.pool");
+  const problems = [];
+  if (!existsSync(emacsPool)) {
+    problems.push("emacs.pool 不存在（扩展池未生成）");
+  } else {
+    // 池是 gzip 的 tar，只能扫 tar 头里能直接看到的路径名 —— 不解压，
+    // 用 inflateRawSync 解 gzip 再逐块找文件名太慢（53 MB）。
+    // 改用 tar 头遍历：读 512 字节块，看 name 字段。
+    const buf = readFileSync(emacsPool);
+    const tarBuf = gunzipSync(buf);
+    let off = 0;
+    let charsetCount = 0;
+    let saw8859 = false;
+    while (off + 512 <= tarBuf.length) {
+      const header = tarBuf.subarray(off, off + 512);
+      // 全零块 = 归档结束
+      if (header.every((b) => b === 0)) break;
+      let nameEnd = header.indexOf(0);
+      if (nameEnd < 0) nameEnd = 100;
+      const name = header.subarray(0, nameEnd).toString("utf8");
+      const sizeStr = header.subarray(124, 136).toString("ascii").replace(/\0.*$/, "").trim();
+      const size = parseInt(sizeStr, 8) || 0;
+      if (name.includes("/etc/charsets/") && name.endsWith(".map")) {
+        charsetCount += 1;
+        if (name.endsWith("8859-2.map")) saw8859 = true;
+      }
+      off += 512 + Math.ceil(size / 512) * 512;
+    }
+    if (charsetCount < 100) {
+      problems.push(`emacs.pool 里字符集映射只有 ${charsetCount} 个（应 ≥100；PRUNE_EXT 里的 .map 又回来了？）`);
+    }
+    if (!saw8859) {
+      problems.push("emacs.pool 里缺 8859-2.map（emacs --batch 会报 Loading charset map 失败）");
+    }
+    if (problems.length === 0) {
+      console.log(`字符集映射：✓ emacs.pool 含 ${charsetCount} 个 charsets/*.map（含 8859-2.map）`);
+    }
+  }
+  if (problems.length > 0) {
+    console.log("字符集映射：✗");
+    for (const p of problems) console.log(`  ${p}`);
+    missing += 1;
   }
 }
 

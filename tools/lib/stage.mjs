@@ -44,8 +44,21 @@ export const PRUNE_DIRS = [
   "libexec/installed-tests/",
 ];
 
-/** 裁剪扩展名：libtool 存档、文档、Windows/Node 专用脚本。 */
-export const PRUNE_EXT = [".la", ".md", ".ps1", ".cmd", ".map"];
+/**
+ * 裁剪扩展名：libtool 存档、文档、Windows/Node 专用脚本。
+ *
+ * **`.map` 绝不能放进来**（缺陷 BA）。它当初是想裁 JS sourcemap，但扩展池里
+ * 带 `.map` 的只有两个包，而且全是要用的数据文件：
+ *   - `emacs` 的 `share/emacs/31.1/etc/charsets/*.map`（131 个 / 2.8 MiB）——
+ *     这是 Emacs 的字符集映射表，缺了连 `--batch` 都跑不起来，报
+ *     `Error: file-missing ("Loading charset map" "No such file or directory" "8859-2")`
+ *     + `Emacs will not function correctly without the character map files.`
+ *   - `texlive-bin` 的 `fonts/map/dvipdfmx/cid-x.map`、`source/fonts/zhmetrics/ttfonts.map`、
+ *     `texconfig/tcfmgr.map`（3 个 / 6 KiB）—— 字体映射，缺了 dvipdfmx 找不到 CID 字体。
+ * 真正的 sourcemap 裁掉与否只值几百 KiB，而误伤这两个包直接让功能不可用。
+ * 代价：扩展池 +2.75 MiB，可接受。
+ */
+export const PRUNE_EXT = [".la", ".md", ".ps1", ".cmd"];
 
 /** 保留链接的顶层目录 —— 只有这三处的别名会被运行时真正打开。 */
 const KEEP_LINK_TOPDIRS = new Set(["bin", "lib", "libexec"]);

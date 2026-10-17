@@ -75,6 +75,7 @@ class RuntimeInstaller(private val ctx: Context) {
             ensureJvmExecBits(root)
             ensureTexFormats(root)
             ensureNoShadowingStubs(root)
+            ensureEmacsSiteLoad(root)
             ensureExtensionPool(root)
             return
         }
@@ -99,6 +100,7 @@ class RuntimeInstaller(private val ctx: Context) {
         ensureJvmExecBits(root)
         ensureTexFormats(root)
         ensureNoShadowingStubs(root)
+        ensureEmacsSiteLoad(root)
         writeStamp(root)
 
         // bin/ 与 lib/ 被整体替换，扩展中心装进 engine/{bin,lib} 的链接/副本
@@ -865,6 +867,71 @@ class RuntimeInstaller(private val ctx: Context) {
     }
 
     /**
+     * 给 Emacs 落一份 `site-load.el`，抹掉 Android 构建期的 git 探测噪音（缺陷 BA 收尾）。
+     *
+     * 真机症状：`emacs --batch` 每次启动都往 stderr 刷两行
+     * `Error running git rev-parse: (file-missing "Setting current directory"
+     * "No such file or directory" "/data/data/com.termux/files/usr/share/emacs/31.1/")`
+     * （`--abbrev-ref` 那条同款）。来源是 `loadup.el:463`：
+     * `(if (and (eq system-type 'android) (not (pdumper-stats))) (setq
+     * emacs-repository-version (ignore-errors (emacs-repository-get-version)) …))`
+     * —— 无 dump 时它会拿 `source-directory`（编译期常量，指向 Termux 前缀）
+     * 当工作目录去 `call-process "git" rev-parse HEAD`，目录不存在于是失败。
+     *
+     * 两个动作：
+     *   1. `(setq source-directory <root>/share/emacs/<版本>/)` —— 让它至少是
+     *      真实存在的目录。这一步单独做**不够**（git 命令仍会跑，只是不再报
+     *      `Setting current directory` 而是别的失败形态）。
+     *   2. `(defalias 'emacs-repository-get-version #'ignore)` 与 `-get-branch`
+     *      —— 直接把这两个探测函数打成空操作，才是彻底消音的那一刀。真机 A/B：
+     *      `git=2 → git=0`，且 `source-directory`、`load-path`、`latin-2` 全正常。
+     *
+     * 文件落在 `$HOME/.emacs.d/kxxy/site-load.el`，由
+     * [EngineConfig.emacsLoadPath] 把这个目录放在 `EMACSLOADPATH` **最前面**，
+     * 于是 `loadup.el:411` 的 `(load "site-load" t)` 会先命中我们这份。
+     * 放 `$HOME` 而不是引擎树：引擎树是 runtime.zip 的产物，重装即整棵重建。
+     *
+     * 幂等：内容一致就不重写（避免每次启动都碰 mtime 让缓存失效）。
+     */
+    private fun ensureEmacsSiteLoad(root: File) {
+        runCatching {
+            val dir = EngineConfig.emacsSiteLoadDir(ctx)
+            val f = File(dir, "site-load.el")
+            val shareDir = runCatching {
+                val base = File(root, "share/emacs")
+                // 只认纯版本号形态的目录名 —— `share/emacs/` 下还有 `site-lisp`，
+                // 按字典序 `"site-lisp" > "31.1"`，不过滤会取错（缺陷 BA 真机踩过）。
+                val ver = base.listFiles { x -> x.isDirectory }
+                    ?.map { it.name }
+                    ?.filter { it.isNotEmpty() && it[0].isDigit() }
+                    ?.sorted()
+                    ?.lastOrNull()
+                if (ver != null) File(base, ver) else File(root, "share/emacs/31.1")
+            }.getOrDefault(File(root, "share/emacs/31.1"))
+
+            val body = buildString {
+                appendLine(";;; site-load.el --- Kxxy: 抹掉 Android 构建期的 git 探测噪音  -*- lexical-binding: t; -*-")
+                appendLine(";;")
+                appendLine(";; 由 RuntimeInstaller.ensureEmacsSiteLoad 自动生成，请勿手改。")
+                appendLine(";; 成因见 loadup.el:463 —— 无 dump 时它会拿 source-directory 去问 git。")
+                appendLine("(setq source-directory")
+                appendLine("      ${quoteElisp(shareDir.absolutePath + "/")})")
+                appendLine("(defalias 'emacs-repository-get-version #'ignore)")
+                appendLine("(defalias 'emacs-repository-get-branch #'ignore)")
+                appendLine(";;; site-load.el ends here.")
+            }
+
+            if (f.isFile && f.readText() == body) return
+            dir.mkdirs()
+            f.writeText(body)
+            Log.i(TAG, "ensureEmacsSiteLoad: wrote ${f.absolutePath} (${body.length} chars)")
+        }.onFailure { Log.w(TAG, "ensureEmacsSiteLoad failed: ${it.message}") }
+    }
+
+    /** 把字符串转成 Elisp 字符串字面量（路径里可能有引号/反斜杠）。 */
+    private fun quoteElisp(s: String): String = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+    /**
      * 生成 TeX Live 的格式文件（`.fmt`），缺则补、有则跳（缺陷 AY 收尾）。
      *
      * 为什么安装期做、而不是留给设备上的 `mktexfmt`：TeX Live 的 `fmtutil.pl` /
@@ -1133,7 +1200,7 @@ class RuntimeInstaller(private val ctx: Context) {
          *
          * 改动 patches.mjs 里任何补丁、或增删补丁时，必须同步递增此编号。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@2"
+        private const val PATCHSET_MARKER = "kxxy-patchset@3"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**

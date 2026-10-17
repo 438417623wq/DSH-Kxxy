@@ -26,6 +26,7 @@ import {
 	applyPlaceholders,
 	buildViews,
 	placeholderMap,
+	poolSignature,
 	relinkAll,
 	removeExtension,
 	staleExtensions,
@@ -417,7 +418,10 @@ try {
 			JSON.stringify({ extId: 'old', bins: [], libs: [], views: [] }));
 		// 当前代码装的
 		writeFileSync(join(root, 'extensions', 'fresh', '.links.json'),
-			JSON.stringify({ extId: 'fresh', bins: [], libs: [], views: [], layout: LAYOUT_VERSION }));
+			JSON.stringify({
+				extId: 'fresh', bins: [], libs: [], views: [],
+				layout: LAYOUT_VERSION, poolBytes: poolSignature(root, 'fresh'),
+			}));
 		// 中间版本装的（layout 落后）
 		writeFileSync(join(root, 'extensions', 'nopool', '.links.json'),
 			JSON.stringify({ extId: 'nopool', bins: [], libs: [], views: [], layout: LAYOUT_VERSION - 1 }));
@@ -433,6 +437,31 @@ try {
 		// buildViews 写出的清单必须带 layout 戳，否则下次启动会永远判「落后」
 		const freshLinks = buildViews(root, 'fresh', join(root, 'extensions', 'fresh'));
 		equal('buildViews 返回的清单带 layout 戳', freshLinks.layout, LAYOUT_VERSION);
+		equal('buildViews 记下了池体积指纹', freshLinks.poolBytes, poolSignature(root, 'fresh'));
+
+		// 池内容变了（缺陷 BA 第二层）：layout 没变，但新 APK 换掉了 pool，
+		// 设备上解出来的目录已经和池对不上，必须重装。
+		// 真机事故：emacs 的 charsets/*.map 修好后 pool 从 53,391,296 B 长到
+		// 54,413,123 B，layout 仍是 3，于是 staleExtensions 判「已最新」。
+		writeFileSync(join(root, 'ext-pool', 'grown.pool'), 'POOL');
+		makeExt(root, 'grown', { 'bin/e': 'E' });
+		writeFileSync(join(root, 'extensions', 'grown', '.links.json'),
+			JSON.stringify({
+				extId: 'grown', bins: [], libs: [], views: [],
+				layout: LAYOUT_VERSION, poolBytes: 3,
+			}));
+		// 池变小（构建期裁掉东西）同样要重装
+		writeFileSync(join(root, 'ext-pool', 'shrunk.pool'), 'POOL');
+		makeExt(root, 'shrunk', { 'bin/f': 'F' });
+		writeFileSync(join(root, 'extensions', 'shrunk', '.links.json'),
+			JSON.stringify({
+				extId: 'shrunk', bins: [], libs: [], views: [],
+				layout: LAYOUT_VERSION, poolBytes: 4096,
+			}));
+		const stale2 = staleExtensions(root);
+		check('池变大后判为需要重装', stale2.includes('grown'), `stale=${JSON.stringify(stale2)}`);
+		check('池变小后判为需要重装', stale2.includes('shrunk'), `stale=${JSON.stringify(stale2)}`);
+		check('池体积一致时不动', !stale2.includes('fresh'), `stale=${JSON.stringify(stale2)}`);
 
 		// 空 root / 不存在的 extensions 目录都要安全返回
 		equal('root 为空时返回空数组', staleExtensions('').length, 0);
