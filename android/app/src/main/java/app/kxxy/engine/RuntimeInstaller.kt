@@ -74,6 +74,7 @@ class RuntimeInstaller(private val ctx: Context) {
             // 修复单独走「每次启动都跑一次」的幂等路径（缺陷 AW）。
             ensureJvmExecBits(root)
             ensureTexFormats(root)
+            ensureNoShadowingStubs(root)
             ensureExtensionPool(root)
             return
         }
@@ -97,6 +98,7 @@ class RuntimeInstaller(private val ctx: Context) {
         restoreExecBits(root)
         ensureJvmExecBits(root)
         ensureTexFormats(root)
+        ensureNoShadowingStubs(root)
         writeStamp(root)
 
         // bin/ 与 lib/ 被整体替换，扩展中心装进 engine/{bin,lib} 的链接/副本
@@ -825,6 +827,44 @@ class RuntimeInstaller(private val ctx: Context) {
     }
 
     /**
+     * 剔除**会遮蔽系统真库**的 Termux 桩库，每次启动都跑（缺陷 AZ）。
+     *
+     * 背景：`libandroid-stub_30-1` 发的 `<root>/lib/libbinder_ndk.so` 只有
+     * 24,000 B、`soname=null`、`strings | grep '^_Z'` 零个符号，而系统
+     * `/system/lib64/libbinder_ndk.so` 有 94,488 B / 190 个符号。因为
+     * [EngineConfig.buildEnv] 把 `<root>/lib` 放在 `LD_LIBRARY_PATH` 首位
+     * （curl / cmake 需要引擎里那批新库），这个桩库会**遮蔽**系统真库，
+     * 于是 `/system/lib64/libui.so` 的 verneed 解析失败，`ffmpeg` / `ffprobe`
+     * 报 `CANNOT LINK EXECUTABLE "…/ffmpeg": cannot find "libbinder_ndk.so"
+     * from verneed[0] in DT_NEEDED list for "/system/lib64/libui.so"` ——
+     * 措辞像「文件缺失」，实际是「版本符号缺失」。
+     *
+     * 为什么只删这一个：真机逐个 `mv` 的单变量 A/B 显示，移走它 ffmpeg 立刻
+     * 恢复、其余 14 个工具输出逐字不变；而移走 `libmediandk.so` 反而让系统
+     * `libunwindstack.so` 报 `cannot locate symbol "Xzs_Construct"`。所以另外
+     * 四个桩库必须保留。安全性另由 `_recon/elfneeded2.py` 证明：整棵引擎
+     * 3,577 个 ELF64 里 `DT_NEEDED` 引用 `libbinder_ndk.so` 的有 **0 个**。
+     *
+     * 为什么走「每次启动」而不是只靠构建期剔除：构建期 `DROPPED_LIBS` 只对
+     * 新装的 runtime 生效，而老设备 `isComplete()` 判真 ⇒ 永不重装 ⇒ 修不到
+     * （与 [ensureJvmExecBits] 同一类「自愈够不到」）。成本仅一次 `File` 存在性
+     * 检查，命中才删一个文件。
+     */
+    private fun ensureNoShadowingStubs(root: File) {
+        for (rel in SHADOWING_STUBS) {
+            val f = File(root, rel)
+            if (!f.exists()) continue
+            val size = f.length()
+            val removed = runCatching { f.delete() }.getOrDefault(false)
+            if (removed) {
+                Log.i(TAG, "ensureNoShadowingStubs: removed $rel ($size B, 遮蔽系统真库)")
+            } else {
+                Log.w(TAG, "ensureNoShadowingStubs: 无法删除 $rel ($size B)")
+            }
+        }
+    }
+
+    /**
      * 生成 TeX Live 的格式文件（`.fmt`），缺则补、有则跳（缺陷 AY 收尾）。
      *
      * 为什么安装期做、而不是留给设备上的 `mktexfmt`：TeX Live 的 `fmtutil.pl` /
@@ -1155,6 +1195,18 @@ class RuntimeInstaller(private val ctx: Context) {
          * 这个值只防「解压中途失败」，不是精确校验，故留足余量。
          */
         private const val MIN_TRAINEDDATA_BYTES = 1_000_000L
+
+        /**
+         * 会遮蔽系统真库、必须从 `<root>/lib/` 删掉的 Termux 桩库（缺陷 AZ）。
+         *
+         * 只有 `libbinder_ndk.so` 一个。真机逐个 `mv` 的单变量 A/B 证明：
+         * 移走其余四个桩库任意一个，ffmpeg 依旧报错且其它 14 个工具无变化；
+         * 移走 `libmediandk.so` 更糟 —— 系统 `libunwindstack.so` 会报
+         * `cannot locate symbol "Xzs_Construct"`。详见 [ensureNoShadowingStubs]。
+         *
+         * 与 `tools/build-runtime.mjs` 的 `DROPPED_LIBS` 必须保持一致。
+         */
+        private val SHADOWING_STUBS = listOf("lib/libbinder_ndk.so")
 
         /**
          * 安装期要生成的 TeX 格式文件名（不含 `.fmt` 后缀）。

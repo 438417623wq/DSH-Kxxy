@@ -167,6 +167,38 @@ const DEAD_INTERPRETER_SCRIPTS = new Set([
  */
 const SCRIPT_TOP_DIRS = ["bin/", "libexec/", "lib/", "share/", "etc/", "var/"];
 
+/**
+ * 必须从产物里剔除的二进制/库（缺陷 AZ）。
+ *
+ * `lib/android-stub`（Termux 的 `libandroid-stub_30-1` deb，5 个文件
+ * `libOpenSLES.so` / `libandroid.so` / `libbinder_ndk.so` / `libmediandk.so` /
+ * `libtermux-platform-ns.so`）里，**只有 `libbinder_ndk.so` 会导致链接失败**，
+ * 其余四个必须保留。真机 A/B（逐个 `mv` 走再跑 16 个工具）：
+ *
+ *   - 移走 `libbinder_ndk.so`  → ffmpeg/ffprobe 从 `CANNOT LINK EXECUTABLE
+ *     "…/ffmpeg": cannot find "libbinder_ndk.so" from verneed[0] in DT_NEEDED
+ *     list for "/system/lib64/libui.so"` 直接变成 `ffmpeg version 8.1.3`，
+ *     且 curl/cmake/sqlite3/node/perl/tesseract/magick/gs/pandoc/qpdf/
+ *     pdftotext/git/python3/clang/rg **输出逐字不变**。
+ *   - 移走其余任意一个 → ffmpeg 依旧失败，其它工具也不变。
+ *   - 但同时移走 `libmediandk.so` → 反而更糟：系统 `libunwindstack.so` 报
+ *     `cannot locate symbol "Xzs_Construct"`。所以 mediandk 桩库动不得。
+ *
+ * 为什么必须删而不是留给设备端：`EngineConfig.buildEnv` 把 `<root>/lib`
+ * 放在 `LD_LIBRARY_PATH` 首位（`curl`/`cmake` 需要 engine 里那批新库），
+ * 于是 24 KB 的桩库会**遮蔽** `/system/lib64/libbinder_ndk.so`（94,488 B）。
+ * 而 `/system/lib64/libui.so` 的 verneed 要求带版本定义的 `libbinder_ndk`，
+ * 桩库 `soname=null` 且无 `.gnu.version_d` ⇒ linker 报「版本符号找不到」，
+ * 措辞却是 「cannot find」，极易误判成文件缺失。
+ *
+ * **为什么删掉没有副作用**：对整棵引擎（44,324 文件 / 3,577 个 ELF64，
+ * 含 `extensions/`）做 ELF 头解析，`DT_NEEDED` 里含 `libbinder_ndk.so` 的
+ * **一个都没有**（脚本见 `_recon/elfneeded2.py`）。它只是 Termux 为了让
+ * `libmediandk.so` / `libOpenSLES.so` 桩库能加载而塞进来的占位，而那两个
+ * 桩库自己 `DT_NEEDED libtermux-platform-ns.so`，与 binder 无关。
+ */
+const DROPPED_LIBS = new Set(["lib/libbinder_ndk.so"]);
+
 /** 超过这个大小的一律当二进制，不做文本替换（避免误伤大 ELF）。 */
 const MAX_SCRIPT_BYTES = 1 << 20;
 
@@ -272,6 +304,15 @@ function normaliseStageFiles(files, blobRoot) {
     const f = files[i];
 
     if (DEAD_INTERPRETER_SCRIPTS.has(f.path) || TERMUX_APP_SCRIPTS.has(f.path)) {
+      files.splice(i, 1);
+      dropped += 1;
+      droppedPaths.push(f.path);
+      continue;
+    }
+
+    // 缺陷 AZ：libandroid-stub 里的 libbinder_ndk.so 会遮蔽系统真库，
+    // 让 ffmpeg/ffprobe 起不来（详见 DROPPED_LIBS 注释）。
+    if (DROPPED_LIBS.has(f.path)) {
       files.splice(i, 1);
       dropped += 1;
       droppedPaths.push(f.path);

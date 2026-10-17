@@ -657,6 +657,40 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
   }
 }
 
+// ---------------------------------------------------------------- 桩库剔除
+//
+// 为什么需要：`libandroid-stub_30-1` 的 5 个桩库里，`lib/libbinder_ndk.so`
+// （24,000 B，soname=null）会遮蔽 `/system/lib64/libbinder_ndk.so`（94,488 B，
+// 带 `LIBAIBINDER` 版本定义）。`EngineConfig.buildEnv` 把 `<root>/lib` 放在
+// `LD_LIBRARY_PATH` 首位，于是 `/system/lib64/libui.so` 的 verneed 找不到带
+// 版本定义的 binder ⇒ `ffmpeg`/`ffprobe` 报
+// `cannot find "libbinder_ndk.so" from verneed[0] in DT_NEEDED list`（措辞像
+// 「文件缺失」，实际是「版本符号缺失」）。真机 A/B 逐个挪走的结论：只有删掉
+// 这一个能让 ffmpeg 恢复，其余四个（尤其 `libmediandk.so`）必须保留 ——
+// 删了 mediandk 会让系统 `libunwindstack.so` 报 `cannot locate symbol
+// "Xzs_Construct"`。全树 3,577 个 ELF64 里 `DT_NEEDED` 引用它的有 0 个。
+{
+  const problems = [];
+  if (byName.get("lib/libbinder_ndk.so")) {
+    problems.push("lib/libbinder_ndk.so 仍在（会遮蔽系统真库，ffmpeg/ffprobe 起不来）");
+  }
+  for (const keep of [
+    "lib/libandroid.so",
+    "lib/libmediandk.so",
+    "lib/libOpenSLES.so",
+    "lib/libtermux-platform-ns.so",
+  ]) {
+    if (!byName.get(keep)) problems.push(`误删了必须保留的桩库：${keep}`);
+  }
+  if (problems.length > 0) {
+    console.log("桩库剔除：✗");
+    for (const p of problems) console.log(`  ${p}`);
+    missing += 1;
+  } else {
+    console.log("桩库剔除：✓ libbinder_ndk.so 已剔除，其余 4 个桩库保留");
+  }
+}
+
 // ---------------------------------------------------------------- 占位符核对
 console.log("\n占位符抽查（应出现 @DSH_ROOT@ 且不含 com.termux）：");
 for (const n of ["bin/am", "bin/pkg", "bin/termux-open", "libexec/git-core/git-subtree"]) {

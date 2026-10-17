@@ -28,6 +28,10 @@ import {
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { inflateRawSync } from "node:zlib";
+import { fileURLToPath } from "node:url";
+
+/** 本脚本所在目录（`tools/`）。静态检查 Kotlin 源码时要用绝对路径。 */
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 const zipPath = process.argv[2] ?? "F:/KF/DSKX/dsh-kxxy/android/app/src/main/assets/runtime.zip";
 const target = resolve(process.argv[3] ?? join(tmpdir(), "kxxy-sim-install"));
@@ -375,6 +379,63 @@ console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755
   } else {
     ok(`spawn helper 已置位（${helpers.length} 个：${helpers[0]}）`);
   }
+}
+
+/*
+ * libbinder_ndk.so 桩库必须已被剔除（缺陷 AZ 的回归断言）。
+ *
+ * 为什么：`libandroid-stub_30-1` 的 24,000 B 桩库 soname=null 且无版本定义，
+ * 会遮蔽 `/system/lib64/libbinder_ndk.so`（94,488 B）。`EngineConfig.buildEnv`
+ * 把 `<root>/lib` 放在 `LD_LIBRARY_PATH` 首位后，`/system/lib64/libui.so`
+ * 的 verneed 解析失败，`ffmpeg`/`ffprobe` 报
+ * `cannot find "libbinder_ndk.so" from verneed[0] in DT_NEEDED list`。
+ * 真机 A/B 证明删掉它不影响任何其它工具，而删掉 `libmediandk.so` 反而会
+ * 让系统 `libunwindstack.so` 报 `cannot locate symbol "Xzs_Construct"`。
+ */
+{
+  const stub = join(target, "lib/libbinder_ndk.so");
+  if (existsSync(stub)) {
+    fail("lib/libbinder_ndk.so 桩库仍在产物里（ffmpeg/ffprobe 会起不来，见缺陷 AZ）");
+  } else {
+    ok("libbinder_ndk.so 桩库已剔除");
+  }
+  for (const keep of [
+    "lib/libandroid.so",
+    "lib/libmediandk.so",
+    "lib/libOpenSLES.so",
+    "lib/libtermux-platform-ns.so",
+  ]) {
+    if (!existsSync(join(target, keep))) fail(`误删了必须保留的桩库：${keep}`);
+  }
+  ok("其余 4 个 libandroid-stub 桩库保留");
+}
+
+/*
+ * RuntimeInstaller 必须带「每次启动补删桩库」的幂等路径（缺陷 AZ 的自愈）。
+ *
+ * 为什么需要：构建期剔除只覆盖新装。老设备 `isComplete()` 判真 ⇒ 永不重装
+ * ⇒ 桩库永远留在盘上，ffmpeg 永远起不来。真机实测确认过这一点：装了带修复
+ * 的 APK 后 logcat 只打 `runtime already installed and complete`，而
+ * `<root>/lib/libbinder_ndk.so` 仍在，直到手工 `rm` 才恢复。
+ * 这与 `ensureJvmExecBits` 完全同型 —— 资产都在，问题在 mode / 多余内容。
+ */
+{
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  if (!/private\s+fun\s+ensureNoShadowingStubs\s*\(/.test(kt)) {
+    fail("缺少 ensureNoShadowingStubs 定义（老设备不会重装，桩库永远删不掉）");
+  }
+  if (!/SHADOWING_STUBS\s*=\s*listOf\(\s*"lib\/libbinder_ndk\.so"\s*\)/.test(kt)) {
+    fail("SHADOWING_STUBS 必须恰好是 lib/libbinder_ndk.so（多删 mediandk 会让 libunwindstack 崩）");
+  }
+  // 两条路径（已完整 / 重装）都得调；只看是否至少出现两次
+  const calls = (kt.match(/ensureNoShadowingStubs\(root\)/g) || []).length;
+  if (calls < 2) {
+    fail(`ensureNoShadowingStubs 只在 ${calls} 处被调用（应同时挂「已完整」与「重装」两条路径）`);
+  }
+  ok(`ensureNoShadowingStubs 已就位并挂了 ${calls} 条路径`);
 }
 
 // ---------------------------------------------------------------- isComplete（十一锚点）
