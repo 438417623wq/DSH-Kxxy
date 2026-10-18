@@ -899,9 +899,17 @@ object EngineConfig {
      * `\w` 会把 `$HOME` 缩写成 `~`，于是会话工作区显示为
      * `~/workspaces/<name>`，与桌面系统的观感一致；不用颜色，是为了在浅色与
      * 深色两套终端主题下都保持可读。
+     *
+     * `# kxxy-shell@2` 追加了一段 Guile 编译缓存的**运行期自愈**（缺陷 BC/BH 的
+     * 同型问题）。`GUILE_LOAD_COMPILED_PATH` 是引擎进程启动时由 [buildEnv]
+     * 算好的，一旦那一刻 `lib/guile/3.0/ccache` 这个合并视图还不存在（runtime
+     * 刚重装、`relinkAll` 尚未跑），变量就固化成一条坏路径，之后终端里跑
+     * `gdb` 会退回「现场编译 `system/repl` 下的 .scm」，真机实测 **160 秒**。
+     * 扩展树里那份 ccache 是持久资产（`runtime` 重装从不碰 `extensions/`），
+     * 所以在这里补一道判断即可。
      */
     private fun userShellInitContent(): String = """
-        # kxxy-shell@1
+        # kxxy-shell@2
         # [dsh-kxxy] 官方终端在 Android 上的默认交互式 shell 初始化。
         #
         # 上游以 `bash --rcfile <临时文件> -i` 启动终端，那个临时 rcfile 的第一行是
@@ -912,6 +920,32 @@ object EngineConfig {
         # 可以随意修改；一旦首行不再是我们写的标记，宿主就不再覆盖它
         # （见 EngineConfig.ensureUserShellInit）。
         PS1='\w\${'$'} '
+
+        # ── Guile 编译缓存自愈（缺陷 BC）────────────────────────────────────
+        # gdb 启动慢 150 秒的唯一原因是 guile 找不到预编译的 .go，只能现场编译
+        # `system/repl` 下的 .scm。引擎进程的 GUILE_LOAD_COMPILED_PATH 在启动时
+        # 就算好，若那一刻合并视图还不存在就会固化坏值；这里按目录真实存在与否
+        # 重新挑一次，优先合并视图、回落扩展树。
+        if [ ! -d "${'$'}{GUILE_LOAD_COMPILED_PATH:-/nonexistent}" ]; then
+            for _gc in "${'$'}KXXY_ENGINE_ROOT/lib/guile/3.0/ccache" \
+                       "${'$'}KXXY_ENGINE_ROOT/extensions/gdb/lib/guile/3.0/ccache"; do
+                if [ -d "${'$'}_gc" ]; then
+                    export GUILE_LOAD_COMPILED_PATH="${'$'}_gc"
+                    break
+                fi
+            done
+            unset _gc
+        fi
+        if [ ! -d "${'$'}{GUILE_LOAD_PATH:-/nonexistent}" ]; then
+            for _gl in "${'$'}KXXY_ENGINE_ROOT/share/guile/3.0" \
+                       "${'$'}KXXY_ENGINE_ROOT/extensions/gdb/share/guile/3.0"; do
+                if [ -d "${'$'}_gl" ]; then
+                    export GUILE_LOAD_PATH="${'$'}_gl"
+                    break
+                fi
+            done
+            unset _gl
+        fi
     """.trimIndent() + "\n"
 
     /** 首行标记前缀，用于识别「这个 .bashrc 是我们写的」，避免覆盖用户自定义。 */
