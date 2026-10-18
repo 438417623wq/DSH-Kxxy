@@ -30,6 +30,7 @@ import {
 	relinkAll,
 	removeExtension,
 	staleExtensions,
+	SHADOWING_BARE_LIBS,
 	LAYOUT_VERSION,
 } from '../plugins/kxxy-host/lib/extinstall.mjs';
 
@@ -156,8 +157,45 @@ try {
 	}
 
 	// -----------------------------------------------------------------------
-	console.log('[5] etc / share 合并视图（问题.txt【6】fontconfig / tessdata）');
+	console.log('[4b] 裸名遮蔽库不进引擎 lib（缺陷 BH）');
 	// -----------------------------------------------------------------------
+	{
+		// 缺陷 BH：扩展带来的 libheif.so 是 soname libheif.so.1 的 1.23.6，
+		// 系统的 /system/lib64/libheif.so 是另一个库（符号零重叠）。因为
+		// <root>/lib 在 LD_LIBRARY_PATH 首位，裸名落进去就会让系统侧
+		// libhwui.so 的 _Z17createHeifDecoderv 解析失败。
+		// 带版本名的那个必须照常复制 —— 13 个消费者一律要 libheif.so.1。
+		const root = join(workdir, 'r4b');
+		const extDir = makeExt(root, 'imagemagick', {
+			'lib/libheif.so': 'SYSTEM-SHADOW',
+			'lib/libheif.so.1': 'REAL-HEIF',
+			'lib/libheif.so.1.23.6': 'REAL-HEIF-2',
+			'lib/libMagickCore.so': 'MAGICK',
+		});
+
+		const links = buildViews(root, 'imagemagick', extDir);
+		check('裸名 libheif.so 没被复制进引擎 lib', !existsSync(join(root, 'lib', 'libheif.so')));
+		check('带 soname 的 libheif.so.1 照常复制', existsSync(join(root, 'lib', 'libheif.so.1')));
+		check('全版本名 libheif.so.1.23.6 照常复制', existsSync(join(root, 'lib', 'libheif.so.1.23.6')));
+		check('其它库不受影响', existsSync(join(root, 'lib', 'libMagickCore.so')));
+		check('清单里也不记裸名', !links.libs.some((l) => l.name === 'libheif.so'));
+		check('清单里记了带版本名的', links.libs.some((l) => l.name === 'libheif.so.1'));
+		check('SHADOWING_BARE_LIBS 含 libheif.so 与 liblzma.so',
+			SHADOWING_BARE_LIBS.has('libheif.so') && SHADOWING_BARE_LIBS.has('liblzma.so'));
+
+		// relink 自愈：老设备上这些裸名已经躺在盘上了，必须被摘掉
+		writeFileSync(join(root, 'lib', 'libheif.so'), 'OLD-INSTALL-LEFTOVER');
+		writeFileSync(join(root, 'lib', 'liblzma.so'), 'OLD-INSTALL-LEFTOVER');
+		mkdirSync(join(root, 'extensions'), { recursive: true });
+		writeFileSync(join(root, 'extensions', '.relink'), '1');
+		relinkAll(root);
+		check('relink 摘掉盘上残留的裸名 libheif.so', !existsSync(join(root, 'lib', 'libheif.so')));
+		check('relink 摘掉盘上残留的裸名 liblzma.so', !existsSync(join(root, 'lib', 'liblzma.so')));
+		check('relink 没有误删带版本名的库', existsSync(join(root, 'lib', 'libheif.so.1')));
+	}
+
+	// -----------------------------------------------------------------------
+	console.log('[5] etc / share 合并视图（问题.txt【6】fontconfig / tessdata）');	// -----------------------------------------------------------------------
 	{
 		const root = join(workdir, 'r5');
 		const fontExt = makeExt(root, 'texlive', {

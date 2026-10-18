@@ -77,7 +77,7 @@ const PTY_NODE_MARKER = "kxxy-pty-node@1";
  * 于是「改了 host.js / lib/index.js 却只重装 APK」的设备一直跑旧插件，
  * 且七锚点全通过、永不重装。标记写在插件入口 lib/index.js 首行。
  */
-const HOST_PLUGIN_MARKER = "kxxy-host@12";
+const HOST_PLUGIN_MARKER = "kxxy-host@13";
 
 /**
  * 与 RuntimeInstaller.MOBILE_PLUGIN_MARKER 保持一致（锚点 10）。
@@ -119,7 +119,7 @@ const OFFICE_FONT_FILES = [
  * `grep -c kxxyArchiveApply` 仍是 0 —— 前面的锚点全通过，isComplete()
  * 判真，补丁根本没解出来。标记由 build-runtime.mjs 写在 kxxy-host 目录下。
  */
-const PATCHSET_MARKER = "kxxy-patchset@4";
+const PATCHSET_MARKER = "kxxy-patchset@5";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**
@@ -427,9 +427,28 @@ console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755
   if (!/private\s+fun\s+ensureNoShadowingStubs\s*\(/.test(kt)) {
     fail("缺少 ensureNoShadowingStubs 定义（老设备不会重装，桩库永远删不掉）");
   }
-  if (!/SHADOWING_STUBS\s*=\s*listOf\(\s*"lib\/libbinder_ndk\.so"\s*\)/.test(kt)) {
-    fail("SHADOWING_STUBS 必须恰好是 lib/libbinder_ndk.so（多删 mediandk 会让 libunwindstack 崩）");
+  // 缺陷 BH：清单从「恰好 binder_ndk」扩到三条。逐条断言而不是整体正则，
+  // 这样多删 / 少删都能指名道姓。
+  //   - libbinder_ndk.so：缺陷 AZ，桩库 soname=null，遮蔽系统真库的版本定义。
+  //   - liblzma.so（裸名）：缺陷 BH，soname 是 liblzma.so.5，系统侧要裸名。
+  //   - libheif.so（裸名）：缺陷 BH 同族，来自扩展 .links.json 而非 zip。
+  const stubsMatch = /SHADOWING_STUBS\s*=\s*listOf\(([\s\S]*?)\)/.exec(kt);
+  const stubs = stubsMatch === null ? [] : [...stubsMatch[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  for (const need of ["lib/libbinder_ndk.so", "lib/liblzma.so", "lib/libheif.so"]) {
+    if (!stubs.includes(need)) fail(`SHADOWING_STUBS 缺少 ${need}（会被 LD_LIBRARY_PATH 首位遮蔽系统真库）`);
   }
+  for (const forbidden of [
+    "lib/libandroid.so",
+    "lib/libmediandk.so",
+    "lib/libOpenSLES.so",
+    "lib/liblzma.so.5",
+    "lib/libheif.so.1",
+  ]) {
+    if (stubs.includes(forbidden)) {
+      fail(`SHADOWING_STUBS 误含 ${forbidden}（带 soname 的版本名必须保留，删了会崩 libunwindstack / libheif 消费者）`);
+    }
+  }
+  if (stubs.length !== 3) fail(`SHADOWING_STUBS 应为 3 条，实得 ${stubs.length}：${stubs.join(", ")}`);
   // 两条路径（已完整 / 重装）都得调；只看是否至少出现两次
   const calls = (kt.match(/ensureNoShadowingStubs\(root\)/g) || []).length;
   if (calls < 2) {

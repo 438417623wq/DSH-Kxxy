@@ -1295,7 +1295,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 旧插件跳过重装。改动 plugins/kxxy-host/ 下任何文件后递增编号。
          */
         private const val HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js"
-        private const val HOST_PLUGIN_MARKER = "kxxy-host@12"
+        private const val HOST_PLUGIN_MARKER = "kxxy-host@13"
 
         /**
          * 移动端 UI 插件（第三方 dsh-web-mobile）版本标记（锚点 10）。
@@ -1359,7 +1359,7 @@ class RuntimeInstaller(private val ctx: Context) {
          *
          * 改动 patches.mjs 里任何补丁、或增删补丁时，必须同步递增此编号。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@4"
+        private const val PATCHSET_MARKER = "kxxy-patchset@5"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**
@@ -1423,16 +1423,50 @@ class RuntimeInstaller(private val ctx: Context) {
         private const val MIN_TRAINEDDATA_BYTES = 1_000_000L
 
         /**
-         * 会遮蔽系统真库、必须从 `<root>/lib/` 删掉的 Termux 桩库（缺陷 AZ）。
+         * 会遮蔽系统真库、必须从 `<root>/lib/` 删掉的库（缺陷 AZ + 缺陷 BH）。
          *
-         * 只有 `libbinder_ndk.so` 一个。真机逐个 `mv` 的单变量 A/B 证明：
-         * 移走其余四个桩库任意一个，ffmpeg 依旧报错且其它 14 个工具无变化；
-         * 移走 `libmediandk.so` 更糟 —— 系统 `libunwindstack.so` 会报
+         * **`lib/libbinder_ndk.so`（缺陷 AZ）**：Termux 的 `libandroid-stub`
+         * 包里塞的 24,000 B 空壳（0 个 `_Z` 符号），系统真库是 94,488 B /
+         * 190 个符号。真机逐个 `mv` 的单变量 A/B 证明：移走其余四个桩库
+         * 任意一个，ffmpeg 依旧报错且其它 14 个工具无变化；移走
+         * `libmediandk.so` 更糟 —— 系统 `libunwindstack.so` 会报
          * `cannot locate symbol "Xzs_Construct"`。详见 [ensureNoShadowingStubs]。
          *
-         * 与 `tools/build-runtime.mjs` 的 `DROPPED_LIBS` 必须保持一致。
+         * **`lib/liblzma.so`（缺陷 BH）**：这一类不是「桩库太小」，而是
+         * **soname 与裸文件名不一致**。`<root>/lib/liblzma.so` 在 zip 里是
+         * 软链 `LINK:lib/liblzma.so.5.8.4`，内容是 liblzma 5.8.4
+         * （soname `liblzma.so.5`、导出 114 个 `lzma_*`、`Xzs_*` 零个）；
+         * 系统的 `/system/lib64/liblzma.so` 是 164,576 B、soname
+         * `liblzma.so`、导出 230 个符号、其中 5 个是 `Xzs_*` —— 两者根本
+         * 不是同一个库。`<root>/lib` 在 `LD_LIBRARY_PATH` 首位，于是系统
+         * `libui.so` → `libunwindstack.so` 那条链 NEEDED 的裸名
+         * `liblzma.so` 会命中引擎这个文件，报
+         * `CANNOT LINK EXECUTABLE "ffmpeg": cannot locate symbol
+         * "Xzs_Construct" referenced by "/system/lib64/libunwindstack.so"`。
+         *
+         * 安全性：全引擎 3,569 个 ELF64 递归扫 `DT_NEEDED`，精确等于
+         * `liblzma.so` 的有 **0 个**（消费者一律用 `liblzma.so.5`，共 50 个）。
+         * 删掉后 21 项工具回归全绿且产物字节数逐一相同。
+         *
+         * ⚠️ `libheif.so` 是同一类（引擎版 soname `libheif.so.1`、1,928,648 B、
+         * 469 个符号；系统版 soname `libheif.so`、43,368 B、37 个符号，两者
+         * 符号零重叠，系统独有 `_Z17createHeifDecoderv` 正是 `libhwui.so` 要的）。
+         * 它**不在 runtime.zip 里** —— 由 gnuplot / imagemagick / texlive 三个
+         * 扩展的 `.links.json` 复制进 `<root>/lib/`。所以除了这里删，
+         * `plugins/kxxy-host/lib/extinstall.mjs` 的 `SHADOWING_BARE_LIBS` 还要
+         * 保证安装/relink 时不再复制回来；两处都做是因为
+         * `relinkAll` 只在 `.relink` 标记存在时跑，而快路径不写这个标记，
+         * 老设备升级后光靠 relink 摘不掉已经躺在盘上的那份。
+         *
+         * 与 `tools/build-runtime.mjs` 的 `DROPPED_LIBS` 必须保持一致 —— 后者
+         * 管 zip 侧的（binder_ndk、liblzma），`libheif.so` 不在 zip 里所以
+         * 只在本清单与 extinstall 的 `SHADOWING_BARE_LIBS` 出现。
          */
-        private val SHADOWING_STUBS = listOf("lib/libbinder_ndk.so")
+        private val SHADOWING_STUBS = listOf(
+            "lib/libbinder_ndk.so",
+            "lib/liblzma.so",
+            "lib/libheif.so",
+        )
 
         /**
          * 安装期要生成的 TeX 格式文件名（不含 `.fmt` 后缀）。

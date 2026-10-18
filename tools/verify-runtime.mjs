@@ -669,25 +669,42 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
 // 这一个能让 ffmpeg 恢复，其余四个（尤其 `libmediandk.so`）必须保留 ——
 // 删了 mediandk 会让系统 `libunwindstack.so` 报 `cannot locate symbol
 // "Xzs_Construct"`。全树 3,577 个 ELF64 里 `DT_NEEDED` 引用它的有 0 个。
+//
+// 缺陷 BH 追加 `lib/liblzma.so`：它不是「桩库太小」，而是 soname 与裸名不一致。
+// zip 里它是 `LINK:lib/liblzma.so.5.8.4` 的软链，内容是 liblzma 5.8.4
+// （soname `liblzma.so.5`、114 个 `lzma_*`、`Xzs_*` 零个），而系统的
+// `/system/lib64/liblzma.so` 是 164,576 B、soname `liblzma.so`、230 个符号、
+// 含 5 个 `Xzs_*` —— 两者根本不是同一个库。系统 `libui.so` → `libunwindstack.so`
+// 那条链 NEEDED 的是**裸名**，于是命中引擎这个文件，报
+// `cannot locate symbol "Xzs_Construct" referenced by "/system/lib64/libunwindstack.so"`。
+// 全引擎 3,569 个 ELF64 里 NEEDED 裸名 `liblzma.so` 的有 0 个（消费者一律用
+// `liblzma.so.5`，共 50 个），所以删掉裸名零副作用。
 {
   const problems = [];
   if (byName.get("lib/libbinder_ndk.so")) {
     problems.push("lib/libbinder_ndk.so 仍在（会遮蔽系统真库，ffmpeg/ffprobe 起不来）");
+  }
+  if (byName.get("lib/liblzma.so")) {
+    problems.push(
+      "lib/liblzma.so 仍在（soname 是 liblzma.so.5，会让系统 libunwindstack.so 找不到 Xzs_Construct）",
+    );
   }
   for (const keep of [
     "lib/libandroid.so",
     "lib/libmediandk.so",
     "lib/libOpenSLES.so",
     "lib/libtermux-platform-ns.so",
+    "lib/liblzma.so.5",
+    "lib/liblzma.so.5.8.4",
   ]) {
-    if (!byName.get(keep)) problems.push(`误删了必须保留的桩库：${keep}`);
+    if (!byName.get(keep)) problems.push(`误删了必须保留的库：${keep}`);
   }
   if (problems.length > 0) {
     console.log("桩库剔除：✗");
     for (const p of problems) console.log(`  ${p}`);
     missing += 1;
   } else {
-    console.log("桩库剔除：✓ libbinder_ndk.so 已剔除，其余 4 个桩库保留");
+    console.log("桩库剔除：✓ libbinder_ndk.so + liblzma.so（裸名）已剔除，其余桩库与 liblzma.so.5 保留");
   }
 }
 

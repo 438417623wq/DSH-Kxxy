@@ -196,8 +196,47 @@ const SCRIPT_TOP_DIRS = ["bin/", "libexec/", "lib/", "share/", "etc/", "var/"];
  * **一个都没有**（脚本见 `_recon/elfneeded2.py`）。它只是 Termux 为了让
  * `libmediandk.so` / `libOpenSLES.so` 桩库能加载而塞进来的占位，而那两个
  * 桩库自己 `DT_NEEDED libtermux-platform-ns.so`，与 binder 无关。
+ *
+ * ---
+ *
+ * 缺陷 BH 追加一条 `lib/liblzma.so`。这一类不是「桩库太小」，而是
+ * **soname 与裸文件名不一致**：`<root>/lib/liblzma.so` 在 zip 里是软链
+ * `LINK:lib/liblzma.so.5.8.4`，内容是 **liblzma 5.8.4，soname 为
+ * `liblzma.so.5`、导出 114 个 `lzma_*`、`Xzs_*` 零个**；而系统的
+ * `/system/lib64/liblzma.so` 是 **164,576 B、soname 为 `liblzma.so`、
+ * 导出 230 个符号、其中 5 个是 `Xzs_*`** —— 两者根本不是同一个库。
+ *
+ * 因为 `<root>/lib` 在 `LD_LIBRARY_PATH` 首位，系统 `/system/lib64/libui.so`
+ * 经 `libnativewindow` → `libunwindstack.so` 那条链上 NEEDED 的**裸名**
+ * `liblzma.so` 会命中引擎这个文件，于是 `libunwindstack` 要的
+ * `Xzs_Construct` 解析不到，报
+ * `CANNOT LINK EXECUTABLE "ffmpeg": cannot locate symbol "Xzs_Construct"
+ * referenced by "/system/lib64/libunwindstack.so"`。
+ *
+ * 触发条件（真机 `_recon/probe-repro2.sh` 逐组隐藏桩库复现）：
+ * `libmediandk.so` 桩库一旦失效，系统 `/system/lib64/libmediandk.so` 被加载，
+ * 它 NEEDED `libnativewindow.so` → `libui.so` → `libunwindstack.so` →
+ * `liblzma.so`，于是撞上这个错名文件。`libmediandk.so` 桩库本身动不得
+ * （移走会直接踩到这条链），所以只能拆掉链尾那个错名的 `liblzma.so`。
+ *
+ * **安全性**：全引擎 3,569 个 ELF64 递归扫 `DT_NEEDED`，精确等于
+ * `liblzma.so` 的有 **0 个**（消费者一律用 `liblzma.so.5`，共 50 个）。
+ * 删掉裸名后 ffmpeg/ffprobe/xz/zstd/gs/gdb/pandoc/qpdf/pdftotext/
+ * tesseract/exiftool/curl/git/sqlite3/rg/node/python-lzma/dpkg-deb **21 项
+ * 全绿且产物字节数逐一相同**（`_recon/probe-final-ab.sh`）。
+ *
+ * `libheif.so` 是同一类（引擎版 soname `libheif.so.1`、系统版
+ * `libheif.so`、系统版独有的 `_Z17createHeifDecoderv` 正是 `libhwui.so`
+ * 要的），但它**不在 runtime.zip 里** —— 由 `gnuplot`/`imagemagick`/
+ * `texlive` 三个扩展的 `.links.json` 的 `libs` 复制进 `<root>/lib/`，
+ * 所以剔除点在 `plugins/kxxy-host/lib/extinstall.mjs` 的
+ * `SHADOWING_BARE_LIBS`，不在这里。
  */
-const DROPPED_LIBS = new Set(["lib/libbinder_ndk.so"]);
+const DROPPED_LIBS = new Set([
+  "lib/libbinder_ndk.so",
+  // 缺陷 BH：soname 是 liblzma.so.5，裸名 liblzma.so 属于系统那条链。
+  "lib/liblzma.so",
+]);
 
 /** 超过这个大小的一律当二进制，不做文本替换（避免误伤大 ELF）。 */
 const MAX_SCRIPT_BYTES = 1 << 20;
@@ -510,7 +549,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 「补丁集变了 ⇒ 设备必然重装一次」。代价是一次几百 MB 的重装，
  * 而漏判的代价是设备上静默复现已经修过的缺陷。
  */
-const PATCHSET_MARKER = "kxxy-patchset@4";
+const PATCHSET_MARKER = "kxxy-patchset@5";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**
@@ -1123,6 +1162,33 @@ async function main() {
     { files: deduped.files, links: deduped.links },
     asarPart,
   );
+
+  /*
+   * 缺陷 BH：`DROPPED_LIBS` 的 LINK 形态。
+   *
+   * `normaliseStageFiles` 只遍历**实体文件**（`deduped.files`），而
+   * `lib/liblzma.so` 在 stage 里是符号链接 —— 它被去重降级成
+   * `type: "link"`、`target: "lib/liblzma.so.5.8.4"`，于是上面的
+   * `DROPPED_LIBS` 分支根本看不见它。真机后果：zip 里仍有
+   * `lib/liblzma.so`（0 字节 + `LINK:` 注释），`materialiseLinks` 照样把它
+   * 建成软链，`LD_LIBRARY_PATH` 首位命中，`Xzs_Construct` 继续报。
+   *
+   * 所以必须在这里按**路径**再筛一遍：实体和链接都算。放在 mergeEntries
+   * 之后、悬空清扫之前 —— 摘掉这个别名不会让任何别的条目悬空
+   * （没有任何东西指向 `lib/liblzma.so`），而悬空清扫会顺带处理万一的级联。
+   */
+  const droppedLinks = [];
+  for (let i = merged.length - 1; i >= 0; i -= 1) {
+    const e = merged[i];
+    if (!DROPPED_LIBS.has(e.path)) continue;
+    droppedLinks.push(`${e.path}${e.type === "link" ? ` → ${e.target}` : ""}`);
+    merged.splice(i, 1);
+  }
+  if (droppedLinks.length) {
+    console.log(`      遮蔽库清扫：剔除 ${droppedLinks.length} 条（含 LINK 形态）`);
+    for (const d of droppedLinks) console.log(`      - ${d}`);
+    norm.droppedPaths.push(...droppedLinks.map((d) => d.split(" → ")[0]));
+  }
 
   // office 预览链：wasm 引擎 + 单文件 CJK 字体（见 bundleOfficeAssets 注释）。
   // 必须放在 mergeEntries 之后：它们只进 asarPart，不参与 stage 冲突检查。

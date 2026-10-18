@@ -58,6 +58,28 @@ export function engineRoot() {
 export const poolDir = (root) => join(root, 'ext-pool')
 export const extensionsDir = (root) => join(root, 'extensions')
 
+/**
+ * 不允许被复制进 `<root>/lib/` 的**裸名**动态库（缺陷 BH）。
+ *
+ * 判据不是「桩库太小」，而是 **soname 与裸文件名不一致**：这类文件一旦落到
+ * `<root>/lib/`，因为该目录在 `LD_LIBRARY_PATH` 首位，系统侧要裸名的库链
+ * 就会命中它，然后缺符号、`CANNOT LINK EXECUTABLE`。
+ *
+ * `libheif.so`：扩展（gnuplot / imagemagick / texlive）带来的那份是
+ * libheif 1.23.6（soname `libheif.so.1`、1,928,648 B、469 个符号），
+ * 系统的 `/system/lib64/libheif.so` 是 43,368 B / 37 个符号，两者符号
+ * **零重叠**，系统独有 20 个 `android::Heif*` 与
+ * `_Z17createHeifDecoderv` —— 后者正是系统 `libhwui.so` 要的。
+ * 全引擎 3,569 个 ELF64 扫 `DT_NEEDED`：要裸名 `libheif.so` 的 **0 个**，
+ * 13 个消费者一律要 `libheif.so.1`（那个照常复制，不受影响）。
+ *
+ * `liblzma.so` 是同一类，但它在 runtime.zip 里，剔除点由
+ * `tools/build-runtime.mjs` 的 `DROPPED_LIBS` 与 `RuntimeInstaller.kt` 的
+ * `SHADOWING_STUBS` 负责，不在这里。这里仍然列出它，是为了让
+ * 「运行期自愈删除」与「安装期不再复制」两处判据共用同一份清单。
+ */
+export const SHADOWING_BARE_LIBS = new Set(['libheif.so', 'liblzma.so'])
+
 /** 引擎 → 原生层的请求文件名（与 EngineConfig.kt 的两个常量严格一致）。 */
 export const RESTART_REQUEST_FILE = 'restart.request'
 export const STDIN_REQUEST_FILE = 'stdin.request'
@@ -447,6 +469,8 @@ export function buildViews(root, id, extDir) {
     for (const name of readdirSync(extLib)) {
       // 只有真正的动态库才进 LD_LIBRARY_PATH；jvm/ 目录树等原样留在扩展里
       if (!name.includes('.so')) continue
+      // 缺陷 BH：裸名会遮蔽系统真库，装进来就是给系统链埋雷
+      if (SHADOWING_BARE_LIBS.has(name)) continue
       const src = join(extLib, name)
       const dest = join(engineLib, name)
       try {
@@ -837,6 +861,17 @@ export function relinkAll(root) {
   let rebuilt = 0
   try {
     const extRoot = extensionsDir(root)
+    // 缺陷 BH 自愈：老设备上这些裸名库已经躺在 <root>/lib/ 里了（安装期
+    // 还没有 SHADOWING_BARE_LIBS 这条规则），rebuild 只跳过复制不会删旧的。
+    // 必须在这里主动摘掉，否则用户升级后仍会踩 `Xzs_Construct` /
+    // `_Z17createHeifDecoderv`。
+    for (const name of SHADOWING_BARE_LIBS) {
+      const victim = join(root, 'lib', name)
+      try {
+        if (lstatSync(victim).isSymbolicLink()) unlinkSync(victim)
+        else if (statSync(victim).isFile()) unlinkSync(victim)
+      } catch { /* 不存在或删不掉，忽略 */ }
+    }
     for (const entry of readdirSync(extRoot, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.endsWith('.tmp-install')) continue
       const extDir = join(extRoot, entry.name)
@@ -856,6 +891,8 @@ export function relinkAll(root) {
           linkExact(src, bin.target)
         }
         for (const lib of links.libs ?? []) {
+          // 缺陷 BH：裸名会遮蔽系统真库，重建时也不再补回来
+          if (SHADOWING_BARE_LIBS.has(lib.name)) continue
           try {
             if (existsSync(lib.target)) continue
             const src = join(extDir, 'lib', lib.name)
