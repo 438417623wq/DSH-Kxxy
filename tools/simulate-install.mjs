@@ -76,8 +76,21 @@ const PTY_NODE_MARKER = "kxxy-pty-node@1";
  * 锚点 5 只判 kxxy-host/package.json 存在，而那个文件从 v0.1.0 起内容未变；
  * 于是「改了 host.js / lib/index.js 却只重装 APK」的设备一直跑旧插件，
  * 且七锚点全通过、永不重装。标记写在插件入口 lib/index.js 首行。
+ *
+ * 这里**从 Kotlin 源码读**而不是抄一份字面量：抄的那一份是纯冗余，
+ * 每次递增标记都要记得改两处，忘一次就是「模拟安装报失败、真机却正常」的
+ * 假红灯（本次缺陷 BM 递增 @13→@14 时就踩了）。verify-runtime.mjs 对
+ * COMPAT_LAYER_MARKER 等标记早就是这么读的，这里统一成同一范式。
  */
-const HOST_PLUGIN_MARKER = "kxxy-host@13";
+const HOST_PLUGIN_MARKER = (() => {
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  const m = /HOST_PLUGIN_MARKER\s*=\s*"([^"]+)"/.exec(kt);
+  if (m === null) throw new Error("RuntimeInstaller.kt 未定义 HOST_PLUGIN_MARKER");
+  return m[1];
+})();
 
 /**
  * 与 RuntimeInstaller.MOBILE_PLUGIN_MARKER 保持一致（锚点 10）。

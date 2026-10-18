@@ -37,6 +37,7 @@ import os
 import posixpath
 import sys
 import tarfile
+import zipfile
 
 TERMUX_PREFIX = "./data/data/com.termux/files/usr/"
 
@@ -124,6 +125,57 @@ def rewrite_prefixes(data):
         if needle in out:
             out = out.replace(needle, repl)
     return (out, True) if out is not data else (data, False)
+
+
+# ── jar 内 jansi native 剥离（缺陷 BM）──────────────────────────────────
+#
+# jansi 2.4.0 把全平台的 `libjansi.so` 都打进 jar 的
+# `org/fusesource/jansi/internal/native/<os>/<arch>/` 下，其中
+# `Linux/arm64/libjansi.so` 是 **glibc 编译**的（DT_NEEDED 只有 `libc.so.6`），
+# 在 Android 的 bionic 上 `System.load` 必抛
+#   `UnsatisfiedLinkError: dlopen failed: "libc.so.6" not found`
+# 而 `JansiLoader.loadNativeLibrary` 把这个 ULE catch 住之后会
+# `System.err.println(ule)`（字节码 :89-93）—— 于是**每次**跑 kotlinc / gradle
+# 都在 stderr 刷一段吓人的 UnsatisfiedLinkError，用户看到的「崩溃」其实是它。
+#
+# 真正干净的解法是让 jansi **压根没有 native 资源可解**：没有资源就跳过
+# extractAndLoadLibraryFile，直接走到「所有候选都失败」的
+# `throw new Exception("No native library found…")`，而这条被
+# `initialize()` 的 catch(Exception) + `jansi.graceful=true`（默认值）静默吞掉，
+# 一个字都不打印。叠加 EngineConfig 里的 `-Djansi.mode=strip`，jansi 这条
+# 路径在设备上就彻底安静了。
+JANSI_NATIVE_PREFIX = "org/fusesource/jansi/internal/native/"
+
+
+def strip_jansi_native(data):
+    """把 jar 里 jansi 的 native 库条目删掉，其余条目原样保留。
+
+    @returns (new_bytes, removed_count)。不是 zip / 不含 native 条目时原样返回。
+    """
+    if not data or data[:4] != b"PK\x03\x04":
+        return data, 0
+    try:
+        src = zipfile.ZipFile(io.BytesIO(data))
+        names = src.namelist()
+    except Exception:
+        return data, 0
+    # 目录条目也要删：JansiLoader 用 `hasResource("/<pkg>/native/<os>/<arch>")`
+    # 判断要不要走解包分支，目录条目还在的话它仍会认为「有资源」，
+    # 只是解不出文件、白跑一趟。全删干净才会直接落到「无 native 库」。
+    doomed = [n for n in names if n.startswith(JANSI_NATIVE_PREFIX)]
+    if not doomed:
+        return data, 0
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as dst:
+        for info in src.infolist():
+            if info.filename in doomed:
+                continue
+            new = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            new.compress_type = zipfile.ZIP_DEFLATED
+            new.external_attr = info.external_attr
+            dst.writestr(new, src.read(info.filename))
+    return buf.getvalue(), len(doomed)
 
 
 def read_ar_members(blob):
@@ -292,12 +344,21 @@ def main():
         out_path = os.path.join(args.out, f"{ext_id}.pool")
         total_bytes = 0
         placeholder_paths = []
+        stripped_native = 0
         with tarfile.open(out_path, "w:gz", format=tarfile.GNU_FORMAT, compresslevel=6) as out:
             for path in sorted(merged):
                 data, mode = merged[path]
                 data, changed = rewrite_prefixes(data)
                 if changed:
                     placeholder_paths.append(path)
+                # jar 内的 jansi native 剥离（缺陷 BM）：只对 .jar 试，且只
+                # 命中 `org/fusesource/jansi/internal/native/` 前缀的条目。
+                stripped = 0
+                if path.endswith(".jar"):
+                    data, stripped = strip_jansi_native(data)
+                    if stripped:
+                        stripped_native += stripped
+                        print(f"      · {ext_id}: {path} 剥掉 {stripped} 个 jansi native 条目")
                 info = tarfile.TarInfo(path)
                 info.size = len(data)
                 # 只保留「属主可执行」这一语义位，其余归一到 0644/0755，
@@ -337,6 +398,7 @@ def main():
             "files": len(merged),
             "totalBytes": total_bytes,
             "placeholderFiles": len(placeholder_paths),
+            "strippedJansiNative": stripped_native,
         })
         print(
             f"      {ext_id}: {len(merged)} 文件 / {total_bytes / 1048576:.1f} MiB"

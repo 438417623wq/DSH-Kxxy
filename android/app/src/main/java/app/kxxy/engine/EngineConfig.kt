@@ -192,6 +192,31 @@ object EngineConfig {
     }
 
     /**
+     * Go 的安装根（GOROOT）—— 缺陷 BI。
+     *
+     * 真机症状：`go` 能跑起来但一切命令都报
+     *   `go: cannot find GOROOT directory: /data/data/com.termux/files/usr/lib/go`
+     * 因为 Go 的 GOROOT 推导规则是「取可执行文件的真实路径 → 上溯两级」，
+     * 而扩展的 `bin/go` 是 poolextract 物化出来的**真实 ELF 副本**（不是软链），
+     * 落在 `<root>/bin/go` ⇒ 上溯两级得到 `<root>`，不是 `<root>/lib/go`。
+     * 而且 go 二进制里根本没有把 Termux 的 lib/go 路径编进去（实测 grep 零命中），
+     * 所以「装好就能自动找到」这条路是不存在的，只能显式给 GOROOT。
+     *
+     * 首选 `<root>/lib/go`：extinstall 的合并视图会把 golang 扩展的 `lib/go`
+     * 摊到引擎根（与 guile / perl5 / rustlib 同路）。
+     * 合并视图还没建立时回落到扩展目录，两处都没有就返回 null（不设 GOROOT，
+     * 让 go 自己报错，比给一个错路径更容易排查）。
+     */
+    private fun goRoot(root: File): File? {
+        val merged = File(root, "lib/go")
+        if (File(merged, "src/runtime").isDirectory) return merged
+        val inExt = File(root, "extensions/golang/lib/go")
+        if (File(inExt, "src/runtime").isDirectory) return inExt
+        // 兜底：只看 VERSION 文件，兼容上游改了 src 布局的情形。
+        return listOf(merged, inExt).firstOrNull { File(it, "VERSION").isFile }
+    }
+
+    /**
      * Guile 的 Scheme 源搜索路径（问题.txt【5】，gdb 依赖它）。
      *
      * 首选 `<root>/share/guile/3.0` —— extinstall 的合并视图会把 gdb 扩展的
@@ -490,7 +515,28 @@ object EngineConfig {
         val javaHome = javaHome(ctx)
 
         val path = buildList {
+            // 缺陷 BN：`opt/<name>/bin` 必须排在 `<root>/bin` **之前**。
+            //
+            // maven / gradle / kotlin 这三个包的启动脚本都用「`dirname $0` 的上一级」
+            // 反推自己的 home：
+            //   · mvn     → `MAVEN_HOME=$(dirname "$PRG")/..`，再找 `boot/plexus-classworlds-*.jar`
+            //   · gradle  → `APP_HOME=$(cd -P "${APP_HOME:-./}.." && pwd)`，再找 `lib/gradle-*-cli-main.jar`
+            //   · kotlinc → `findKotlinHome()` 用 `BASH_SOURCE` 上溯一级，再找 `lib/kotlin-compiler.jar`
+            // 而 extinstall 的 collectBins 会把每个扩展 `bin/` 下的**每个**文件都摊平软链到
+            // `<root>/bin`，于是 `<root>/bin/mvn` 存在但它的「上一级」是 `<root>` ——
+            // 三个工具全都找不到自己的 jar，报的却是一句毫无线索的
+            // `Error: Could not find or load main class ...`。
+            // 真身在 `<root>/opt/<name>/bin/<name>`（`opt/` 由 mergeViews 摊到引擎根）。
+            for (name in listOf("maven", "gradle", "kotlin")) {
+                val dir = File(root, "opt/$name/bin")
+                if (dir.isDirectory) add(dir.absolutePath)
+            }
             add(File(root, "bin").absolutePath)
+            // git-core 的 `git-remote-https` / `git-remote-http` 等 helper 与
+            // termux-api 的 shim 都在 `<root>/libexec`。不在这里的话
+            // `git clone https://…` 会报 `git: 'remote-https' is not a git command`。
+            val libexec = File(root, "libexec")
+            if (libexec.isDirectory) add(libexec.absolutePath)
             // OpenJDK 不在 <root>/bin 下，必须显式加进去，否则 kotlinc / gradle
             // 的 `command -v java` 与 `$JAVA_HOME/bin/java` 两条路都落空。
             javaHome?.let { add(File(it, "bin").absolutePath) }
@@ -509,7 +555,21 @@ object EngineConfig {
         //
         // `aarch64-linux-android/` 是 NDK 那份（`asm/types.h` 只在这里，
         // 而 `<root>/include/linux/types.h` 第 9 行就 `#include <asm/types.h>`）。
-        val includeDirs = listOf(File(root, "include"), File(root, "include/aarch64-linux-android"))
+        //
+        // `include/c++/v1` 是 **C++ 标准库头**（缺陷 BJ）—— 真机症状是
+        // `fatal error: 'iostream' file not found`，`g++`/`clang++` 一律编译不过。
+        // 那一千多个头文件（`iostream`、`vector`、`__config` …）确实在 runtime.zip
+        // 里、也确实解到了 `<root>/include/c++/v1`，但这个 clang 的驱动**不会**
+        // 自动把 `<sysroot>/include/c++/v1` 加进搜索列表 —— 它只认自己
+        // resource-dir 下的 `lib/clang/21/include`。Termux 那边是 libc++ 的包
+        // 往 clang 的配置里塞了 `-stdlib=libc++ -isystem .../c++/v1`，我们脱离
+        // 了那套包管理，只能自己用 CPATH 补。注意必须排在 `<root>/include`
+        // **之后**：C 头优先，避免 C++ 版 `<cstdio>` 之类遮蔽 `<stdio.h>`。
+        val includeDirs = listOf(
+            File(root, "include"),
+            File(root, "include/aarch64-linux-android"),
+            File(root, "include/c++/v1"),
+        )
             .filter { it.isDirectory }
             .joinToString(":") { it.absolutePath }
 
@@ -666,7 +726,23 @@ object EngineConfig {
             "COREPACK_NPM_REGISTRY=https://registry.npmmirror.com",
             "npm_config_registry=https://registry.npmmirror.com",
             "NPM_CONFIG_REGISTRY=https://registry.npmmirror.com",
+            // Go 的临时目录（go build 往这里写中间产物）。GOTMPDIR 只解决 tmp，
+            // 真正的 GOROOT 在下面按目录探测后追加（缺陷 BI）。
             "GOTMPDIR=${tmp.absolutePath}",
+            // Python 的字节码缓存（缺陷 BK，gdb 启动慢的第二条腿）。
+            //
+            // gdb 的 `share/gdb/python/gdb/**` 有 53 个 `.py`、**一个 `.pyc` 都没有**，
+            // 而合并视图是只读软链 ⇒ 每次启动 gdb 的 Python 初始化都要把这一批
+            // 重新编译一遍，写不进 `__pycache__` 又重试，`gdb --version` 因此能挂
+            // 到分钟级。用 `PYTHONPYCACHEPREFIX` 把字节码重定向到 tmp 下的独立
+            // 前缀：首次生成、之后直接命中，且永远不往只读视图里戳。
+            //
+            // 刻意**不**设 `PYTHONDONTWRITEBYTECODE=1` —— 那只是「不写」，
+            // 于是每次启动都要重新编译全部 53 个文件，等于把慢速固化下来。
+            "PYTHONPYCACHEPREFIX=${File(tmp, "pycache").absolutePath}",
+            // Ruby 的 gem 装到用户目录（Termux 前缀只读/不存在）
+            "GEM_HOME=${File(home, ".gem").absolutePath}",
+            "GEM_PATH=${File(home, ".gem").absolutePath}",
             // kxxy-host 插件靠这两个变量定位宿主资源：KXXY_ENGINE_ROOT 用于
             // collectRuntimeState 的七项探针（有 PREFIX 兜底，但显式给出更稳），
             // KXXY_STATE_FILE 用于 collectEngineState 读取原生层写入的
@@ -677,6 +753,61 @@ object EngineConfig {
 
         // JAVA_HOME：kotlinc 与 gradle 都优先读它，比 PATH 更硬。
         if (javaHome != null) env += "JAVA_HOME=${javaHome.absolutePath}"
+
+        // GOROOT / GOPATH / GOCACHE（缺陷 BI）。
+        //
+        // 为什么必须显式给：扩展的 `<root>/bin/go` 是 poolextract 物化出来的
+        // **真实 ELF 副本**（16 MB，不是软链），而 go 的默认 GOROOT 推导是
+        // 「取自身路径上溯两级」⇒ 得到 `<root>` 而不是 `<root>/lib/go`，
+        // 于是每个子命令都 `cannot find GOROOT directory`。go 二进制里也**没有**
+        // 编入 Termux 的 `lib/go` 路径（实测 strings 零命中），所以不存在
+        // 「装好就自动对」的可能。
+        //
+        // GOPATH/GOCACHE 指向 HOME 下：不设时它们默认 `$HOME/go` 与
+        // `$HOME/.cache/go-build`，HOME 已经指到 kxxy-home，本来也能用；
+        // 但显式写出来可以避免 `go env -w` 写进只读的 `lib/go/go.env`。
+        // GOTOOLCHAIN=local 很关键：go 1.21+ 默认 `auto`，一旦 go.mod 里
+        // 要求更高版本，go 会**试图联网下载新工具链**（在手机上下几百 MB，
+        // 且 Termux 的 go 不带 toolchain 模块），本地锁死更符合预期。
+        val goRoot = goRoot(root)
+        if (goRoot != null) {
+            env += "GOROOT=${goRoot.absolutePath}"
+            env += "GOPATH=${File(home, "go").absolutePath}"
+            env += "GOCACHE=${File(home, ".cache/go-build").absolutePath}"
+            env += "GOTOOLCHAIN=local"
+        }
+
+        // PHP 的 ini 与扩展目录（缺陷 BL）。
+        //
+        // Termux 的 php 编译期把 `--with-config-file-path` 钉在
+        // `/data/data/com.termux/files/usr/etc/php`，那个目录在设备上不存在 ⇒
+        // 启动刷 `PHP Warning:  PHP Startup: Unable to load dynamic library`，
+        // 且 `php.ini` 完全不生效。`PHPRC` 指向引擎根下合并视图的 `etc/php`。
+        val phpEtc = File(root, "etc/php")
+        if (phpEtc.isDirectory) env += "PHPRC=${phpEtc.absolutePath}"
+        // Maven 的本地仓库落在 HOME 下，避免往只读的引擎根写
+        env += "MAVEN_OPTS=-Dmaven.repo.local=${File(home, ".m2/repository").absolutePath}"
+
+        // Erlang 的根目录（缺陷 BO）。
+        //
+        // `bin/erl`（扩展池里的顶层入口，`#!/system/bin/sh`）用
+        // `ROOTDIR=$(find_rootdir "$0" "@DSH_ROOT@/lib/erlang")`：从 $0 逐级上溯，
+        // 找「含 `erts-*/` 的目录」，找不到就**回落到第二个参数**。从
+        // `<root>/bin/erl` 上溯只会经过 `<root>` 与 `/`，两者都没有 `erts-*`，
+        // 所以实际永远走回落分支 —— 而回落值来自安装期回填的占位符，引擎根
+        // 一旦迁移（备份还原、换 filesDir）就失效。
+        //
+        // `ERL_ROOTDIR` 是 erl 脚本自己认的官方覆盖点（脚本里
+        // `if [ -z "$ERL_ROOTDIR" ]; then ROOTDIR=$(find_rootdir ...)`），
+        // 显式给死最稳，也不依赖安装顺序。判据用 `erts-*` 目录而不是
+        // `isDirectory`：池解包到一半时 `lib/erlang` 可能已存在但没有 erts。
+        val erlRoot = listOf(
+            File(root, "lib/erlang"),
+            File(root, "extensions/erlang/lib/erlang"),
+        ).firstOrNull { dir ->
+            dir.isDirectory && dir.listFiles()?.any { it.name.startsWith("erts-") } == true
+        }
+        if (erlRoot != null) env += "ERL_ROOTDIR=${erlRoot.absolutePath}"
 
         // JVM 的 user.home / java.io.tmpdir 是**编译期写死的 C 字符串**
         // （`/data/data/com.termux/files/home` 与 `.../usr/tmp/`），跟 perl 的 @INC
@@ -704,6 +835,24 @@ object EngineConfig {
         val jvmOpts = buildList {
             add("-Djava.io.tmpdir=${tmp.absolutePath}")
             add("-Duser.home=${home.absolutePath}")
+            // jansi 的 native 库在 bionic 上必然 dlopen 失败（缺陷 BM）。
+            //
+            // 字节码级取证（jansi 2.4.0，打进 kotlin-compiler.jar 与 gradle 里）：
+            //   · `Linux/arm64/libjansi.so` 的 DT_NEEDED 只有 `libc.so.6`，
+            //     而 Android 是 bionic，只有 `libc.so` ⇒ `System.load` 必抛
+            //     `UnsatisfiedLinkError: dlopen failed: "libc.so.6" not found`；
+            //   · `JansiLoader.loadNativeLibrary` 只 catch `UnsatisfiedLinkError`，
+            //     然后**把异常对象 println 到 stderr**（字节码 :89-93），
+            //     所以真机日志里那两行 "Failed to load native library…" 后面
+            //     紧跟的 ULE 只是**噪音**，不是崩溃；
+            //   · `initialize()` 在 graceful（默认 true）下静默返回 false，
+            //     `AnsiConsole.ansiStream` 的异常表也把 `Throwable` 兜住了。
+            // 即便如此，噪音会让人误判成「工具链崩了」，而且每次 JVM 启动都刷。
+            // `jansi.mode=strip` 让 AnsiConsole 直接走「不输出 ANSI」的分支，
+            // 配合构建期剥掉 jar 内 native 资源（见 tools/lib/poolextract.py）
+            // 之后，jansi 这条路径彻底安静。
+            add("-Djansi.mode=strip")
+            add("-Djansi.graceful=true")
         }.joinToString(" ")
         env += "JAVA_TOOL_OPTIONS=$jvmOpts"
         env += "GRADLE_USER_HOME=${File(home, ".gradle").absolutePath}"

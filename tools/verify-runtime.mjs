@@ -4,7 +4,7 @@
  *
  * 用法：node tools/verify-runtime.mjs [zip 路径]
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { gunzipSync, inflateRawSync } from "node:zlib";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -767,6 +767,139 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
   }
 }
 
+// ---------------------------------------------------------------- C++ 标准库头
+//
+// 为什么需要：缺陷 BJ。真机上 `g++` / `clang++` 编译任何 C++ 文件都报
+// `fatal error: 'iostream' file not found`。头文件本身是在的（runtime 的
+// `include/c++/v1/` 有 1,757 个条目），缺的是「谁告诉 clang 去那儿找」——
+// 这个 clang 的驱动只认自己 resource-dir 下的 `lib/clang/21/include`，
+// 不会自动加 `<sysroot>/include/c++/v1`。修法是在 EngineConfig 里把它塞进
+// `CPATH` / `C_INCLUDE_PATH`。这里做两条静态断言：
+//   ① 头文件必须在包里（否则改环境变量也没用）；
+//   ② EngineConfig 的 includeDirs 必须真的含 `include/c++/v1`（否则改了环境
+//      变量却漏掉这一项，症状与「头文件不在包里」完全一样，极难区分）。
+{
+  const problems = [];
+  const iostream = byName.get("include/c++/v1/iostream");
+  if (!iostream) problems.push("runtime.zip 缺 include/c++/v1/iostream");
+  const cxxHeaders = entries.filter((e) => e.name.startsWith("include/c++/v1/")).length;
+  if (cxxHeaders < 1000) {
+    problems.push(`include/c++/v1 只有 ${cxxHeaders} 个条目（应 ≥1000）`);
+  }
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/EngineConfig.kt"),
+    "utf8",
+  );
+  if (!/File\(root,\s*"include\/c\+\+\/v1"\)/.test(kt)) {
+    problems.push("EngineConfig.kt 的 includeDirs 里没有 include/c++/v1（CPATH 补不上）");
+  }
+  // 链接期的第二层：clang 按 `-lc++` 找 `libc++.so`，而 runtime 只有
+  // `libc++_shared.so`。别名由 RuntimeInstaller 的 SONAME_ALIASES 在设备上建。
+  const ri = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  if (!/"libc\+\+\.so"\s+to\s+"libc\+\+_shared\.so"/.test(ri)) {
+    problems.push("RuntimeInstaller.kt 的 SONAME_ALIASES 里没有 libc++.so → libc++_shared.so");
+  }
+  if (!/materialiseSonameAliases\(root\)/.test(ri)) {
+    problems.push("RuntimeInstaller.kt 没有在启动路径上调用 materialiseSonameAliases（别名不会自愈）");
+  }
+  if (problems.length === 0) {
+    console.log(`C++ 标准库头：✓ include/c++/v1 有 ${cxxHeaders} 个条目，CPATH 与链接别名均就位`);
+  } else {
+    console.log("C++ 标准库头：✗");
+    for (const p of problems) console.log(`  ${p}`);
+    missing += 1;
+  }
+}
+
+// ---------------------------------------------------------------- 扩展目录与 jansi
+//
+// 为什么需要：缺陷 BI～BO 一次性补了 5 个扩展（maven / php / ruby / erlang /
+// yarn），它们的可见性完全依赖 `lib/node_modules/kxxy-host/extensions.json`
+// 这一个文件 —— 那个文件被 `.gitignore` 忽略，只靠 build-runtime 从工作区读进来
+// 打进 zip。漏打的表现是「池文件都在设备上、扩展页却一张卡都没有」，与
+// 「池没生成」完全同型。
+//
+// jansi 那半边：缺陷 BM。jansi 2.4.0 的 `Linux/arm64/libjansi.so` 的
+// DT_NEEDED 只有 `libc.so.6`，Android 的 bionic 只有 `libc.so` ⇒ 必然 dlopen
+// 失败。失败本身被 graceful 吞掉，但 `loadNativeLibrary` 会把异常 println 到
+// stderr，每次 JVM 启动都刷两行吓人的 `UnsatisfiedLinkError`。构建期由
+// `tools/lib/poolextract.py` 的 `strip_jansi_native()` 把 jar 内 native 资源
+// 连目录一起删掉（`JansiLoader.hasResource()` 判的是目录，只删文件不够）。
+{
+  const problems = [];
+  const catalogEntry = byName.get("lib/node_modules/kxxy-host/extensions.json");
+  if (!catalogEntry) {
+    problems.push("runtime.zip 里没有 lib/node_modules/kxxy-host/extensions.json");
+  } else {
+    const catalog = JSON.parse(readLocal(catalogEntry).toString("utf8"));
+    const ids = (catalog.items ?? []).map((i) => i.id);
+    if (ids.length < 25) problems.push(`扩展目录只有 ${ids.length} 项（应 ≥25）`);
+    for (const need of ["maven", "php", "ruby", "erlang", "yarn"]) {
+      if (!ids.includes(need)) problems.push(`扩展目录缺 ${need}`);
+    }
+    console.log(`扩展目录：${ids.length} 项 — ${ids.join(" ")}`);
+  }
+
+  // jansi：扫所有 pool 里的 jar，断言 native 条目为 0。
+  const poolDir = join(HERE, "..", "android", "app", "src", "main", "assets", "ext-pool");
+  const JANSI = "org/fusesource/jansi/internal/native/";
+  let jarsScanned = 0;
+  let jansiHits = 0;
+  const hitDetail = [];
+  if (existsSync(poolDir)) {
+    for (const f of readdirSync(poolDir)) {
+      if (!f.endsWith(".pool")) continue;
+      let tarBuf;
+      try {
+        tarBuf = gunzipSync(readFileSync(join(poolDir, f)));
+      } catch {
+        continue;
+      }
+      let off = 0;
+      while (off + 512 <= tarBuf.length) {
+        const header = tarBuf.subarray(off, off + 512);
+        if (header.every((b) => b === 0)) break;
+        let nameEnd = header.indexOf(0);
+        if (nameEnd < 0) nameEnd = 100;
+        const name = header.subarray(0, nameEnd).toString("utf8");
+        const sizeStr = header.subarray(124, 136).toString("ascii").replace(/\0.*$/, "").trim();
+        const size = parseInt(sizeStr, 8) || 0;
+        const dataStart = off + 512;
+        if (name.endsWith(".jar")) {
+          jarsScanned += 1;
+          // 必须**真正解析 zip 中央目录**，不能拿原始字节搜字符串 ——
+          // 首版就是那么写的，结果被 `kotlin-compiler-embeddable-2.4.10.jar`
+          // 报了一次假阳性：那个 jar 里 jansi 已被 shade 成
+          // `org/jetbrains/kotlin/org/fusesource/jansi/…`（native 条目 0 个），
+          // 但某个 class 的常量池里留着原包名字符串，字节扫描照样命中。
+          const slice = tarBuf.subarray(dataStart, dataStart + size);
+          const names = jarEntryNames(slice);
+          if (names.some((n) => n.startsWith(JANSI))) {
+            jansiHits += 1;
+            hitDetail.push(`${f}:${name}`);
+          }
+        }
+        off += 512 + Math.ceil(size / 512) * 512;
+      }
+    }
+  }
+  if (jansiHits > 0) {
+    problems.push(`仍有 ${jansiHits} 个 jar 带 jansi native 资源（strip_jansi_native 没生效？）`);
+    for (const d of hitDetail.slice(0, 8)) console.log(`  ! ${d}`);
+  }
+
+  if (problems.length === 0) {
+    console.log(`jansi native 剥离：✓ 扫描 ${jarsScanned} 个 jar，命中 0`);
+  } else {
+    console.log("扩展目录 / jansi：✗");
+    for (const p of problems) console.log(`  ${p}`);
+    missing += 1;
+  }
+}
+
 // ---------------------------------------------------------------- 占位符核对
 console.log("\n占位符抽查（应出现 @DSH_ROOT@ 且不含 com.termux）：");
 for (const n of ["bin/am", "bin/pkg", "bin/termux-open", "libexec/git-core/git-subtree"]) {
@@ -817,4 +950,32 @@ function readLocal(e) {
   const raw = buf.subarray(start, start + e.csize);
   if (e.method === 0) return raw;
   return inflateRawSync(raw);
+}
+
+/**
+ * 从一个 jar 的原始字节里解析出**全部条目名**（只读中央目录，不解压内容）。
+ *
+ * 为什么不用第三方库：这个仓库的校验脚本一律零依赖（只用 node: 内置模块），
+ * 且中央目录结构极简 —— 末尾找 EOCD（`PK\x05\x06`），读条目数与偏移，
+ * 再逐条读 `PK\x01\x02` 头里的文件名长度与文件名。
+ */
+function jarEntryNames(zipBuf) {
+  const names = [];
+  // EOCD 在最末尾 22 + 最多 65535 字节注释内，从后往前找签名。
+  let eocd = -1;
+  for (let i = zipBuf.length - 22; i >= Math.max(0, zipBuf.length - 22 - 65535); i -= 1) {
+    if (zipBuf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return names;
+  const count = zipBuf.readUInt16LE(eocd + 10);
+  let off = zipBuf.readUInt32LE(eocd + 16);
+  for (let i = 0; i < count; i += 1) {
+    if (off + 46 > zipBuf.length || zipBuf.readUInt32LE(off) !== 0x02014b50) break;
+    const nameLen = zipBuf.readUInt16LE(off + 28);
+    const extraLen = zipBuf.readUInt16LE(off + 30);
+    const commentLen = zipBuf.readUInt16LE(off + 32);
+    names.push(zipBuf.subarray(off + 46, off + 46 + nameLen).toString("utf8"));
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return names;
 }

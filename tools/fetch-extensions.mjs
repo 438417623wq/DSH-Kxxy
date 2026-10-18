@@ -87,6 +87,20 @@ const STAGE_DIR = join(CACHE, "stage");
 /** Windows 文件名安全化（与 fetch-runtime.mjs 一致）。 */
 const safeName = (s) => s.replace(/[:*?"<>|\\/]/g, "_");
 
+/**
+ * 增量重打：`KXXY_POOL_ONLY=maven,php` 只处理列出的条目。
+ *
+ * 为什么需要它：poolextract.py 对每个条目都要把整个边际 deb 集合解一遍，
+ * 26 个条目全跑一次是十几分钟起步（1.1 GiB 池）。只补几个新条目时，
+ * 全量重打纯属浪费 —— 已存在的 `.pool` 本来就是幂等产物。
+ * 不设这个变量时行为与原来完全一致（全量）。
+ */
+const POOL_ONLY = (process.env.KXXY_POOL_ONLY ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const wanted = (item) => POOL_ONLY.length === 0 || POOL_ONLY.includes(item.id);
+
 async function main() {
   const debsDir = process.env.KXXY_CACHE ?? join(CACHE, "debs");
   mkdirSync(debsDir, { recursive: true });
@@ -104,6 +118,7 @@ async function main() {
   const missingAll = [];
   const failedItems = [];
   for (const item of POOL_ITEMS) {
+    if (!wanted(item)) continue;
     const closure = resolveClosure(index, item.seeds);
     const marginal = closure.ordered.filter((n) => index.has(n) && !baselineNames.has(n));
     const missing = closure.missing.filter((n) => !index.has(n));
@@ -231,6 +246,19 @@ async function main() {
 
   console.log("[5/5] 生成扩展目录 extensions.json ...");
   const reportById = new Map(report.items.map((r) => [r.id, r]));
+  // 增量模式下 spec 只含被点名的条目，直接覆盖会把其它条目从目录里抹掉。
+  // 所以先读回旧目录，把本次没重打的条目原样带过来。
+  let carried = new Map();
+  if (POOL_ONLY.length && existsSync(CATALOG_OUT)) {
+    try {
+      const prev = JSON.parse(readFileSync(CATALOG_OUT, "utf8"));
+      for (const it of prev.items ?? []) {
+        if (!wanted(it)) carried.set(it.id, it);
+      }
+    } catch (err) {
+      console.warn(`      ⚠️ 旧目录读不回来（${err.message}），将只写本次条目`);
+    }
+  }
   const catalog = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
@@ -245,6 +273,7 @@ async function main() {
     },
     items: POOL_ITEMS.map((item) => {
       const r = reportById.get(item.id);
+      if (!r) return carried.get(item.id) ?? null;
       return {
         id: item.id,
         name: item.name,
@@ -255,7 +284,7 @@ async function main() {
         sizeBytes: r?.totalBytes ?? 0,
         fileCount: r?.files ?? 0,
       };
-    }).filter((item) => reportById.has(item.id)),
+    }).filter(Boolean),
   };
   writeFileSync(CATALOG_OUT, `${JSON.stringify(catalog, null, 2)}\n`);
 

@@ -169,6 +169,48 @@ export const POOL_ITEMS = [
     description: "C/C++ 断点调试。",
     bins: ["gdb"],
   },
+  // ── L 组：Java / 脚本语言运行时（缺陷 BL / BN / BO 的补齐）─────────────
+  //
+  // 这五个都是「用户报缺、Termux 主仓确实有」的常驻语言工具链，此前完全
+  // 没进池 —— 真机上 `mvn` / `php` / `ruby` / `erl` / `yarn` 一律 command
+  // not found。边际体积（相对 ④ 预装闭包）实测：maven 9.17 MiB、
+  // yarn 875 KiB、php 13.33 MiB、ruby 9.33 MiB、erlang 44.82 MiB，合计
+  // 约 77.5 MiB，相对现有 1.1 GiB 池增 7%，可以接受。
+  //
+  // ⚠️ maven 的 37 包闭包里 36 包已在预装基线（openjdk-21 等），所以边际
+  // 只有 maven 本体 —— 但它**依赖 openjdk-21**，而 openjdk-21 只在 ④ 档
+  // 预装里；③ 档用户装 maven 时 `java` 可能不存在。所以 Maven 的运行
+  // 还依赖 EngineConfig 注入的 JAVA_HOME（见 buildEnv 的 javaHome 探测）。
+  {
+    id: "maven", seeds: ["maven"], category: "toolchain",
+    name: "Apache Maven",
+    description: "mvn 构建 Java 工程。依赖引擎自带 OpenJDK 21，联网拉依赖仍走手机网络。",
+    bins: ["mvn"],
+  },
+  {
+    id: "php", seeds: ["php"], category: "devtools",
+    name: "PHP",
+    description: "php 8.x 解释器与 CLI（含 libxml/libzip/tidy 等扩展依赖）。",
+    bins: ["php"],
+  },
+  {
+    id: "ruby", seeds: ["ruby"], category: "devtools",
+    name: "Ruby",
+    description: "ruby 4.x 解释器与 gem 基础设施。",
+    bins: ["ruby", "gem", "irb"],
+  },
+  {
+    id: "erlang", seeds: ["erlang"], category: "devtools",
+    name: "Erlang/OTP",
+    description: "erl / escript / erlc，OTP 运行时（体积较大，44 MiB）。",
+    bins: ["erl", "erlc", "escript"],
+  },
+  {
+    id: "yarn", seeds: ["yarn"], category: "devtools",
+    name: "Yarn",
+    description: "经典 Yarn 1.x 包管理器（引擎已带 node，不需要它拉 nodejs）。",
+    bins: ["yarn", "yarnpkg"],
+  },
   {
     id: "texlive", seeds: ["texlive-bin"], category: "toolchain",
     name: "TeX Live (bin)",

@@ -74,6 +74,12 @@ class RuntimeInstaller(private val ctx: Context) {
             // 文件全都在、标记也匹配，只是某几个文件的 mode 不够。所以这条
             // 修复单独走「每次启动都跑一次」的幂等路径（缺陷 AW）。
             ensureJvmExecBits(root)
+            // SONAME 别名表会随版本增删（缺陷 BJ 新增了 `libc++.so` /
+            // `libc++abi.so`），而它**不是**锚点能表达的资产变更：runtime.zip
+            // 没变、标记也没变，只是别名表多了一项。所以和 ensureJvmExecBits
+            // 一样走「每次启动都跑一次」的幂等路径 —— 已存在的别名会因
+            // `length() > 0` 被跳过，开销就是几次 stat。
+            materialiseSonameAliases(root)
             // texlinks 必须先于 ensureTexFormats —— 前者把 `bin/pdflatex` 这类
             // 标准名建出来，而格式生成虽然直接用 `bin/pdftex`/`bin/luahbtex`
             // 这类引擎本名（不依赖别名），但用户敲的是标准名，两个都到位才完整。
@@ -1295,7 +1301,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 旧插件跳过重装。改动 plugins/kxxy-host/ 下任何文件后递增编号。
          */
         private const val HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js"
-        private const val HOST_PLUGIN_MARKER = "kxxy-host@13"
+        private const val HOST_PLUGIN_MARKER = "kxxy-host@14"
 
         /**
          * 移动端 UI 插件（第三方 dsh-web-mobile）版本标记（锚点 10）。
@@ -1536,6 +1542,27 @@ class RuntimeInstaller(private val ctx: Context) {
             "libncursesw.so.6" to "libncursesw.so.6.5",
             "libncurses.so.6" to "libncurses.so.6.5",
             "libncurses.so" to "libncurses.so.6.5",
+
+            /*
+             * 缺陷 BJ 的第二层：`clang++` 的**链接期**。
+             *
+             * runtime 的 `lib/` 里只有 `libc++_shared.so`（Termux 的 libc++
+             * 编译成单一共享库，把 libc++ 与 libc++abi 的符号合并进去了），
+             * 没有 `libc++.so` / `libc++abi.so` 这两个**链接名**。
+             *
+             * `CPATH` 补 `include/c++/v1` 只让编译期找到 `<iostream>`；
+             * 链接期 clang 仍会按 `-lc++`（或 `-lc++abi`）去找 `libc++.so`，
+             * 找不到就 `ld: cannot find -lc++`。实测 `libclang-cpp.so` 的
+             * driver 串表里 `-lc++` 出现 6 次、`-lc++abi` 2 次、`-lc++_shared`
+             * 1 次，说明三条路径都可能被走到。
+             *
+             * 用**副本**而不是软链：`libc++_shared.so` 的 SONAME 就是
+             * `libc++_shared.so`，所以 `-lc++` 链接出的产物 DT_NEEDED 仍是
+             * `libc++_shared.so` —— 正是设备上真实存在、且已被
+             * `LD_LIBRARY_PATH` 覆盖的那个，运行时不会缺库。
+             */
+            "libc++.so" to "libc++_shared.so",
+            "libc++abi.so" to "libc++_shared.so",
         )
     }
 }

@@ -1,4 +1,4 @@
-/* kxxy-host@13 */
+/* kxxy-host@14 */
 /**
  * kxxy-host — DSH Kxxy 宿主管理页插件。
  *
