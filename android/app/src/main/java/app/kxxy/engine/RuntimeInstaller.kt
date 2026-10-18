@@ -73,6 +73,10 @@ class RuntimeInstaller(private val ctx: Context) {
             // 文件全都在、标记也匹配，只是某几个文件的 mode 不够。所以这条
             // 修复单独走「每次启动都跑一次」的幂等路径（缺陷 AW）。
             ensureJvmExecBits(root)
+            // texlinks 必须先于 ensureTexFormats —— 前者把 `bin/pdflatex` 这类
+            // 标准名建出来，而格式生成虽然直接用 `bin/pdftex`/`bin/luahbtex`
+            // 这类引擎本名（不依赖别名），但用户敲的是标准名，两个都到位才完整。
+            ensureTexLinks(root)
             ensureTexFormats(root)
             ensureNoShadowingStubs(root)
             ensureEmacsSiteLoad(root)
@@ -98,6 +102,7 @@ class RuntimeInstaller(private val ctx: Context) {
         materialiseSonameAliases(root)
         restoreExecBits(root)
         ensureJvmExecBits(root)
+        ensureTexLinks(root)
         ensureTexFormats(root)
         ensureNoShadowingStubs(root)
         ensureEmacsSiteLoad(root)
@@ -932,6 +937,74 @@ class RuntimeInstaller(private val ctx: Context) {
     private fun quoteElisp(s: String): String = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
     /**
+     * 跑 TeX Live 的 `texlinks`，把 411 个引擎名补成 `<root>/bin/` 下的软链。
+     *
+     * **这是 `pdflatex` / `xelatex` / `lualatex` / `latex` 四个标准命令长期
+     * 缺失的直接原因。** 它们的真身一直在
+     * `extensions/texlive/bin/texlive/<name>`，但只有 `pdftex`/`xetex`/`tex`/
+     * `luatex`/`luahbtex` 这几个「引擎本名」被 extinstall 的 `collectBins`
+     * 展平进了 `<root>/bin/`；`pdflatex`/`latex`/`xelatex`/`lualatex` 是
+     * `texlinks` 建的**运行时别名**，安装流程从未调用过它。
+     *
+     * 真机实测：手工跑一次 `texlinks` 后，四个命令立刻全部出现在
+     * `<root>/bin/`，且 `pdflatex t.tex` → 12,267 B PDF、`xelatex` → 2,985 B、
+     * `latex` → 260 B DVI、`lualatex` → 3,321 B PDF，全部 rc=0。
+     *
+     * `texlinks` 本身是 perl 脚本，但**它不走 `system("…")` 那种在 Android 上
+     * 会失败-1 的路径**（那是 `mktexfmt`/`fmtutil` 的毛病）—— 它只用 perl 的
+     * `symlink` 内建，所以能跑通。它对已存在的目标只报
+     * `install_link … failed: file already exists.` 且仍 rc=0，天然幂等。
+     *
+     * 幂等判据用「四个标准命令是否都已存在」：都在就只做 4 次 `exists()`。
+     */
+    private fun ensureTexLinks(root: File) {
+        runCatching {
+            val bin = File(root, "bin")
+            val wanted = TEX_LINK_NAMES.map { File(bin, it) }
+            if (wanted.all { it.exists() }) return
+
+            val texlinks = File(bin, "texlinks")
+            if (!texlinks.isFile) {
+                Log.w(TAG, "ensureTexLinks: texlinks 缺失，跳过")
+                return
+            }
+            val perl = File(bin, "perl")
+            if (!perl.isFile) {
+                Log.w(TAG, "ensureTexLinks: perl 缺失，跳过")
+                return
+            }
+
+            val started = System.currentTimeMillis()
+            val pb = ProcessBuilder(perl.absolutePath, texlinks.absolutePath)
+            pb.environment().clear()
+            pb.environment().putAll(
+                EngineConfig.buildEnv(ctx, EngineConfig.DEFAULT_PORT, "normal")
+                    .mapNotNull { line ->
+                        val i = line.indexOf('=')
+                        if (i <= 0) null else line.substring(0, i) to line.substring(i + 1)
+                    }
+                    .toMap()
+            )
+            pb.directory(root)
+            pb.redirectErrorStream(true)
+            val out = File(EngineConfig.tmpDir(ctx), "texlinks.log")
+            pb.redirectOutput(out)
+            val rc = runCatching { pb.start().waitFor() }
+                .onFailure { Log.w(TAG, "ensureTexLinks failed: ${it.message}") }
+                .getOrDefault(-1)
+
+            val cost = System.currentTimeMillis() - started
+            val missing = TEX_LINK_NAMES.filterNot { File(bin, it).exists() }
+            if (missing.isEmpty()) {
+                Log.i(TAG, "ensureTexLinks: ${TEX_LINK_NAMES.size} 个标准命令就位 (rc=$rc, ${cost}ms)")
+            } else {
+                Log.w(TAG, "ensureTexLinks: 仍缺 ${missing.joinToString(",")} (rc=$rc, ${cost}ms)")
+            }
+            runCatching { out.delete() }
+        }.onFailure { Log.w(TAG, "ensureTexLinks failed: ${it.message}") }
+    }
+
+    /**
      * 生成 TeX Live 的格式文件（`.fmt`），缺则补、有则跳（缺陷 AY 收尾）。
      *
      * 为什么安装期做、而不是留给设备上的 `mktexfmt`：TeX Live 的 `fmtutil.pl` /
@@ -962,8 +1035,11 @@ class RuntimeInstaller(private val ctx: Context) {
         if (wanted.values.all { it.isFile && it.length() >= MIN_FMT_BYTES }) return
 
         val bin = File(root, "bin")
-        if (!File(bin, "pdftex").isFile || !File(bin, "xetex").isFile) {
-            Log.w(TAG, "ensureTexFormats: pdftex/xetex 缺失，跳过格式生成")
+        // pdftex / xetex / luahbtex 三者全缺才整体放弃。**逐个**判而不是一起判：
+        // 闭包里某个引擎缺失时，其余格式仍然值得生成（真机上 `luahbtex` 是有的，
+        // 早前注释错误地断定 scheme-basic 不含 luatex，导致 lualatex 长期没 fmt）。
+        if (!File(bin, "pdftex").isFile && !File(bin, "xetex").isFile && !File(bin, "luahbtex").isFile) {
+            Log.w(TAG, "ensureTexFormats: pdftex/xetex/luahbtex 全缺，跳过格式生成")
             return
         }
 
@@ -971,7 +1047,17 @@ class RuntimeInstaller(private val ctx: Context) {
         var made = 0
         for ((name, fmt) in wanted) {
             if (fmt.isFile && fmt.length() >= MIN_FMT_BYTES) continue
-            val engine = if (name == "xelatex") "xetex" else "pdftex"
+            // 引擎选择：`lualatex` 走 `luahbtex`（HarfBuzz 版 LuaTeX），
+            // `xelatex` 走 `xetex`，其余都是 pdftex 系。
+            val engine = when (name) {
+                "xelatex" -> "xetex"
+                "lualatex" -> "luahbtex"
+                else -> "pdftex"
+            }
+            if (!File(bin, engine).isFile) {
+                Log.w(TAG, "ensureTexFormats: $engine 缺失，跳过 $name")
+                continue
+            }
             // `latex` 的 ini 要用 `'*latex.ini'` 形式传：latex.ini 把 * 当输入文件，
             // 没有前导星号时 pdftex 会去读 `latex.ini` 里的 `\input` 而不是当格式源。
             val ini = if (name == "latex") "*latex.ini" else "$name.ini"
@@ -982,9 +1068,11 @@ class RuntimeInstaller(private val ctx: Context) {
                 "-progname=$name",
                 "-output-directory=${web2c.absolutePath}",
             )
-            // pdflatex 与 latex 都必须带 -etex / -translate-file（TeX Live 的
-            // fmtutil.cnf 里就是这么写的）；xelatex 只带 -etex。
-            if (name != "xelatex") argv.add("-translate-file=cp227.tcx")
+            // 参数按引擎特性分三档（与 fmtutil.cnf 的写法一致）：
+            //   · `-translate-file=cp227.tcx` 只有 pdftex 系认（pdflatex / latex）；
+            //     xetex 与 luahbtex 都不认这个选项。
+            //   · `-etex` 除 `latex` 外都要（latex 已用 `*latex.ini` 表达同一语义）。
+            if (name == "pdflatex" || name == "latex") argv.add("-translate-file=cp227.tcx")
             if (name != "latex") argv.add("-etex")
             argv.add(ini)
 
@@ -1200,7 +1288,7 @@ class RuntimeInstaller(private val ctx: Context) {
          *
          * 改动 patches.mjs 里任何补丁、或增删补丁时，必须同步递增此编号。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@3"
+        private const val PATCHSET_MARKER = "kxxy-patchset@4"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**
@@ -1278,14 +1366,28 @@ class RuntimeInstaller(private val ctx: Context) {
         /**
          * 安装期要生成的 TeX 格式文件名（不含 `.fmt` 后缀）。
          *
-         * 只做这三个：`pdflatex`（主流）、`latex`（DVI 路线，jdvips 类工具链
-         * 需要）、`xelatex`（CJK 与 OTF 字体）。`lualatex` 没做 —— 闭包里没有
-         * `luatex` 二进制（scheme-basic 不含），补了也没法生成。
+         * 四个都做：`pdflatex`（主流）、`latex`（DVI 路线，jdvips 类工具链
+         * 需要）、`xelatex`（CJK 与 OTF 字体）、`lualatex`（LuaTeX，HarfBuzz）。
          *
-         * 设备上实测每个 11~12 秒，三个合计约 35 秒，只在首次安装/格式缺失时
-         * 跑一次。生成参数见 [ensureTexFormats]。
+         * ⚠️ `lualatex` 曾经被排除，注释理由是「闭包里没有 luatex 二进制」——
+         * 这是**错的**。真机实测 `<root>/bin/luahbtex` 与 `luatex` 都在（都是
+         * `extensions/texlive/bin/texlive/` 的软链），`lualatex.ini` 也能被
+         * `kpsewhich` 命中，手工 `luahbtex -ini -jobname=lualatex -progname=lualatex
+         * -etex lualatex.ini` **只要 2 秒**就产出 6,859,642 B 的 fmt，之后
+         * `lualatex t.tex` 直接出 3,321 B 的 PDF。
+         *
+         * 设备上实测 pdftex/xetex 系每个 11~12 秒、luahbtex 约 2 秒，四个合计
+         * 约 37 秒，只在首次安装/格式缺失时跑一次。参数见 [ensureTexFormats]。
          */
-        private val TEX_FORMATS = listOf("pdflatex", "latex", "xelatex")
+        private val TEX_FORMATS = listOf("pdflatex", "latex", "xelatex", "lualatex")
+
+        /**
+         * `texlinks` 应当补出来的标准命令名（见 [ensureTexLinks]）。
+         *
+         * 只列用户真正会敲的四个 LaTeX 入口，不列全部 411 个引擎别名 ——
+         * 判据只用来决定「要不要再跑一次 texlinks」，列全了反而更慢。
+         */
+        private val TEX_LINK_NAMES = listOf("pdflatex", "latex", "xelatex", "lualatex")
 
         /**
          * `.fmt` 的下限体积。

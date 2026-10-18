@@ -25,6 +25,18 @@
     <!-- 设置页「系统权限」卡片请求电池优化白名单（kxxy://perm/request?name=battery） -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- ===== Termux:API 原生桥（缺陷 BE）所需的权限 =====
+         这些都是普通（normal）权限，安装即授予，不弹窗、无需运行时请求。
+         缺了它们，对应方法会在应用进程里抛 SecurityException 而不是静默 rc=0；
+         `TermuxApiServer` 会把异常原样转成 JSON error + 非零退出码，
+         所以即便某个权限被 OEM 收回，用户也能看到明确原因。 -->
+    <!-- termux-vibrate：真机实测缺它报
+         `SecurityException: vibrate: Neither user NNNNN nor current process has android.permission.VIBRATE` -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- termux-wifi-connectioninfo：缺它报
+         `WifiService: Neither user NNNNN nor current process has android.permission.ACCESS_WIFI_STATE` -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
     <application
         android:name=".KxxyApp"
         android:label="DSH Kxxy"
@@ -81,6 +93,26 @@
             android:exported="true"
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!--
+          文件分享用的只读 ContentProvider（缺陷 BE）。
+
+          为什么必须有：termux-share <file> 要把文件交给别的应用，而从
+          targetSdk>=24 起把 file:// 放进 Intent 会抛 FileUriExposedException
+          直接崩溃。工程没引 androidx，用不了官方 FileProvider，所以这里用
+          自写的等价实现（见 KxxyFilesProvider）。
+
+          三条属性缺一不可：
+          - exported="false"：别的应用不能主动查询本 provider，只能拿本应用
+            随 Intent 授出的单个 URI 的临时权限；
+          - grantUriPermissions="true"：允许签发临时读授权，否则接收方打不开；
+          - authorities 必须与 KxxyFilesProvider.AUTHORITY 逐字一致。
+        -->
+        <provider
+            android:name=".engine.KxxyFilesProvider"
+            android:authorities="app.kxxy.files"
+            android:exported="false"
+            android:grantUriPermissions="true" />
 
     </application>
 </manifest>

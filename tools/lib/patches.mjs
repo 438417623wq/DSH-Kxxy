@@ -867,10 +867,72 @@ export function patchDshManifest(ctx) {
   return `${added.join(" / ")} → 注册进 @deepseek-ai/dsh 的 dependencies（installation scope）`;
 }
 
+/**
+ * sharp：libvips 原生预编译产物没有 android 平台，图片附件一律准入失败。
+ *
+ * 症状（用户报，Android 16 真机）：纯文本与普通文件附件都能发，**只要带图片**
+ * 就报 `prompt rejected (session/agent-busy)`，全程无更具体的错误。
+ *
+ * 根因链：
+ *   1. `@deepseek-ai/dsh-api-session-controller` 的 `prompt()` 里，
+ *      `AttachmentError` 会被转成 `session/attachment-invalid`，而**其它任何
+ *      异常**都落到最后一行 `new RemoteError("session/agent-busy", "prompt rejected",
+ *      { reason: String(error) })` —— 所以 `agent-busy` 只是兜底包装。
+ *   2. `@deepseek-ai/dsh-attachment-local` 的 `detectImage()` / `normalizeImage()` /
+ *      `probeImage()` 里，`const sharp = requireSharp();` 写在 **try 之外**，
+ *      它抛的普通 `Error` 不会被包成 `AttachmentError` ⇒ 直接冒到上面那行。
+ *   3. `sharp/dist/libvips.cjs` 的 `prebuiltPlatforms` 里根本没有 android-*，
+ *      `sharp.cjs` 的 switch 也没有 android 分支 ⇒ Node 在 Android 上
+ *      （`process.platform === "android"`）解析出 `android-arm64` 后必抛
+ *      `Could not load the "sharp" module using the android-arm64 runtime`。
+ *   4. 闭包里 `sharp/` 与 `@img/` 都没有任何 `.node`，也没有 `@img/sharp-wasm32`
+ *      ⇒ 无预编译可用。
+ *
+ * 为什么普通文件能发：文件附件走 `saveFileVerbatim`，完全不经 sharp。
+ *
+ * 修法：**换整个 package**（与 `patchKoffi` 同一范式），用引擎自带的
+ * ImageMagick 7 实现 dsh-attachment-local 实际用到的那一小片 sharp API。
+ * 替身源码随仓库提交在 `tools/prebuilt/sharp-android/`（纯 JS，无原生依赖）。
+ *
+ * 安全性依据：全依赖树里 `require("sharp")` / `createLazyRequire("sharp")` 的
+ * 消费者**只有 dsh-attachment-local 一个**（构建期可复核），所以替换实现不会
+ * 波及别处。
+ */
+function patchSharp(ctx) {
+  if (!ctx.exists("sharp")) return "跳过（依赖树无 sharp）";
+  const NM = "sharp";
+  ctx.rmrf(NM);
+  ctx.write(
+    `${NM}/package.json`,
+    `${JSON.stringify(
+      {
+        name: "sharp",
+        version: "0.35.5-android-substitute",
+        description: "Android 替身：用引擎自带 ImageMagick 实现 dsh-attachment-local 用到的那一小片 sharp API",
+        type: "commonjs",
+        main: "./dist/index.cjs",
+        exports: {
+          ".": {
+            require: "./dist/index.cjs",
+            import: "./dist/index.cjs",
+            default: "./dist/index.cjs",
+          },
+        },
+        license: "Apache-2.0",
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  ctx.copy(prebuilt("sharp-android/dist/index.cjs"), `${NM}/dist/index.cjs`, 0o644);
+  return "sharp → ImageMagick 替身（原包无 android 预编译，必抛 android-arm64 加载失败）";
+}
+
 export function applyAllPatches(root, termuxRead) {
   const ctx = createPatchContext(root);
   const results = [
     patchKoffi(ctx),
+    patchSharp(ctx),
     patchNodePty(ctx),
     patchSubprocessInspector(ctx),
     patchFlock(ctx),

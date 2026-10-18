@@ -211,6 +211,49 @@ object EngineConfig {
     }
 
     /**
+     * Guile 的**预编译字节码**（`.go`）搜索路径 —— 缺陷 BC，性能修复。
+     *
+     * 这一条是 gdb「启动要 150 秒」的真正解药，与 [guileLoadPath]（源码路径）
+     * 完全独立：源码路径只解决「能不能启动」，这条解决「要等多久」。
+     *
+     * 真机 A/B（同一设备、同一份 gdb，`guile -c '1'` 各跑两次）：
+     *   什么都不设                        → 14 s / 13 s
+     *   只设 GUILE_AUTO_COMPILE=0         → 13 s   ← 关自动编译**毫无作用**
+     *   只设 GUILE_LOAD_COMPILED_PATH     →  0 s   ← 唯一有效的那一个
+     *   两者都设                          →  0 s
+     * 对应 `gdb --version`：151 s CPU / 2:37 墙钟 → 亚秒级。
+     *
+     * ⚠️ 旧注释里「AUTO_COMPILE=0 是纯粹收益（225 s vs 1837 s）」的结论是
+     * **测量假象**：两组都没设 LOAD_COMPILED_PATH，guile 每次都现场把
+     * `system/repl` 下的 `.scm`（`command.scm` 32 KB、`repl.scm` 8 KB ……）编译成
+     * 字节码，落不落盘只影响「下次是否重编」，量级都在百秒级。设上这条之后
+     * 编译产物直接被命中，**两条路一起消失**。
+     *
+     * 路径取 `<root>/lib/guile/3.0/ccache`：扩展里打包的预编译产物在
+     * `extensions/gdb/lib/guile/3.0/ccache`（344 个 `.go`），由 extinstall 的
+     * 合并视图摊到引擎根的 `lib/` 下 —— 与 `share/guile/3.0` 的源码树同构。
+     *
+     * 注意有 17 个辅助 `.scm`（`ice-9/psyntax.scm`、`system/repl/describe.scm`、
+     * `sxml/upstream` 下的几个 …）在 ccache 里没有对应 `.go`（上游不预编译它们，
+     * 都是被 `include` 进别的模块的），这些仍然只能解释执行 —— 但它们不是
+     * 那 150 秒的来源，实测不设本条时 `system repl` 一棵树就要 141 s。
+     *
+     * ⚠️ 上面几处路径**不能写成带星号的 glob**：KDoc 本身是块注释，
+     * 而 Kotlin 的块注释**支持嵌套** —— 路径里出现斜杠紧跟星号就被当成新的
+     * 注释开层，本段的结束标记只关掉内层，外层一直吞到文件末尾，报
+     * `Missing '}'` + `Unclosed comment` 两个完全不指向真因的错误。
+     */
+    private fun guileCompiledPath(root: File): String {
+        val merged = File(root, "lib/guile/3.0/ccache")
+        val inExt = File(root, "extensions/gdb/lib/guile/3.0/ccache")
+        return when {
+            merged.isDirectory -> merged.absolutePath
+            inExt.isDirectory -> inExt.absolutePath
+            else -> merged.absolutePath
+        }
+    }
+
+    /**
      * Emacs 的版本目录（`<root>/share/emacs/<版本>`），缺陷 BA。
      *
      * 版本号（当前 `31.1`）随包升级而变，所以扫 `share/emacs/` 取**字典序最大**
@@ -526,11 +569,22 @@ object EngineConfig {
             // FONTCONFIG_PATH / TESSDATA_PREFIX 走的是同一条路。扩展目录作为兜底，
             // 覆盖「刚装好但合并视图还没建立」的窗口。
             "GUILE_LOAD_PATH=${guileLoadPath(root)}",
-            // 关掉自动编译。真机对照实测（同一设备、同一份 gdb，各跑两次）：
-            //   AUTO_COMPILE=0 → 225 s / 238 s（纯解释，缓存目录 0 个 .go）
-            //   AUTO_COMPILE=1 → 1837 s / 1494 s（冷/热，只写出 4–5 个 .go）
-            // 带它慢 6–8 倍，而且几乎不落缓存（369 个 .scm 只编译出个位数），
-            // 每次启动都在重复同一份白工。关掉是纯粹的收益。
+            // Guile 的预编译字节码路径（缺陷 BC）。这一条才是 gdb 启动慢的解药：
+            // 只设它可以 151 s → 亚秒级，只设下面的 AUTO_COMPILE=0 则**毫无作用**
+            // （13–14 s 与不设持平）。真机 A/B 与推导详见 [guileCompiledPath]。
+            "GUILE_LOAD_COMPILED_PATH=${guileCompiledPath(root)}",
+            // 关掉自动编译。
+            //
+            // ⚠️ 这条的旧结论「AUTO_COMPILE=0 是纯粹收益（225 s vs 1837 s）」已被
+            // 推翻，见缺陷 BC：那两组测量**都没设 GUILE_LOAD_COMPILED_PATH**，
+            // guile 每次都在现场编译 `system/repl/*.scm`，落不落盘只是「下次重编」
+            // 的差别，量级都在百秒级。真正起作用的是上面那条编译路径。
+            //
+            // 保留 =0 的理由变成了「防御」：万一某个扩展的 ccache 缺 `.go`（或用户
+            // 动了 share/ 里的 .scm 让缓存过期），自动编译会试图把产物写回
+            // **只读的合并视图**、失败后每次启动重试一遍；而静态编译产物命中的
+            // 路径下它本来就不该被触发。真机实测两条都设 → 0 s，与只设编译路径持平，
+            // 所以保留它没有代价。
             //
             // ⚠️ 曾经的测量陷阱：早期探针写成 `gdb --version | head -1`，head
             // 读完一行就关管道、gdb 收 SIGPIPE 提前退出，自动编译循环被中断，

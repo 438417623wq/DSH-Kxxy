@@ -5,6 +5,7 @@ import android.util.Log
 import app.kxxy.engine.EngineSupervisor
 import app.kxxy.engine.ShizukuBridge
 import app.kxxy.engine.ShizukuShellServer
+import app.kxxy.engine.TermuxApiServer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -34,6 +35,11 @@ class KxxyApp : Application() {
         // Shizuku 执行通道的服务端：应用进程是唯一持有 binder 的地方，
         // 引擎侧脚本经文件请求/响应把命令送到这里执行。
         ShizukuShellServer.start(this, appScope)
+        // Termux:API 原生桥的服务端（缺陷 BE）。闭包里 libexec/termux-api 是
+        // 一个 execv 到 /data/data/com.termux/.../am 的 ELF，在本机必然失败且
+        // 静默 rc=0；这里把它换成脚本 shim，请求经文件通道回到应用进程执行。
+        // 必须在这里启动：Toast / 剪贴板 / 通知都要求应用进程的上下文。
+        TermuxApiServer.start(this, appScope)
         supervisor = EngineSupervisor(this)
         Log.i(TAG, "KxxyApp created, version=${BuildConfig.VERSION_NAME}")
     }

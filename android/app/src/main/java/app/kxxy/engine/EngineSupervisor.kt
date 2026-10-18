@@ -260,6 +260,10 @@ class EngineSupervisor(private val ctx: Context) {
                 // bin/，写在那里的 shz 会消失。放在启动路径上比在安装器里登记
                 // 「额外产物」更不容易漏（见 ShizukuShellServer.installGateScript）。
                 ShizukuShellServer.installGateScript(ctx)
+                // termux-api 的脚本 shim 同理必须每轮重装：闭包里的
+                // libexec/termux-api 是 ELF（execv 到不存在的 termux am），
+                // 重装 runtime 会让它复活。见 TermuxApiServer.installShim。
+                TermuxApiServer.installShim(ctx)
 
                 _state.value = State.Starting
                 proc = spawnEngine()

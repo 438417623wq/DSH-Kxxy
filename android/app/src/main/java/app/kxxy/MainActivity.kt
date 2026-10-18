@@ -221,8 +221,42 @@ class MainActivity : Activity() {
         if (requestCode != REQUEST_FILE_CHOOSER) return
         val callback = filePathCallback
         filePathCallback = null
-        // parseResult 兼容单选/多选（ClipData）与取消（resultCode != OK → null）
-        callback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data))
+        // 不能直接用 FileChooserParams.parseResult：它只读 data.getData()，
+        // 而系统 Photo Picker / HyperOS 文件选择器返回的是 ClipData-only 结果
+        // （getData()==null），会被解析成 null ⇒ WebView 当成「用户取消」，
+        // <input type=file> 的 change 永不触发，附件永远加不上。见缺陷 BD。
+        callback?.onReceiveValue(fileChooserResult(resultCode, data))
+    }
+
+    /**
+     * 文件选择结果的兜底解析（缺陷 BD）。
+     *
+     * 官方 `FileChooserParams.parseResult` 的实现只认 `Intent.getData()`：
+     *   - DocumentsUI 单选 → `setData(uri)`，能拿到；
+     *   - 系统 Photo Picker（`PhotoPickerGetContentActivity`）与部分 OEM
+     *     文件选择器 → 只 `setClipData(...)`，`getData()` 是 null ⇒ 解析出 null。
+     * 新版 WebView（Chromium 110+）客户端收到 null 就按「用户取消」处理，
+     * 于是 `input[type=file]` 的 `change` 不触发；WebView 104 这类老版本
+     * 自己还有 ClipData 分支，所以旧机型上看不出问题——这正是
+     * 「Android 13 能加、Android 16 加不上」的版本分化来源。
+     *
+     * 解析顺序：ClipData 全部条目 → `getData()` 兜底；取消返回 null。
+     */
+    private fun fileChooserResult(resultCode: Int, data: android.content.Intent?): Array<android.net.Uri>? {
+        if (resultCode == Activity.RESULT_CANCELED) return null
+        val picked = ArrayList<android.net.Uri>()
+        val clip = data?.clipData
+        if (clip != null) {
+            for (i in 0 until clip.itemCount) {
+                clip.getItemAt(i).uri?.let { picked.add(it) }
+            }
+        }
+        if (picked.isEmpty()) {
+            val single = data?.data ?: return null
+            picked.add(single)
+        }
+        Log.i(TAG, "file chooser result: ${picked.size} uri(s) ${picked.joinToString()}")
+        return picked.toTypedArray()
     }
 
     /**
