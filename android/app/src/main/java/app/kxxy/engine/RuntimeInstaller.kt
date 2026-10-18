@@ -7,6 +7,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
@@ -120,6 +121,13 @@ class RuntimeInstaller(private val ctx: Context) {
         Log.i(TAG, "runtime install complete")
         onProgress.onProgress(1f)
         ensureExtensionPool(root)
+
+        // 上面 :106/:107 那两趟是在扩展尚未解包时跑的（全新安装时 `extensions/`
+        // 还是空的，`texlinks` 与各引擎都不在），必然静默跳过。包池落盘后如果
+        // 扩展已经就位（升级/重装场景），这里补跑一次就能立刻可用，不必等下一次
+        // 启动走快路径。两个函数都是幂等的，且引擎缺失时开销接近零。
+        ensureTexLinks(root)
+        ensureTexFormats(root)
     }
 
     /**
@@ -960,31 +968,41 @@ class RuntimeInstaller(private val ctx: Context) {
     private fun ensureTexLinks(root: File) {
         runCatching {
             val bin = File(root, "bin")
-            val wanted = TEX_LINK_NAMES.map { File(bin, it) }
-            if (wanted.all { it.exists() }) return
+            if (TEX_LINK_NAMES.all { File(bin, it).exists() }) return
 
-            val texlinks = File(bin, "texlinks")
-            if (!texlinks.isFile) {
-                Log.w(TAG, "ensureTexLinks: texlinks 缺失，跳过")
-                return
-            }
-            val perl = File(bin, "perl")
-            if (!perl.isFile) {
-                Log.w(TAG, "ensureTexLinks: perl 缺失，跳过")
+            // texlinks 的真身**只**在扩展树里（`extensions/texlive/bin/texlive/texlinks`）：
+            // `runtime.zip` 里没有 `bin/texlinks`，整个 `extensions/` 都不在 zip 里 ——
+            // 它由 ext-pool 解包 + 插件 relinkAll 建立。而完整重装会把 `bin/` 与
+            // `lib/` 整体删空重建，此刻 `bin/texlinks` 还不存在，旧实现因此每次都
+            // 打「texlinks 缺失，跳过」然后静默放弃（缺陷 BD 的持久化根因）。
+            val extBin = File(EngineConfig.extensionsRoot(ctx), "texlive/bin/texlive")
+            val texlinks = listOf(File(extBin, "texlinks"), File(bin, "texlinks"))
+                .firstOrNull { it.isFile }
+            if (texlinks == null) {
+                Log.w(TAG, "ensureTexLinks: texlinks 缺失（扩展树与 bin/ 都没有），跳过")
                 return
             }
 
             val started = System.currentTimeMillis()
-            val pb = ProcessBuilder(perl.absolutePath, texlinks.absolutePath)
+            // texlinks 是 **shell 脚本**（10,284 B，首行 `#!<root>/bin/sh`），不是 perl
+            // 脚本 —— 旧实现 `ProcessBuilder(perl, texlinks)` 用 perl 去跑 shell 脚本，
+            // 必然失败。它有 shebang 与可执行位，直接 exec 即可。
+            val pb = ProcessBuilder(texlinks.absolutePath)
             pb.environment().clear()
-            pb.environment().putAll(
-                EngineConfig.buildEnv(ctx, EngineConfig.DEFAULT_PORT, "normal")
-                    .mapNotNull { line ->
-                        val i = line.indexOf('=')
-                        if (i <= 0) null else line.substring(0, i) to line.substring(i + 1)
-                    }
-                    .toMap()
-            )
+            val env = EngineConfig.buildEnv(ctx, EngineConfig.DEFAULT_PORT, "normal")
+                .mapNotNull { line ->
+                    val i = line.indexOf('=')
+                    if (i <= 0) null else line.substring(0, i) to line.substring(i + 1)
+                }
+                .toMap()
+                .toMutableMap()
+            // texlinks 靠 `kpsewhich` 定位 `fmtutil.cnf` 与各引擎。重装后
+            // `<root>/bin/kpsewhich` 要等插件 relinkAll 才出现，所以必须把扩展树的
+            // bin 目录也塞进 PATH —— 否则报 `kpsewhich: Permission denied` 再报
+            // `texlinks: config file 'fmtutil.cnf' not found.`（真机实测）。
+            val path = env["PATH"].orEmpty()
+            env["PATH"] = if (path.isEmpty()) extBin.absolutePath else "${extBin.absolutePath}:$path"
+            pb.environment().putAll(env)
             pb.directory(root)
             pb.redirectErrorStream(true)
             val out = File(EngineConfig.tmpDir(ctx), "texlinks.log")
@@ -993,15 +1011,58 @@ class RuntimeInstaller(private val ctx: Context) {
                 .onFailure { Log.w(TAG, "ensureTexLinks failed: ${it.message}") }
                 .getOrDefault(-1)
 
+            // texlinks 只把标准名建在**扩展树**里（`…/bin/texlive/pdflatex -> pdftex`），
+            // 不会碰 `<root>/bin/`。用户敲的是 `<root>/bin/pdflatex`，所以补一步。
+            val linked = linkExtensionBinaries(extBin, bin)
+
             val cost = System.currentTimeMillis() - started
-            val missing = TEX_LINK_NAMES.filterNot { File(bin, it).exists() }
-            if (missing.isEmpty()) {
-                Log.i(TAG, "ensureTexLinks: ${TEX_LINK_NAMES.size} 个标准命令就位 (rc=$rc, ${cost}ms)")
+            val still = TEX_LINK_NAMES.filterNot { File(bin, it).exists() }
+            if (still.isEmpty()) {
+                Log.i(TAG, "ensureTexLinks: ${TEX_LINK_NAMES.size} 个标准命令就位 (rc=$rc, 补链 $linked, ${cost}ms)")
             } else {
-                Log.w(TAG, "ensureTexLinks: 仍缺 ${missing.joinToString(",")} (rc=$rc, ${cost}ms)")
+                Log.w(TAG, "ensureTexLinks: 仍缺 ${still.joinToString(",")} (rc=$rc, 补链 $linked, ${cost}ms)")
             }
             runCatching { out.delete() }
         }.onFailure { Log.w(TAG, "ensureTexLinks failed: ${it.message}") }
+    }
+
+    /**
+     * 把扩展树里的标准 TeX 命令名补链进 `<root>/bin/`（只补缺失的，幂等）。
+     *
+     * 为什么必须有这一步：`collectBins`（`plugins/kxxy-host/lib/extinstall.mjs`）
+     * 在建 `.links.json` 时就把扩展 bin 目录里的文件展平进 `<root>/bin/` 并登记，
+     * 但 **`texlinks` 是在那之后才跑的** —— 它新建的 `pdflatex`/`latex`/`xelatex`/
+     * `lualatex` 等标准名一个都不在 `.links.json` 里，所以 `relinkAll` 永远不会
+     * 重建它们。重装一次 `bin/` 就全丢，这正是「修好的内容又被重建覆盖」的
+     * 直接机制（真机 `.links.json` 里 `pdflatex` 的 name-hits = 0 就是铁证）。
+     *
+     * **只补 [TEX_LINK_NAMES] 这四个**，不做全量遍历：扩展树 `bin/texlive/`
+     * 有 446 个文件（含 eptex/uptex 等别名与 411 个引擎变体），其余名字
+     * `relinkAll` 会从 `.links.json` 重建；这里全量补链会与它撞名，
+     * 而 `linkExact` 对已存在的目标行为不明确，没必要冒险。
+     *
+     * 用 `NOFOLLOW_LINKS` 判存在：悬空链接也算「已存在」，否则 `symlink` 抛
+     * EEXIST 后条目永远修不回来（与 `extinstall.mjs` 的 `isPresent` 同型）。
+     */
+    private fun linkExtensionBinaries(extBin: File, bin: File): Int {
+        bin.mkdirs()
+        var linked = 0
+        for (name in TEX_LINK_NAMES) {
+            val source = File(extBin, name)
+            if (!source.isFile) continue
+            val dest = File(bin, name)
+            val present = runCatching {
+                Files.exists(dest.toPath(), LinkOption.NOFOLLOW_LINKS)
+            }.getOrDefault(false)
+            if (present) continue
+            val ok = runCatching {
+                Files.createSymbolicLink(dest.toPath(), source.toPath())
+                true
+            }.onFailure { Log.w(TAG, "ensureTexLinks: symlink $name failed: ${it.message}") }
+                .getOrDefault(false)
+            if (ok) linked++
+        }
+        return linked
     }
 
     /**
@@ -1035,10 +1096,19 @@ class RuntimeInstaller(private val ctx: Context) {
         if (wanted.values.all { it.isFile && it.length() >= MIN_FMT_BYTES }) return
 
         val bin = File(root, "bin")
+        // `pdftex` / `xetex` / `luahbtex` 也**不在** `runtime.zip` 里，它们是扩展
+        // `texlive` 的文件经 `collectBins` 展平进 `bin/` 的。完整重装把 `bin/`
+        // 清空后、插件 relinkAll 之前，`bin/<engine>` 一律不存在 —— 旧实现直接
+        // 打「全缺，跳过」放弃（与 ensureTexLinks 同源，缺陷 BD）。
+        // 所以这里先看 `bin/`，回落扩展树。
+        val extBin = File(EngineConfig.extensionsRoot(ctx), "texlive/bin/texlive")
+        fun engineBin(name: String): File? =
+            listOf(File(bin, name), File(extBin, name)).firstOrNull { it.isFile }
+
         // pdftex / xetex / luahbtex 三者全缺才整体放弃。**逐个**判而不是一起判：
         // 闭包里某个引擎缺失时，其余格式仍然值得生成（真机上 `luahbtex` 是有的，
         // 早前注释错误地断定 scheme-basic 不含 luatex，导致 lualatex 长期没 fmt）。
-        if (!File(bin, "pdftex").isFile && !File(bin, "xetex").isFile && !File(bin, "luahbtex").isFile) {
+        if (engineBin("pdftex") == null && engineBin("xetex") == null && engineBin("luahbtex") == null) {
             Log.w(TAG, "ensureTexFormats: pdftex/xetex/luahbtex 全缺，跳过格式生成")
             return
         }
@@ -1054,7 +1124,8 @@ class RuntimeInstaller(private val ctx: Context) {
                 "lualatex" -> "luahbtex"
                 else -> "pdftex"
             }
-            if (!File(bin, engine).isFile) {
+            val engineFile = engineBin(engine)
+            if (engineFile == null) {
                 Log.w(TAG, "ensureTexFormats: $engine 缺失，跳过 $name")
                 continue
             }
@@ -1062,7 +1133,7 @@ class RuntimeInstaller(private val ctx: Context) {
             // 没有前导星号时 pdftex 会去读 `latex.ini` 里的 `\input` 而不是当格式源。
             val ini = if (name == "latex") "*latex.ini" else "$name.ini"
             val argv = mutableListOf(
-                File(bin, engine).absolutePath,
+                engineFile.absolutePath,
                 "-ini",
                 "-jobname=$name",
                 "-progname=$name",

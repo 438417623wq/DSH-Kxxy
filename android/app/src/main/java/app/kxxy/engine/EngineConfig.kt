@@ -380,20 +380,38 @@ object EngineConfig {
     private val perlArchName = Regex("^[a-z0-9_]+-[a-z0-9_]+$")
 
     private fun perlLibPath(root: File): String {
-        val base = File(root, "lib/perl5")
-        if (!base.isDirectory) return base.absolutePath
         val dirs = linkedSetOf<File>()
-        for (root5 in listOf(base, File(base, "site_perl"))) {
-            val versions = root5.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name } ?: continue
-            for (version in versions) {
-                dirs += version
-                version.listFiles()
-                    ?.filter { it.isDirectory && perlArchName.matches(it.name) }
-                    ?.sortedBy { it.name }
-                    ?.forEach { dirs += it }
+        // 候选根：合并视图 `lib/perl5` **加上**每个扩展自己的 `lib/perl5`。
+        //
+        // 为什么必须双份：`lib/perl5` 下的 `5.44.0` / `site_perl` 是插件
+        // `relinkAll` 建的软链视图（指向 `extensions/autotools/lib/perl5/…`），
+        // 而 `exiftool` 的 `Image/ExifTool.pm` 又是 relink 从
+        // `extensions/exiftool/lib/perl5/site_perl/5.44.0/Image` 再链进
+        // autotools 那一层的。完整重装会把 `lib/` 整体删空，此刻 relink 还没跑，
+        // `lib/perl5` 整棵树都不存在 ⇒ exiftool 报
+        // `Can't locate Image/ExifTool.pm in @INC`（缺陷 BD 的第二个出口）。
+        // 直接扫扩展树就不受 relink 时序影响。
+        val roots = linkedSetOf<File>()
+        File(root, "lib/perl5").let { roots += it }
+        File(root, "extensions").listFiles()
+            ?.filter { it.isDirectory }
+            ?.sortedBy { it.name }
+            ?.forEach { ext -> roots += File(ext, "lib/perl5") }
+        for (base in roots) {
+            if (!base.isDirectory) continue
+            for (root5 in listOf(base, File(base, "site_perl"))) {
+                val versions = root5.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name } ?: continue
+                for (version in versions) {
+                    dirs += version
+                    version.listFiles()
+                        ?.filter { it.isDirectory && perlArchName.matches(it.name) }
+                        ?.sortedBy { it.name }
+                        ?.forEach { dirs += it }
+                }
+                dirs += root5
             }
-            dirs += root5
         }
+        if (dirs.isEmpty()) return File(root, "lib/perl5").absolutePath
         return dirs.joinToString(":") { it.absolutePath }
     }
 
