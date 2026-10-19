@@ -104,6 +104,26 @@
     btnRestartEngine: document.getElementById('btn-restart-engine'),
     btnExportLogs: document.getElementById('btn-export-logs'),
 
+    // 体检视图元素（方案 K 常驻形态）
+    healthRing: document.getElementById('health-ring'),
+    healthRingIcon: document.getElementById('health-ring-icon'),
+    healthHeadline: document.getElementById('health-headline'),
+    healthSubline: document.getElementById('health-subline'),
+    healthChecks: document.getElementById('health-checks'),
+    healthCountBadge: document.getElementById('health-count-badge'),
+    healthRepairCard: document.getElementById('health-repair-card'),
+    healthRepairHint: document.getElementById('health-repair-hint'),
+    healthLevels: document.getElementById('health-levels'),
+    healthRepairFoot: document.getElementById('health-repair-foot'),
+    healthLastCard: document.getElementById('health-last-card'),
+    healthLastTime: document.getElementById('health-last-time'),
+    healthLastChanges: document.getElementById('health-last-changes'),
+    healthBusy: document.getElementById('health-busy'),
+    healthBusyTitle: document.getElementById('health-busy-title'),
+    healthBusyDesc: document.getElementById('health-busy-desc'),
+    btnHealthRefresh: document.getElementById('btn-health-refresh'),
+    btnHealthUndo: document.getElementById('btn-health-undo'),
+
     // 导航 Tab
     tabItems: document.querySelectorAll('.tab-item'),
     viewPanes: document.querySelectorAll('.view-pane')
@@ -1206,7 +1226,394 @@
   }
 
   // ==========================================
-  // 7. 轮询生命周期管理 (支持 visibilitychange)
+  // 7. 启动配置体检（方案 K 的常驻形态）
+  // ==========================================
+  //
+  // 为什么体检在前端做轮询而不是推送：体检本身很便宜（六个文件解析），
+  // 但引擎侧没有推送通道，且这个页面的刷新语义就是「我现在看一眼」。
+  // 用户切到体检页时拉一次，之后每 POLL_INTERVAL 拉一次。
+  //
+  // 为什么不自动定时刷新：解析三层 YAML 虽然快，但没必要在用户没看的时候
+  // 每 5 秒跑一遍。只在体检页可见时才轮询（见 initHealth 的可见性判断）。
+
+  /** 体检结果缓存：修复时要拿它的 level 决定推荐力度。 */
+  let lastHealth = null;
+  /** 体检轮询定时器（仅体检页可见时存在）。 */
+  let healthTimer = null;
+  /** 修复请求是否已发出、正在等引擎重启。 */
+  let recoveryPending = false;
+
+  const LEVEL_META = {
+    L1: {
+      title: 'L1 · 软恢复',
+      desc: '移走写坏的配置补丁，把插件列表收回核心三项。不删数据、不联网，可撤销。',
+      className: ''
+    },
+    L2: {
+      title: 'L2 · 隔离第三方插件',
+      desc: '在 L1 基础上把第三方插件挪到隔离区，插件包仍保留，随时能装回。',
+      className: ''
+    },
+    L3: {
+      title: 'L3 · 重建插件目录',
+      desc: '备份后整体重建 profile 的 node_modules，需要联网重新下载。不影响会话数据。',
+      className: 'danger'
+    }
+  };
+
+  async function fetchHealth(manual) {
+    if (!dom.healthChecks) return;
+    try {
+      const data = await apiGet('/kxxy/api/health');
+      lastHealth = data;
+      renderHealth(data);
+      if (manual) showToast('体检完成', 'success');
+    } catch {
+      // apiGet 已提示；这里把页面切到「读不到」而不是留旧数据骗人
+      if (dom.healthHeadline) dom.healthHeadline.textContent = '体检失败';
+      if (dom.healthSubline) dom.healthSubline.textContent = '无法连接引擎，稍后重试';
+      if (dom.healthRing) dom.healthRing.setAttribute('data-state', 'warn');
+      if (dom.healthRingIcon) dom.healthRingIcon.textContent = '!';
+    }
+  }
+
+  function renderHealth(data) {
+    if (!data) return;
+    const checks = Array.isArray(data.checks) ? data.checks : [];
+    const bad = checks.filter(c => c.verdict === 'BAD');
+    const unknown = checks.filter(c => c.verdict === 'UNKNOWN');
+
+    // ── 总评 ──────────────────────────────────────────────
+    let ringState = 'ok';
+    let ringIcon = '✓';
+    if (bad.length) {
+      ringState = 'bad';
+      ringIcon = '✕';
+    } else if (unknown.length) {
+      ringState = 'warn';
+      ringIcon = '!';
+    }
+    if (dom.healthRing) dom.healthRing.setAttribute('data-state', ringState);
+    if (dom.healthRingIcon) dom.healthRingIcon.textContent = ringIcon;
+    if (dom.healthHeadline) dom.healthHeadline.textContent = data.headline || '体检完成';
+    if (dom.healthSubline) {
+      const okCount = checks.length - bad.length - unknown.length;
+      dom.healthSubline.textContent = `${okCount}/${checks.length} 项正常`
+        + (bad.length ? ` · ${bad.length} 项有问题` : '')
+        + (unknown.length ? ` · ${unknown.length} 项无法验证` : '')
+        + ' · ' + formatClock(data.checkedAt);
+    }
+
+    // ── 检查项列表 ────────────────────────────────────────
+    if (dom.healthChecks) {
+      dom.healthChecks.innerHTML = '';
+      checks.forEach(item => {
+        const div = document.createElement('div');
+        div.className = 'check-item';
+
+        // 三态映射。UNKNOWN 刻意用中性灰：它是「我没法验证」，
+        // 染成绿色会让人误以为没问题，染成红色又是在报假警。
+        let iconClass = 'check-status-icon success';
+        let iconSymbol = '✓';
+        let badgeText = '正常';
+        if (item.verdict === 'BAD') {
+          iconClass = 'check-status-icon fail';
+          iconSymbol = '✕';
+          badgeText = '有问题';
+        } else if (item.verdict === 'UNKNOWN') {
+          iconClass = 'check-status-icon unknown';
+          iconSymbol = '–';
+          badgeText = '未知';
+        }
+
+        const fixHint = item.verdict === 'BAD' && item.fixHint
+          ? `<div class="check-fixhint">${escapeHtml(item.fixHint)}</div>`
+          : '';
+
+        div.innerHTML = `
+          <div class="${iconClass}" aria-hidden="true">${iconSymbol}</div>
+          <div class="check-content">
+            <div class="check-main">
+              <span class="check-name">${escapeHtml(item.title || item.code)}</span>
+              <span class="check-badge">${escapeHtml(badgeText)}</span>
+            </div>
+            <div class="check-detail">${escapeHtml(item.detail || '')}</div>
+            ${fixHint}
+          </div>
+        `;
+        dom.healthChecks.appendChild(div);
+      });
+    }
+
+    if (dom.healthCountBadge) {
+      dom.healthCountBadge.textContent = bad.length
+        ? `${bad.length} 项待修`
+        : (unknown.length ? `${unknown.length} 项未知` : '全部通过');
+    }
+
+    // ── 修复区 ────────────────────────────────────────────
+    // 只在真有 BAD 项时出现。全绿却给个「修复」按钮，用户会以为有隐患。
+    if (dom.healthRepairCard) {
+      dom.healthRepairCard.hidden = bad.length === 0;
+    }
+    if (bad.length && dom.healthLevels) {
+      renderRepairLevels(data.level || 'L1');
+    }
+
+    // ── 上次修复记录 ──────────────────────────────────────
+    const last = data.lastRecovery;
+    if (dom.healthLastCard) {
+      dom.healthLastCard.hidden = !last;
+    }
+    if (last) {
+      if (dom.healthLastTime) {
+        dom.healthLastTime.textContent = `${formatClock(last.createdAt)} · ${last.level}`
+          + (last.headline ? ` · ${last.headline}` : '');
+      }
+      if (dom.healthLastChanges) {
+        dom.healthLastChanges.innerHTML = '';
+        const changes = Array.isArray(last.changes) ? last.changes : [];
+        if (!changes.length) {
+          const empty = document.createElement('div');
+          empty.className = 'repair-change-item';
+          empty.textContent = '这次修复没有改动任何文件（配置本来就正常）。';
+          dom.healthLastChanges.appendChild(empty);
+        }
+        changes.forEach(text => {
+          const row = document.createElement('div');
+          row.className = 'repair-change-item';
+          row.innerHTML = `<span class="repair-change-dot"></span><span>${escapeHtml(text)}</span>`;
+          dom.healthLastChanges.appendChild(row);
+        });
+      }
+    }
+
+    // ── 撤销按钮 ──────────────────────────────────────────
+    if (dom.healthRepairFoot) {
+      dom.healthRepairFoot.hidden = !(data.recoveryCount > 0);
+    }
+  }
+
+  /**
+   * 渲染三档修复按钮。
+   *
+   * 推荐档由后端给（`data.level`）：后端看的是「哪一项坏了」，
+   * 运行时坏了才推荐 L3，配置坏了推荐 L1。前端不重复这套判断。
+   *
+   * 三档都始终可点（除了 L3 需二次确认），因为用户可能知道后端不知道
+   * 的事 —— 比如刚装了某个插件想整体回退。但推荐档必须显眼。
+   */
+  function renderRepairLevels(recommended) {
+    dom.healthLevels.innerHTML = '';
+    ['L1', 'L2', 'L3'].forEach(level => {
+      const meta = LEVEL_META[level];
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'repair-level'
+        + (level === recommended ? ' recommended' : '')
+        + (meta.className ? ` ${meta.className}` : '');
+      btn.innerHTML = `
+        <span class="repair-level-badge">${level}</span>
+        <span class="repair-level-text">
+          <span class="repair-level-title">${escapeHtml(meta.title)}${level === recommended ? ' · 推荐' : ''}</span>
+          <span class="repair-level-desc">${escapeHtml(meta.desc)}</span>
+        </span>
+        <svg class="repair-level-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M9 5L16 12L9 19" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      `;
+      btn.addEventListener('click', () => requestRecovery(level));
+      dom.healthLevels.appendChild(btn);
+    });
+  }
+
+  /**
+   * 发起修复。
+   *
+   * 通道：POST /kxxy/api/recovery → 引擎写 recovery.request →
+   * 原生 EngineSupervisor 的请求轮询消费 → RecoveryManager 执行 →
+   * 引擎重启 → 新进程写 recovery-result.json。
+   *
+   * 为什么不在引擎里直接修：修复要移文件、重写清单、重启自身进程 ——
+   * 一个进程没法体面地重启自己，而且引擎正在被修的目录里跑着。
+   */
+  async function requestRecovery(level) {
+    if (recoveryPending) {
+      showToast('上一次修复还在进行中', 'warning');
+      return;
+    }
+
+    // L3 会重建 node_modules（联网 + 耗时长），必须二次确认。
+    if (level === 'L3') {
+      const ok = confirm(
+        'L3 会备份并重建插件目录，需要联网重新下载依赖，可能需要几分钟。\n'
+        + '会话记录、工作区文件不受影响。\n\n确定继续吗？'
+      );
+      if (!ok) return;
+    }
+
+    recoveryPending = true;
+    setHealthBusy(true, `正在执行 ${level} 修复…`, '引擎会重启，完成后页面自动刷新');
+
+    try {
+      await apiPost('/kxxy/api/recovery', { level, headline: lastHealth ? lastHealth.headline : '' });
+      showToast(`${level} 修复已下发，引擎正在重启`, 'success');
+      // 引擎重启需要时间：轮询等它回来，回来后重新体检一次确认效果
+      pollAfterRecovery();
+    } catch {
+      recoveryPending = false;
+      setHealthBusy(false);
+    }
+  }
+
+  /**
+   * 修复后等待引擎恢复。
+   *
+   * 引擎重启期间所有 API 都会失败（连接被拒），所以这里不能用 apiGet
+   * （它会弹一堆「获取数据失败」的 toast）。改用裸 fetch + 吞掉异常，
+   * 直到 /api/health 能返回 200 为止。
+   *
+   * 最多等 90 秒（引擎启动 + 健康检查超时是 45 秒，留一倍余量），
+   * 超时就明确告诉用户「没等到」，而不是无限转圈。
+   */
+  function pollAfterRecovery() {
+    const deadline = Date.now() + 90_000;
+    const tick = async () => {
+      if (Date.now() > deadline) {
+        recoveryPending = false;
+        setHealthBusy(false);
+        showToast('引擎重启耗时较长，请稍后手动刷新体检页', 'warning');
+        return;
+      }
+      try {
+        const res = await fetch('/kxxy/api/health', { cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json();
+          lastHealth = data;
+          renderHealth(data);
+          recoveryPending = false;
+          setHealthBusy(false);
+          if (data.ok) {
+            showToast('修复完成，配置已恢复正常', 'success');
+          } else {
+            // 修复完还有红项：可能是 L1 解不了的问题，让用户看到真实结论
+            showToast('引擎已恢复，但仍有问题项，请查看下方结论', 'warning');
+          }
+          // 修复结果文件读一次，把「修了什么」补进页面
+          fetchRecoveryResult();
+          return;
+        }
+      } catch {
+        // 引擎还没起来，正常
+      }
+      setTimeout(tick, 2000);
+    };
+    setTimeout(tick, 3000);
+  }
+
+  /**
+   * 读原生层写的修复结果（recovery-result.json）。
+   *
+   * 与 /api/health 里的 lastRecovery 有重叠但不等价：lastRecovery 读的是
+   * 备份目录里的 manifest.json（持久、跨重启有效），result 是原生层刚写完
+   * 的那一次（可能包含失败原因）。两者都读，页面上以 lastRecovery 为准，
+   * 失败原因用 result 补充。
+   */
+  async function fetchRecoveryResult() {
+    try {
+      const data = await apiGet('/kxxy/api/recovery/result');
+      const result = data && data.result;
+      if (result && result.ok === false && result.error) {
+        showToast(`修复未完成：${result.error}`, 'error');
+      }
+    } catch {
+      // 读不到就算了，不影响主流程
+    }
+  }
+
+  async function undoLastRecovery() {
+    if (!confirm('撤销上次修复会把移走的配置文件放回去、恢复原来的插件列表，然后重启引擎。\n\n如果原来的配置本来就是坏的，撤销后引擎会再次起不来。确定继续吗？')) {
+      return;
+    }
+    setHealthBusy(true, '正在撤销…', '引擎会重启，完成后页面自动刷新');
+    try {
+      // 撤销同样是「请原生层动手」：引擎自己搬不动正在用的文件。
+      await apiPost('/kxxy/api/recovery', { level: 'UNDO' });
+      showToast('撤销已下发，引擎正在重启', 'success');
+      pollAfterRecovery();
+    } catch {
+      setHealthBusy(false);
+    }
+  }
+
+  function setHealthBusy(busy, title, desc) {
+    if (dom.healthBusy) dom.healthBusy.hidden = !busy;
+    if (busy && title && dom.healthBusyTitle) dom.healthBusyTitle.textContent = title;
+    if (busy && desc && dom.healthBusyDesc) dom.healthBusyDesc.textContent = desc;
+    // 修复期间禁用按钮，避免连点下发多次
+    if (dom.healthLevels) {
+      dom.healthLevels.querySelectorAll('.repair-level').forEach(b => {
+        b.disabled = busy;
+      });
+    }
+  }
+
+  /** 时间戳 → HH:mm:ss（体检页的时间显示，跨天不显示日期，够用）。 */
+  function formatClock(ms) {
+    if (!ms) return '—';
+    const d = new Date(Number(ms));
+    if (isNaN(d.getTime())) return '—';
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+
+  /**
+   * 体检页初始化。
+   *
+   * 轮询只在「体检页可见」时跑：
+   *   · 切到体检 tab → 立刻拉一次 + 开轮询
+   *   · 切走 → 停轮询（省电，也别在用户没看时反复解析 YAML）
+   *   · 整个页面隐藏（切后台）→ initLifecycle 会统一停掉所有轮询
+   *
+   * 注意：不能只在 init() 里拉一次 —— 用户可能开着体检页等引擎自己
+   * 恢复，这时候需要持续刷新才能看到状态变化。
+   */
+  function initHealth() {
+    if (dom.btnHealthRefresh) {
+      dom.btnHealthRefresh.addEventListener('click', () => fetchHealth(true));
+    }
+    if (dom.btnHealthUndo) {
+      dom.btnHealthUndo.addEventListener('click', undoLastRecovery);
+    }
+
+    // Tab 切换时控制体检轮询（复用 initTabSwitch 的点击，这里额外挂一个）
+    dom.tabItems.forEach(btn => {
+      btn.addEventListener('click', () => {
+        const target = btn.getAttribute('data-target');
+        if (target === 'health') startHealthPolling();
+        else stopHealthPolling();
+      });
+    });
+  }
+
+  function startHealthPolling() {
+    fetchHealth(false);
+    if (healthTimer) return;
+    healthTimer = setInterval(() => {
+      // 修复进行中时不要抢着刷新（引擎正在重启，拉了也是失败）
+      if (!recoveryPending) fetchHealth(false);
+    }, POLL_INTERVAL);
+  }
+
+  function stopHealthPolling() {
+    if (healthTimer) {
+      clearInterval(healthTimer);
+      healthTimer = null;
+    }
+  }
+
+  // ==========================================
+  // 8. 轮询生命周期管理 (支持 visibilitychange)
   // ==========================================
   function startPolling() {
     if (pollTimer) return;
@@ -1249,6 +1656,7 @@
     initActionButtons();
     initAboutDialog();
     initBatchActions();
+    initHealth();
     initLifecycle();
 
     // 启动初始拉取

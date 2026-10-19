@@ -86,6 +86,12 @@ object EngineConfig {
      */
     const val STDIN_REQUEST_FILE_NAME = "stdin.request"
 
+    /** 引擎 → 原生层的修复请求（kxxy-host 体检页「一键修复」写）。 */
+    const val RECOVERY_REQUEST_FILE_NAME = "recovery.request"
+
+    /** 原生层 → 引擎的修复结果（引擎重启后新进程读，页面上展示）。 */
+    const val RECOVERY_RESULT_FILE_NAME = "recovery-result.json"
+
     /** 运行时根目录。 */
     fun engineRoot(ctx: Context): File = File(ctx.filesDir, "engine")
 
@@ -113,6 +119,27 @@ object EngineConfig {
 
     /** 引擎请求向引擎 stdin 注入按键的文件（见 STDIN_REQUEST_FILE_NAME）。 */
     fun stdinRequestFile(ctx: Context): File = File(engineRoot(ctx), STDIN_REQUEST_FILE_NAME)
+
+    /**
+     * 引擎（kxxy-host 体检页）请求执行修复的文件。
+     *
+     * 与 restart.request 同一套文件交换机制，但载荷是 JSON（要带 level
+     * 和归因文案）。**为什么引擎不能自己修**：修复要移走配置、重写清单、
+     * 重建 node_modules，最后还得重启引擎进程 —— 一个进程没法体面地重启
+     * 自己，而且它正在被修的目录里跑着。所以引擎侧只写请求，原生层动手。
+     */
+    fun recoveryRequestFile(ctx: Context): File =
+        File(engineRoot(ctx), RECOVERY_REQUEST_FILE_NAME)
+
+    /**
+     * 原生层写完修复结果后落的文件（引擎重启后由新进程读，页面上展示）。
+     *
+     * 与备份目录里的 manifest.json 有重叠但不等价：manifest 是持久的、
+     * 跨重启有效的「改了什么」；result 是「这一次执行成功还是失败、
+     * 失败原因是什么」—— 失败时根本不会有备份目录，只能靠它。
+     */
+    fun recoveryResultFile(ctx: Context): File =
+        File(engineRoot(ctx), RECOVERY_RESULT_FILE_NAME)
 
     /**
      * 宿主偏好文件（kxxy-host 插件写的 set-priv-mode / set-toggle 落在这里）。

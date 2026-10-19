@@ -358,7 +358,93 @@
         </div>
       </section>
 
-      <!-- 3. 设置视图 -->
+      <!-- 3. 体检视图（方案 K 的常驻形态） -->
+      <!--
+        为什么单独一页而不是塞进设置：这是「随时想知道下次重启会不会挂」的
+        高频入口，塞进设置深处等于没有。它和概览页的「运行时完整性检查」也不
+        是一回事 —— 那边查的是运行时文件在不在，这边查的是「配置能不能被引擎
+        解析」，后者才是真正让引擎起不来的那类问题。
+      -->
+      <section class="view-pane" data-view="health" id="view-health">
+        <!-- 总评卡：一眼看到结论 -->
+        <div class="card health-hero" id="health-hero">
+          <div class="health-hero-main">
+            <div class="health-ring" id="health-ring" data-state="loading">
+              <svg viewBox="0 0 44 44" aria-hidden="true">
+                <circle class="ring-track" cx="22" cy="22" r="19"/>
+                <circle class="ring-fill" cx="22" cy="22" r="19"/>
+              </svg>
+              <span class="health-ring-icon" id="health-ring-icon">…</span>
+            </div>
+            <div class="health-hero-text">
+              <h2 class="health-headline" id="health-headline">正在体检…</h2>
+              <span class="health-subline" id="health-subline">解析三层配置与运行时</span>
+            </div>
+          </div>
+          <button class="icon-button" id="btn-health-refresh" title="重新体检" aria-label="重新体检">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- 检查项：逐层列出，坏的那条自己会说话 -->
+        <div class="card block-card">
+          <div class="card-title-row">
+            <div class="card-title-group">
+              <h3 class="card-title">启动配置检查</h3>
+              <span class="card-subtitle">每次重启引擎都会重新读这些文件，任何一条坏了都起不来</span>
+            </div>
+            <span class="badge badge-subtle" id="health-count-badge">—</span>
+          </div>
+          <div class="check-list" id="health-checks">
+            <div class="check-item">
+              <div class="check-status-icon" aria-hidden="true">…</div>
+              <div class="check-content">
+                <div class="check-main"><span class="check-name">正在读取…</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 修复区：力度由检查结果决定，默认只给最轻的那档 -->
+        <div class="card block-card" id="health-repair-card" hidden>
+          <div class="card-title-group">
+            <h3 class="card-title">修复</h3>
+            <span class="card-subtitle" id="health-repair-hint">修复会重启引擎，当前页面会短暂断开</span>
+          </div>
+
+          <div class="repair-levels" id="health-levels"></div>
+        </div>
+
+        <!-- 上次修复记录 + 撤销入口。
+             撤销按钮必须挂在这里而不是「修复」卡里：修复成功后检查全绿、
+             修复卡会被整块隐藏（缺陷 BW 的原始症状），按钮跟着一起消失
+             就等于把「可撤销」的承诺吞掉了。 -->
+        <div class="card block-card" id="health-last-card" hidden>
+          <div class="card-title-group">
+            <h3 class="card-title">上次修复</h3>
+            <span class="card-subtitle" id="health-last-time">—</span>
+          </div>
+          <div class="repair-changes" id="health-last-changes"></div>
+          <div class="repair-foot" id="health-repair-foot" hidden>
+            <button class="button button-subtle button-block" id="btn-health-undo">撤销上次修复</button>
+          </div>
+        </div>
+
+        <!-- 修复进行中的遮罩提示（引擎重启会断连，给用户明确预期） -->
+        <div class="card block-card health-busy" id="health-busy" hidden>
+          <div class="health-busy-inner">
+            <span class="health-busy-spinner" aria-hidden="true"></span>
+            <div>
+              <div class="health-busy-title" id="health-busy-title">正在修复…</div>
+              <div class="health-busy-desc" id="health-busy-desc">引擎将重启，页面会自动重连</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. 设置视图 -->
       <section class="view-pane" data-view="settings" id="view-settings">
         <!-- 外观（读写官方 ui-theme 偏好：控制台与对话界面同步生效） -->
         <div class="card block-card">
@@ -594,6 +680,15 @@
             </svg>
           </div>
           <span class="tab-label">扩展</span>
+        </button>
+
+        <button class="tab-item" data-target="health">
+          <div class="tab-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12h4l2.5-6 4 12 2.5-6h5"/>
+            </svg>
+          </div>
+          <span class="tab-label">体检</span>
         </button>
 
         <button class="tab-item" data-target="settings">

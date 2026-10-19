@@ -1,4 +1,4 @@
-/* kxxy-host@14 */
+/* kxxy-host@17 */
 /**
  * kxxy-host — DSH Kxxy 宿主管理页插件。
  *
@@ -36,6 +36,7 @@ import { join, dirname, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import * as extinstall from './extinstall.mjs'
+import * as health from './health.mjs'
 import * as mirror from './mirror.mjs'
 import { tarGzSync } from './tar.mjs'
 
@@ -1063,6 +1064,101 @@ export function apply(ctx) {
               'cache-control': 'no-store',
             })
             res.end(buf)
+            return
+          }
+
+          // ── 启动配置体检（方案 K 的常驻形态）───────────────────────
+          //
+          // 只读：解析三层补丁、profile 清单、宿主覆盖层、扩展目录、
+          // 运行时锚点。引擎健康时随时可调，不写盘、不重启。
+          //
+          // 为什么不是「等引擎崩了再诊断」：原生侧 RecoveryProbe 只能在
+          // BootstrapActivity 的 Failed 分支跑，而用户真正想要的是提前
+          // 知道「下次重启会不会挂」。体检放在这里才能满足这个诉求。
+          if (path === '/kxxy/api/health' && req.method === 'GET') {
+            // 体检绝不能把宿主插件搞崩。它要读用户配置文件、按路径推导
+            // 引擎根，任何一处意外（权限、路径不存在、解析器缺失）都可能
+            // 抛异常 —— 而这个路由挂在引擎进程内，未捕获异常会带走整个
+            // 宿主插件，让「体检」本身变成故障源。所以兜住，把错误当成
+            // 一条诊断结果返回。
+            try {
+              sendJson(res, 200, health.runHealthCheck(extinstall.engineRoot()))
+            } catch (e) {
+              sendJson(res, 500, {
+                ok: false,
+                headline: '体检执行失败',
+                level: 'NONE',
+                checks: [],
+                error: String(e?.stack ?? e?.message ?? e),
+              })
+            }
+            return
+          }
+
+          // 修复请求：写 recovery.request，由原生 EngineSupervisor 的
+          // 请求轮询消费（与 restart.request / stdin.request 同一机制）。
+          //
+          // 引擎进程没法修自己 —— 修复要移文件、重写清单、重启进程，
+          // 这些只有原生层能做。所以这里只落一个请求文件就返回 202，
+          // 前端轮询 /api/health 看结果。
+          if (path === '/kxxy/api/recovery' && req.method === 'POST') {
+            const raw = await readBody(req)
+            let payload
+            try {
+              payload = JSON.parse(raw || '{}')
+            } catch {
+              sendJson(res, 400, { error: 'invalid json' })
+              return
+            }
+            const level = String(payload.level ?? 'L1').toUpperCase()
+            // UNDO 走同一条通道：撤销同样是「请原生层动手」——它要搬回
+            // 文件、恢复 bundle 列表、重启引擎，引擎自己做不到。
+            if (!['L1', 'L2', 'L3', 'UNDO'].includes(level)) {
+              sendJson(res, 400, { error: `invalid level: ${level}` })
+              return
+            }
+            const root = extinstall.engineRoot()
+            if (!root) {
+              sendJson(res, 500, { error: 'engine root unknown' })
+              return
+            }
+            try {
+              writeFileSync(
+                join(root, 'recovery.request'),
+                `${JSON.stringify({
+                  level,
+                  headline: String(payload.headline ?? ''),
+                  requestedAt: Date.now(),
+                }, null, 2)}\n`,
+              )
+            } catch (e) {
+              sendJson(res, 500, { error: String(e?.message ?? e) })
+              return
+            }
+            ctx.logger?.info?.(`[kxxy-host] recovery requested: ${level}`)
+            sendJson(res, 202, {
+              accepted: true,
+              level,
+              note: '已请求原生层修复，引擎会重启',
+            })
+            return
+          }
+
+          // 最近一次修复的执行结果（原生层写 recovery-result.json）。
+          // 引擎重启后新进程读它，页面就能显示「上次修了什么」。
+          if (path === '/kxxy/api/recovery/result' && req.method === 'GET') {
+            const root = extinstall.engineRoot()
+            const file = root ? join(root, 'recovery-result.json') : ''
+            if (!file || !existsSync(file)) {
+              sendJson(res, 200, { pending: false, result: null })
+              return
+            }
+            try {
+              const raw = readFileSync(file, 'utf8').replace(/^\uFEFF/, '')
+              sendJson(res, 200, { pending: false, result: JSON.parse(raw) })
+            } catch (e) {
+              sendJson(res, 200, { pending: false, result: null, error: String(e?.message ?? e) })
+            }
             return
           }
 

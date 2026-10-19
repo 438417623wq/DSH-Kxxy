@@ -16,11 +16,12 @@
  */
 
 import { createServer, request as httpRequest } from 'node:http'
-import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { openZip } from './lib/zipread.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = join(HERE, '..', 'plugins', 'kxxy-host', 'lib', 'index.js')
@@ -284,7 +285,7 @@ if (indexTaps.length === 1) {
 const server = createServer((req, res) => {
   const path = String(req.url ?? '/').split('?')[0]
   const h = exact.get(path)
-  if (h) return void h(req, res)
+  if (h) return void run(h, req, res)
   // 最长前缀优先（官方实现即如此，避免 /a 抢走 /a/b 的请求）
   let best = null
   for (const [p, handler] of prefixes) {
@@ -292,19 +293,66 @@ const server = createServer((req, res) => {
     if (path !== p && !path.startsWith(`${p}/`)) continue
     if (best === null || p.length > best[0].length) best = [p, handler]
   }
-  if (best) return void best[1](req, res)
+  if (best) return void run(best[1], req, res)
   res.writeHead(404, { 'content-type': 'text/plain' })
   res.end('not found')
 })
+
+/**
+ * 调 handler 并把异常暴露成断言失败。
+ *
+ * 不这样做的话，handler 里的异常会变成未处理的 Promise 拒绝 —— 连接被
+ * 直接断开，客户端只看到 `fetch failed / ECONNRESET`，完全看不出是哪条
+ * 路由、什么原因。冒烟测试的价值就在「失败时能立刻定位」，所以这里必须
+ * 兜住并打印。
+ */
+function run(handler, req, res) {
+  if (process.env.SMOKE_TRACE) console.log(`  · REQ ${req.method} ${req.url}`)
+  const onError = (e) => {
+    fail(`handler 抛异常：${String(req.url)} → ${e?.stack ?? e?.message ?? e}`)
+    if (!res.headersSent) {
+      res.writeHead(500)
+      res.end('handler error')
+    } else {
+      res.destroy()
+    }
+  }
+  // 客户端侧的 ECONNRESET 完全看不出是哪条路由断的 —— 连接被销毁时
+  // 请求已经发出去了，错误只落在 fetch 那一侧。所以在服务端留一条
+  // 兜底：socket 在响应结束前就关掉，直接报出来。
+  res.on('close', () => {
+    if (!res.writableEnded) fail(`响应未完成就关闭：${String(req.url)}（handler 提前销毁了连接）`)
+  })
+  try {
+    const r = handler(req, res)
+    if (r && typeof r.catch === 'function') r.catch(onError)
+  } catch (e) {
+    onError(e)
+  }
+}
 
 await new Promise((r) => server.listen(0, '127.0.0.1', r))
 const base = `http://127.0.0.1:${server.address().port}`
 console.log(`  测试服务器：${base}\n`)
 
 async function get(path, headers = {}) {
-  const res = await fetch(base + path, { headers })
-  const text = await res.text()
-  return { status: res.status, type: res.headers.get('content-type'), text }
+  // 网络层失败**不能**让整个冒烟脚本崩掉：那会把「一条断言失败」变成
+  // 「后面所有断言一条都没跑」，而且输出缓冲在崩溃时可能丢失，连是哪条
+  // 路由断的都看不出来。返回 status 0 + 错误文本，让它变成一条正常的 ✗。
+  //
+  // `connection: close`：媒体用例里有几处 `res.destroy()`（流错误、客户端
+  // 提前断开），undici 的连接池仍可能把那条半死的 socket 留在池里复用，
+  // 下一条请求就报 ECONNRESET —— 实测正是 /api/health 的第一条断言。
+  // 冒烟测试要的是确定性，不是压测连接复用，所以每条请求都新开连接。
+  try {
+    const res = await fetch(base + path, {
+      headers: { connection: 'close', ...headers },
+    })
+    const text = await res.text()
+    return { status: res.status, type: res.headers.get('content-type'), text }
+  } catch (e) {
+    return { status: 0, type: null, text: `fetch failed: ${e?.cause?.code ?? e?.message ?? e}` }
+  }
 }
 
 /**
@@ -841,6 +889,277 @@ console.log('\n[14] /kxxy/media（音视频流式路由）')
   })
   if (evilHost.status !== 403) fail(`非回环 Host 应 403，实为 ${evilHost.status}`)
   else ok('非回环 Host → 403（与 /kxxy/api 同等严格）')
+}
+
+console.log('\n[14b] /kxxy/api/health（启动配置体检）')
+{
+  // 体检是**只读**的，但它依赖 DSH_HOME 指向真实的 profile 目录 ——
+  // 这里造一个临时 home，逐项喂「好/坏」两种内容，断言判定与建议力度。
+  //
+  // 为什么值得单独测：这套判定是「一键修复」的唯一依据。判错了要么
+  // 白改用户配置（假阳性），要么把真问题放过（假阴性）—— 两种都比
+  // 不做体检更糟。而它全是纯函数式的文件解析，正好可以在 CI 里钉住。
+
+  // ---- 夹具：把 FAKE_ENGINE_ROOT 补成一个「健康的引擎根」 ----------------
+  //
+  // 不补的话 RUNTIME / OVERLAY 两项永远 BAD，基线就永远不是全绿，后面
+  // 每个断言都要为这两项写例外 —— 测试会变得没人敢改。
+  //
+  // 解析器必须真给：仓库里没有 node_modules，`require('js-yaml')` 在开发机
+  // 上必然失败，所有 YAML 项会退化成 UNKNOWN，等于判定逻辑一行都没测到。
+  // 所以从 runtime.zip 里把 js-yaml 解出来（体检模块会按 KXXY_ENGINE_ROOT
+  // 找 lib/node_modules，正好命中）。
+  {
+    const engineRoot = FAKE_ENGINE_ROOT
+    const nm = join(engineRoot, 'lib', 'node_modules')
+    mkdirSync(join(engineRoot, 'bin'), { recursive: true })
+    mkdirSync(join(nm, '@deepseek-ai', 'dsh', 'lib'), { recursive: true })
+    mkdirSync(join(nm, 'kxxy-host'), { recursive: true })
+
+    writeFileSync(join(engineRoot, 'bin', 'node'), '#!/bin/sh\n', { mode: 0o755 })
+    writeFileSync(join(nm, '@deepseek-ai', 'dsh', 'lib', 'bin.js'), '// fixture\n')
+    writeFileSync(join(nm, 'kxxy-host', 'package.json'), '{"name":"kxxy-host"}\n')
+    writeFileSync(join(engineRoot, 'android-overlay.yml'), '- id: sandbox-policy\n  config: {}\n')
+
+    const zipPath = join(HERE, '..', 'android', 'app', 'src', 'main', 'assets', 'runtime.zip')
+    if (!existsSync(zipPath)) {
+      fail(`夹具缺失：${zipPath} 不存在，无法解出 js-yaml`)
+    } else {
+      const zip = openZip(zipPath)
+      const prefix = 'lib/node_modules/js-yaml/'
+      const files = zip.names().filter((n) => n.startsWith(prefix) && !n.endsWith('/'))
+      let written = 0
+      for (const name of files) {
+        const rel = name.slice(prefix.length)
+        const dest = join(nm, 'js-yaml', rel)
+        mkdirSync(dirname(dest), { recursive: true })
+        const data = zip.read(name)
+        if (data) {
+          writeFileSync(dest, data)
+          written += 1
+        }
+      }
+      if (written < 10) fail(`只解出 ${written} 个 js-yaml 文件，夹具不完整`)
+      else ok(`夹具：从 runtime.zip 解出 js-yaml（${written} 个文件）`)
+    }
+  }
+
+  const HOME_DIR = mkdtempSync(join(tmpdir(), 'kxxy-health-'))
+  const profileDir = join(HOME_DIR, 'profiles', 'web')
+  mkdirSync(profileDir, { recursive: true })
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = HOME_DIR
+
+  try {
+    // ① 全绿基线：合法的三层配置 + 核心三项 bundle。
+    writeFileSync(join(profileDir, 'cordis.patch.yml'),
+      '- id: ui-theme\n  config:\n    preference: light\n')
+    writeFileSync(join(profileDir, 'package.json'), JSON.stringify({
+      name: 'dsh-profile-web',
+      private: true,
+      dependencies: { 'dsh-web-mobile': '3.1.0' },
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-web-mobile'] } },
+    }, null, 2))
+
+    const good = await get('/kxxy/api/health')
+    if (good.status !== 200) fail(`状态码 ${good.status}`)
+    else {
+      const j = JSON.parse(good.text)
+      if (!Array.isArray(j.checks) || !j.checks.length) fail('checks 为空')
+      else ok(`返回 ${j.checks.length} 项检查`)
+      if (j.ok !== true) fail(`合法配置应判 ok=true，实为 ${j.ok}（${j.headline}）`)
+      else ok('合法配置 → ok=true，无需修复')
+      if (j.level !== 'NONE') fail(`无需修复时 level 应为 NONE，实为 ${j.level}`)
+      else ok('level=NONE（不给修复按钮）')
+      const bad = j.checks.filter((c) => c.verdict === 'BAD')
+      if (bad.length) fail(`不应有 BAD 项：${bad.map((c) => `${c.code}:${c.detail}`).join(' | ')}`)
+      else ok('无 BAD 项')
+    }
+
+    // ② 空补丁文件：官方 yaml.load('') → undefined → 非数组 → 启动终止。
+    //    这是最容易被想反的一格（「空文件 = 没配置 = 没问题」），必须钉住。
+    writeFileSync(join(profileDir, 'cordis.patch.yml'), '   \n\n')
+    {
+      const j = JSON.parse((await get('/kxxy/api/health')).text)
+      const c = j.checks.find((x) => x.code === 'PROFILE_PATCH')
+      if (!c) fail('缺 PROFILE_PATCH 项')
+      else if (c.verdict !== 'BAD') fail(`空补丁应判 BAD，实为 ${c.verdict}`)
+      else ok('空补丁文件 → BAD（官方会判非数组）')
+      if (j.level !== 'L1') fail(`配置坏应建议 L1，实为 ${j.level}`)
+      else ok('建议力度 L1')
+    }
+
+    // ③ YAML 语法坏：引号未闭合（真机上抓到的原始故障形态）。
+    writeFileSync(join(profileDir, 'cordis.patch.yml'), 'preference: "light\n')
+    {
+      const j = JSON.parse((await get('/kxxy/api/health')).text)
+      const c = j.checks.find((x) => x.code === 'PROFILE_PATCH')
+      if (c?.verdict !== 'BAD') fail(`坏 YAML 应判 BAD，实为 ${c?.verdict}`)
+      else ok(`坏 YAML → BAD（${c.detail.slice(0, 60)}…）`)
+    }
+
+    // ④ 顶层不是数组：合法的 YAML，但官方要求数组。
+    writeFileSync(join(profileDir, 'cordis.patch.yml'), 'id: ui-theme\nconfig: {}\n')
+    {
+      const j = JSON.parse((await get('/kxxy/api/health')).text)
+      const c = j.checks.find((x) => x.code === 'PROFILE_PATCH')
+      if (c?.verdict !== 'BAD') fail(`非数组应判 BAD，实为 ${c?.verdict}`)
+      else ok('顶层非数组 → BAD')
+    }
+
+    // ⑤ 数组元素不是 mapping。
+    writeFileSync(join(profileDir, 'cordis.patch.yml'), '- just-a-string\n')
+    {
+      const j = JSON.parse((await get('/kxxy/api/health')).text)
+      const c = j.checks.find((x) => x.code === 'PROFILE_PATCH')
+      if (c?.verdict !== 'BAD') fail(`非 mapping 条目应判 BAD，实为 ${c?.verdict}`)
+      else ok('条目非 mapping → BAD')
+    }
+
+    // ⑥ 恢复成合法补丁，改坏 manifest：核心 bundle 被删掉。
+    writeFileSync(join(profileDir, 'cordis.patch.yml'), '- id: ui-theme\n')
+    writeFileSync(join(profileDir, 'package.json'), JSON.stringify({
+      name: 'dsh-profile-web',
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
+    }))
+    {
+      const j = JSON.parse((await get('/kxxy/api/health')).text)
+      const c = j.checks.find((x) => x.code === 'MANIFEST')
+      if (c?.verdict !== 'BAD') fail(`核心 bundle 缺失应判 BAD，实为 ${c?.verdict}`)
+      else ok(`核心 bundle 缺失 → BAD（${c.detail}）`)
+    }
+
+    // ⑦ manifest 是坏 JSON：官方 readProfileManifest 直接抛错。
+    writeFileSync(join(profileDir, 'package.json'), '{ "name": "x", ')
+    {
+      const j = JSON.parse((await get('/kxxy/api/health')).text)
+      const c = j.checks.find((x) => x.code === 'MANIFEST')
+      if (c?.verdict !== 'BAD') fail(`坏 JSON 应判 BAD，实为 ${c?.verdict}`)
+      else ok('坏 JSON → BAD')
+    }
+
+    // ⑧ BOM：官方 JSON.parse 不剥 BOM，而原生侧剥了 —— 这个不一致正是
+    //    缺陷 C 的土壤，必须判 BAD 才能让用户看到真实原因。
+    writeFileSync(join(profileDir, 'package.json'),
+      '\uFEFF' + JSON.stringify({ name: 'x', dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-web-mobile'] } } }))
+    {
+      const j = JSON.parse((await get('/kxxy/api/health')).text)
+      const c = j.checks.find((x) => x.code === 'MANIFEST')
+      if (c?.verdict !== 'BAD') fail(`BOM 应判 BAD，实为 ${c?.verdict}`)
+      else ok('带 BOM → BAD（官方 JSON.parse 会失败）')
+    }
+
+    // ⑨ home 级补丁：不存在是正常态，必须是 OK 而不是 BAD。
+    {
+      const j = JSON.parse((await get('/kxxy/api/health')).text)
+      const c = j.checks.find((x) => x.code === 'HOME_PATCH')
+      if (c?.verdict !== 'OK') fail(`缺失的 home 补丁应为 OK（跳过属正常），实为 ${c?.verdict}`)
+      else ok('home 补丁不存在 → OK（正常跳过）')
+    }
+
+    // ⑩ 覆盖层缺失 → BAD（引擎能起来但沙箱/权限全失效，属隐性故障）。
+    //    夹具里是**有** android-overlay.yml 的（否则基线不可能全绿），
+    //    所以这一格必须真的把它删掉再断言 —— 不删就永远测不到这条。
+    {
+      rmSync(join(FAKE_ENGINE_ROOT, 'android-overlay.yml'), { force: true })
+      const j = JSON.parse((await get('/kxxy/api/health')).text)
+      const c = j.checks.find((x) => x.code === 'OVERLAY')
+      if (c?.verdict !== 'BAD') fail(`缺失覆盖层应判 BAD，实为 ${c?.verdict}`)
+      else ok('覆盖层缺失 → BAD')
+    }
+
+    // ⑩b 扩展目录：`engine/extensions/<id>/` 是 deb 解出来的纯目录树，
+    //     **没有 package.json**。首版按 npm 包直觉去查它，25 个扩展全被判红
+    //     （真机实测），而且用户无从修 —— 典型的「假红项比不报更糟」。
+    //     判据是 `.links.json`（扩展中心真正依赖的接入点清单）。
+    {
+      const extRoot = join(FAKE_ENGINE_ROOT, 'extensions')
+      // 正常扩展：只有 bin/lib/share，没有 package.json，但有合法 .links.json
+      mkdirSync(join(extRoot, 'ffmpeg', 'bin'), { recursive: true })
+      writeFileSync(join(extRoot, 'ffmpeg', '.links.json'), JSON.stringify({ views: [] }))
+      writeFileSync(join(extRoot, 'ffmpeg', '.ext-version'), '7.0.0\n')
+      {
+        const j = JSON.parse((await get('/kxxy/api/health')).text)
+        const c = j.checks.find((x) => x.code === 'EXTENSIONS')
+        if (c?.verdict !== 'OK') fail(`无 package.json 的扩展目录应判 OK，实为 ${c?.verdict}（${c?.detail}）`)
+        else ok('扩展目录无 package.json → OK（判据是 .links.json）')
+      }
+      // 坏 .links.json → BAD
+      writeFileSync(join(extRoot, 'ffmpeg', '.links.json'), '{ "views": [ ')
+      {
+        const j = JSON.parse((await get('/kxxy/api/health')).text)
+        const c = j.checks.find((x) => x.code === 'EXTENSIONS')
+        if (c?.verdict !== 'BAD') fail(`坏 .links.json 应判 BAD，实为 ${c?.verdict}`)
+        else ok('坏 .links.json → BAD')
+      }
+      // 安装没跑完（只有目录、没有 .links.json）→ OK，不能报红。
+      // 注意：上一格把 ffmpeg 的 .links.json 改坏了，这里必须先修回来，
+      // 否则 EXTENSIONS 的整体结论仍是 BAD，测不到「跳过」这条分支。
+      writeFileSync(join(extRoot, 'ffmpeg', '.links.json'), JSON.stringify({ views: [] }))
+      mkdirSync(join(extRoot, 'halfway', 'bin'), { recursive: true })
+      writeFileSync(join(extRoot, 'halfway', '.ext-progress.json'), '{"percent":40}')
+      {
+        const j = JSON.parse((await get('/kxxy/api/health')).text)
+        const c = j.checks.find((x) => x.code === 'EXTENSIONS')
+        if (c?.verdict !== 'OK') fail(`安装未完成的扩展目录应判 OK（跳过），实为 ${c?.verdict}`)
+        else ok('安装未完成（无 .links.json）→ OK（跳过，不误报）')
+      }
+    }
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = prevHome
+  }
+
+  // ⑪ 修复请求通道：POST 后必须真的落 recovery.request 文件（动作真做）。
+  {
+    const res = await fetch(base + '/kxxy/api/recovery', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ level: 'L1', headline: '测试' }),
+    })
+    if (res.status !== 202) fail(`修复请求应 202，实为 ${res.status}`)
+    else ok('202 accepted')
+    const reqFile = join(FAKE_ENGINE_ROOT, 'recovery.request')
+    if (!existsSync(reqFile)) fail('未落 recovery.request 文件（动作没真做）')
+    else {
+      const payload = JSON.parse(readFileSync(reqFile, 'utf8'))
+      if (payload.level !== 'L1') fail(`level 应为 L1，实为 ${payload.level}`)
+      else ok('recovery.request 已落盘且 level 正确')
+    }
+  }
+
+  // ⑫ 非法 level 必须 400（否则原生层会拿到无法解析的载荷）。
+  {
+    const res = await fetch(base + '/kxxy/api/recovery', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ level: 'L9' }),
+    })
+    if (res.status !== 400) fail(`非法 level 应 400，实为 ${res.status}`)
+    else ok('非法 level → 400')
+  }
+
+  // ⑬ UNDO 是合法 level（撤销走同一条通道）。
+  {
+    const res = await fetch(base + '/kxxy/api/recovery', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ level: 'UNDO' }),
+    })
+    if (res.status !== 202) fail(`UNDO 应 202，实为 ${res.status}`)
+    else ok('UNDO → 202')
+  }
+
+  // ⑭ 修复结果端点：没有结果文件时返回 result:null 而不是 500。
+  {
+    const r = await get('/kxxy/api/recovery/result')
+    if (r.status !== 200) fail(`状态码 ${r.status}`)
+    else {
+      const j = JSON.parse(r.text)
+      if (j.result !== null) fail(`无结果时应为 null，实为 ${JSON.stringify(j.result)}`)
+      else ok('无结果 → 200 {result:null}')
+    }
+  }
 }
 
 console.log('\n[15] disposer 卸载后路由消失')

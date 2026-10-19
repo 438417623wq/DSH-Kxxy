@@ -447,21 +447,28 @@ class RecoveryProbe(private val ctx: Context) {
      * extensions 目录的体检。
      *
      * 这一层走的是 kxxy-host 插件的加载路径（不在 app-boot 的 profile 层叠里），
-     * 所以 dump 查不出来，只能自己看：每个扩展目录下应当有一个能解析的
-     * `package.json`。坏的那份会让插件在 require 阶段抛错。
+     * 所以 dump 查不出来，只能自己看。
+     *
+     * 判据是 `.links.json`（接入点清单），**不是 `package.json`**：
+     * `engine/extensions/<id>/` 是 deb 包解出来的纯目录树（`bin/` `lib/`
+     * `share/`），从来没有 `package.json`。首版按 npm 包的直觉去查它，
+     * 得到的是一段永远走不到的代码（`!pkg.isFile` 直接 continue）——
+     * 与 kxxy-host 侧 health.mjs 犯的是同一个错，两边一起改。
      */
     private fun checkExtensions(): String? {
         val root = EngineConfig.extensionsRoot(ctx)
         if (!root.isDirectory) return null
         val dirs = root.listFiles()?.filter { it.isDirectory } ?: return null
         for (dir in dirs) {
-            val pkg = File(dir, "package.json")
-            if (!pkg.isFile) continue
+            val links = File(dir, ".links.json")
+            // 没有清单文件不是错误：可能安装没跑完（自愈路径是重装），
+            // 也可能是用户手工放进来的目录（根本不该管）。
+            if (!links.isFile) continue
             val bad = runCatching {
-                JSONObject(pkg.readText().replace("\uFEFF", ""))
+                JSONObject(links.readText().replace("\uFEFF", ""))
             }.exceptionOrNull()
             if (bad != null) {
-                return "${dir.name}/package.json 解析失败：${bad.message?.take(120)}"
+                return "${dir.name}/.links.json 解析失败：${bad.message?.take(120)}"
             }
         }
         return null

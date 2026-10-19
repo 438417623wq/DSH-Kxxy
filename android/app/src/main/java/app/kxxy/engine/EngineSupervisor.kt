@@ -177,6 +177,23 @@ class EngineSupervisor(private val ctx: Context) {
                         process?.write(bytes)
                     }
                 }
+
+                // 体检页「一键修复」/「撤销修复」请求。
+                //
+                // 排在 restart/stdin 之后：修复本身会重启引擎，而用户此刻
+                // 更可能在点重启按钮，先满足更轻的意图。
+                val recoveryReq = EngineConfig.recoveryRequestFile(ctx)
+                if (recoveryReq.isFile) {
+                    val raw = runCatching { recoveryReq.readText() }.getOrNull()
+                    runCatching { recoveryReq.delete() }
+                    if (!raw.isNullOrBlank()) {
+                        Log.i(TAG, "recovery.request consumed: ${raw.take(120)}")
+                        runRecovery(raw)
+                        // 修复必然伴随重启（配置改完不重启不生效），
+                        // 所以这里 continue，别再走本轮的后续判断。
+                        continue
+                    }
+                }
             }
         }
     }
@@ -243,6 +260,112 @@ class EngineSupervisor(private val ctx: Context) {
     }
 
     private val restarting = AtomicBoolean(false)
+
+    /**
+     * 执行体检页下发的修复请求（消费 recovery.request）。
+     *
+     * 载荷形如 `{"level":"L1","headline":"...","requestedAt":123}`，
+     * `level` 取 L1/L2/L3/UNDO。
+     *
+     * 三个必须做对的地方：
+     *
+     * 1. **先落结果再重启**。修复完立刻写 recovery-result.json，然后才
+     *    restart() —— 重启会把本进程杀掉，写在后面的东西永远写不出来。
+     *    引擎重启后由新进程的插件读这个文件展示「上次修了什么」。
+     *
+     * 2. **失败也必须写结果**。修复失败时不会有备份目录，manifest.json
+     *    也就无从谈起；页面只剩 result 这一个信息源。静默失败是最坏的结果
+     *    —— 用户看到按钮转了一圈、引擎重启了、问题还在，却不知道为什么。
+     *
+     * 3. **撤销失败不重启**。撤销本身不改配置，失败了重启只会让用户
+     *    多等一次；而成功则必须重启（配置被搬回去了）。
+     */
+    private suspend fun runRecovery(raw: String) {
+        val level = runCatching {
+            org.json.JSONObject(raw).optString("level", "L1").uppercase()
+        }.getOrElse { "L1" }
+        val headline = runCatching {
+            org.json.JSONObject(raw).optString("headline", "")
+        }.getOrDefault("")
+
+        val manager = RecoveryManager(ctx)
+        val resultFile = EngineConfig.recoveryResultFile(ctx)
+
+        if (level == "UNDO") {
+            val ok = runCatching { manager.undoLatest() }
+                .onFailure { Log.w(TAG, "undo failed: ${it.message}") }
+                .getOrDefault(false)
+            writeRecoveryResult(resultFile, level, ok, emptyList(),
+                if (ok) "" else "没有可撤销的修复记录，或撤销过程中出错")
+            if (!ok) return
+            Log.i(TAG, "undo done -> restarting engine")
+            restart()
+            return
+        }
+
+        val outcome = runCatching { manager.recover(level = parseLevel(level), headline = headline) }
+            .onFailure { Log.w(TAG, "recover($level) failed: ${it.message}") }
+
+        val failure = outcome.exceptionOrNull()
+        if (failure != null) {
+            writeRecoveryResult(resultFile, level, false, emptyList(), failure.message ?: "未知错误")
+            Log.w(TAG, "recovery failed, engine left as-is: ${failure.message}")
+            return
+        }
+
+        val result = outcome.getOrThrow()
+        writeRecoveryResult(resultFile, level, true, result.changes, "")
+        Log.i(TAG, "recover($level) done, ${result.changes.size} change(s) -> restarting engine")
+        restart()
+    }
+
+    private fun parseLevel(level: String): RecoveryManager.Level = when (level.uppercase()) {
+        "L2" -> RecoveryManager.Level.L2
+        "L3" -> RecoveryManager.Level.L3
+        else -> RecoveryManager.Level.L1
+    }
+
+    /**
+     * 写修复结果快照。
+     *
+     * 手写 JSON 而不是引 JSONObject 序列化：这里的字段全是 ASCII 安全的值
+     * （level/ok/error 是我们自己产出的），只有 changes 是中文文案，而
+     * JSONObject 会把中文转成 \uXXXX —— 页面上虽然能还原，但引擎日志里
+     * 会变成一串转义，排障时读不了。手动拼 + 转义引号/反斜杠即可。
+     */
+    private fun writeRecoveryResult(
+        file: File,
+        level: String,
+        ok: Boolean,
+        changes: List<String>,
+        error: String,
+    ) {
+        runCatching {
+            val json = buildString {
+                append("{\n")
+                append("  \"level\": \"$level\",\n")
+                append("  \"ok\": $ok,\n")
+                append("  \"at\": ${System.currentTimeMillis()},\n")
+                append("  \"error\": \"${escapeJson(error)}\",\n")
+                append("  \"changes\": [")
+                changes.forEachIndexed { i, c ->
+                    if (i > 0) append(", ")
+                    append("\"${escapeJson(c)}\"")
+                }
+                append("]\n")
+                append("}\n")
+            }
+            file.parentFile?.mkdirs()
+            file.writeText(json)
+        }.onFailure { Log.w(TAG, "writeRecoveryResult failed: ${it.message}") }
+    }
+
+    private fun escapeJson(s: String): String = s
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "")
+        .replace("\t", "\\t")
 
     // ── 监管主循环 ──────────────────────────────────────────────────────
 
