@@ -773,11 +773,19 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
 // `fatal error: 'iostream' file not found`。头文件本身是在的（runtime 的
 // `include/c++/v1/` 有 1,757 个条目），缺的是「谁告诉 clang 去那儿找」——
 // 这个 clang 的驱动只认自己 resource-dir 下的 `lib/clang/21/include`，
-// 不会自动加 `<sysroot>/include/c++/v1`。修法是在 EngineConfig 里把它塞进
-// `CPATH` / `C_INCLUDE_PATH`。这里做两条静态断言：
-//   ① 头文件必须在包里（否则改环境变量也没用）；
-//   ② EngineConfig 的 includeDirs 必须真的含 `include/c++/v1`（否则改了环境
-//      变量却漏掉这一项，症状与「头文件不在包里」完全一样，极难区分）。
+// 不会自动加 `<sysroot>/include/c++/v1`。
+//
+// ⚠️ 修法在 v0.8.1 被改过（缺陷 BP）：最初塞进 `CPATH` / `C_INCLUDE_PATH`，
+// 但这两个变量对 C 也生效，而 libc++ 的 `c++/v1/stdio.h` 是 `#include_next`
+// 包装头、要求 C++ 头排在 C 头之前 —— 放末尾报
+// `<cstdio> tried including <stdio.h> but didn't find libc++'s <stdio.h> header`，
+// 放最前又污染纯 C 编译。正解是只给 C++ 用的 `CPLUS_INCLUDE_PATH`。
+//
+// 同时 v0.8.0 加的 `libc++.so` / `libc++abi.so` 两条 SONAME 别名已被回滚
+// （缺陷 BQ）：这个 clang 的 driver 在 android triple 下推的是 `-lc++_shared`，
+// 从不推 `-lc++`；而那两个同名文件躺在 `<root>/lib` 里会遮蔽系统的
+// `/system/lib64/libc++.so`（`std::__1` vs `std::__ndk1` ABI 不兼容），
+// 导致 toybox 的 `rm`/`mkdir`/`ls` 全部 CANNOT LINK。
 {
   const problems = [];
   const iostream = byName.get("include/c++/v1/iostream");
@@ -790,23 +798,51 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
     join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/EngineConfig.kt"),
     "utf8",
   );
-  if (!/File\(root,\s*"include\/c\+\+\/v1"\)/.test(kt)) {
-    problems.push("EngineConfig.kt 的 includeDirs 里没有 include/c++/v1（CPATH 补不上）");
+  // `c++/v1` 必须出现在 CPLUS_INCLUDE_PATH 的列表里，且该列表的第一项就是它。
+  const cxxBlock = /val cxxIncludeDirs = listOf\(([\s\S]*?)\n\s*\)/.exec(kt);
+  if (cxxBlock === null) {
+    problems.push("EngineConfig.kt 没有 cxxIncludeDirs（C++ 头搜索路径未定义）");
+  } else {
+    const first = /File\(root,\s*"([^"]+)"\)/.exec(cxxBlock[1]);
+    if (first === null || first[1] !== "include/c++/v1") {
+      problems.push("cxxIncludeDirs 的第一项必须是 include/c++/v1（否则 <cstdio> 找不到 libc++ 的 <stdio.h>）");
+    }
   }
-  // 链接期的第二层：clang 按 `-lc++` 找 `libc++.so`，而 runtime 只有
-  // `libc++_shared.so`。别名由 RuntimeInstaller 的 SONAME_ALIASES 在设备上建。
+  if (!/"CPLUS_INCLUDE_PATH=\$cxxIncludeDirs"/.test(kt)) {
+    problems.push("EngineConfig.kt 没有把 cxxIncludeDirs 注入 CPLUS_INCLUDE_PATH");
+  }
+  // `c++/v1` 不许再出现在 CPATH/C_INCLUDE_PATH 的 includeDirs 里（缺陷 BP）。
+  const incBlock = /val includeDirs = listOf\(([\s\S]*?)\n\s*\)/.exec(kt);
+  if (incBlock !== null && incBlock[1].includes("c++/v1")) {
+    problems.push("includeDirs 仍含 include/c++/v1 —— CPATH 对 C 也生效，会破坏纯 C 编译（缺陷 BP）");
+  }
+
   const ri = readFileSync(
     join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
     "utf8",
   );
-  if (!/"libc\+\+\.so"\s+to\s+"libc\+\+_shared\.so"/.test(ri)) {
-    problems.push("RuntimeInstaller.kt 的 SONAME_ALIASES 里没有 libc++.so → libc++_shared.so");
+  // 缺陷 BQ 的回归闸门：这两个别名一旦回到 SONAME_ALIASES，系统库就会被遮蔽。
+  const aliasBlock = /private val SONAME_ALIASES = linkedMapOf\(([\s\S]*?)\n\s*\)/.exec(ri);
+  if (aliasBlock === null) {
+    problems.push("RuntimeInstaller.kt 里找不到 SONAME_ALIASES");
+  } else {
+    for (const bad of ['"libc++.so" to', '"libc++abi.so" to']) {
+      if (aliasBlock[1].includes(bad)) {
+        problems.push(`SONAME_ALIASES 又加回了 ${bad} … —— 会遮蔽 /system/lib64/libc++.so，所有系统命令 CANNOT LINK（缺陷 BQ）`);
+      }
+    }
+  }
+  // 但清理清单里必须有它们，否则装过 v0.8.0 的设备盘上残留摘不掉。
+  for (const need of ['"lib/libc++.so"', '"lib/libc++abi.so"']) {
+    if (!ri.includes(need)) {
+      problems.push(`SHADOWING_STUBS 缺 ${need} —— v0.8.0 装过的设备无法自愈`);
+    }
   }
   if (!/materialiseSonameAliases\(root\)/.test(ri)) {
     problems.push("RuntimeInstaller.kt 没有在启动路径上调用 materialiseSonameAliases（别名不会自愈）");
   }
   if (problems.length === 0) {
-    console.log(`C++ 标准库头：✓ include/c++/v1 有 ${cxxHeaders} 个条目，CPATH 与链接别名均就位`);
+    console.log(`C++ 标准库头：✓ include/c++/v1 有 ${cxxHeaders} 个条目，CPLUS_INCLUDE_PATH 就位、无 libc++ 遮蔽别名`);
   } else {
     console.log("C++ 标准库头：✗");
     for (const p of problems) console.log(`  ${p}`);
@@ -895,6 +931,68 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
     console.log(`jansi native 剥离：✓ 扫描 ${jarsScanned} 个 jar，命中 0`);
   } else {
     console.log("扩展目录 / jansi：✗");
+    for (const p of problems) console.log(`  ${p}`);
+    missing += 1;
+  }
+}
+
+// ---------------------------------------------------------------- 新工具链的环境变量
+//
+// 为什么需要：v0.8.0 把 5 个扩展装进池子之后，真机上仍有三个命令是坏的，
+// 而且都是同一个根因的两副面孔 —— `tools/lib/poolextract.py` 把 deb 里
+// `bin/` 下的符号链接**物化成实体副本**（`plugins/kxxy-host/lib/tar.mjs`
+// 不解 type '2' 条目），于是启动脚本靠 `readlink -f $0` / `dirname $0/..`
+// 反推自己的 home 时，反推出的都是「副本所在的目录」而不是链接指向的真身。
+//
+//   · mvn   —— `bin/mvn -> ../opt/maven/bin/mvn`，副本落在 `<root>/bin/mvn`，
+//              `MAVEN_HOME` 被算成 `<root>`，报
+//              `Could not find or load main class org.codehaus.plexus.classworlds.launcher.Launcher`
+//   · yarn  —— `bin/yarn -> ../share/yarn/bin/yarn`，副本落在 `<root>/bin/yarn`，
+//              `basedir` 被算成 `<root>/bin`，报
+//              `Cannot find module '…/engine/extensions/yarn/bin/yarn.js'`
+//   · gem   —— 不在这一类里，是 `libruby.so` 的 `$LOAD_PATH` 编译期写死成
+//              Termux 前缀（ELF 不被 poolextract 改写），任何 `require` 都失败。
+//
+// 前两个靠把真身目录排在 PATH 的 `<root>/bin` 之前解决（缺陷 BN / BR），
+// 第三个靠 `RUBYLIB`（缺陷 BS）。
+{
+  const problems = [];
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/EngineConfig.kt"),
+    "utf8",
+  );
+
+  // 缺陷 BR：yarn 的真身目录必须在 `<root>/bin` 之前。
+  //
+  // 取块的方式：从 `val path = buildList {` 到 `}.joinToString(":")`。
+  // 不能用「第一个行首 `}`」—— 块里还有 `for` 循环，它的收尾 `}` 也是行首。
+  const pathStart = kt.indexOf("val path = buildList {");
+  const pathEnd = pathStart < 0 ? -1 : kt.indexOf('}.joinToString(":")', pathStart);
+  if (pathStart < 0 || pathEnd < 0) {
+    problems.push("EngineConfig.kt 里找不到 PATH 的 buildList");
+  } else {
+    const body = kt.slice(pathStart, pathEnd);
+    const yarnAt = body.indexOf('share/yarn/bin');
+    const rootBinAt = body.indexOf('File(root, "bin").absolutePath');
+    if (yarnAt < 0) {
+      problems.push("PATH 里没有 share/yarn/bin —— yarn 会去 extensions/yarn/bin 找不存在的 yarn.js（缺陷 BR）");
+    } else if (rootBinAt >= 0 && yarnAt > rootBinAt) {
+      problems.push("share/yarn/bin 排在 <root>/bin 之后 —— yarn 仍会命中错误的副本（缺陷 BR）");
+    }
+  }
+
+  // 缺陷 BS：RUBYLIB 必须注入，且探测函数要在。
+  if (!/fun rubyLibPath\(root: File\): String/.test(kt)) {
+    problems.push("EngineConfig.kt 没有 rubyLibPath（ruby 的 $LOAD_PATH 补不上）");
+  }
+  if (!/"RUBYLIB=\$\{rubyLibPath\(root\)\}"/.test(kt)) {
+    problems.push("EngineConfig.kt 没有把 rubyLibPath 注入 RUBYLIB（缺陷 BS）");
+  }
+
+  if (problems.length === 0) {
+    console.log("新工具链环境：✓ share/yarn/bin 在 PATH 前置、RUBYLIB 就位");
+  } else {
+    console.log("新工具链环境：✗");
     for (const p of problems) console.log(`  ${p}`);
     missing += 1;
   }

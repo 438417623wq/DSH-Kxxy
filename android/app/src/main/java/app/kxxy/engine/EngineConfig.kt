@@ -441,6 +441,85 @@ object EngineConfig {
     }
 
     /**
+     * Ruby 的 `$LOAD_PATH` 补丁（缺陷 BS）。
+     *
+     * 真机症状：`ruby -e 'puts 1'` 正常，但任何 `require` 标准库都炸 ——
+     * `gem --version` 报 `cannot load such file -- rubygems/gem_runner`，
+     * `ruby -rjson -e …` 报 `cannot load such file -- json`。
+     *
+     * 根因与 perl / gdb 同族：`libruby.so` 把 `$LOAD_PATH` 的前缀**编译期写死**
+     * 成 Termux 的 `/data/data/com.termux/files/usr/lib/ruby/…`（真机实测
+     * `ruby -e 'puts $LOAD_PATH'` 打印的八条全是 `com.termux` 路径），而
+     * `poolextract.py` 的 `rewrite_prefixes` **跳过 ELF**，所以这些字符串在
+     * 设备上仍是字面量，一个都不存在。`libruby` 会读 `RUBYLIB` 并在内置
+     * 路径**之前**插入，这正是官方的覆盖点。
+     *
+     * 目录形状（Termux 的 ruby 包）：
+     *   `lib/ruby/<ver>/{,<arch>}`          —— 标准库与架构扩展（.so）
+     *   `lib/ruby/site_ruby/<ver>/{,<arch>}` —— 站点库
+     *   `lib/ruby/vendor_ruby/<ver>/{,<arch>}` —— 第三方库
+     * `gem` 的 `rubygems/gem_runner` 在 `lib/ruby/<ver>/rubygems/`，`json` 在
+     * `lib/ruby/<ver>/json.rb` 与 `lib/ruby/<ver>/<arch>/json/` 两处，所以
+     * 版本目录与架构目录**都要**加。
+     *
+     * 版本号与架构名都随包版本变（当前 `4.0.0` / `aarch64-linux-android`），
+     * 所以扫目录而不是写死 —— 与 [perlLibPath] 同一套思路。
+     */
+    private fun rubyLibPath(root: File): String {
+        // 架构目录的判据：名字里带连字符（`aarch64-linux-android`），
+        // 与 `rubygems`、`bundler` 这类普通模块目录区分得开。
+        fun archDirs(version: File): List<File> =
+            version.listFiles()
+                ?.filter { it.isDirectory && it.name.contains('-') }
+                ?.sortedBy { it.name }
+                ?: emptyList()
+
+        // 候选根：合并视图 `lib/ruby` **加上**每个扩展自己的 `lib/ruby`。
+        // 双份的理由与 [perlLibPath] 完全相同：`lib/ruby` 是 extinstall 建的
+        // 软链视图，完整重装会把 `lib/` 删空、relink 还没跑，此刻只有扩展树里有。
+        val roots = linkedSetOf<File>()
+        roots += File(root, "lib/ruby")
+        File(root, "extensions").listFiles()
+            ?.filter { it.isDirectory }
+            ?.sortedBy { it.name }
+            ?.forEach { ext -> roots += File(ext, "lib/ruby") }
+
+        val dirs = linkedSetOf<File>()
+        for (base in roots) {
+            if (!base.isDirectory) continue
+            // `site_ruby` 与 `vendor_ruby` 先于版本目录（Ruby 官方顺序），
+            // 它们下面还有一层版本目录。
+            for (sub in listOf("site_ruby", "vendor_ruby")) {
+                val holder = File(base, sub)
+                if (!holder.isDirectory) {
+                    dirs += holder
+                    continue
+                }
+                dirs += holder
+                val versions = holder.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }
+                    ?: continue
+                for (version in versions) {
+                    dirs += version
+                    dirs += archDirs(version)
+                }
+            }
+            // 主版本目录：`lib/ruby/4.0.0` 与 `lib/ruby/4.0.0/<arch>`。
+            val versions = base.listFiles()
+                ?.filter { it.isDirectory && !it.name.contains('-') && it.name != "gems" }
+                ?.sortedBy { it.name }
+                ?: continue
+            for (version in versions) {
+                dirs += version
+                dirs += archDirs(version)
+            }
+            // `gems/` 是 `gem install` 的落地根，RubyGems 靠 `GEM_HOME` 找它，
+            // 但 `gem` 自己的 `rubygems/*.rb` 在版本目录里，不需要 `gems/`。
+        }
+        if (dirs.isEmpty()) return File(root, "lib/ruby").absolutePath
+        return dirs.joinToString(":") { it.absolutePath }
+    }
+
+    /**
      * kpathsea 的配置文件搜索路径（问题.txt【4】）。
      *
      * 真机症状：`kpsewhich` 与 `pdftex` 都报
@@ -531,6 +610,21 @@ object EngineConfig {
                 val dir = File(root, "opt/$name/bin")
                 if (dir.isDirectory) add(dir.absolutePath)
             }
+            // 缺陷 BR：yarn 的启动脚本不在 `opt/` 而在 `share/yarn/bin`，且它
+            // 用 `basedir=$(dirname "$(readlink -f "$0")")` 反推 `yarn.js` 的位置。
+            //
+            // 真机症状：`yarn --version` 报
+            //   Error: Cannot find module '…/engine/extensions/yarn/bin/yarn.js'
+            // 根因与 maven 同型但方向相反：deb 里 `bin/yarn` 是
+            // `-> ../share/yarn/bin/yarn` 的符号链接，而 `tools/lib/poolextract.py`
+            // 会把符号链接**物化成实体副本**（`plugins/kxxy-host/lib/tar.mjs` 不解
+            // type '2' 的条目），于是 `extensions/yarn/bin/yarn` 是一份真文件，
+            // `readlink -f` 解析到的就是它自己所在的 `extensions/yarn/bin/` ——
+            // 那个目录下只有 `yarn` 与 `yarnpkg`，没有 `yarn.js`。
+            // 真正带 `yarn.js` 的是 `<root>/share/yarn/bin/`（extinstall 的 mergeViews
+            // 把扩展的 `share/` 摊到引擎根），所以把它排在 `<root>/bin` 之前即可。
+            val yarnBin = File(root, "share/yarn/bin")
+            if (yarnBin.isDirectory) add(yarnBin.absolutePath)
             add(File(root, "bin").absolutePath)
             // git-core 的 `git-remote-https` / `git-remote-http` 等 helper 与
             // termux-api 的 shim 都在 `<root>/libexec`。不在这里的话
@@ -563,12 +657,34 @@ object EngineConfig {
         // 自动把 `<sysroot>/include/c++/v1` 加进搜索列表 —— 它只认自己
         // resource-dir 下的 `lib/clang/21/include`。Termux 那边是 libc++ 的包
         // 往 clang 的配置里塞了 `-stdlib=libc++ -isystem .../c++/v1`，我们脱离
-        // 了那套包管理，只能自己用 CPATH 补。注意必须排在 `<root>/include`
-        // **之后**：C 头优先，避免 C++ 版 `<cstdio>` 之类遮蔽 `<stdio.h>`。
+        // 了那套包管理，只能自己用环境变量补。
+        //
+        // ⚠️ **它不能放进 `CPATH` / `C_INCLUDE_PATH`**（缺陷 BP，v0.8.1 修正）。
+        // 那两个变量对 C 与 C++ **都**生效，而 libc++ 的 `c++/v1/stdio.h` 是
+        // 一层 `#include_next` 包装头，要求「C++ 头目录排在 C 头目录之前」。
+        // 放在 `CPATH` 末尾时顺序反了，真机报：
+        //
+        //   c++/v1/cstdio:107:5: error: <cstdio> tried including <stdio.h> but
+        //   didn't find libc++'s <stdio.h> header. …
+        //
+        // 放在 `CPATH` 最前又会污染纯 C 编译（`stdio.h` 先命中 libc++ 包装头）。
+        // 正解是 `CPLUS_INCLUDE_PATH`：GCC/Clang 都只对 C++ 输入生效，
+        // 且天然排在 `CPATH` 之前。真机四组对照（V1~V4）里只有
+        // 「`CPATH` 只放 C 头 + `CPLUS_INCLUDE_PATH` = c++/v1 + C 头」这一组
+        // 让 C++ 与 C 同时通过，`clang++ -v` 也确认它被展开成
+        // `-cxx-isystem .../c++/v1` 且排在 `-c-isystem` 之前。
         val includeDirs = listOf(
             File(root, "include"),
             File(root, "include/aarch64-linux-android"),
+        )
+            .filter { it.isDirectory }
+            .joinToString(":") { it.absolutePath }
+
+        // C++ 专用头搜索路径：`c++/v1` 必须**排在 C 头之前**（见上）。
+        val cxxIncludeDirs = listOf(
             File(root, "include/c++/v1"),
+            File(root, "include"),
+            File(root, "include/aarch64-linux-android"),
         )
             .filter { it.isDirectory }
             .joinToString(":") { it.absolutePath }
@@ -586,6 +702,9 @@ object EngineConfig {
             "LIBRARY_PATH=$ldPath",
             "CPATH=$includeDirs",
             "C_INCLUDE_PATH=$includeDirs",
+            // 缺陷 BP：C++ 头搜索路径单独走 CPLUS_INCLUDE_PATH ——
+            // `c++/v1` 必须排在 C 头之前，而 CPATH 对 C 也生效、顺序上做不到两全。
+            "CPLUS_INCLUDE_PATH=$cxxIncludeDirs",
             "PREFIX=${root.absolutePath}",
             "HOME=${home.absolutePath}",
             "DSH_HOME=${home.absolutePath}",
@@ -616,6 +735,10 @@ object EngineConfig {
             // mktexfmt / tlmgr（它们全是 perl 脚本），于是「装了 TeX Live 却
             // 生成不了格式文件、编不出任何文档」。
             "PERL5LIB=${perlLibPath(root)}",
+            // ruby 的 $LOAD_PATH 修复（缺陷 BS）。没有它，`ruby` 本身能跑，
+            // 但任何 `require` 都失败 —— `gem`、`bundle`、`irb` 全部不可用。
+            // 详见 [rubyLibPath] 的注释。
+            "RUBYLIB=${rubyLibPath(root)}",
             // kpathsea 的 texmf.cnf 定位（问题.txt【4】）。没有它，pdftex 会去
             // 可执行文件所在目录上下级找 texmf.cnf、遍寻不获后回落到编译期前缀，
             // 最终 `I can't find the format file 'pdftex.fmt'!`。

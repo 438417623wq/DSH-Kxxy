@@ -440,14 +440,29 @@ console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755
   if (!/private\s+fun\s+ensureNoShadowingStubs\s*\(/.test(kt)) {
     fail("缺少 ensureNoShadowingStubs 定义（老设备不会重装，桩库永远删不掉）");
   }
-  // 缺陷 BH：清单从「恰好 binder_ndk」扩到三条。逐条断言而不是整体正则，
-  // 这样多删 / 少删都能指名道姓。
+  // 缺陷 BH：清单从「恰好 binder_ndk」扩到三条，缺陷 BQ 又加了两条。逐条断言
+  // 而不是整体正则，这样多删 / 少删都能指名道姓。
   //   - libbinder_ndk.so：缺陷 AZ，桩库 soname=null，遮蔽系统真库的版本定义。
   //   - liblzma.so（裸名）：缺陷 BH，soname 是 liblzma.so.5，系统侧要裸名。
   //   - libheif.so（裸名）：缺陷 BH 同族，来自扩展 .links.json 而非 zip。
-  const stubsMatch = /SHADOWING_STUBS\s*=\s*listOf\(([\s\S]*?)\)/.exec(kt);
+  //   - libc++.so / libc++abi.so：缺陷 BQ，v0.8.0 误加的别名，遮蔽
+  //     /system/lib64/libc++.so（std::__1 vs std::__ndk1 ABI）。
+  //
+  // ⚠️ 必须先**剥掉注释**再抽字符串：`listOf(` 那段里夹着大段说明，而说明
+  // 正文引用了现场报错原文（`CANNOT LINK EXECUTABLE "rm" … "/system/lib64/liblog.so"`），
+  // 里面的 ASCII 双引号会被 `"([^"]+)"` 一并当成条目 —— 首版就是这么写的，
+  // 实得 6 条而不是 5 条，还混进了 `rm` 和那句报错里的符号名。
+  const stripComments = (src) =>
+    src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  const stubsMatch = /SHADOWING_STUBS\s*=\s*listOf\(([\s\S]*?)\n\s*\)/.exec(stripComments(kt));
   const stubs = stubsMatch === null ? [] : [...stubsMatch[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
-  for (const need of ["lib/libbinder_ndk.so", "lib/liblzma.so", "lib/libheif.so"]) {
+  for (const need of [
+    "lib/libbinder_ndk.so",
+    "lib/liblzma.so",
+    "lib/libheif.so",
+    "lib/libc++.so",
+    "lib/libc++abi.so",
+  ]) {
     if (!stubs.includes(need)) fail(`SHADOWING_STUBS 缺少 ${need}（会被 LD_LIBRARY_PATH 首位遮蔽系统真库）`);
   }
   for (const forbidden of [
@@ -461,7 +476,7 @@ console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755
       fail(`SHADOWING_STUBS 误含 ${forbidden}（带 soname 的版本名必须保留，删了会崩 libunwindstack / libheif 消费者）`);
     }
   }
-  if (stubs.length !== 3) fail(`SHADOWING_STUBS 应为 3 条，实得 ${stubs.length}：${stubs.join(", ")}`);
+  if (stubs.length !== 5) fail(`SHADOWING_STUBS 应为 5 条，实得 ${stubs.length}：${stubs.join(", ")}`);
   // 两条路径（已完整 / 重装）都得调；只看是否至少出现两次
   const calls = (kt.match(/ensureNoShadowingStubs\(root\)/g) || []).length;
   if (calls < 2) {

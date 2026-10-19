@@ -1472,6 +1472,27 @@ class RuntimeInstaller(private val ctx: Context) {
             "lib/libbinder_ndk.so",
             "lib/liblzma.so",
             "lib/libheif.so",
+
+            /*
+             * 缺陷 BQ：v0.8.0 曾把 `libc++.so` / `libc++abi.so` 作为
+             * 「链接名别名」复制进 `<root>/lib`，结果遮蔽了 Android 系统的
+             * `/system/lib64/libc++.so`（`std::__1` ABI）——
+             * `LD_LIBRARY_PATH=<root>/lib` 让它优先命中 Termux 的
+             * `libc++_shared.so`（`std::__ndk1` ABI），于是**所有系统二进制**
+             * （toybox 的 `rm`/`mkdir`/`ls`/`sh`）都报
+             * `CANNOT LINK EXECUTABLE "rm": cannot locate symbol
+             * "_ZNKSt3__121__basic_string_commonILb1EE20__throw_length_errorEv"
+             * referenced by "/system/lib64/liblog.so"`，整个终端全废。
+             *
+             * 别名本身也没用：这个 clang 的 driver 在 android triple 下推的是
+             * `-lc++_shared`（`clang++ -v` 的链接行实测），从不推 `-lc++`。
+             *
+             * 只从 `SONAME_ALIASES` 里删**不够** —— 装过 v0.8.0 的设备盘上
+             * 已经躺着这两个文件，而快路径（`isComplete()` 为真）不会重装
+             * `lib/`。所以必须同时列进这份「每次启动都清一遍」的清单。
+             */
+            "lib/libc++.so",
+            "lib/libc++abi.so",
         )
 
         /**
@@ -1544,25 +1565,31 @@ class RuntimeInstaller(private val ctx: Context) {
             "libncurses.so" to "libncurses.so.6.5",
 
             /*
-             * 缺陷 BJ 的第二层：`clang++` 的**链接期**。
+             * 缺陷 BQ（v0.8.1 回滚）：这里**曾经**有 `libc++.so` 与
+             * `libc++abi.so` 两条别名，指向 `libc++_shared.so`，理由是
+             * 「clang++ 链接期按 -lc++ 找 libc++.so，找不到就 cannot find -lc++」。
+             * 那个理由是**错的**，而且修出了比原缺陷严重得多的回归。
              *
-             * runtime 的 `lib/` 里只有 `libc++_shared.so`（Termux 的 libc++
-             * 编译成单一共享库，把 libc++ 与 libc++abi 的符号合并进去了），
-             * 没有 `libc++.so` / `libc++abi.so` 这两个**链接名**。
+             * 真机实测（缺陷 BP 的探针，`clang++ -v` 的完整链接行）：
              *
-             * `CPATH` 补 `include/c++/v1` 只让编译期找到 `<iostream>`；
-             * 链接期 clang 仍会按 `-lc++`（或 `-lc++abi`）去找 `libc++.so`，
-             * 找不到就 `ld: cannot find -lc++`。实测 `libclang-cpp.so` 的
-             * driver 串表里 `-lc++` 出现 6 次、`-lc++abi` 2 次、`-lc++_shared`
-             * 1 次，说明三条路径都可能被走到。
+             *   ld.lld … -L/system/lib64 -L<root>/lib … -lc++_shared …
              *
-             * 用**副本**而不是软链：`libc++_shared.so` 的 SONAME 就是
-             * `libc++_shared.so`，所以 `-lc++` 链接出的产物 DT_NEEDED 仍是
-             * `libc++_shared.so` —— 正是设备上真实存在、且已被
-             * `LD_LIBRARY_PATH` 覆盖的那个，运行时不会缺库。
+             * 这个 clang 的 driver 在 android triple 下推的是 `-lc++_shared`，
+             * **从不推 `-lc++`**。所以那两条别名对 C++ 链接毫无用处。
+             *
+             * 但它们在 `<root>/lib` 里造出了两个**同名文件**，而
+             * `LD_LIBRARY_PATH=<root>/lib` 会让动态链接器优先命中它们：
+             * Android 系统库 `/system/lib64/libc++.so` 用的是 `std::__1` ABI，
+             * Termux 的 `libc++_shared.so` 用的是 `std::__ndk1`，两者同名不兼容。
+             * 于是**每一个系统二进制**（`rm`/`mkdir`/`ls`/`sh` 的 toybox）在
+             * 启动时都 `CANNOT LINK EXECUTABLE "rm": cannot locate symbol
+             * "_ZNKSt3__121__basic_string_commonILb1EE20__throw_length_errorEv"
+             * referenced by "/system/lib64/liblog.so"` —— 整个终端全废。
+             *
+             * 所以：这两条别名必须删除。C++ 的**链接期**本来就不需要它们
+             * （driver 直接 `-lc++_shared`），**编译期**才是真缺口，由
+             * `CPLUS_INCLUDE_PATH` 补（见 EngineConfig.buildEnv）。
              */
-            "libc++.so" to "libc++_shared.so",
-            "libc++abi.so" to "libc++_shared.so",
         )
     }
 }
