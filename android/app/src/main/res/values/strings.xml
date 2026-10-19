@@ -25,6 +25,34 @@
     <string name="boot_webview_too_old">系统 WebView 版本过低（需 Chrome 85 以上），请更新「Android System WebView」后重试。</string>
     <string name="boot_hint">首次启动需要解压约 480 MB 运行时，请保持屏幕常亮。</string>
 
+    <!-- 崩溃自愈（方案 K） -->
+    <string name="boot_repair">修复启动</string>
+    <string name="boot_diagnose">诊断</string>
+    <string name="boot_diagnosing">正在定位原因…</string>
+    <string name="boot_diagnose_failed">无法完成诊断（诊断命令本身执行失败）</string>
+    <string name="boot_repairing">正在修复…</string>
+    <string name="boot_repair_done">修复完成，正在重新启动引擎…</string>
+    <string name="boot_repair_nothing">没有可修复的内容，问题不在启动配置上。</string>
+    <string name="boot_repair_failed">修复失败：%1$s</string>
+    <string name="boot_recovered">已修复，引擎恢复正常</string>
+    <string name="boot_enter">进入主界面</string>
+    <string name="boot_recovered_hint">修复只改启动配置，会话、工作区与插件包都还在。个人设置（主题、模型服务等）被移走的部分可以用「撤销上次修复」原样搬回。</string>
+    <string name="boot_failed_hint">可以先用「诊断」查看具体是哪一层配置坏了；「修复启动」会备份后移走坏配置，不删除插件与数据。</string>
+    <string name="diag_title">启动诊断</string>
+    <string name="diag_close">关闭</string>
+    <string name="diag_l1">软恢复（L1）</string>
+    <string name="diag_l2">隔离第三方插件（L2）</string>
+    <string name="diag_l3">重建依赖（L3）</string>
+    <string name="diag_undo">撤销上次修复</string>
+    <string name="diag_l3_confirm">L3 会移除 profile 的 node_modules 并需要联网重新拉取依赖。插件包已备份，可撤销。继续？</string>
+    <string name="diag_l3_offline">L3 需要联网，当前网络不可用。</string>
+    <string name="diag_undo_done">已撤销，正在重新启动引擎…</string>
+    <string name="diag_undo_none">没有可撤销的修复记录。</string>
+    <string name="diag_last_repair">上次修复：%1$s</string>
+    <string name="diag_verdict_hit">命中</string>
+    <string name="diag_verdict_miss">正常</string>
+    <string name="diag_verdict_unknown">未执行</string>
+
     <!-- 主界面 -->
     <string name="main_loading">正在加载界面…</string>
     <string name="main_error">界面加载失败，请重启引擎后重试。</string>

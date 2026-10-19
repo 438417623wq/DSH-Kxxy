@@ -13,4 +13,13 @@
     <color name="kxxy_boot_title">#0F1115</color>
     <color name="kxxy_boot_status">#61666B</color>
     <color name="kxxy_boot_hint">#81858C</color>
+
+    <!-- 崩溃自愈（方案 K）的强调色与状态色 -->
+    <color name="kxxy_accent">#1D6FF2</color>
+    <color name="kxxy_accent_text">#FFFFFF</color>
+    <color name="kxxy_danger">#C0392B</color>
+    <color name="kxxy_ok">#1E8E5A</color>
+    <color name="kxxy_warn">#B26B00</color>
+    <color name="kxxy_card_bg">#F4F6F9</color>
+    <color name="kxxy_divider">#E2E6EC</color>
 </resources>

@@ -98,6 +98,23 @@ class EngineSupervisor(private val ctx: Context) {
     var lastGoodUrl: String? = null
         private set
 
+    /**
+     * 上一轮失败的判定文本 + 同一条错误连续出现的次数。
+     *
+     * 用途只有一个：**同一条确定性错误不再退避 14 次**。配置类故障（补丁 YAML
+     * 写坏、bundle 装坏）在输入不变时是 100% 复现的，重试第 2 次和第 14 次
+     * 结果一模一样，用户却要为此等 2+4+8+16+32×10 ≈ 5 分钟。判定文本相同即
+     * 认为「重试无意义」，提前进入 Failed 态并带着原因让用户走修复流程。
+     *
+     * 反过来，不同错误（或同一条错误在健康之后又出现）仍走完整退避 ——
+     * 网络抖动、端口残留这类瞬时故障靠重试自愈，不能被这条规则误杀。
+     */
+    @Volatile
+    private var lastFailureText: String? = null
+
+    @Volatile
+    private var repeatFailure = 0
+
     // ── 对外控制面 ──────────────────────────────────────────────────────
 
     /** 用户点「退出」。 */
@@ -271,41 +288,57 @@ class EngineSupervisor(private val ctx: Context) {
 
                 val healthy = pollHealth(EngineConfig.DEFAULT_PORT, proc)
                 if (!healthy) {
-                    // 健康检查超时：这是我们主动放弃，不是引擎故障
-                    Log.w(TAG, "health check timed out after ${EngineConfig.HEALTH_TIMEOUT_MS}ms")
-                    proc.stop(graceMs = 2_000L)
+                    if (proc.exitStatus.isCompleted) {
+                        // 引擎在健康检查期间就自己退出了 —— 这不是「我们主动放弃」，
+                        // 而是确定性失败。原实现把它并进超时分支，于是每次都要白等
+                        // 满 45 秒、真正的崩溃原因（如 profile 补丁解析失败）被丢掉，
+                        // 14 轮下来要 11 分钟才进 Failed 态（缺陷 BT：方案 K 的归因
+                        // 拿不到第一手证据，用户只看到「32 秒后重试」）。
+                        val status = proc.exitStatus.getCompleted()
+                        deterministicFailure =
+                            "engine exited: ${app.kxxy.pty.PtyBridge.describe(status)}${errorHint(proc)}"
+                        proc.stop(graceMs = 1_000L)
+                        process = null
+                        Log.w(TAG, deterministicFailure)
+                    } else {
+                        // 健康检查超时：进程还活着只是没监听端口，这是我们主动放弃
+                        Log.w(TAG, "health check timed out after ${EngineConfig.HEALTH_TIMEOUT_MS}ms")
+                        proc.stop(graceMs = 2_000L)
+                        process = null
+                        backoffIndex++
+                        if (backoffIndex > EngineConfig.MAX_RESTART) {
+                            _state.value = State.Failed("引擎连续 ${EngineConfig.MAX_RESTART} 次启动失败")
+                            return
+                        }
+                        val delayMs = EngineConfig.BACKOFF_STEPS[
+                            (backoffIndex - 1).coerceAtMost(EngineConfig.BACKOFF_STEPS.size - 1)
+                        ]
+                        _state.value = State.Backoff(delayMs, backoffIndex)
+                        delay(delayMs)
+                        continue
+                    }
+                } else {
+                    // 健康：清零退避（连同「同一条错误重复了几次」的账）
+                    backoffIndex = 0
+                    lastFailureText = null
+                    repeatFailure = 0
+                    val tokenUrl = extractTokenUrlWithRetry(proc)
+                    lastGoodUrl = tokenUrl
+                    _state.value = State.Healthy(EngineConfig.DEFAULT_PORT, tokenUrl)
+
+                    // 阻塞等待引擎退出
+                    val status = proc.exitStatus.await()
                     process = null
-                    backoffIndex++
-                    if (backoffIndex > EngineConfig.MAX_RESTART) {
-                        _state.value = State.Failed("引擎连续 ${EngineConfig.MAX_RESTART} 次启动失败")
+
+                    if (userStopped.get()) {
+                        _state.value = State.Stopped
                         return
                     }
-                    val delayMs = EngineConfig.BACKOFF_STEPS[
-                        (backoffIndex - 1).coerceAtMost(EngineConfig.BACKOFF_STEPS.size - 1)
-                    ]
-                    _state.value = State.Backoff(delayMs, backoffIndex)
-                    delay(delayMs)
-                    continue
+
+                    // 运行中退出 = 真实死亡
+                    deterministicFailure = "engine exited: ${app.kxxy.pty.PtyBridge.describe(status)}"
+                    Log.w(TAG, deterministicFailure)
                 }
-
-                // 健康：清零退避
-                backoffIndex = 0
-                val tokenUrl = extractTokenUrlWithRetry(proc)
-                lastGoodUrl = tokenUrl
-                _state.value = State.Healthy(EngineConfig.DEFAULT_PORT, tokenUrl)
-
-                // 阻塞等待引擎退出
-                val status = proc.exitStatus.await()
-                process = null
-
-                if (userStopped.get()) {
-                    _state.value = State.Stopped
-                    return
-                }
-
-                // 运行中退出 = 真实死亡
-                deterministicFailure = "engine exited: ${app.kxxy.pty.PtyBridge.describe(status)}"
-                Log.w(TAG, deterministicFailure)
 
             } catch (e: EngineStartException) {
                 deterministicFailure = e.message ?: "engine start failed"
@@ -329,9 +362,25 @@ class EngineSupervisor(private val ctx: Context) {
                 }
 
                 backoffIndex++
-                if (backoffIndex > EngineConfig.MAX_RESTART) {
+
+                // 同一条确定性错误连续出现：输入没变，重试注定复现。
+                // 第 2 次就放弃（而不是 14 次），把真正的原因尽快交给用户 ——
+                // 见 lastFailureText 的注释。阈值 2 是因为「第一次失败」也可能是
+                // 安装器刚写完文件、还没落盘的瞬时状态，值得再试一次。
+                if (deterministicFailure == lastFailureText) {
+                    repeatFailure++
+                } else {
+                    lastFailureText = deterministicFailure
+                    repeatFailure = 1
+                }
+
+                if (repeatFailure >= DETERMINISTIC_GIVE_UP || backoffIndex > EngineConfig.MAX_RESTART) {
                     _state.value = State.Failed(
-                        "引擎连续 ${EngineConfig.MAX_RESTART} 次启动失败：$deterministicFailure"
+                        if (repeatFailure >= DETERMINISTIC_GIVE_UP) {
+                            "同一条启动错误连续出现 $repeatFailure 次，重试已无意义：$deterministicFailure"
+                        } else {
+                            "引擎连续 ${EngineConfig.MAX_RESTART} 次启动失败：$deterministicFailure"
+                        }
                     )
                     return
                 }
@@ -342,6 +391,33 @@ class EngineSupervisor(private val ctx: Context) {
                 delay(delayMs)
             }
         }
+    }
+
+    /**
+     * 从引擎日志尾部抓一行「像原因」的输出，拼进失败描述。
+     *
+     * 官方 CLI 崩溃时把真实原因写在 stderr（经 PTY 进 engine.log），而进程退出
+     * 状态只有一句 `exit code 1`。少了这行，用户在 Failed 态看到的永远是
+     * 「引擎连续 14 次启动失败：engine exited: exit code 1」—— 等于没说。
+     *
+     * 抓取范围刻意限定在 [logBaseline] 之后（本轮启动的日志），否则会捞到上一次
+     * 正常运行时的旧内容；`Error:` / `throw` / `Exception` / `Cannot find` 这些
+     * 前缀覆盖了官方启动链上绝大多数致命错误的开头。
+     */
+    private fun errorHint(proc: EngineProcess): String {
+        val tail = runCatching { proc.tailLog(16 * 1024) }.getOrDefault("")
+        if (tail.isEmpty()) return ""
+        val line = tail.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .firstOrNull { l ->
+                (l.startsWith("Error:") || l.startsWith("TypeError:") ||
+                    l.startsWith("YAMLException") || l.startsWith("Cannot find") ||
+                    l.contains("failed to parse") || l.contains("failed to read") ||
+                    l.contains("must be a mapping") || l.contains("MODULE_NOT_FOUND"))
+            }
+            ?: return ""
+        return " · ${line.take(220)}"
     }
 
     private fun ensureDirs() {
@@ -638,6 +714,15 @@ class EngineSupervisor(private val ctx: Context) {
 
     companion object {
         private const val TAG = "KxxySupervisor"
+
+        /**
+         * 同一条确定性错误连续出现多少次就放弃重试。
+         *
+         * 取 2 而非 1：第一次失败可能是安装器刚落盘、文件系统还没同步的瞬时
+         * 状态，值得再试一次；但第二次结果一模一样就说明输入没变，再退避
+         * 14 次也只是让用户干等 5 分钟。
+         */
+        private const val DETERMINISTIC_GIVE_UP = 2
 
         /**
          * 状态文件心跳间隔。

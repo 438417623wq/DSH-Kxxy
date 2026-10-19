@@ -29,6 +29,18 @@ import java.io.File
  */
 object EngineConfig {
 
+    /**
+     * 内置移动端插件的包名与声明版本（见 build-runtime.mjs 的 MOBILE_PLUGIN_PKG）。
+     *
+     * 版本只用于写进 profile 的 `dependencies` —— 真实代码来自 runtime.zip 里那份
+     * 已解包的 `lib/node_modules/dsh-web-mobile`，不依赖 profile 目录做任何安装。
+     *
+     * 声明在对象最前面，是因为 [CORE_BUNDLES] 的属性初始化器要用到它：Kotlin 的
+     * 对象字段按声明顺序初始化，放后面会拿到 null。
+     */
+    const val MOBILE_PLUGIN_NAME = "dsh-web-mobile"
+    const val MOBILE_PLUGIN_VERSION = "3.1.0"
+
     /** 引擎监听端口。官方前端与 WebView 都硬编码它。 */
     const val DEFAULT_PORT = 3080
 
@@ -1063,6 +1075,56 @@ object EngineConfig {
     fun profileManifestFile(ctx: Context): File = File(profileDir(ctx), "package.json")
 
     /**
+     * profile 级用户补丁（`$HOME/profiles/web/cordis.patch.yml`）。
+     *
+     * 这是**用户**通过插件页或手写 YAML 改配置留下的文件。它被引擎在 bundle
+     * 层叠的第二级加载，一旦 YAML 语法坏掉，`dsh-app-boot` 会直接抛
+     * `failed to parse patch` 并终止启动 —— 而 bundle 层的同名问题只会被记进
+     * `skippedBundles`（不致命）。这一非对称是本文件里 [RecoveryManager] 存在
+     * 的主要原因。
+     */
+    fun profilePatchFile(ctx: Context): File = File(profileDir(ctx), "cordis.patch.yml")
+
+    /**
+     * home 级用户补丁（`$HOME/cordis.patch.yml`，即 `$DSH_HOME/cordis.patch.yml`）。
+     *
+     * ⚠️ 桌面端的 `sanitizeProfile` **刻意不碰**这个文件（它只处理 profile 目录），
+     * 因为桌面用户的 home 是真实家目录、可能被多个 profile 共用。手机端不同：
+     * `$DSH_HOME` 是 App 私有目录下的 `files/kxxy-home`，只有这一个引擎在用，
+     * 且这一层在层叠顺序里排在 profile 之后（优先级更高），坏掉同样致命。
+     * 所以手机端的恢复必须连它一起移走 —— 这是与桌面端**有意为之的差异**。
+     */
+    fun homePatchFile(ctx: Context): File = File(dshHome(ctx), "cordis.patch.yml")
+
+    /** profile 的 `node_modules`：官方 profile 机制安装第三方插件的位置。 */
+    fun profileModulesDir(ctx: Context): File = File(profileDir(ctx), "node_modules")
+
+    /**
+     * 崩溃自愈的备份根（`files/kxxy-recovery/`）。
+     *
+     * 刻意**不放在 `$DSH_HOME` 里**：那个目录会被引擎当作 home 扫描（会话、
+     * 工作区、插件配置都在里面），多塞一棵含 `cordis.patch.yml.bak-*` 的树
+     * 有被误加载的风险；而且用户在工作区里 `ls ~` 时会看到一堆陌生目录。
+     */
+    fun recoveryRoot(ctx: Context): File = File(ctx.filesDir, "kxxy-recovery")
+
+    /**
+     * 恢复后必须保留在 `dsh.profile.bundles` 里的内置 bundle。
+     *
+     * 与桌面端 `sanitizeProfile` 的两项相比多一个 [MOBILE_PLUGIN_NAME]：
+     * 少掉它，引擎能起来但移动端那套 Web UI 完全不存在（页面是桌面布局，
+     * 在手机上没法用）。这不是「多一个插件更保险」，而是移动端的功能下限。
+     */
+    val CORE_BUNDLES: List<String> = listOf(
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        MOBILE_PLUGIN_NAME,
+    )
+
+    /** 是否是内置（受恢复保护、永不被隔离）的 bundle。 */
+    fun isCoreBundle(name: String): Boolean = name in CORE_BUNDLES
+
+    /**
      * 把内置的移动端插件登记进 profile manifest，使其出现在官方插件页。
      *
      * 为什么必须写这个文件：官方「插件」页（`dsh-client-ui-plugin-manager`）的
@@ -1128,6 +1190,29 @@ object EngineConfig {
             f.parentFile?.mkdirs()
             f.writeText(text)
         }
+    }
+
+    /**
+     * 一份最小可用的 profile manifest（崩溃自愈兜底用）。
+     *
+     * 只在原文件**不是合法 JSON** 时被 [RecoveryManager] 用来重建。它必须满足
+     * `dsh-app-boot` 对 profile 的最低要求：`dsh.profile.bundles` 是个数组，
+     * 且里面至少有一个存在的 bundle。故意只写核心三项 —— 这时用户装的第三方
+     * 插件已经救不回来了（清单本身就坏了，无从知道原来启用了什么），
+     * 能起得来、能进 UI 才是第一优先级。
+     *
+     * `dependencies` 里补上移动端插件，理由同 [ensureProfileManifest]：
+     * 官方插件页的「已安装」分组只认这个字段。
+     */
+    fun minimalProfileManifest(): String {
+        val bundles = org.json.JSONArray()
+        for (name in CORE_BUNDLES) bundles.put(name)
+        val json = org.json.JSONObject()
+            .put("name", "dsh-profile-web")
+            .put("private", true)
+            .put("dependencies", org.json.JSONObject().put(MOBILE_PLUGIN_NAME, MOBILE_PLUGIN_VERSION))
+            .put("dsh", org.json.JSONObject().put("profile", org.json.JSONObject().put("bundles", bundles)))
+        return json.toString(2) + "\n"
     }
 
     /**
@@ -1222,13 +1307,4 @@ object EngineConfig {
 
     /** 首行标记前缀，用于识别「这个 .bashrc 是我们写的」，避免覆盖用户自定义。 */
     private const val USER_SHELL_INIT_TAG = "# kxxy-shell@"
-
-    /**
-     * 内置移动端插件的包名与声明版本（见 build-runtime.mjs 的 MOBILE_PLUGIN_PKG）。
-     *
-     * 版本只用于写进 profile 的 `dependencies` —— 真实代码来自 runtime.zip 里那份
-     * 已解包的 `lib/node_modules/dsh-web-mobile`，不依赖 profile 目录做任何安装。
-     */
-    private const val MOBILE_PLUGIN_NAME = "dsh-web-mobile"
-    private const val MOBILE_PLUGIN_VERSION = "3.1.0"
 }

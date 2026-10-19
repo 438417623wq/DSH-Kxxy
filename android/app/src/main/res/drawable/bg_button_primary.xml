@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  主操作按钮（「修复启动」）的底色。
+
+  用 shape 而不是 setBackgroundColor：后者会把 Button 的默认背景整个替换成
+  一块纯色矩形，圆角、按下态、内边距全部丢失，观感与系统其它按钮割裂。
+  这里只提供形状，按下态交给 android:stateListAnimator 的默认高度变化。
+
+  颜色引用 kxxy_accent，深浅色主题各有一份，见 values{,-night}/colors.xml。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/kxxy_accent" />
+    <corners android:radius="10dp" />
+</shape>
