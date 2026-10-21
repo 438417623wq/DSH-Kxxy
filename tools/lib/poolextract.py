@@ -82,6 +82,10 @@ POOL_MANIFEST = ".pool-manifest.json"
 ELF_MAGIC = b"\x7fELF"
 AR_MAGIC = b"!<arch>\n"
 
+# golang 池里 `go` 的两份副本（Termux 的 bin/go 与 lib/go/bin/go 内容相同）。
+# 见 --go-binary：这两条路径会在打包时被整体替换成编译期钉死引擎根的产物。
+GO_OVERRIDE_PATHS = frozenset({"bin/go", "lib/go/bin/go"})
+
 # 与 tools/lib/stage.mjs 的 PRUNE_DIRS / PRUNE_EXT 保持一致的子集：
 # 纯文档在包池里同样没有价值（include/ 与 .a 必须保留 —— 工具链要编译）。
 #
@@ -252,7 +256,22 @@ def main():
     ap.add_argument("--stage", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--report", required=True)
+    ap.add_argument("--go-binary",
+                    help="用这个 ELF 覆盖 golang 池里的 bin/go 与 lib/go/bin/go"
+                         "（由 tools/build-go-android.ps1 交叉编译产出）")
     args = ap.parse_args()
+
+    # 覆盖用的 go 二进制只读一次。它必须是交叉编译产物而不是 deb 里那份：
+    # deb 里的 go 是在 Termux 环境编的，二进制里写死
+    # /data/data/com.termux/files/usr/etc/resolv.conf；而 ELF 内容在本项目里
+    # 是**绝不改写**的（见本文件 rewrite_prefixes 的 ELF 短路、以及
+    # tools/build-runtime.mjs 的 isElf 跳过），所以路径只能在编译期钉死。
+    go_override = None
+    if args.go_binary:
+        with open(args.go_binary, "rb") as fh:
+            go_override = fh.read()
+        if go_override[:4] != ELF_MAGIC:
+            raise SystemExit(f"--go-binary 不是 ELF：{args.go_binary}")
 
     with open(args.spec, "r", encoding="utf-8") as fh:
         spec = json.load(fh)
@@ -345,9 +364,26 @@ def main():
         total_bytes = 0
         placeholder_paths = []
         stripped_native = 0
+        go_overridden = 0
         with tarfile.open(out_path, "w:gz", format=tarfile.GNU_FORMAT, compresslevel=6) as out:
             for path in sorted(merged):
                 data, mode = merged[path]
+                # golang 池：把 deb 自带的 go 换成编译期已钉死引擎根的产物。
+                # 两份都要换 —— Termux 里 bin/go 与 lib/go/bin/go 是同一个文件，
+                # 但设备端 `go` 走 PATH 命中的是 bin/go，而 GOROOT 自检用的是
+                # lib/go/bin/go；漏掉任一份就会出现「版本/行为不一致」。
+                if (go_override is not None and ext_id == "golang"
+                        and path in GO_OVERRIDE_PATHS):
+                    data = go_override
+                    mode = 0o755
+                    go_overridden += 1
+                    info = tarfile.TarInfo(path)
+                    info.size = len(data)
+                    info.mode = 0o755
+                    info.mtime = 0
+                    out.addfile(info, io.BytesIO(data))
+                    total_bytes += len(data)
+                    continue
                 data, changed = rewrite_prefixes(data)
                 if changed:
                     placeholder_paths.append(path)
@@ -399,11 +435,15 @@ def main():
             "totalBytes": total_bytes,
             "placeholderFiles": len(placeholder_paths),
             "strippedJansiNative": stripped_native,
+            "goOverridden": go_overridden,
         })
         print(
             f"      {ext_id}: {len(merged)} 文件 / {total_bytes / 1048576:.1f} MiB"
             f"（跳过 {skipped} 条，改写路径 {len(placeholder_paths)} 个）→ {out_path}"
         )
+        if go_overridden:
+            print(f"      {ext_id}: 已替换 {go_overridden} 份 go 二进制"
+                  f"（{len(go_override)} B，引擎根已钉死）")
 
     with open(args.report, "w", encoding="utf-8") as fh:
         json.dump({"items": report}, fh, ensure_ascii=False, indent=2)

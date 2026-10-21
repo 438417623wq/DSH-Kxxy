@@ -24,6 +24,13 @@ import {
   writeFileSync,
   chmodSync,
   copyFileSync,
+  symlinkSync,
+  openSync,
+  readSync,
+  closeSync,
+  fstatSync,
+  lstatSync,
+  readlinkSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
@@ -112,8 +119,19 @@ const MOBILE_PLUGIN_MARKER_FILE = "lib/node_modules/dsh-web-mobile/plugin.versio
  * 而 RUNTIME_VERSION 从未变过 —— 老设备升级 APK 时前面的锚点全部通过，
  * isComplete() 判真并跳过重装，设备上永远没有这两份文件，Office 预览
  * 一直报「Office 预览不可用」。标记写在独立小文件里（TTF 头部不能动）。
+ *
+ * 从 Kotlin 源码读，不抄字面量：@1 → @2 那轮（wasm 0.1.1 → 0.1.5，缺陷 CL）
+ * 就是先改了 Kotlin、忘了改这里，模拟安装仍拿 @1 去比对，等于白测。
  */
-const OFFICE_LAYER_MARKER = "kxxy-office@1";
+const OFFICE_LAYER_MARKER = (() => {
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  const m = /OFFICE_LAYER_MARKER\s*=\s*"([^"]+)"/.exec(kt);
+  if (m === null) throw new Error("RuntimeInstaller.kt 未定义 OFFICE_LAYER_MARKER");
+  return m[1];
+})();
 const OFFICE_LAYER_MARKER_FILE = "lib/node_modules/kxxy-host/fonts/office-assets.version";
 const OFFICE_WASM_ENGINE =
   "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.wasm";
@@ -153,13 +171,52 @@ const TESSDATA_LANGUAGE_FILE = "share/tessdata/chi_sim.traineddata";
  * `tex/latex`/`tex/plain`/`tlpkg` 全为 0 条 —— 宏包树由构建期从 CTAN 取
  * scheme-basic 打进 runtime。缺了它 `pdftex t.tex` 连 plain TeX 都跑不了。
  */
-const TEXLIVE_MARKER = "kxxy-texlive@2";
+const TEXLIVE_MARKER = "kxxy-texlive@3";
 const TEXLIVE_MARKER_FILE = "lib/node_modules/kxxy-host/texlive.version";
 const TEXLIVE_CORE_FILES = [
   "share/texlive/2026.0/texmf-dist/tex/latex/base/article.cls",
   "share/texlive/2026.0/texmf-dist/tex/plain/base/plain.tex",
   "share/texlive/2026.0/tlpkg/TeXLive/TLConfig.pm",
 ];
+
+/**
+ * 与 RuntimeInstaller.ANDROID_JAR_MARKER 保持一致（锚点 14，缺陷 CQ）。
+ *
+ * 上游 ecj 的 `share/java/android.jar` 是 4555 条目的精简 stub，没有
+ * `resources.arsc`；`aapt2 link` 处理任何 `@android:*` 都会报
+ * `No package ID 01 found for resource ID 0x0101053d`。构建期由
+ * `bundleAndroidJar()` 用本机 SDK 的 `platforms/android-36/android.jar`
+ * 裁出 arsc + 清单 + class 覆盖，体积从 3.88 MB 涨到 10.58 MB。
+ */
+const ANDROID_JAR_MARKER = "kxxy-androidjar@1";
+const ANDROID_JAR_MARKER_FILE = "lib/node_modules/kxxy-host/androidjar.version";
+const MIN_ANDROID_JAR_BYTES = 6 * 1024 * 1024;
+
+/**
+ * 与 RuntimeInstaller.PACKAGING_MARKER 保持一致（锚点 15，缺陷 CT）。
+ *
+ * `bin/corepack` 的修复是**原地换掉一个文件的形态**（`dist/corepack.js` 的副本
+ * → 156 B 的 sh 包装器），不新增文件、不改变 RUNTIME_VERSION ⇒ 前十四锚点全过、
+ * `isComplete()` 判真、老设备永不重装。同型陷阱的第四次出现（锚点 11–14 之后）。
+ */
+const PACKAGING_MARKER = "kxxy-packaging@1";
+const PACKAGING_MARKER_FILE = "lib/node_modules/kxxy-host/packaging.version";
+const PACKAGING_WRAPPERS = [
+  "bin/corepack",
+  "bin/npm",
+  "bin/npx",
+  "bin/pnpm",
+  "bin/zipalign",
+  "bin/bundletool",
+];
+
+/**
+ * 允许以「corepack dist 软链」形态出现的包装器（与 `RuntimeInstaller.COREPACK_SHIM_NAMES`
+ * 一致）。`corepack enable` 会自己接管这四个，属于官方文档行为；`zipalign` /
+ * `bundletool` 是自造的，没有这个合法形态。
+ */
+const COREPACK_SHIM_NAMES = new Set(["bin/corepack", "bin/npm", "bin/npx", "bin/pnpm"]);
+
 const EXECUTABLE_NAMES = new Set(["rg", "esbuild", "node", "sharp", "swc", "dprint", "biome"]);
 const SONAME_ALIASES = [
   ["lib/libreadline.so.8", "lib/libreadline.so.8.3"],
@@ -177,23 +234,62 @@ const fail = (msg) => {
 const ok = (msg) => console.log(`  ✓ ${msg}`);
 
 // ---------------------------------------------------------------- readZipIndex
-const buf = readFileSync(zipPath);
+/*
+ * 用 fd + 偏移随机读，**不**把整个 zip 读进内存。
+ *
+ * 首版是 `const buf = readFileSync(zipPath)`，然后从这块 707 MiB 的 Buffer
+ * 里切片解压。本机提交上限 16.2 GB、空闲常剩 1 GB 上下，于是：
+ *   · 先把 707 MiB 常驻钉住；
+ *   · 再解 `lib/jvm/.../modules`（142 MB 输出 + 45 MB 输入）时
+ *     `zlibBufferSync` 里的 `Buffer.concat` 申请不到内存：
+ *
+ *         RangeError: Failed to allocate memory
+ *           at createUnsafeBuffer (node:internal/buffer:1113:25)
+ *           at Buffer.concat (node:buffer:672:18)
+ *           at processChunkSync (node:zlib:502:54)
+ *           at readEntryData (tools/simulate-install.mjs:285:46)
+ *
+ * 而模拟安装只需要「中央目录 + 逐条数据」，两者都可以按偏移读。
+ * 中央目录本身只有几 MB（58,920 条 × 约 100 B），整份读入没有问题。
+ */
+const zipFd = openSync(zipPath, "r");
+const zipSize = fstatSync(zipFd).size;
+
+/** 从 zip 的 `[offset, offset+len)` 读一段（越界即报错，不做静默截断）。 */
+function readAt(offset, len) {
+  const out = Buffer.allocUnsafeSlow(len);
+  let got = 0;
+  while (got < len) {
+    const n = readSync(zipFd, out, got, len - got, offset + got);
+    if (n <= 0) break;
+    got += n;
+  }
+  if (got !== len) throw new Error(`readAt: 只读到 ${got}/${len} 字节（zip@${offset}）`);
+  return out;
+}
+
+// EOCD 在最尾部，最多回看 66,000 字节（22 字节固定头 + 64 KiB 注释上限）。
+const tailLen = Math.min(zipSize, 66_000);
+const tailStart = zipSize - tailLen;
+const tail = readAt(tailStart, tailLen);
 let eocd = -1;
-for (let i = buf.length - 22; i >= Math.max(0, buf.length - 66_000); i -= 1) {
-  if (buf.readUInt32LE(i) === 0x06054b50) {
-    eocd = i;
+for (let i = tail.length - 22; i >= 0; i -= 1) {
+  if (tail.readUInt32LE(i) === 0x06054b50) {
+    eocd = tailStart + i;
     break;
   }
 }
 if (eocd < 0) throw new Error("找不到 EOCD");
-const count = buf.readUInt16LE(eocd + 10);
-const cdStart = buf.readUInt32LE(eocd + 16);
+const count = tail.readUInt16LE(eocd - tailStart + 10);
+const cdStart = tail.readUInt32LE(eocd - tailStart + 16);
+const cdSize = tail.readUInt32LE(eocd - tailStart + 12);
+const buf = readAt(cdStart, cdSize); // 只放中央目录，几 MB
 
 /** name → { method, csize, usize, localOffset, comment } */
 const index = new Map();
 const topDirs = new Set();
 {
-  let p = cdStart;
+  let p = 0;
   for (let i = 0; i < count; i += 1) {
     const method = buf.readUInt16LE(p + 10);
     const csize = buf.readUInt32LE(p + 20);
@@ -230,12 +326,14 @@ console.log(`模拟安装到：${target}\n`);
 /** 读一个条目的原始内容（method=0 直接切片，否则 inflateRaw）。 */
 function readEntryData(name, e) {
   const lp = e.localOffset;
-  if (buf.readUInt32LE(lp) !== 0x04034b50) throw new Error(`local header 签名错误：${name}`);
-  const nameLen = buf.readUInt16LE(lp + 26);
-  const extraLen = buf.readUInt16LE(lp + 28);
+  // 本地头单独读 30 字节，再读文件名/扩展区，最后只读数据段 —— 不碰整份 zip。
+  const localHead = readAt(lp, 30);
+  if (localHead.readUInt32LE(0) !== 0x04034b50) throw new Error(`local header 签名错误：${name}`);
+  const nameLen = localHead.readUInt16LE(26);
+  const extraLen = localHead.readUInt16LE(28);
   const start = lp + 30 + nameLen + extraLen;
-  const raw = buf.subarray(start, start + e.csize);
-  return e.method === 0 ? Buffer.from(raw) : inflateRawSync(raw);
+  const raw = readAt(start, e.csize);
+  return e.method === 0 ? raw : inflateRawSync(raw);
 }
 
 // ---------------------------------------------------------------- extract
@@ -275,6 +373,12 @@ console.log(`[1] extract：写出 ${extracted} 个文件，跳过 ${skippedLinks
 }
 
 // ---------------------------------------------------------------- materialiseLinks
+//
+// 与 `RuntimeInstaller.materialiseLinks` 对齐：建**相对符号链接**而非复制
+// （缺陷 DD）。复制会让 `$ORIGIN` / `$0` 依赖自身位置的程序失效 —— 真机上
+// `bin/java` 报 `CANNOT LINK ... "libjli.so" not found`、`bin/mvn` 推出错的
+// `MAVEN_HOME`。这里用 symlinkSync 如实模拟，才能在校验阶段就发现「别名
+// 指向了不存在的本体」这类问题。
 let madeLinks = 0;
 const missingLinkTargets = [];
 for (const [alias, targetRel] of linkTargets) {
@@ -285,12 +389,13 @@ for (const [alias, targetRel] of linkTargets) {
     continue;
   }
   mkdirSync(dirname(dst), { recursive: true });
-  copyFileSync(src, dst);
+  // 相对路径软链：与 Kotlin 侧 `Path.relativize` 等价，root 搬迁后不断链。
+  symlinkSync(relative(dirname(dst), src), dst);
   madeLinks += 1;
 }
-console.log(`[2] materialiseLinks：物化 ${madeLinks}/${linkTargets.size} 个别名`);
+console.log(`[2] materialiseLinks：软链 ${madeLinks}/${linkTargets.size} 个别名`);
 if (missingLinkTargets.length) fail(`LINK 目标缺失 ${missingLinkTargets.length} 条：${missingLinkTargets.slice(0, 5).join(", ")}`);
-else ok("全部 LINK 目标都在包内（可物化）");
+else ok("全部 LINK 目标都在包内（可软链）");
 
 // ---------------------------------------------------------------- rewriteRootPlaceholder
 const placeholders = manifest.placeholderPaths ?? [];
@@ -352,9 +457,34 @@ const walk = (dir, out = []) => {
 for (const full of walk(target)) {
   const base = full.slice(full.lastIndexOf(sep) + 1);
   const rel = relative(target, full).split(sep).join("/");
-  const head = readFileSync(full, { encoding: null }).subarray(0, 4);
-  const isElf = head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46;
-  const isScript = head[0] === 0x23 && head[1] === 0x21;
+  /*
+   * 只读头 4 字节判断 ELF / shebang —— **不能** `readFileSync(full)` 整份读。
+   *
+   * 解包树里最大的条目是 `lib/jvm/java-21-openjdk/lib/modules`（142 MB）与
+   * `lib/libLLVM.so`（133 MB）。整份读进来只为看前 4 个字节，在这台提交
+   * 内存只剩 1 GB 上下的机器上直接：
+   *
+   *     RangeError: Failed to allocate memory
+   *       at tryCreateBuffer (node:fs:402:21)
+   *       at readFileSync (node:fs:500:14)
+   *
+   * 而 5 万多个文件逐个整读，即使小文件也会把 8 KB pool 反复占满。
+   */
+  const head = Buffer.allocUnsafeSlow(4);
+  let headLen = 0;
+  try {
+    const fd = openSync(full, "r");
+    try {
+      headLen = readSync(fd, head, 0, 4, 0);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    headLen = 0;
+  }
+  const isElf =
+    headLen === 4 && head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46;
+  const isScript = headLen >= 2 && head[0] === 0x23 && head[1] === 0x21;
   // 与 RuntimeInstaller.restoreExecBits 的三段策略保持一致：
   // bin/ + usr/bin/ + libexec/ 全量；lib/jvm 下两级（openjdk-21 布局）；
   // node_modules 内按路径与名单。
@@ -569,10 +699,61 @@ const anchors = [
   // tex/latex、tex/plain、tlpkg 全为 0 条 —— 宏包树由构建期从 CTAN 打进 runtime。
   ["锚点 13 宏包树标记", join(target, TEXLIVE_MARKER_FILE)],
   ...TEXLIVE_CORE_FILES.map((f, i) => [`锚点 13 宏包树主体 ${i + 1}`, join(target, f)]),
+  // 锚点 14：带 resources.arsc 的 android.jar（缺陷 CQ）。上游 ecj 自带的是
+  // 4555 条目的精简 stub，aapt2 link 解析任何 @android:* 都失败。
+  ["锚点 14 android.jar 标记", join(target, ANDROID_JAR_MARKER_FILE)],
+  // 锚点 15：打包工具包装器（缺陷 CT）。corepack 的修复换的是**已有文件的
+  // 形态**而不是新增文件 —— 不升任何标记就永远到不了老设备。
+  ["锚点 15 打包工具标记", join(target, PACKAGING_MARKER_FILE)],
+  ...PACKAGING_WRAPPERS.map((f, i) => [`锚点 15 包装器 ${i + 1}`, join(target, f)]),
 ];
 for (const [label, f] of anchors) {
   if (!existsSync(f)) fail(`${label} 缺失：${f.slice(target.length + 1)}`);
   else ok(`${label} 存在`);
+}
+{
+  // 锚点 15 的第二段判定：形态。标记只能证明 zip 里带的是新版，证明不了解
+  // 出来的就是包装器 —— 副本形态（`#!/usr/bin/env node` 开头的 dist/corepack.js）
+  // 照样能让「文件存在」为真。首行必须是 `#!/system/bin/sh`，且不得出现
+  // `lib/corepack.cjs`（那是副本入口按 __dirname 解析失败的那一句）。
+  //
+  // 但「首行是 sh」不是唯一合法形态：用户跑一次 `corepack enable`（corepack 的
+  // 官方文档行为）就会把 `bin/npm` / `bin/pnpm` 换成指向
+  // `lib/node_modules/corepack/dist/<name>.js` 的软链，首行变成
+  // `#!/<root>/bin/env node`。这形态实测可用（目标与 `lib/corepack.cjs` 同级，
+  // `require('./lib/corepack.cjs')` 按 __dirname 解析命中），判假的代价是
+  // 741 MB 全量重装 —— 与 RuntimeInstaller 的判据保持一致：软链只允许出现在
+  // corepack 管的那四个名字上，且目标必须在 corepack/dist 下。
+  for (const rel of PACKAGING_WRAPPERS) {
+    const f = join(target, rel);
+    if (!existsSync(f)) continue; // 缺失已在上面报过
+    if (lstatSync(f).isSymbolicLink()) {
+      const link = readlinkSync(f).replace(/\\/g, "/");
+      if (!COREPACK_SHIM_NAMES.has(rel)) {
+        fail(`锚点 15 ${rel} 是软链 —— 只有 corepack 管的四个允许软链形态`);
+      } else if (!link.includes("lib/node_modules/corepack/dist/") || !link.endsWith(".js")) {
+        fail(`锚点 15 ${rel} 软链目标不在 corepack/dist 下（${link}）`);
+      } else ok(`锚点 15 ${rel} 是 corepack dist 软链（${link}）`);
+      continue;
+    }
+    const head = readFileSync(f, "utf8").slice(0, 256);
+    if (!head.startsWith("#!/system/bin/sh")) {
+      fail(`锚点 15 ${rel} 首行不是 #!/system/bin/sh（${head.slice(0, 24)}）`);
+    } else if (head.includes("lib/corepack.cjs")) {
+      fail(`锚点 15 ${rel} 正文含 lib/corepack.cjs —— 仍是副本，缺陷 CT 复发`);
+    } else ok(`锚点 15 ${rel} 是 sh 包装器`);
+  }
+}
+{
+  // 锚点 14 的第二段判定：体积。标记只能证明 zip 里带的是新版，证明不了
+  // 解出来的是新版 —— 旧 stub 3.88 MB、裁剪新版 10.58 MB，按 6 MiB 分界。
+  const aj = join(target, "share/java/android.jar");
+  if (!existsSync(aj)) fail("锚点 14 android.jar 缺失");
+  else {
+    const size = statSync(aj).size;
+    if (size < MIN_ANDROID_JAR_BYTES) fail(`锚点 14 android.jar 仍是精简 stub（${size} B）`);
+    else ok(`锚点 14 android.jar 体积达标（${size} B）`);
+  }
 }
 {
   // 锚点 6 的第二段判定：版本标记。RuntimeInstaller.compatLayerIsCurrent 读

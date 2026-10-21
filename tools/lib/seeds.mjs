@@ -28,7 +28,26 @@ export const SEED_PACKAGES = [
   "make", "ninja", "cmake", "pkg-config",
 
   // ── G1 脚本与数据：AI 写脚本、处理 JSON/CSV/SQLite 的日常工具 ───────
-  "python", "python-pip", "jq", "yq", "fd", "fzf", "bat", "eza",
+  // python-ensurepip-wheels 必须跟着 python 一起装（缺陷 CM，问题清单 P6）：
+  // `python` deb 自己只发 `ensurepip/{__init__,__main__,_uninstall}.py`，
+  // 而 `ensurepip/_bundled/pip-<version>-py3-none-any.whl` 在这个**独立包**里。
+  // 缺了它 `python -m venv .venv` 直接失败：
+  //   Error: Command '[... /bin/python3.14, '-m', 'ensurepip', ...]' returned non-zero exit status 1.
+  // shell 里的 `pip` 不受影响（python-pip 把 site-packages/pip 装好了），
+  // 所以这个缺陷只在 venv 上暴露，很容易漏。
+  // ⚠️ 不能只抄 wheels 包名了事：wheels 包声明 `Depends: python (= <同版本>)`，
+  // 两者版本必须由 resolveClosure 一起解析，硬挑某个 whl 版本会和 python 的
+  // `_PIP_VERSION` 常量错位（实测 3.14.6 期望 pip-26.1.2，而新 wheels 带 26.2.1）。
+  "python", "python-pip", "python-ensurepip-wheels",
+  // 三个最常用、且 PyPI 上**没有 Android wheel** 的扩展，由 Termux 预编译
+  // 版本顶上（缺陷 CP，问题清单 P14）：
+  //   `pip install numpy psutil cryptography` → `No matching distribution found`
+  //   （numpy/psutil 没有 android_arm64 的 wheel），转源码编译又要 ninja/meson
+  //   与完整 NDK 头，手机上一律失败。
+  // 装这三个只多 7.1 MiB（numpy 5.93 含 libopenblas / psutil 0.08 / crypto 1.08），
+  // 却把「数据分析、进程监控、加密」三条最常走的 Python 路打通。
+  "python-numpy", "python-psutil", "python-cryptography",
+  "jq", "yq", "fd", "fzf", "bat", "eza",
   "tree", "sd", "sqlite", "bc", "lua54",
 
   // ── G2 归档压缩：任何格式都能解 ────────────────────────────────────
@@ -63,6 +82,33 @@ export const SEED_PACKAGES = [
 
   // ── G9 包管理：AI 能自己查/装包 ────────────────────────────────────
   "dpkg", "debianutils", "command-not-found", "root-repo", "x11-repo",
+
+  // ── G10 标准 Unix 环境补缺（缺陷 CN，问题清单 P18）──────────────────
+  //
+  // 原报告「缺 man/libtool/zsh/fish/vim/nvim/gh/zipalign/bundletool/btop/ncdu」
+  // 里，zipalign / bundletool / btop 在 Termux 主仓库**根本不存在**（不是漏装）：
+  //   · zipalign   —— Android SDK build-tools 的二进制，从不在 Termux 仓库。
+  //                   已自建：`build-runtime.mjs` 的 `packagingWrappers()`
+  //                   生成 `bin/zipalign` 包装器（转调自研
+  //                   `packaging/zipalign.mjs`，纯 JS 做 4/8/16 KiB 对齐、
+  //                   不重压数据）。见流水线 6.9 步。
+  //   · bundletool —— Google 的 Java jar，靠 `java -jar bundletool.jar` 跑，
+  //                   不是 apt 包。已自建：`bundletool-all.jar`（32.5 MiB，
+  //                   取自 GitHub Releases 1.18.3）随插件落
+  //                   `lib/node_modules/kxxy-host/packaging/`，
+  //                   `bin/bundletool` 包装器先找 `share/java/` 再回落这里，
+  //                   并自动用引擎自带 JDK（不依赖 PATH 上的 java）。
+  //   · btop       —— 仓库里只有 htop（已在 G7）。**这一项是真的不装**：
+  //                   它只是 htop 的替代品，功能重叠且没有独有能力。
+  // 剩下能装的分两档：便宜的、几乎所有构建脚本都会碰的进预装；
+  // fish / neovim / gh 体积各 6.8–9.6 MiB、且和已装的 tmux/nano/emacs 功能重叠，
+  // 放进扩展池 `shells` 项，用户按需获取。
+  //
+  // libtool 属于「autoreconf 缺它就 Exit 127」的地基（G0 同族），
+  // mandoc + manpages 让 `man ls` 这类最基础的求助方式可用，
+  // ncdu 只有 40 KiB 却能救磁盘满的现场，zsh 1.9 MiB、vim 6.7 MiB
+  // （报告明确点了 vim/nvim 都没有，而现有只有 nano/emacs）。
+  "mandoc", "manpages", "libtool", "ncdu", "zsh", "vim",
 ];
 
 /**
@@ -246,5 +292,16 @@ export const POOL_ITEMS = [
     name: "Perl",
     description: "git-svn / git-p4 的依赖，经典脚本语言。",
     bins: ["perl"],
+  },
+  // ── L 组：编辑器与 shell（缺陷 CN，问题清单 P18 里体积大的那几个）───────
+  //
+  // 报告点的 man/libtool/zsh/vim 已进预装（G10），这里只放「功能和已有东西
+  // 重叠 / 单个体积不小」的三个：neovim 16 个依赖含全套 tree-sitter 语法、
+  // fish 自带 6.8 MiB 的 function 库、gh 是老版本 git 之外的 GitHub 客户端。
+  {
+    id: "shells", seeds: ["fish", "neovim", "gh"], category: "devtools",
+    name: "fish / Neovim / GitHub CLI",
+    description: "交互式 shell（fish）、现代编辑器（nvim + tree-sitter 语法）、GitHub 命令行客户端。",
+    bins: ["fish", "nvim", "gh"],
   },
 ];

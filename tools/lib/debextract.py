@@ -20,16 +20,27 @@
   python debextract.py --debs <deb目录> --out <输出目录>
 """
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import lzma
 import os
+import posixpath
+import re
 import sys
 import tarfile
+import tempfile
 from io import BytesIO
 
 # Termux 的 deb 把内容装在绝对路径下，平铺时需要剥掉这个前缀。
 TERMUX_PREFIX = "./data/data/com.termux/files/usr/"
+TERMUX_ABS_PREFIX = "/data/data/com.termux/files/usr/"
+
+# `update-alternatives --install "<link>" "<name>" "<target>" <priority>`
+ALT_INSTALL_RE = re.compile(
+    r"--install\s+\"([^\"]+)\"\s+\"([^\"]+)\"\s+\"([^\"]+)\"\s+(\d+)"
+)
 
 
 def read_ar_members(blob):
@@ -52,8 +63,19 @@ def read_ar_members(blob):
     return members
 
 
+@contextlib.contextmanager
 def open_data_tar(deb_path):
-    """取出 deb 的 data.tar.* 并解成 tarfile。"""
+    """取出 deb 的 data.tar.* 并解成 tarfile（上下文管理器）。
+
+    为什么不用 `lzma.decompress` 一把梭：
+      首版就是那么写的，注释还断言「单个 data.tar 解压后最大约 60 MiB，构建机
+      内存足够」——那个断言是错的。`erlang` 的 data.tar.xz 解压后 424 MiB、
+      `rust` 更大，在 8 GB 的构建机上 `lzma.decompress` 直接
+      `MemoryError: Unable to allocate output buffer.`（真机实测，整个
+      stage 生成卡在 erlang 这一包）。改成**分块流式解压到临时文件**，
+      峰值内存只剩压缩块本身；tarfile 直接打开该临时文件（用真文件而不是
+      BytesIO，顺带避开 tarfile 对不可 seek 流做头部探测的问题）。
+    """
     with open(deb_path, "rb") as fh:
         blob = fh.read()
     members = read_ar_members(blob)
@@ -61,17 +83,115 @@ def open_data_tar(deb_path):
     if name is None:
         raise ValueError(f"no data.tar member in {deb_path} (have: {list(members)})")
     raw = members[name]
-    if name.endswith(".xz"):
-        # 不能用 lzma.LZMAFile 流式喂给 tarfile：tarfile 的 seek 探测会报
-        # "invalid header"。全量解压后再包 BytesIO 是稳的（单个 data.tar
-        # 解压后最大约 60 MiB，构建机内存足够）。
+    del blob  # 成员是切片拷贝，blob 本身可以立刻释放
+
+    if name.endswith(".zst"):
+        raise ValueError("zstd data.tar is not supported by this extractor")
+
+    tmp_path = None
+    try:
+        if name.endswith(".xz"):
+            fd, tmp_path = tempfile.mkstemp(prefix="debextract-", suffix=".tar")
+            decomp = lzma.LZMADecompressor()
+            view = memoryview(raw)
+            step = 1 << 20
+            with os.fdopen(fd, "wb") as out:
+                for i in range(0, len(view), step):
+                    chunk = decomp.decompress(view[i:i + step])
+                    if chunk:
+                        out.write(chunk)
+                # 收尾：只在解压器尚未到流尾时喂空串，让它吐出最后一点缓冲。
+                # （直接 `decompress(b"")` 在刚好读完时抛 `EOFError: Already at
+                # end of stream` —— 首版就是这样把整轮 stage 生成打挂的。）
+                if not decomp.eof:
+                    tail = decomp.decompress(b"")
+                    if tail:
+                        out.write(tail)
+            tar = tarfile.open(tmp_path, mode="r:")
+        else:
+            if name.endswith(".gz"):
+                import gzip
+                raw = gzip.decompress(raw)
+            tar = tarfile.open(fileobj=BytesIO(raw), mode="r:")
+
+        try:
+            yield tar
+        finally:
+            tar.close()
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def read_control_member(deb_path, member_name):
+    """从 deb 的 control.tar.* 里读一个成员（如 postinst）。没有则返回 None。"""
+    with open(deb_path, "rb") as fh:
+        blob = fh.read()
+    members = read_ar_members(blob)
+    key = next((k for k in members if k.startswith("control.tar")), None)
+    if key is None:
+        return None
+    raw = members[key]
+    del members
+    del blob
+    if key.endswith(".xz"):
         raw = lzma.decompress(raw)
-    elif name.endswith(".gz"):
+    elif key.endswith(".gz"):
         import gzip
         raw = gzip.decompress(raw)
-    elif name.endswith(".zst"):
-        raise ValueError("zstd data.tar is not supported by this extractor")
-    return tarfile.open(fileobj=BytesIO(raw), mode="r:")
+    elif key.endswith(".zst"):
+        return None
+    tar = tarfile.open(fileobj=io.BytesIO(raw), mode="r:")
+    try:
+        want = member_name.lstrip("./")
+        for m in tar.getmembers():
+            if m.name.lstrip("./") == want:
+                fh2 = tar.extractfile(m)
+                return fh2.read() if fh2 else None
+        return None
+    finally:
+        tar.close()
+
+
+def collect_alternatives(deb_path):
+    """挖出 deb 的 postinst/prerm 里注册的 update-alternatives 项。
+
+    为什么需要这个：
+      Termux 的 vim 包**根本没有** `bin/vim`、`bin/vi`、`bin/ex`、`bin/view`
+      这些文件 —— 它们是 postinst 里 `update-alternatives --install` 在装包
+      时才创建的命令链接（`bin/vim -> ../libexec/vim/vim`，`bin/vi -> bin/vim`，
+      `bin/editor -> bin/vim`）。我们只解 data.tar、不跑 postinst，于是
+      「报告说装了 vim 却没有 vim 命令」。全仓 396 个 deb 里有 12 个包走这条路
+      （vim 7 项、busybox 4 项、lua52/lua54 各 2 项、bat/coreutils/emacs/less/
+      nano/netcat-openbsd/openjdk-21/util-linux 各 1 项）。
+      这里把注册项读出来，由调用方按「目标存在才建链」合成 symlink 条目。
+    """
+    items = []
+    for member in ("postinst", "prerm", "preinst"):
+        data = read_control_member(deb_path, member)
+        if not data:
+            continue
+        text = data.decode("utf-8", "replace")
+        if "update-alternatives" not in text:
+            continue
+        if member != "postinst":
+            continue  # 只有 postinst 会 --install，其余只 --remove
+        for m in ALT_INSTALL_RE.finditer(text):
+            link, name, target, prio = m.groups()
+            if not link.startswith(TERMUX_ABS_PREFIX):
+                continue
+            items.append(
+                {
+                    "link": link[len(TERMUX_ABS_PREFIX):],
+                    "name": name,
+                    "target": target,
+                    "priority": int(prio),
+                }
+            )
+    return items
 
 
 def main():
@@ -90,12 +210,15 @@ def main():
     entries = {}
     stats = {"file": 0, "symlink": 0, "dir": 0, "hardlink": 0, "skipped": 0}
     blob_bytes = 0
+    # 每个包的 update-alternatives 注册项，循环结束后统一合成链接。
+    alt_items = []
 
     for pkg in manifest["packages"]:
         deb_path = os.path.join(args.debs, pkg["file"])
         if not os.path.exists(deb_path):
             print(f"缺少 deb：{deb_path}", file=sys.stderr)
             return 1
+        alt_items.extend(collect_alternatives(deb_path))
         with open_data_tar(deb_path) as tar:
             for member in tar:
                 rel = member.name
@@ -163,6 +286,54 @@ def main():
                     "sha256": digest,
                     "pkg": pkg["name"],
                 }
+
+    # ── update-alternatives 合成 ──────────────────────────────────────────
+    # 同一个 link 可能有多个包注册（`bin/editor`：nano prio 50 / vim 40 /
+    # emacs 40 / busybox 10；`bin/pager`：less 50 / util-linux 25 / busybox 10 /
+    # bat 10 / coreutils 1）。update-alternatives 的规则是**优先级最高者胜**，
+    # 这里照抄。target 可能本身又是另一条 alternative 链（`bin/vi -> bin/vim`，
+    # 而 `bin/vim -> libexec/vim/vim`），所以要做不动点解析。
+    alt_links = {}
+    for item in alt_items:
+        link = item["link"]
+        target = item["target"]
+        if target.startswith(TERMUX_ABS_PREFIX):
+            target = target[len(TERMUX_ABS_PREFIX):]
+        prev = alt_links.get(link)
+        if prev is None or item["priority"] > prev["priority"]:
+            alt_links[link] = {"target": target, "priority": item["priority"], "name": item["name"]}
+
+    resolved = 0
+    for link, info in sorted(alt_links.items()):
+        # 已有实体（包自己带了这个文件）时不覆盖 —— alternatives 只负责补缺口。
+        if link in entries and entries[link]["type"] != "symlink":
+            continue
+        target = info["target"]
+        seen = set()
+        while target not in entries and target in alt_links and target not in seen:
+            seen.add(target)
+            target = alt_links[target]["target"]
+        if target not in entries:
+            continue
+        # tar 里的链接目标一律是「相对所在目录」的写法（`bin/mvn -> ../opt/maven/bin/mvn`），
+        # 而 alternatives 注册的是 usr 下的绝对路径。这里换算回相对形式，保持全仓一致。
+        rel_target = posixpath.relpath(target, posixpath.dirname(link) or ".")
+        entries[link] = {
+            "path": link,
+            "type": "symlink",
+            "mode": 0o120777,
+            "target": rel_target,
+            "pkg": "alternatives:" + info["name"],
+        }
+        stats["symlink"] += 1
+        resolved += 1
+
+    if alt_links:
+        print(
+            f"update-alternatives：注册 {len(alt_items)} 项 / 去重后 {len(alt_links)} 个命令，"
+            f"合成 {resolved} 条链接"
+        )
+
 
     with open(os.path.join(args.out, "entries.json"), "w", encoding="utf-8") as fh:
         json.dump(

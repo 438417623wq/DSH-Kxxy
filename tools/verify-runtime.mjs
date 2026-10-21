@@ -4,30 +4,185 @@
  *
  * 用法：node tools/verify-runtime.mjs [zip 路径]
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { gunzipSync, inflateRawSync } from "node:zlib";
+import { existsSync, createReadStream, readdirSync, readFileSync, openSync, readSync, closeSync, fstatSync } from "node:fs";
+import { createGunzip, gunzipSync, inflateRawSync } from "node:zlib";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * 找扩展池里的某个 `.pool`。
+ *
+ * 两个位置都要认：`build-apk.ps1` 会把 `assets/ext-pool/` 整体 `Move-Item`
+ * 到 `.cache/apk-assets-hold/ext-pool/`（大资源不能进 APK 的 assets），
+ * 所以打完包之后 assets 下是空的、池在 hold 里。只查 assets 会让校验在
+ * 「刚打完包」这个最常见的时刻误报「池未生成」。
+ */
+function resolvePool(name) {
+  const dirs = [
+    join(HERE, "..", "android", "app", "src", "main", "assets", "ext-pool"),
+    join(HERE, "..", ".cache", "apk-assets-hold", "ext-pool"),
+  ];
+  for (const d of dirs) {
+    const p = join(d, name);
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+/**
+ * 流式遍历扩展池（gzip 的 tar），**不**把解压结果整体读进内存。
+ *
+ * ── 为什么（构建事故）─────────────────────────────────────────────────────
+ * 首版是 `gunzipSync(readFileSync(pool))`：`golang.pool` 解压后 **220.6 MiB**、
+ * `emacs.pool` **118.4 MiB**，加上当时还整份读入的 707 MiB `runtime.zip`，
+ * 在本机（提交上限 16.2 GB、空闲 1 GB 上下）直接死在
+ *
+ *     RangeError: Failed to allocate memory
+ *       at createUnsafeBuffer (node:internal/buffer:1113:25)
+ *       at createPool (node:buffer:181:17)
+ *       at processChunkSync (node:zlib:476:23)
+ *       at zlibBufferSync (node:zlib:182:12)
+ *
+ * 而这两段检查只需要「tar 头里的文件名」与「两个 go 二进制的正文」，完全
+ * 可以边解边扫：`skip` 只丢字节不攒内存，`take` 只为点名的条目分配。
+ *
+ * @param {string} poolPath  `.pool` 文件路径
+ * @param {(name: string) => boolean} want  返回 true 的条目才把正文读出来
+ * @param {(name: string, data: Buffer|null, size: number) => void} onEntry
+ */
+async function scanPoolTar(poolPath, want, onEntry) {
+  const stream = createReadStream(poolPath).pipe(createGunzip());
+  const it = stream[Symbol.asyncIterator]();
+  let pending = [];
+  let pendingLen = 0;
+  let done = false;
+
+  const pull = async () => {
+    if (done) return false;
+    const r = await it.next();
+    if (r.done) { done = true; return false; }
+    if (r.value.length) { pending.push(r.value); pendingLen += r.value.length; }
+    return true;
+  };
+  const ensure = async (n) => {
+    while (pendingLen < n) {
+      if (!(await pull())) return false;
+    }
+    return true;
+  };
+  const take = (n) => {
+    const out = Buffer.allocUnsafeSlow(n);
+    let off = 0;
+    while (off < n) {
+      const head = pending[0];
+      const k = Math.min(head.length, n - off);
+      head.copy(out, off, 0, k);
+      off += k;
+      if (k === head.length) pending.shift();
+      else pending[0] = head.subarray(k);
+      pendingLen -= k;
+    }
+    return out;
+  };
+  const skip = async (n) => {
+    let left = n;
+    while (left > 0) {
+      if (pendingLen === 0 && !(await pull())) {
+        throw new Error(`scanPoolTar: 归档提前结束（还差 ${left} 字节）`);
+      }
+      const head = pending[0];
+      const k = Math.min(head.length, left);
+      if (k === head.length) pending.shift();
+      else pending[0] = head.subarray(k);
+      pendingLen -= k;
+      left -= k;
+    }
+  };
+
+  for (;;) {
+    if (!(await ensure(512))) break;
+    const header = take(512);
+    // 全零块 = 归档结束
+    if (header.every((b) => b === 0)) break;
+    let nameEnd = header.indexOf(0);
+    if (nameEnd < 0 || nameEnd > 100) nameEnd = 100;
+    const name = header.subarray(0, nameEnd).toString("utf8");
+    const sizeStr = header.subarray(124, 136).toString("ascii").replace(/\0.*$/, "").trim();
+    const size = parseInt(sizeStr, 8) || 0;
+    let data = null;
+    if (want(name) && size > 0) {
+      if (!(await ensure(size))) throw new Error(`scanPoolTar: ${name} 正文被截断`);
+      data = take(size);
+    } else {
+      await skip(size);
+    }
+    onEntry(name, data, size);
+    // 数据区补齐到 512 字节边界
+    await skip((512 - (size % 512)) % 512);
+  }
+}
+
 const zipPath = process.argv[2] ?? "F:/KF/DSKX/dsh-kxxy/android/app/src/main/assets/runtime.zip";
-const buf = readFileSync(zipPath);
+
+/*
+ * 用 fd + 偏移随机读，**不**把整个 zip 读进内存。
+ *
+ * ── 为什么（构建事故，与 zipwrite 的池化泄漏是同一场调试的后半段）──────
+ * 首版是 `const buf = readFileSync(zipPath)`，707 MiB 常驻，然后本脚本还要
+ * 解两个扩展池（`golang.pool` 解压后 220.6 MiB、`emacs.pool` 118.4 MiB），
+ * 于是跑到「golang 池里的 go」那段必死在
+ *
+ *     RangeError: Failed to allocate memory
+ *       at createUnsafeBuffer (node:internal/buffer:1113:25)
+ *       at createPool (node:buffer:181:17)
+ *       at processChunkSync (node:zlib:476:23)
+ *       at zlibBufferSync (node:zlib:182:12)
+ *       at tools/verify-runtime.mjs:874
+ *
+ * 本机提交上限 16.2 GB、空闲常剩 1 GB 上下。`--max-old-space-size` 调多大
+ * 都没用（栈顶是 zlib 建池，不是 JS 堆）。
+ *
+ * 而本脚本真正需要的只有「中央目录 + 逐条按需读的数据段」：中央目录
+ * 58,920 条 × 约 100 B ≈ 6 MB，整份读入没问题；数据段一律按偏移读。
+ */
+const zipFd = openSync(zipPath, "r");
+const zipSize = fstatSync(zipFd).size;
+
+/** 从 zip 的 `[offset, offset+len)` 读一段（读不满即抛错，不静默截断）。 */
+function readAt(offset, len) {
+  const out = Buffer.allocUnsafeSlow(len);
+  let got = 0;
+  while (got < len) {
+    const n = readSync(zipFd, out, got, len - got, offset + got);
+    if (n <= 0) break;
+    got += n;
+  }
+  if (got !== len) throw new Error(`readAt: 只读到 ${got}/${len} 字节（zip@${offset}）`);
+  return out;
+}
 
 // ---------------------------------------------------------------- 找 EOCD
+// EOCD 在最尾部，最多回看 66,000 字节（22 字节固定头 + 64 KiB 注释上限）。
+const tailLen = Math.min(zipSize, 66_000);
+const tailStart = zipSize - tailLen;
+const tail = readAt(tailStart, tailLen);
 let eocd = -1;
-for (let i = buf.length - 22; i >= Math.max(0, buf.length - 66_000); i -= 1) {
-  if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+for (let i = tail.length - 22; i >= 0; i -= 1) {
+  if (tail.readUInt32LE(i) === 0x06054b50) { eocd = tailStart + i; break; }
 }
 if (eocd < 0) throw new Error("找不到 EOCD");
-const count = buf.readUInt16LE(eocd + 10);
-const cdSize = buf.readUInt32LE(eocd + 12);
-const cdStart = buf.readUInt32LE(eocd + 16);
-console.log(`EOCD @${eocd}  条目 ${count}  中央目录 ${cdStart}..${cdStart + cdSize}  文件 ${buf.length}`);
+const count = tail.readUInt16LE(eocd - tailStart + 10);
+const cdSize = tail.readUInt32LE(eocd - tailStart + 12);
+const cdStart = tail.readUInt32LE(eocd - tailStart + 16);
+console.log(`EOCD @${eocd}  条目 ${count}  中央目录 ${cdStart}..${cdStart + cdSize}  文件 ${zipSize}`);
 
 // ---------------------------------------------------------------- 遍历中央目录
+// `buf` 只装中央目录（几 MB），不是整个 zip —— 下面的偏移都是相对它的。
+const buf = readAt(cdStart, cdSize);
 const entries = [];
-let p = cdStart;
+let p = 0;
 for (let i = 0; i < count; i += 1) {
   if (buf.readUInt32LE(p) !== 0x02014b50) throw new Error(`中央目录项 ${i} 签名错误 @${p}`);
   const method = buf.readUInt16LE(p + 10);
@@ -353,6 +508,74 @@ for (const n of NEED) {
       missing += 1;
     } else {
       console.log(`TeX Live 宏包树主体：✓ ${rel.split("/").pop()}（${size} B）`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- android.jar 完整度
+// 锚点 14（缺陷 CQ）：上游 ecj 的 `share/java/android.jar` 是 4555 条目的精简
+// stub，没有 `resources.arsc` ⇒ `aapt2 link` 处理任何 `@android:*` 引用都报
+// `No package ID 01 found for resource ID 0x0101053d`（0x01 就是 framework 包 ID）。
+// 构建期由 `bundleAndroidJar()` 用本机 SDK `platforms/android-36/android.jar`
+// 裁出 arsc + 清单 + class 覆盖，体积 3.88 MB → 10.58 MB。
+//
+// 三重断言，缺一不可：
+//   ① 标记文件与 RuntimeInstaller.ANDROID_JAR_MARKER 一致；
+//   ② android.jar 体积过 6 MiB（旧 stub 3.88 MB）；
+//   ③ **jar 内部真的有条目名叫 resources.arsc** —— 体积够了也可能是别的
+//      打包错误产物，必须解析 jar 自己的中央目录看到名字。
+{
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  const markerNeed = /ANDROID_JAR_MARKER\s*=\s*"([^"]+)"/.exec(kt);
+  const markerFile = /ANDROID_JAR_MARKER_FILE\s*=\s*"([^"]+)"/.exec(kt);
+  const minBytes = /MIN_ANDROID_JAR_BYTES\s*=\s*([\d_]+)L/.exec(kt);
+
+  if (markerNeed === null || markerFile === null || minBytes === null) {
+    console.log("android.jar 完整度：✗ RuntimeInstaller.kt 未定义 ANDROID_JAR_MARKER/MARKER_FILE/MIN_BYTES");
+    missing += 1;
+  } else {
+    const markerEntry = byName.get(markerFile[1]);
+    if (!markerEntry) {
+      console.log(`android.jar 完整度：✗ 标记条目缺失 ${markerFile[1]}`);
+      missing += 1;
+    } else {
+      const head = readLocal(markerEntry).toString("utf8").slice(0, 256);
+      if (!head.includes(markerNeed[1])) {
+        console.log(`android.jar 完整度：✗ 标记文件不含 ${markerNeed[1]}`);
+        missing += 1;
+      } else {
+        console.log(`android.jar 完整度：✓ 标记 ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+      }
+    }
+
+    const jarEntry = byName.get("share/java/android.jar");
+    const floor = Number(minBytes[1].replace(/_/g, ""));
+    if (!jarEntry) {
+      console.log("android.jar 完整度：✗ 条目缺失 share/java/android.jar");
+      missing += 1;
+    } else {
+      const jarBuf = readLocal(jarEntry);
+      if (jarBuf.length < floor) {
+        console.log(
+          `android.jar 完整度：✗ 仍是精简 stub（${jarBuf.length} B < ${floor} B）`,
+        );
+        missing += 1;
+      } else {
+        const names = jarEntryNames(jarBuf);
+        if (!names.includes("resources.arsc")) {
+          console.log(
+            `android.jar 完整度：✗ ${jarBuf.length} B 但内部没有 resources.arsc（aapt2 仍会失败）`,
+          );
+          missing += 1;
+        } else {
+          console.log(
+            `android.jar 完整度：✓ ${jarBuf.length} B / ${names.length} 条目，含 resources.arsc`,
+          );
+        }
+      }
     }
   }
 }
@@ -721,35 +944,25 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
 // 检查对象是 ext-pool 里的 emacs.pool（不是 runtime.zip）—— 扩展池是独立产物，
 // 由 tools/fetch-extensions.mjs 生成。
 {
-  const poolDir = join(HERE, "..", "android", "app", "src", "main", "assets", "ext-pool");
-  const emacsPool = join(poolDir, "emacs.pool");
+  const emacsPool = resolvePool("emacs.pool");
   const problems = [];
-  if (!existsSync(emacsPool)) {
+  if (!emacsPool) {
     problems.push("emacs.pool 不存在（扩展池未生成）");
   } else {
-    // 池是 gzip 的 tar，只能扫 tar 头里能直接看到的路径名 —— 不解压，
-    // 用 inflateRawSync 解 gzip 再逐块找文件名太慢（53 MB）。
-    // 改用 tar 头遍历：读 512 字节块，看 name 字段。
-    const buf = readFileSync(emacsPool);
-    const tarBuf = gunzipSync(buf);
-    let off = 0;
+    // 池是 gzip 的 tar。用 scanPoolTar 边解边扫 tar 头，只数文件名、不攒正文
+    // —— 解压后 118.4 MiB，整份 `gunzipSync` 会撞上提交内存上限（见函数注释）。
     let charsetCount = 0;
     let saw8859 = false;
-    while (off + 512 <= tarBuf.length) {
-      const header = tarBuf.subarray(off, off + 512);
-      // 全零块 = 归档结束
-      if (header.every((b) => b === 0)) break;
-      let nameEnd = header.indexOf(0);
-      if (nameEnd < 0) nameEnd = 100;
-      const name = header.subarray(0, nameEnd).toString("utf8");
-      const sizeStr = header.subarray(124, 136).toString("ascii").replace(/\0.*$/, "").trim();
-      const size = parseInt(sizeStr, 8) || 0;
-      if (name.includes("/etc/charsets/") && name.endsWith(".map")) {
-        charsetCount += 1;
-        if (name.endsWith("8859-2.map")) saw8859 = true;
-      }
-      off += 512 + Math.ceil(size / 512) * 512;
-    }
+    await scanPoolTar(
+      emacsPool,
+      () => false,
+      (name) => {
+        if (name.includes("/etc/charsets/") && name.endsWith(".map")) {
+          charsetCount += 1;
+          if (name.endsWith("8859-2.map")) saw8859 = true;
+        }
+      },
+    );
     if (charsetCount < 100) {
       problems.push(`emacs.pool 里字符集映射只有 ${charsetCount} 个（应 ≥100；PRUNE_EXT 里的 .map 又回来了？）`);
     }
@@ -762,6 +975,82 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
   }
   if (problems.length > 0) {
     console.log("字符集映射：✗");
+    for (const p of problems) console.log(`  ${p}`);
+    missing += 1;
+  }
+}
+
+// ---------------------------------------------------------------- golang 池里的 go
+//
+// 为什么需要：缺陷 DB。`ext-pool/golang.pool` 里的 `bin/go` 与 `lib/go/bin/go`
+// 必须是 `tools/build-go-android.ps1` 的交叉编译产物（resolv.conf 路径在**源码期**
+// 就写成了引擎根），而不是 Termux 原件 —— 原件写死
+// `/data/data/com.termux/files/usr/etc/resolv.conf`，设备上不存在该文件 ⇒
+// `dnsReadConfig()` 落回 `defaultNS = {"127.0.0.1:53", "[::1]:53"}` ⇒ 只有恰好
+// 有 dnsmasq 监听时才能解析，否则 `go get` 报 `connection refused`。
+//
+// 这个缺陷最恶劣的地方是**构建全程无异常**：池照常生成、APK 照常打包，
+// 只有用户真去 `go get` 时才失败。所以必须在产物校验里把它钉死。
+{
+  const problems = [];
+  const goPool = resolvePool("golang.pool");
+  if (!goPool) {
+    problems.push("golang.pool 不存在（扩展池未生成）");
+  } else {
+    const WANT = ["bin/go", "lib/go/bin/go"];
+    const seen = new Map();
+    // 边解边扫（解压后 220.6 MiB，整份 gunzipSync 会撞提交内存上限）。
+    // 只为两个 go 二进制分配正文，其余条目直接跳过。
+    await scanPoolTar(
+      goPool,
+      (name) => WANT.includes(name),
+      (name, data, size) => {
+        if (!WANT.includes(name)) return;
+        // Go 二进制的 rodata 在中间，字面量可能在任何位置，所以老实全扫。
+        const text = (data ?? Buffer.alloc(0)).toString("latin1");
+        seen.set(name, {
+          size,
+          engine: (text.match(/files\/engine\/etc\/resolv\.conf/g) ?? []).length,
+          termux: (text.match(/com\.termux\/files\/usr\/etc\/resolv\.conf/g) ?? []).length,
+          placeholder: (text.match(/@DSH_ROOT@/g) ?? []).length,
+          elf:
+            data !== null &&
+            data.length >= 4 &&
+            data[0] === 0x7f && data[1] === 0x45 && data[2] === 0x4c && data[3] === 0x46,
+        });
+      },
+    );
+    for (const w of WANT) {
+      const info = seen.get(w);
+      if (!info) {
+        problems.push(`golang.pool 里缺 ${w}`);
+        continue;
+      }
+      if (!info.elf) problems.push(`${w} 不是 ELF`);
+      if (info.termux > 0) {
+        problems.push(
+          `${w} 里还有旧 Termux resolv.conf 路径（${info.termux} 处）—— ` +
+          "这是 Termux 原件，设备上 go 无法解析 DNS。先跑 tools\\build-go-android.ps1",
+        );
+      }
+      if (info.engine === 0) {
+        problems.push(`${w} 里没有 <root>/etc/resolv.conf 字面量（交叉编译没生效？）`);
+      }
+      if (info.placeholder > 0) {
+        problems.push(`${w} 里残留 @DSH_ROOT@ 占位符（${info.placeholder} 处）`);
+      }
+    }
+    if (problems.length === 0) {
+      const a = seen.get("bin/go");
+      const b = seen.get("lib/go/bin/go");
+      console.log(
+        `golang 池的 go：✓ 两份均为交叉编译产物（${a.size}B / ${b.size}B，` +
+        `resolv.conf 指向引擎根，旧 Termux 路径 0 处）`,
+      );
+    }
+  }
+  if (problems.length > 0) {
+    console.log("golang 池的 go：✗");
     for (const p of problems) console.log(`  ${p}`);
     missing += 1;
   }
@@ -880,6 +1169,11 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
   }
 
   // jansi：扫所有 pool 里的 jar，断言 native 条目为 0。
+  //
+  // 只扫 assets/ext-pool，**不要**跟着去扫 .cache/apk-assets-hold ——
+  // 那是打包时搬过去的一份副本，28 个池加起来 1 GB 以上，`gunzipSync`
+  // 全解到堆上会撞 `FATAL ERROR: Committing semi space failed.`
+  // （本机实测，校验跑到这里直接 OOM）。assets 为空时静默跳过，与旧行为一致。
   const poolDir = join(HERE, "..", "android", "app", "src", "main", "assets", "ext-pool");
   const JANSI = "org/fusesource/jansi/internal/native/";
   let jarsScanned = 0;
@@ -998,6 +1292,190 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
   }
 }
 
+// ---------------------------------------------------------------- 打包工具包装器
+//
+// 缺陷 CT（corepack）：Termux 的 `nodejs-lts` 把 `dist/corepack.js`（204 B 入口）
+// **复制**到 `bin/corepack`，而入口第一句是 `require('./lib/corepack.cjs')` ——
+// require 的相对路径按文件所在目录（`__dirname`）解析，从 `bin/` 出发就是
+// `<root>/bin/lib/corepack.cjs`，那个目录根本不存在。真机报
+// `Error: Cannot find module './lib/corepack.cjs'`，Require stack 指向
+// `<root>/bin/corepack`；而 `npm` / `npx` / `pnpm` 一切正常 —— 它们早就是包装器，
+// 只有 `corepack` 这一个漏了，所以症状是「npm 好用、corepack 坏」。
+//
+// 这里的断言是**双向**的，缺一不可：
+//   ① 四个 corepack 系入口都必须是 `#!/system/bin/sh` 包装器、mode 0755、LF 换行；
+//   ② `bin/corepack` **不许**再是 `dist/corepack.js` 的副本。
+// 只断言 ① 会漏掉「包装器生成了，但 stage 里的同名符号链接没摘掉、最终写进 zip
+// 的还是副本」这种半修复 —— 那正是 build-runtime 第 6 步「摘掉 stage 同名条目」
+// 一旦失效的表现，而它跑在包装器写入**之后**，光看包装器代码是看不出来的。
+//
+// 注意 zip 里只会有 sh 形态（`corepack enable` 是装机后的用户行为，改不到产物），
+// 所以这里不对软链形态做断言；软链形态的判据在 RuntimeInstaller 的
+// `COREPACK_SHIM_NAMES` / `isCorepackDistShim` 与 `simulate-install.mjs` 的同名段，
+// 本文件只负责核对那份白名单**恰好**是那四个名字（见 ⑤）。
+//
+// bundletool / zipalign 同理，且必须连被包装的实体一起断言：包装器在、实体缺失
+// 时真机上是 `exit 127` 加一行中文提示，比「命令不存在」更难归因。
+{
+  const problems = [];
+  const modeOf = (e) => (e.externalAttr >>> 16) & 0o7777;
+
+  // ① corepack 系四个包装器
+  for (const [name, target] of [
+    ["bin/corepack", "../lib/node_modules/corepack/dist/corepack.js"],
+    ["bin/npm", null],
+    ["bin/npx", null],
+    ["bin/pnpm", null],
+  ]) {
+    const e = byName.get(name);
+    if (!e) { problems.push(`缺 ${name}`); continue; }
+    if (e.comment.startsWith("LINK:")) { problems.push(`${name} 是 LINK 条目（应为实体包装器）`); continue; }
+    const text = readLocal(e).toString("utf8");
+    if (!text.startsWith("#!/system/bin/sh\n")) problems.push(`${name} 首行不是 #!/system/bin/sh`);
+    if (text.includes("\r")) problems.push(`${name} 含 CR（必须 LF 换行）`);
+    if (!text.includes('exec "$d/node"')) problems.push(`${name} 没有 exec "$d/node"`);
+    if (target !== null && !text.includes(target)) problems.push(`${name} 未指向 ${target}`);
+    if (modeOf(e) !== 0o755) problems.push(`${name} mode=0o${modeOf(e).toString(8)}（应 0755）`);
+  }
+
+  // ② 反例闸门：bin/corepack 不许是 dist/corepack.js 的副本
+  const cpEntry = byName.get("bin/corepack");
+  const cpDist = byName.get("lib/node_modules/corepack/dist/corepack.js");
+  if (cpEntry && cpDist) {
+    const a = readLocal(cpEntry);
+    if (a.equals(readLocal(cpDist))) {
+      problems.push("bin/corepack 与 dist/corepack.js 字节相同 —— 又是副本，缺陷 CT 复发");
+    }
+    if (a.toString("latin1").includes("lib/corepack.cjs")) {
+      problems.push("bin/corepack 正文里出现 './lib/corepack.cjs' —— 它仍是从 bin/ 出发按 __dirname 解析的那个入口");
+    }
+  } else if (!cpDist) {
+    problems.push("缺 lib/node_modules/corepack/dist/corepack.js（包装器的 exec 目标）");
+  }
+
+  // ③ Android 打包工具：bundletool（jar + java 包装器）
+  const bt = byName.get("bin/bundletool");
+  const btJar = byName.get("lib/node_modules/kxxy-host/packaging/bundletool-all.jar");
+  if (!bt) problems.push("缺 bin/bundletool");
+  else {
+    const text = readLocal(bt).toString("utf8");
+    if (!text.startsWith("#!/system/bin/sh\n")) problems.push("bin/bundletool 首行不是 #!/system/bin/sh");
+    if (text.includes("\r")) problems.push("bin/bundletool 含 CR（必须 LF 换行）");
+    if (modeOf(bt) !== 0o755) problems.push(`bin/bundletool mode=0o${modeOf(bt).toString(8)}（应 0755）`);
+  }
+  if (!btJar) {
+    problems.push("缺 lib/node_modules/kxxy-host/packaging/bundletool-all.jar");
+  } else {
+    const jar = readLocal(btJar);
+    if (jar.length < 4 || jar.readUInt32LE(0) !== 0x04034b50) {
+      problems.push("bundletool-all.jar 不是 zip（本地头签名错）");
+    } else if (btJar.usize < (1 << 20)) {
+      problems.push(`bundletool-all.jar 只有 ${btJar.usize} B —— fat jar 应 ≥1 MiB，可能抓了个占位文件`);
+    } else if (!jarEntryNames(jar).includes("META-INF/MANIFEST.MF")) {
+      problems.push("bundletool-all.jar 中央目录里没有 META-INF/MANIFEST.MF");
+    }
+  }
+
+  // ④ Android 打包工具：zipalign（纯 JS 实现 + node 包装器）
+  const za = byName.get("bin/zipalign");
+  const zaJs = byName.get("lib/node_modules/kxxy-host/packaging/zipalign.mjs");
+  if (!za) problems.push("缺 bin/zipalign");
+  else {
+    const text = readLocal(za).toString("utf8");
+    if (!text.startsWith("#!/system/bin/sh\n")) problems.push("bin/zipalign 首行不是 #!/system/bin/sh");
+    if (text.includes("\r")) problems.push("bin/zipalign 含 CR（必须 LF 换行）");
+    if (!text.includes("packaging/zipalign.mjs")) problems.push("bin/zipalign 没有指向 packaging/zipalign.mjs");
+    if (modeOf(za) !== 0o755) problems.push(`bin/zipalign mode=0o${modeOf(za).toString(8)}（应 0755）`);
+  }
+  if (!zaJs) {
+    problems.push("缺 lib/node_modules/kxxy-host/packaging/zipalign.mjs");
+  } else {
+    // 它是**脚本入口**不是库：没有 export，靠 `main()` 自执行。
+    // 断言 `function main(` 与 zip 里最关键的 `EOCD` 解析都在，避免打包进一个空壳。
+    const js = readLocal(zaJs).toString("utf8");
+    if (!js.includes("function main(")) problems.push("packaging/zipalign.mjs 里没有 function main —— 不是可执行入口");
+    if (!/findEocd|0x06054b50/.test(js)) problems.push("packaging/zipalign.mjs 里找不到 EOCD 解析 —— 不是真的 zipalign 实现");
+  }
+
+  if (problems.length === 0) {
+    console.log("\n打包工具包装器：✓ corepack/npm/npx/pnpm + bundletool + zipalign（0755 / LF / 实体非 LINK）");
+  } else {
+    console.log("\n打包工具包装器：✗");
+    for (const p of problems) console.log(`  ${p}`);
+    missing += 1;
+  }
+
+  // ⑤ 锚点 15 的标记文件必须与 RuntimeInstaller 逐字一致。
+  //
+  // 这一条单独判，因为它守的是「修复能不能到达老设备」而不是「产物对不对」：
+  // `bin/corepack` 换形态不改变 RUNTIME_VERSION，前十四锚点全过 ⇒ isComplete()
+  // 判真 ⇒ 跳过重装。标记缺失或与 Kotlin 常量不一致，真机上就永远不重装，
+  // 而产物校验全绿 —— 这种「产物对、装机不生效」最难排查。
+  const kt = readFileSync(
+    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
+    "utf8",
+  );
+  const wantMarker = /PACKAGING_MARKER\s*=\s*"([^"]+)"/.exec(kt);
+  const wantFile = /PACKAGING_MARKER_FILE\s*=\s*\n?\s*"([^"]+)"/.exec(kt);
+  const problems2 = [];
+  if (wantMarker === null || wantFile === null) {
+    problems2.push("RuntimeInstaller.kt 未定义 PACKAGING_MARKER / PACKAGING_MARKER_FILE");
+  } else {
+    const me = byName.get(wantFile[1]);
+    if (!me) problems2.push(`缺锚点 15 标记文件 ${wantFile[1]}`);
+    else {
+      const text = readLocal(me).toString("utf8").trim();
+      if (text !== wantMarker[1]) problems2.push(`标记不一致：zip 里是 ${text}，Kotlin 要 ${wantMarker[1]}`);
+    }
+    // 反向：Kotlin 的包装器清单必须与实际断言的一致，避免「清单里少一个就静默放过」。
+    const listBody = /PACKAGING_WRAPPERS\s*=\s*listOf\(([\s\S]*?)\)/.exec(kt);
+    if (listBody === null) problems2.push("RuntimeInstaller.kt 未定义 PACKAGING_WRAPPERS");
+    else {
+      const names = [...listBody[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+      for (const n of ["bin/corepack", "bin/npm", "bin/npx", "bin/pnpm", "bin/zipalign", "bin/bundletool"]) {
+        if (!names.includes(n)) problems2.push(`PACKAGING_WRAPPERS 里少了 ${n}`);
+      }
+    }
+    // 软链白名单：`corepack enable` 会把四个 corepack 入口换成指向
+    // `lib/node_modules/corepack/dist/*.js` 的软链（官方文档行为、实测可用）。
+    // Kotlin 侧靠 COREPACK_SHIM_NAMES 区分「合法软链」与「被人动过」，所以这份
+    // 白名单必须**恰好**是那四个 —— 多一个（比如把 zipalign 也放进去）就等于
+    // 放弃了「自造包装器不许变成软链」这条判据，而 zip 侧断言查不出来。
+    const shimBody = /COREPACK_SHIM_NAMES\s*=\s*setOf\(([\s\S]*?)\)/.exec(kt);
+    if (shimBody === null) {
+      problems2.push("RuntimeInstaller.kt 未定义 COREPACK_SHIM_NAMES");
+    } else {
+      const shims = [...shimBody[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
+      const want = ["bin/corepack", "bin/npm", "bin/npx", "bin/pnpm"].sort();
+      if (shims.length !== want.length || shims.some((s, i) => s !== want[i])) {
+        problems2.push(`COREPACK_SHIM_NAMES 应为 ${want.join(" / ")}，实际 ${shims.join(" / ")}`);
+      }
+    }
+    // 安装前自愈：`corepack disable` 会把入口**删掉**（实测
+    // `ls: cannot access '…/bin/pnpm': No such file or directory`），第一版判据
+    // 因此判假、触发 741 MiB 全量重装。修法是 `ensureInstalled` 里在
+    // `isComplete()` **之前**调 `healPackagingWrappers(root)` —— 顺序是判据成立的
+    // 前提（放到 isComplete 之后，快路径直接返回，自愈永远跑不到），所以这里
+    // 连顺序一起核。
+    if (!/private\s+fun\s+healPackagingWrappers\s*\(/.test(kt)) {
+      problems2.push("RuntimeInstaller.kt 缺 healPackagingWrappers（corepack disable 删入口会触发全量重装）");
+    } else {
+      const healAt = kt.indexOf("healPackagingWrappers(root)");
+      const probeAt = kt.indexOf("if (isComplete(root))");
+      if (healAt < 0) problems2.push("healPackagingWrappers 定义了却没有调用点");
+      else if (probeAt < 0) problems2.push("RuntimeInstaller.kt 找不到 `if (isComplete(root))`");
+      else if (healAt > probeAt) problems2.push("healPackagingWrappers 必须在 isComplete() 之前调用（否则快路径直接返回，自愈跑不到）");
+    }
+  }
+  if (problems2.length === 0) {
+    console.log(`锚点 15 打包工具标记：✓ ${wantMarker[1]}（与 RuntimeInstaller 一致）`);
+  } else {
+    console.log("锚点 15 打包工具标记：✗");
+    for (const p of problems2) console.log(`  ${p}`);
+    missing += 1;
+  }
+}
+
 // ---------------------------------------------------------------- 占位符核对
 console.log("\n占位符抽查（应出现 @DSH_ROOT@ 且不含 com.termux）：");
 for (const n of ["bin/am", "bin/pkg", "bin/termux-open", "libexec/git-core/git-subtree"]) {
@@ -1041,11 +1519,13 @@ console.log(`\n结论：${missing === 0 ? "全部关键条目齐备" : `${missin
 
 function readLocal(e) {
   const lp = e.localOffset;
-  if (buf.readUInt32LE(lp) !== 0x04034b50) throw new Error(`本地头签名错误 @${lp} for ${e.name}`);
-  const nameLen = buf.readUInt16LE(lp + 26);
-  const extraLen = buf.readUInt16LE(lp + 28);
+  // 本地头单独读 30 字节，再只读数据段 —— 不碰整份 zip（见 readAt 的注释）。
+  const localHead = readAt(lp, 30);
+  if (localHead.readUInt32LE(0) !== 0x04034b50) throw new Error(`本地头签名错误 @${lp} for ${e.name}`);
+  const nameLen = localHead.readUInt16LE(26);
+  const extraLen = localHead.readUInt16LE(28);
   const start = lp + 30 + nameLen + extraLen;
-  const raw = buf.subarray(start, start + e.csize);
+  const raw = readAt(start, e.csize);
   if (e.method === 0) return raw;
   return inflateRawSync(raw);
 }

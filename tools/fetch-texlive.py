@@ -68,6 +68,50 @@ MIRRORS = [
 # `tlmgr.pl`（361 KB）与 `tlpkg/TeXLive/*.pm` 全在这个包里。
 EXTRA_PACKAGES = ("texlive.infra",)
 
+# ---- 宏包闭包（缺陷 CO，问题清单 R4 / P8）-------------------------------------
+#
+# 真机症状：pandoc 出 PDF、或任何 `\usepackage{xcolor}` 的文档
+#   `! LaTeX Error: File 'xcolor.sty' not found.`
+# 量出来才发现 `texmf-dist/tex/latex` 只有 **54** 个目录 —— 因为 `scheme-basic`
+# 只保证 LaTeX 能编最小文档，连 xcolor/geometry 都不在其中。
+#
+# 修法不是换成 scheme-medium（1465 包 / 343 MiB，塞不进 APK），而是
+# 「scheme-basic + 一份日常文档真正会用到的宏包清单」：
+WANT_PACKAGES = (
+    # 排版地基。
+    #
+    # ⚠️ `array` / `tabularx` / `longtable` / `multicol` / `lmodern` 这几个
+    # **不能单独列**：它们不是 tlpdb 里的独立包，而是 `tools` / `lm` 包里的
+    # 文件。列出来只会让本函数的入口报「tlpdb 里没有该包」的假警告（实测
+    # 5 条），真正的 .sty 早被 `tools` 与 `lm` 带进来了。
+    "geometry", "xcolor", "graphics", "tools", "amsmath", "amsfonts",
+    "amscls", "mathtools", "float", "caption", "paralist",
+    # 版面控制
+    "titlesec", "tocloft", "enumitem", "booktabs", "multirow",
+    "tabularray", "makecell", "colortbl",
+    "microtype", "setspace", "fancyhdr", "ragged2e", "hyperref", "url",
+    # 字体与排版引擎（xelatex / lualatex 路线）
+    "fontspec", "unicode-math", "xecjk", "ctex", "zhnumber",
+    # 图表与代码
+    "pgf", "pgfplots", "listings", "minted", "tikz-cd",
+    # 参考文献与交叉引用
+    "natbib", "biblatex", "biber", "cleveref", "doi",
+    # 语言与文字
+    "polyglossia", "babel", "csquotes", "ulem", "soul", "xstring",
+    # pandoc 默认模板点名要的（缺一个就直接 Failed to produce PDF）
+    "upquote", "fancyvrb", "framed", "needspace", "lm",
+)
+
+# 字体包占闭包体积的绝大部分，而它们**互相可替代**：
+#   arphic 26.1 MiB / fandol 20.6 / wadalab 17.0 / fonts-tlwg 4.8 / uhc 3.4 /
+#   cns 2.9 / tipa 2.7 / adobemapping 2.1（单位 MiB，均为 xz 压缩后）
+# 只保留 `fandol` —— ctex 在非 Windows 平台上默认 `fontset=fandol`，
+# 其余几套是日文/韩文/泰文/繁体字形，中文正文用不到。整套下来省 58 MiB。
+SKIP_PACKAGES = frozenset({
+    "arphic", "wadalab", "fonts-tlwg", "uhc", "cns", "tipa",
+    "uptex-fonts", "adobemapping", "ttfutils", "tex-gyre",
+})
+
 # 这些子树随包带 doc/src，体积大且运行时用不到 —— 与 poolextract.py 的
 # PRUNE_DIRS 同路数。TeX Live 自己的 scheme 定义里 doc/src 也是可选的。
 PRUNE_PREFIXES = (
@@ -212,12 +256,19 @@ def norm(name: str) -> str:
     return s
 
 
-def closure(pkgs, root: str):
+def closure(pkgs, root: str, roots=()):
+    """从 `root` 出发求依赖闭包，再把 `roots` 里的包各走一遍。
+
+    `SKIP_PACKAGES` 在**入栈前**过滤：它是要么体积巨大、要么与已保留的字库
+    功能重复的字体包，跳过它们不能破坏任何 `.sty` 的可用性（字体由 fandol
+    顶上）。注意过滤只能放在 `walk` 入口——放在遍历结果上过滤会把已经
+    经由它们带入的依赖也一并漏掉。
+    """
     seen = set()
 
     def walk(n: str) -> int:
         key = norm(n)
-        if key in seen:
+        if key in seen or key in SKIP_PACKAGES:
             return 0
         seen.add(key)
         p = pkgs.get(key)
@@ -234,6 +285,16 @@ def closure(pkgs, root: str):
     # 单独带入）。设备上要能 `tlmgr install <包>` 就必须显式补进来。
     for extra in EXTRA_PACKAGES:
         total += walk(extra)
+    # 日常宏包（缺陷 CO）：scheme-basic 连 xcolor 都不含，必须逐名补。
+    missing_want = []
+    for extra in WANT_PACKAGES:
+        if extra not in pkgs:
+            missing_want.append(extra)
+            continue
+        total += walk(extra)
+    if missing_want:
+        print(f"[texlive] 警告：tlpdb 里没有 {len(missing_want)} 个 WANT 包"
+              f"（{', '.join(missing_want[:8])}）", file=sys.stderr)
     return seen, total
 
 # ★ tlnet 的包内路径有**两套约定**，必须归一化：

@@ -7,6 +7,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 缺陷 DC：`RuntimeInstaller.ensureResolvConf` 从 ConnectivityManager
+         读当前活动网络的 DNS 服务器，用来生成 `<root>/etc/resolv.conf`。
+         缺这条权限时 `cm.activeNetwork` 直接抛 SecurityException：
+           `ConnectivityService: Neither user NNNNN nor current process has
+            android.permission.ACCESS_NETWORK_STATE.`
+         于是 ensureResolvConf 每次都在第一行放弃、永远写不出文件 ——
+         而 Go 的纯 Go resolver 是**唯一**读这个文件的组件（bionic 的
+         getaddrinfo 走 netd，Node/curl/git/python 都不受影响），所以症状
+         只表现为 `go get` 报 `lookup goproxy.cn on [::1]:53: connection refused`。
+         这是普通（normal）权限，安装即授予，不弹窗、无需运行时请求。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Android 14+ 要求前台服务声明类型。specialUse 不被系统限时强杀；
          对照：dataSync 类型有 6 小时上限，长任务会被中断。 -->

@@ -38,3 +38,10 @@ plugins/kxxy-host/web/theme.css
 # .cache/debs（下载的 .deb）与 .cache/stage（解包后的 Termux 前缀树），
 # 可由 tools/fetch-runtime.mjs 重新拉取，体积约 226 MiB。
 .cache/
+
+# ---- 开发期临时脚本与探针 ----
+# tools/ 下的 _dev_*.sh / _probe_*.mjs / _build_*.log 等是真机排障时随手写的一次性
+# 脚本，不是构建链路的一部分（构建只用 build-runtime.mjs / build-apk.ps1 /
+# build-go-android.ps1 / inject-apk-assets.mjs 这几个固定入口）。
+# 保留在本地便于回溯，但不入库：265 个文件里绝大多数只在某一次复现里有意义。
+tools/_*

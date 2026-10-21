@@ -1,6 +1,7 @@
 package app.kxxy.engine
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
@@ -22,11 +23,19 @@ import java.util.zip.ZipInputStream
  *    解压后一律是 0644。若不恢复可执行位，`bin/node` 无法 execve。
  *    必须显式 chmod：bin/ 与 usr/bin/ 全量，node_modules 内按路径与文件名判定。
  *
- * 2. **SONAME 别名必须复制成实体文件**
- *    Android 的 linker 在 app 域既不认硬链接（SELinux 直接拒绝
- *    `avc: denied { link } scontext=u:r:untrusted_app_27`）也不认符号链接
- *    （能创建但 linker 不跟随 → `CANNOT LINK EXECUTABLE ... library
- *    "libz.so.1" not found`）。所以别名只能复制。
+ * 2. **别名必须建成符号链接，绝不能复制成实体文件**（缺陷 DD，真机 A/B 定案）
+ *    这里原先写着「Android 的 linker 在 app 域既不认硬链接也不认符号链接，
+ *    所以别名只能复制」—— **该结论是错的**，真机 `run-as app.kxxy`
+ *    （`u:r:runas_app:s0:c129,c257,c512,c768`）实测：跨目录、多级、绝对、
+ *    相对四种软链全部可 exec、可读、可被 linker 跟随。见 [materialiseLinks]。
+ *    硬链接确实不可用（SELinux 拒绝 `link`），但那是另一回事。
+ *
+ *    复制真正破坏的是**依赖自身位置的程序**：`$ORIGIN` 与 `$0`。`bin/java`
+ *    的 RUNPATH 含 `$ORIGIN:$ORIGIN/../lib`，副本落在 `<root>/bin` 后
+ *    `$ORIGIN` 变成 `<root>/bin`，于是 `CANNOT LINK ... "libjli.so" not found`；
+ *    `mvn` 脚本用 `dirname "$0"/..` 推 `MAVEN_HOME`，副本从 `<root>/bin`
+ *    上溯得到 `<root>`，`boot/classworlds.jar` 不在那儿。只有「别名与本体
+ *    同目录」时复制才是等价替换。
  *
  * 3. **别名条目可能排在本体之前**
  *    实测 `libz.so.1` 排在 `libz.so` 之前。若边解压边建链，链接时本体还不
@@ -67,9 +76,25 @@ class RuntimeInstaller(private val ctx: Context) {
     fun ensureInstalled(onProgress: Progress) {
         val root = EngineConfig.engineRoot(ctx)
 
+        // 锚点 15 的**安装前自愈**，必须早于 isComplete()。
+        //
+        // `corepack enable` / `corepack disable` 会合法地改写或删除
+        // `bin/{corepack,npm,npx,pnpm}`：enable 换成指向 `dist/` 的软链（软链目标
+        // 落盘是 0600，`pnpm` 报 `Permission denied`），disable 干脆把文件删掉
+        // （实测 `ls: cannot access '…/bin/pnpm': No such file or directory`）。
+        // 两者都是 corepack 官方文档里的命令，用户敲一次就整包重装 741 MiB 显然
+        // 不对 —— 这些状态全都能就地修好。`bin/node` 在说明 runtime 已装过，
+        // 此时才动；全新安装由 extract 从 zip 里取，不需要这里插手。
+        if (File(root, "bin/node").isFile) healPackagingWrappers(root)
+
         if (isComplete(root)) {
             Log.i(TAG, "runtime already installed and complete")
             onProgress.onProgress(1f)
+            // 缺陷 DD：老设备上 1618 条别名全是复制出来的实体，`bin/java`
+            // 找不到 `libjli.so`、`bin/mvn` 推出错的 `MAVEN_HOME`。这一步把
+            // 它们按安装期落下的清单改回符号链接；新装的设备上跑一遍全是
+            // 「已是软链」的 no-op。放在最前面，后续步骤都在正确的形态上干活。
+            healCopiedAliases(root)
             // 可执行位规则会随版本演进，而它**不是**锚点能表达的资产变更：
             // 文件全都在、标记也匹配，只是某几个文件的 mode 不够。所以这条
             // 修复单独走「每次启动都跑一次」的幂等路径（缺陷 AW）。
@@ -87,7 +112,51 @@ class RuntimeInstaller(private val ctx: Context) {
             ensureTexFormats(root)
             ensureNoShadowingStubs(root)
             ensureEmacsSiteLoad(root)
+            // 缺陷 CU：guile 的 `.go` 与 `.scm` 的 mtime 先后决定 gdb 是否卡死。
+            // 扩展解包会把 `.scm` 的 mtime 抬到「现在」，而 pool 里的 `.go`
+            // 是打包时刻（poolextract 统一写 mtime=0）—— 于是每次启动 guile
+            // 都认为缓存过期、在内存里重编 boot-9.scm（分钟级），表现为
+            // `gdb --version` 无输出、被 SIGKILL。必须每次启动都校一次。
+            ensureGuileCcacheFresh(root)
+            // 缺陷 CV：fontconfig 的 `<dir>` 不含 kxxy-host/fonts，中文 PDF 的
+            // 字体永远找不到。这里落一份自建配置并用 FONTCONFIG_FILE 指过去
+            // （不能改 etc/fonts/fonts.conf —— 那是扩展池的软链，重装即覆盖）。
+            ensureFontConfig(root)
+            // 缺陷 CW：TeX 的 `web2c/mktex*` 缺可执行位（extract 用
+            // FileOutputStream 写出，忽略 zip 条目的 unix mode），于是
+            // `mktextfm: 1: .../mktexnam: Permission denied`。
+            ensureTexExecBits(root)
+            // exec 重写器每次启动都从 APK 覆盖一次（缺陷 CF）。APK 升级后
+            // nativeLibraryDir 会换，而 LD_PRELOAD 里写的是 <root>/lib 下的
+            // 稳定路径，必须保证那份是**当前这个 APK 编译出来的**版本 ——
+            // 否则重写逻辑改动不会生效，还会出现「半新半旧」的诡异行为。
+            installExecShim(root)
+            ensureDshWrapper(root)
+            // 旧设备盘上 26 个别名脚本的 shebang 还是字面量 @DSH_ROOT@
+            // （缺陷 CE 的历史残留），靠这一趟自愈，不必重装 runtime。
+            repairPlaceholderScripts(root)
+            // resolv.conf 随网络变化，必须每次启动重算（缺陷 CJ）。
+            ensureResolvConf(root)
             ensureExtensionPool(root)
+            ensureTmpDir(ctx)
+            // texlive 与 perl 扩展都是**按需安装**的：全新设备上安装期这一趟
+            // 跑得比扩展解包早，`bin/xetex` 还不存在，于是 ensureTexFormats
+            // 打一句「pdftex/xetex/luahbtex 全缺，跳过格式生成」就放弃了 ——
+            // 而它只在安装期跑过一次，之后用户装了 texlive 也没人来补。
+            // 真机症状：`xelatex --version` 正常，但一编译就
+            // `I can't find the format file 'xelatex.fmt'!`，pandoc 全链路失败
+            // （缺陷 CX 的下游 —— 上游是 perl 的 @INC 指到 Termux 死路径，
+            // 见 EngineConfig.buildEnv 里的 PERL5LIB）。
+            //
+            // **顺序**：texlinks 先、formats 后。texlinks 建出 `bin/xelatex`
+            // 这类标准名，formats 用引擎本名（xetex）生成 `.fmt`，用户敲的
+            // 是标准名，两个都到位才完整。
+            //
+            // 两趟都幂等（四个标准名齐了只剩 4 次 exists()，三个 `.fmt`
+            // 齐了只剩 3 次 stat），所以放进每次启动的路径是安全的；
+            // `.fmt` 的判据含文件大小，生成到一半被杀也会重来。
+            ensureTexLinks(root)
+            ensureTexFormats(root)
             return
         }
 
@@ -104,17 +173,35 @@ class RuntimeInstaller(private val ctx: Context) {
         }
 
         extract(root, index.linkTargets, onProgress)
-        materialiseLinks(root, index.linkTargets)
+        // ⚠️ 顺序曾是**语义要求**，缺陷 DD 改成软链后它退化成「无害但保留」。
+        //
+        // 历史上这里是「先物化链接、再改写占位符」，而物化用的是 `copyTo`：
+        // 复制的是当时盘上的本体，此刻本体 shebang 还是字面量
+        // `#!@DSH_ROOT@/bin/python3.14`；等 `rewriteRootPlaceholder` 跑起来，
+        // 它改的是**本体**，别名那份副本已经固化在盘上了。真机症状：
+        //   · `bin/pip`（本体）正常；
+        //   · `bin/pip3`（别名副本）首行是 `#!@DSH_ROOT@/bin/python3.14`。
+        //
+        // 改成软链后别名不再持有字节，占位符改写对本体的效果天然传导到别名，
+        // 先后顺序不再影响正确性。仍然保持「先改写、后建链」，一是因为语义更
+        // 直观，二是 [materialiseLinks] 的 `realFile.isFile` 检查要求本体已落地。
         rewriteRootPlaceholder(root, index.manifest)
+        materialiseLinks(root, index.linkTargets)
         materialiseSonameAliases(root)
+        installExecShim(root)
+        ensureDshWrapper(root)
+        ensureResolvConf(root)
         restoreExecBits(root)
         ensureJvmExecBits(root)
         ensureTexLinks(root)
         ensureTexFormats(root)
         ensureNoShadowingStubs(root)
         ensureEmacsSiteLoad(root)
+        ensureGuileCcacheFresh(root)
+        ensureFontConfig(root)
+        ensureTexExecBits(root)
+        ensureTmpDir(ctx)
         writeStamp(root)
-
         // bin/ 与 lib/ 被整体替换，扩展中心装进 engine/{bin,lib} 的链接/副本
         // 全部丢失。extensions/ 在扩展侧留有 .links.json，这里立一个标记，
         // kxxy-host 插件启动时据此重建（五项改进方案 §2.4「升级后的自愈」）。
@@ -373,6 +460,101 @@ class RuntimeInstaller(private val ctx: Context) {
             }
         }
 
+        // 锚点 14：带 resources.arsc 的 android.jar（缺陷 CQ）。
+        // 同样是「新增资产」而非新增版本：RUNTIME_VERSION 从未变过，老设备
+        // 升级 APK 时前十三锚点全通过，isComplete() 判真、跳过重装，于是
+        // 旧的精简 stub 一直留在 share/java/android.jar 上，`aapt2 link`
+        // 继续报 `No package ID 01 found for resource ID 0x0101053d`。
+        //
+        // 与其它锚点不同的是，这一条**同时探标记与实体**：标记只能证明 zip
+        // 里带的是新版，证明不了 install 真的把它解出来了。所以再加一条
+        // 「jar 里必须能搜到 resources.arsc 这个字符串」——arsc 是 jar 内部
+        // 条目的名字，出现在 ZIP 中央目录里，普通文件读即可命中。
+        if (!markerIsCurrent(root, ANDROID_JAR_MARKER_FILE, ANDROID_JAR_MARKER)) {
+            Log.w(TAG, "runtime probe: android.jar marker outdated, forcing reinstall")
+            return false
+        }
+        val androidJar = File(root, "share/java/android.jar")
+        if (!androidJar.isFile || androidJar.length() < MIN_ANDROID_JAR_BYTES) {
+            Log.w(
+                TAG,
+                "runtime probe: android.jar missing or still the stub " +
+                    "(${androidJar.length()} B < $MIN_ANDROID_JAR_BYTES B)",
+            )
+            return false
+        }
+
+        // 锚点 15：打包工具包装器（缺陷 CT）。
+        //
+        // 与锚点 12–14 同型，但这次换的不是「新增文件」而是**已有文件的形态**：
+        // `bin/corepack` 从「dist/corepack.js 的副本」变成 156 B 的 sh 包装器。
+        // 它既不改变 RUNTIME_VERSION，也不影响任何既有标记 —— 前十四锚点全通过，
+        // isComplete() 判真，老设备继续报
+        // `Cannot find module './lib/corepack.cjs'`。
+        //
+        // 所以这一条**必须同时探标记与实体**（锚点 14 的教训）：标记只证明 zip
+        // 里带的是新版，证明不了 install 真把它解出来了。实体判据取「首行是
+        // #!/system/bin/sh」——副本的首行是 `#!/usr/bin/env node`，两者不可能混淆。
+        if (!markerIsCurrent(root, PACKAGING_MARKER_FILE, PACKAGING_MARKER)) {
+            Log.w(TAG, "runtime probe: packaging wrappers outdated, forcing reinstall")
+            return false
+        }
+        for (rel in PACKAGING_WRAPPERS) {
+            val f = File(root, rel)
+            if (!f.isFile || f.length() == 0L) {
+                Log.w(TAG, "runtime probe: packaging wrapper missing: $rel")
+                return false
+            }
+            // 可执行位在这里**自愈而不是直接判死**。
+            //
+            // [extract] 用 `FileOutputStream` 逐条写出，忽略 zip 条目的 unix
+            // mode，所以新装设备上这些包装器落盘是 0600/0644；正常流程靠
+            // [restoreExecBits]（安装路径第 183 行，扫 `bin/` 全量置位）补回来。
+            // 但若某次安装被系统杀掉在 `extract` 与 `restoreExecBits` 之间、
+            // 或用户/清理工具动过权限，这里直接 `return false` 会触发 741 MB
+            // 重装 —— 而重装正是最容易再次被打断的那件事，于是形成「越修越坏」
+            // 的死循环。补一个 bit 就能恢复的情况，不该付重装的代价。
+            if (!f.canExecute() && !f.setExecutable(true, false)) {
+                Log.w(TAG, "runtime probe: packaging wrapper not executable: $rel")
+                return false
+            }
+            // 合法形态有两种，缺一不可（真机实测踩过）：
+            //
+            // ① 自带的 sh 包装器 —— 首行 `#!/system/bin/sh`。这是 zip 里的形态，
+            //    也是全新安装后的形态。
+            // ② `corepack enable` 生成的软链 —— 指向
+            //    `../lib/node_modules/corepack/dist/<name>.js`。用户手动跑一次
+            //    `corepack enable`（corepack 的文档行为）就会把 `bin/npm` /
+            //    `bin/pnpm` 换掉，首行变成 `#!/<root>/bin/env node`。
+            //
+            // 第一版只认 ①，结果真机上 `corepack enable` 之后下一次启动就判假，
+            // 触发 741 MB 全量重装（日志 `restoreExecBits: 1241` +
+            // `runtime install complete`）—— 用户只是敲了一条官方命令，代价是
+            // 整个 runtime 重装一遍，且重装完再 enable 一次又是同样结果。
+            // ② 之所以等价安全：corepack 的入口第一句是 `require('./lib/corepack.cjs')`，
+            // 按 `__dirname` 解析，而软链的目标本身就在 `dist/` 里，`lib/corepack.cjs`
+            // 与它同级，所以能跑（真机 `pnpm --version` → 12.14.0）。缺陷 CT 的
+            // 根因从来不是「软链」，而是**副本落到了 `bin/`**。
+            if (Files.isSymbolicLink(f.toPath())) {
+                if (!COREPACK_SHIM_NAMES.contains(rel) || !isCorepackDistShim(f)) {
+                    Log.w(TAG, "runtime probe: packaging wrapper symlink is not a corepack dist shim: $rel")
+                    return false
+                }
+            } else {
+                val head = readHead(f, COMPAT_MARKER_PROBE_BYTES)
+                if (!head.startsWith("#!" + "/system/bin/sh")) {
+                    Log.w(TAG, "runtime probe: packaging wrapper is not a sh shim: $rel (${head.take(32)})")
+                    return false
+                }
+                // 副本形态的反例：正文里出现 `lib/corepack.cjs` 就说明它仍是从
+                // `bin/` 出发按 __dirname 解析的那个入口，缺陷 CT 复发。
+                if (head.contains("lib/corepack.cjs")) {
+                    Log.w(TAG, "runtime probe: bin/corepack is still the copied entry: $rel")
+                    return false
+                }
+            }
+        }
+
         return true
     }
 
@@ -398,17 +580,45 @@ class RuntimeInstaller(private val ctx: Context) {
     private fun markerIsCurrent(root: File, relativePath: String, marker: String): Boolean {
         val file = File(root, relativePath)
         return try {
-            val head = file.inputStream().use { input ->
-                val buffer = ByteArray(COMPAT_MARKER_PROBE_BYTES)
-                val read = input.read(buffer)
-                if (read <= 0) "" else String(buffer, 0, read, Charsets.UTF_8)
-            }
-            head.contains(marker)
+            readHead(file, COMPAT_MARKER_PROBE_BYTES).contains(marker)
         } catch (e: Exception) {
             Log.w(TAG, "runtime probe: cannot read marker of $relativePath: ${e.message}")
             false
         }
     }
+
+    /** 读文件头部若干字节（读不到就返回空串，不抛）。 */
+    private fun readHead(file: File, limit: Int): String =
+        try {
+            file.inputStream().use { input ->
+                val buffer = ByteArray(limit)
+                val read = input.read(buffer)
+                if (read <= 0) "" else String(buffer, 0, read, Charsets.UTF_8)
+            }
+        } catch (e: Exception) {
+            ""
+        }
+
+    /**
+     * 软链形态的包装器是否指向 corepack 的 `dist/`。
+     *
+     * 只接受「链到 `<root>/lib/node_modules/corepack/dist/<名字>.js`」这一种 ——
+     * 那正是 `corepack enable` 的产物，也是唯一能正常工作的软链形态（目标与
+     * `lib/corepack.cjs` 同级，`require('./lib/corepack.cjs')` 才解析得到）。
+     * 指向别处的软链一律判假：`bin/` 下出现任意软链是可疑的，而这条判据的
+     * 目的就是「`bin/` 里不许再出现那个按 `bin/` 解析相对路径的入口」。
+     *
+     * 注意：Kotlin 的块注释是可嵌套的，注释里不要写出「星号紧跟斜杠」的序列，
+     * 那会开启一层新的嵌套注释，把文件后半段全吃掉（我在这里踩过一次）。
+     */
+    private fun isCorepackDistShim(file: File): Boolean =
+        try {
+            val target = Files.readSymbolicLink(file.toPath()).toString().replace('\\', '/')
+            target.contains("lib/node_modules/corepack/dist/") && target.endsWith(".js")
+        } catch (e: Exception) {
+            Log.w(TAG, "runtime probe: cannot read symlink target of ${file.name}: ${e.message}")
+            false
+        }
 
     /**
      * 把 asset 拷到 cacheDir 后用 [ZipFile] 读中央目录。
@@ -520,20 +730,93 @@ class RuntimeInstaller(private val ctx: Context) {
     }
 
     /**
-     * 两阶段的第二阶段：为每个别名条目创建**实体副本**。
+     * 兜底自愈：扫 `bin/` 与 `libexec/` 里残留占位符的小脚本（缺陷 CE）。
      *
-     * 必须在全部本体落地后执行（类注释第 3 点）。别名共 421 条，其中
-     * `bin/git` 的 149 个别名、`bin/coreutils` 的 100 个 applet 是主要来源；
-     * 构建期只存一份本体 + 注释，App 侧复制，两侧体积都最优。
+     * 为什么需要它：修 `materialiseLinks` 的顺序只对**全新安装**生效 ——
+     * 已经装过旧版本的设备，26 个别名文件在盘上已经是「本体副本 + 字面量
+     * shebang」，`isComplete(root)` 为真，根本不会重走 extract。
+     *
+     * 扫描范围很小（`bin/` 有 ~400 个文件、`libexec/` 只有 git-core 一批），
+     * 且只看大小 ≤ 64 KiB 的文件、只读前若干字节，每次启动的开销可以忽略。
+     * 幂等：没有占位符的文件一个字节都不会被写。
+     */
+    private fun repairPlaceholderScripts(root: File) {
+        val dirs = listOf(File(root, "bin"), File(root, "libexec"))
+        val needles = listOf(ROOT_PLACEHOLDER, HOME_PLACEHOLDER, TMP_PLACEHOLDER)
+            .map { it.toByteArray(Charsets.ISO_8859_1) }
+
+        val filesDir = ctx.filesDir.absolutePath
+        val values = listOf(
+            ROOT_PLACEHOLDER to root.absolutePath,
+            HOME_PLACEHOLDER to EngineConfig.dshHome(ctx).absolutePath,
+            TMP_PLACEHOLDER to EngineConfig.tmpDir(ctx).absolutePath,
+            FILES_PLACEHOLDER to filesDir,
+            DATA_PLACEHOLDER to (ctx.filesDir.parentFile?.absolutePath ?: filesDir),
+        ).map { (ph, value) ->
+            ph.toByteArray(Charsets.ISO_8859_1) to value.toByteArray(Charsets.ISO_8859_1)
+        }
+
+        var repaired = 0
+        fun scan(dir: File, depth: Int) {
+            if (depth > 3) return
+            val children = dir.listFiles() ?: return
+            for (f in children) {
+                if (f.isDirectory) {
+                    scan(f, depth + 1)
+                    continue
+                }
+                if (!f.isFile || f.length() > MAX_PLACEHOLDER_SCRIPT_BYTES) continue
+                val data = runCatching { f.readBytes() }.getOrNull() ?: continue
+                // 只碰脚本（`#!`）与极少数带占位符的文本，绝不逐个盲扫二进制。
+                if (data.size < 2 || data[0] != '#'.code.toByte() || data[1] != '!'.code.toByte()) {
+                    continue
+                }
+                var has = false
+                for (n in needles) {
+                    if (indexOf(data, n, 0) >= 0) {
+                        has = true
+                        break
+                    }
+                }
+                if (!has) continue
+
+                var out = data
+                for ((needle, value) in values) out = replaceAll(out, needle, value)
+                if (out !== data) {
+                    runCatching { f.writeBytes(out) }
+                        .onSuccess { repaired++ }
+                        .onFailure { Log.w(TAG, "placeholder repair failed for ${f.path}: ${it.message}") }
+                }
+            }
+        }
+
+        scan(dirs[0], 0)
+        scan(dirs[1], 0)
+        if (repaired > 0) Log.i(TAG, "repairPlaceholderScripts: $repaired script(s) repaired")
+    }
+
+    /**
+     * 两阶段的第二阶段：为每个别名条目建**符号链接**（缺陷 DD）。
+     *
+     * 必须在全部本体落地后执行（类注释第 3 点）。别名共 1618 条，来源有二：
+     * stage 里的真符号链接，以及 [dedupeByContent] 把同内容文件降级成的别名；
+     * `bin/git` 的 149 个别名、`bin/coreutils` 的 100 个 applet 是主要来源。
+     *
+     * **链接目标写成相对路径**（`../../lib/jvm/.../bin/java` 这种），理由有二：
+     * ① 相对链接在 root 目录整体搬迁后仍然有效；② Termux 上游本身就这么写，
+     * 与 `lib/` 下那 18 条扩展软链风格一致。
+     *
+     * 处理完把「别名 → 本体」映射交给构建期清单，快路径
+     * [healCopiedAliases] 在老设备上把已经复制成实体的别名改回软链。
      */
     private fun materialiseLinks(root: File, linkTargets: Map<String, String>) {
         var created = 0
+        var reused = 0
         var failed = 0
         val canonicalRoot = root.canonicalPath
 
         for ((alias, target) in linkTargets) {
             val aliasFile = File(root, alias)
-            if (aliasFile.isFile && aliasFile.length() > 0) continue
 
             val realFile = File(root, target)
             if (!realFile.isFile) {
@@ -550,15 +833,101 @@ class RuntimeInstaller(private val ctx: Context) {
 
             try {
                 aliasFile.parentFile?.mkdirs()
-                realFile.copyTo(aliasFile, overwrite = true)
-                created++
+                if (Files.isSymbolicLink(aliasFile.toPath())) {
+                    // 已是软链：内容由 [extract] 跳过别名条目保证不会错，直接留用。
+                    reused++
+                } else if (aliasFile.isFile && aliasFile.length() != realFile.length()) {
+                    // 盘上这份与本体不等长 ⇒ 不是本体的副本，而是别的东西
+                    // （扩展往同名路径放的真文件）。绝不能删。
+                    Log.w(TAG, "alias occupied by a foreign file, keep it: $alias")
+                    failed++
+                } else {
+                    // 实体文件（上一版留下的副本，或本轮解出的残留）一律替换。
+                    // 别名在本体集合里永远不是本体，删掉不会丢数据。
+                    Files.deleteIfExists(aliasFile.toPath())
+                    createRelativeSymlink(aliasFile, realFile)
+                    created++
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "link failed for $alias -> $target: ${e.message}")
                 failed++
             }
         }
 
-        Log.i(TAG, "materialiseLinks: $created created, $failed failed")
+        Log.i(TAG, "materialiseLinks: $created created, $reused reused, $failed failed")
+    }
+
+    /**
+     * 建一条指向 [realFile] 的相对符号链接 [aliasFile]。
+     *
+     * 相对路径由两条绝对路径 `relativize` 得出，所以 root 换位置也不断链。
+     */
+    private fun createRelativeSymlink(aliasFile: File, realFile: File) {
+        val parent = aliasFile.parentFile ?: throw IllegalStateException("no parent: $aliasFile")
+        val relative = parent.toPath().relativize(realFile.toPath())
+        Files.createSymbolicLink(aliasFile.toPath(), relative)
+    }
+
+    /**
+     * 快路径的别名自愈（缺陷 DD 的存量修复）。
+     *
+     * 老设备上 runtime 早已解完，`isComplete()` 判真走快路径，永远不会再跑
+     * [materialiseLinks]，于是 1618 条别名全是复制出来的实体 —— `bin/java`
+     * 找不到 `libjli.so`、`bin/mvn` 推出错的 `MAVEN_HOME`。这里按构建期产出的
+     * [ALIAS_LIST_ASSET] 逐条检查，把「本该是软链却是实体」的改回软链。
+     *
+     * 清单读 APK 资产而不是安装期落盘，是因为快路径**从来没跑过**
+     * [materialiseLinks] 的那批老设备上根本没有安装期记录；资产则随 APK
+     * 一起升级，永远是最新的。清单只有几十 KB，`assets.open()` 一次读完。
+     *
+     * 每次启动都跑（1618 次 stat，毫秒级），幂等。
+     */
+    private fun healCopiedAliases(root: File) {
+        val pairs = runCatching { readAliasList() }.getOrElse {
+            Log.w(TAG, "healCopiedAliases: 读别名清单失败：${it.message}")
+            return
+        }
+        if (pairs.isEmpty()) return
+
+        var healed = 0
+        var failed = 0
+
+        for ((alias, target) in pairs) {
+            val aliasFile = File(root, alias)
+            if (Files.isSymbolicLink(aliasFile.toPath())) continue
+            if (!aliasFile.isFile) continue
+            val realFile = File(root, target)
+            if (!realFile.isFile) continue
+            // 只改「确实是本体副本」的实体：长度必须一致。扩展往同名路径放了
+            // 自己的文件时长度不同，必须原样留着。
+            if (aliasFile.length() != realFile.length()) continue
+
+            try {
+                Files.delete(aliasFile.toPath())
+                createRelativeSymlink(aliasFile, realFile)
+                healed++
+            } catch (e: Exception) {
+                Log.w(TAG, "heal alias failed for $alias: ${e.message}")
+                failed++
+            }
+        }
+
+        if (healed > 0 || failed > 0) {
+            Log.i(TAG, "healCopiedAliases: $healed 个别名由实体副本改回符号链接，$failed 个失败")
+        }
+    }
+
+    /** 读 APK 里的别名清单，每行 `<别名>\t<本体>`。 */
+    private fun readAliasList(): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        ctx.assets.open(ALIAS_LIST_ASSET).bufferedReader().useLines { lines ->
+            for (line in lines) {
+                val tab = line.indexOf('\t')
+                if (tab <= 0) continue
+                out.add(line.substring(0, tab) to line.substring(tab + 1))
+            }
+        }
+        return out
     }
 
     /**
@@ -706,6 +1075,67 @@ class RuntimeInstaller(private val ctx: Context) {
         }
 
         if (!target.delete()) Log.w(TAG, "deleteTreeSafely: cannot delete $target")
+    }
+
+    /**
+     * 把 APK 自带的 native 库（`libkxxy_exec.so`）落到 `<root>/lib`。
+     *
+     * 为什么不能直接用 `ApplicationInfo.nativeLibraryDir` 里那份：
+     * LD_PRELOAD 要求绝对路径，而 nativeLibraryDir 随安装路径变化
+     * （`/data/app/~~<hash>/app.kxxy-<hash>/lib/arm64`），且**在 app 升级后
+     * 会失效**（旧目录被删）。而 LD_PRELOAD 是写进环境变量、传给子进程的，
+     * 一旦路径失效，所有子进程启动都会因 preload 加载失败而 abort。
+     *
+     * 拷到 `<root>/lib` 后，路径稳定、跟着引擎根走，且已经在
+     * LD_LIBRARY_PATH 里。
+     *
+     * 每次启动都覆盖一次（文件只有几十 KB）：避免升级 APK 后盘上留着
+     * 旧版本的重写器 —— 那种「半新半旧」最难排查。
+     */
+    private fun installExecShim(root: File) {
+        val lib = File(root, "lib")
+        if (!lib.isDirectory) {
+            Log.w(TAG, "installExecShim: lib dir missing")
+            return
+        }
+
+        val target = File(lib, EXEC_SHIM_NAME)
+
+        // APK 里的 native 库按 ABI 分目录，nativeLibraryDir 直接指向本机那份。
+        val src = File(ctx.applicationInfo.nativeLibraryDir, EXEC_SHIM_NAME)
+
+        if (!src.isFile) {
+            // 极少数情况（比如 ABI 分裂安装）下这里取不到，退一步按 ABI 名拼。
+            val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+            val alt = File(File(ctx.applicationInfo.nativeLibraryDir).parentFile, abi + "/" + EXEC_SHIM_NAME)
+            if (alt.isFile) {
+                copyShim(alt, target)
+                return
+            }
+            Log.w(TAG, "installExecShim: $EXEC_SHIM_NAME not in APK native libs ($src)")
+            return
+        }
+
+        copyShim(src, target)
+    }
+
+    private fun copyShim(src: File, target: File) {
+        try {
+            val inBytes = src.readBytes()
+            // 内容一致就不重写：减少每次启动的 I/O 与 mtime 抖动。
+            if (target.isFile && target.length() == inBytes.size.toLong()) {
+                val old = runCatching { target.readBytes() }.getOrNull()
+                if (old != null && old.contentEquals(inBytes)) {
+                    target.setExecutable(true, false)
+                    return
+                }
+            }
+            target.writeBytes(inBytes)
+            target.setExecutable(true, false)
+            Log.i(TAG, "exec shim installed: ${target.absolutePath} (${inBytes.size} bytes)")
+        } catch (e: Exception) {
+            Log.w(TAG, "installExecShim failed: ${e.message}")
+        }
     }
 
     /**
@@ -883,6 +1313,425 @@ class RuntimeInstaller(private val ctx: Context) {
                 Log.w(TAG, "ensureNoShadowingStubs: 无法删除 $rel ($size B)")
             }
         }
+    }
+
+    /**
+     * 把 guile 的 `.go` 编译缓存的 mtime 抬到不早于对应的 `.scm`（缺陷 CU）。
+     *
+     * ── 症状 ────────────────────────────────────────────────────────────────
+     *
+     * `gdb --version` 20s / 45s / 90s 三档全是 0 字节输出、被 SIGKILL（rc=137）。
+     * strace 看到它反复 `openat(...share/guile/3.0/ice-9/boot-9.scm)` 与
+     * `psyntax-pp.scm`，随后卡在 `rt_sigprocmask` 节律里 —— 看起来像死循环，
+     * 实际是**在内存里重编宏展开器自身**。而且 `ccache/ice-9/boot-9.go`
+     * （933,053 B）明明存在，所以「缓存缺失」这个直觉是错的。
+     *
+     * ── 机制（真机 A/B 定案）────────────────────────────────────────────────
+     *
+     * guile 3.0 判断 `.go` 是否可用的依据是 **`.scm` 的 mtime vs `.go` 的
+     * mtime**，不是内容哈希。任一 `.scm` 比对应 `.go` 新 ⇒ 走重编译路径。
+     * 而 `GUILE_AUTO_COMPILE=0` 只阻止把结果**写回**磁盘，**不阻止在内存里
+     * 重编** —— 于是每次启动都白编一遍。
+     *
+     * 触发条件在设备上必然成立：`.scm` 的 mtime 来自**扩展解包时刻**
+     * （`bin/tar` 解包时按条目时间落盘），而 `.go` 的 mtime 来自**池打包时刻**
+     * （`tools/lib/poolextract.py` 统一写 `info.mtime = 0`，解包后又被 tar
+     * 归一）。谁新谁旧完全取决于「先装扩展还是先装 runtime」。
+     *
+     * 决定性实验：`touch` 全部 `.scm` → `gdb --version` **rc=124 / 137 秒超时**；
+     * 再 `touch` 全部 `.go` → **rc=0 / 0 秒**。同一台设备、同一份二进制。
+     *
+     * ── 为什么走「每次启动」而不是构建期 ──────────────────────────────────────
+     *
+     * 扩展是用户按需安装/重装的，每次都会重写 `.scm` 的 mtime；构建期没有任何
+     * 手段能预知。而且这不是「资产在不在」的问题（文件都在），锚点表达不了。
+     * 成本：遍历 ccache 目录的 stat（真机 344 个 `.go`），只在需要时 `setLastModified`。
+     */
+    private fun ensureGuileCcacheFresh(root: File) {
+        runCatching {
+            // ccache 有两个候选位置：合并视图优先，回落扩展树（与 guileCompiledPath 同序）。
+            val ccache = listOf(
+                File(root, "lib/guile/3.0/ccache"),
+                File(EngineConfig.extensionsRoot(ctx), "gdb/lib/guile/3.0/ccache"),
+            ).firstOrNull { it.isDirectory } ?: return
+
+            // `.go` 的路径是 `ccache/ice-9/boot-9.go`，对应源码在
+            // `share/guile/3.0/ice-9/boot-9.scm`；两棵树的相对布局一致，
+            // 所以按相对路径去 share 侧找同名 `.scm` 即可。
+            val share = listOf(
+                File(root, "share/guile/3.0"),
+                File(EngineConfig.extensionsRoot(ctx), "gdb/share/guile/3.0"),
+            ).firstOrNull { it.isDirectory }
+
+            var touched = 0
+            var checked = 0
+            ccache.walkTopDown()
+                .maxDepth(MAX_SCAN_DEPTH)
+                .filter { it.isFile && it.name.endsWith(".go") }
+                .forEach { go ->
+                    checked++
+                    val rel = go.relativeTo(ccache).path
+                    val scmRel = rel.removeSuffix(".go") + ".scm"
+                    // 源码可能在 share 侧，也可能就在 ccache 旁边（少数布局）。
+                    val scm = listOfNotNull(share?.let { File(it, scmRel) }, File(ccache, scmRel))
+                        .firstOrNull { it.isFile } ?: return@forEach
+                    // 留 2 秒余量：同一次解包出来的文件 mtime 可能只差毫秒，
+                    // 而 tar 的时间精度是秒，正好卡在边界上仍会被判「更新」。
+                    val need = scm.lastModified() + 2_000L
+                    if (go.lastModified() >= need) return@forEach
+                    if (go.setLastModified(need)) touched++
+                }
+            if (touched > 0) {
+                Log.i(TAG, "ensureGuileCcacheFresh: $touched/$checked .go re-dated（避免 gdb 每次重编 boot-9）")
+            }
+        }.onFailure { Log.w(TAG, "ensureGuileCcacheFresh failed: ${it.message}") }
+    }
+
+    /**
+     * 创建 `$TMPDIR`（`filesDir/tmp`），并尽量把 `/tmp` 也变可用（缺口 A）。
+     *
+     * ── 为什么需要这一趟（真机缺口）──────────────────────────────────────────
+     *
+     * `EngineConfig` 只把 `TMPDIR` / `TMP` / `TEMP` / `GOTMPDIR` 等环境变量
+     * **指向** `filesDir/tmp`，从来没有创建那个目录。全新安装后第一次启动：
+     *
+     *     $ touch /tmp/k2
+     *     No such file or directory
+     *     $ mkdir -p $TMPDIR && touch $TMPDIR/x   # 才能过
+     *
+     * 受影响的不止 `/tmp` 字面路径：
+     *   · gdb 往 `$TMPDIR/gdbout.<pid>` 写输出，目录不存在时**静默挂起**
+     *     （问题 2 的直接成因）；
+     *   · `go build -o /tmp/...`、部分脚本的 `mktemp` 同样失败；
+     *   · 少数工具（Java 的 `java.io.tmpdir` 回退、部分 shell 模板）只认字面
+     *     `/tmp`，不读 `$TMPDIR`。
+     *
+     * 所以这里做两件事：
+     *   1. 确保 `filesDir/tmp` 存在（幂等，`mkdirs()`）；
+     *   2. 尝试把字面 `/tmp` 指过去。**`/tmp` 归 root 且 `chmod 1777`**，普通
+     *      App 建不了它，所以这条只在能写父目录时成功 —— 失败不是错误，
+     *      直接吞掉（引擎侧的 `TMPDIR` 已经可用，功能不受影响）。
+     */
+    private fun ensureTmpDir(ctx: Context) {
+        val tmp = EngineConfig.tmpDir(ctx)
+        if (!tmp.isDirectory && !tmp.mkdirs() && !tmp.isDirectory) {
+            Log.w(TAG, "ensureTmpDir: 无法创建 ${tmp.absolutePath}")
+            return
+        }
+
+        // 让 `getprop` / 三方脚本眼里的 `/tmp` 也指向同一处。Android 上
+        // `/tmp` 通常不存在且 `/` 只读，这里失败是**预期**，不记错误。
+        val slashTmp = File("/tmp")
+        if (slashTmp.exists()) return
+        runCatching {
+            // 极少数机型 `/` 可写（userdebug / 已 root）。能建就建成软链，
+            // 与 $TMPDIR 共享同一份内容，避免「两个 tmp 各写一半」。
+            if (slashTmp.parentFile?.canWrite() == true) {
+                Files.createSymbolicLink(slashTmp.toPath(), tmp.toPath())
+                Log.i(TAG, "ensureTmpDir: /tmp → ${tmp.absolutePath}")
+            }
+        }.onFailure { Log.i(TAG, "ensureTmpDir: /tmp 不可创建（预期，${it.message}）") }
+    }
+
+    /**
+     * 落一份自建 fontconfig 配置，让 fontconfig 看得见随 runtime 走的 CJK 字体（缺陷 CV）。
+     *
+     * ── 症状 ────────────────────────────────────────────────────────────────
+     *
+     * `pandoc zh.md -o zh.pdf --pdf-engine=xelatex -V CJKmainfont=NotoSansSC-Regular`
+     * 报 `! Package fontspec Error: The font "NotoSansSC-Regular" cannot be found;`
+     * 换成按文件路径给字体能出 PDF，但中文全丢（`Missing character: There is no
+     * 文 ("6587) in font nullfont!`）。
+     *
+     * ── 根因 ────────────────────────────────────────────────────────────────
+     *
+     * `<root>/etc/fonts/fonts.conf` 是**扩展池的软链**（texlive 与 ffmpeg 各带
+     * 一份，合并视图先到者胜），它的 `<dir>` 只有 `/system/fonts`、
+     * `<root>/share/fonts`、`<dir prefix="xdg">fonts</dir>`、`~/.fonts` ——
+     * 而 NotoSansSC 两个字体在 `lib/node_modules/kxxy-host/fonts/` 下，
+     * 那个目录 fontconfig 完全看不到，索引里根本没有这个 face。
+     *
+     * 顺带纠正一个误判：用户清单里写「`fc-list | wc -l` = 0」—— 真机上
+     * **`fc-list` 这个命令根本不存在**（Termux 的 fontconfig 包没进种子），
+     * 所以那条证据是假的；但「索引里没有字体」这个结论是对的。
+     *
+     * ── 为什么不能改 fonts.conf ───────────────────────────────────────────────
+     *
+     * 它是扩展池落下来的软链，扩展重装/重打池就会覆盖，改它等于把修复放在
+     * 随时会被冲掉的地方。所以这里写**自己的**文件（`etc/fonts/kxxy-fonts.conf`），
+     * 由 `EngineConfig` 用 `FONTCONFIG_FILE` 指过去 —— fontconfig 认这个变量，
+     * 有它就完全不读默认路径。
+     *
+     * 配置内容照抄标准 fonts.conf 的骨架（含 `conf.d` 的 include），只额外把
+     * kxxy-host 的字体目录插到最前，并给 CJK 加一条 sans-serif 别名，
+     * 这样 `fc-match sans-serif:lang=zh` 也能命中。
+     */
+    private fun ensureFontConfig(root: File) {
+        val fontsDir = EngineConfig.officeFontsDir(ctx)
+
+        val conf = buildString {
+            append("<?xml version=\"1.0\"?>\n")
+            append("<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n")
+            append("<!-- generated by Kxxy RuntimeInstaller — do not edit -->\n")
+            append("<fontconfig>\n")
+            // 随 runtime 走的 CJK 字体必须排第一：它是唯一含完整简中字形的
+            // 单文件 TTF（`/system/fonts` 里的 NotoSansCJK 是 .ttc 集合，
+            // LibreOffice wasm 会把它导成无字形空壳，见 officeFontsDir 注释）。
+            append("  <dir>${xmlEscape(fontsDir.absolutePath)}</dir>\n")
+            append("  <dir>/system/fonts</dir>\n")
+            append("  <dir>${xmlEscape(File(root, "share/fonts").absolutePath)}</dir>\n")
+            append("  <dir prefix=\"xdg\">fonts</dir>\n")
+            append("  <dir>~/.fonts</dir>\n")
+            append("  <cachedir>${xmlEscape(File(root, "var/cache/fontconfig").absolutePath)}</cachedir>\n")
+            append("  <cachedir>~/.fontconfig</cachedir>\n")
+            // 复用扩展池带来的 conf.d（抗锯齿/微调/子像素那批），有则包含。
+            val confD = File(root, "etc/fonts/conf.d")
+            if (confD.isDirectory) {
+                append("  <include ignore_missing=\"yes\">${xmlEscape(confD.absolutePath)}</include>\n")
+            }
+            // CJK 别名：`fontspec` 按 PostScript 名找（NotoSansSC-Regular），
+            // 而 fontconfig 的 family 是 `Noto Sans SC`（带空格）。两条都登记，
+            // 这样 `fc-match`、`fontspec`、`fontconfig` 三条路都能命中。
+            append("  <alias binding=\"same\"><family>sans-serif</family>")
+            append("<accept><family>Noto Sans SC</family></accept></alias>\n")
+            append("  <alias binding=\"same\"><family>sans-serif</family>")
+            append("<accept><family>NotoSansSC-Regular</family></accept></alias>\n")
+            append("</fontconfig>\n")
+        }.toByteArray(Charsets.UTF_8)
+
+        val target = File(root, "etc/fonts/kxxy-fonts.conf")
+        if (target.isFile && target.length() == conf.size.toLong()) {
+            val existing = runCatching { target.readBytes() }.getOrNull()
+            if (existing != null && existing.contentEquals(conf)) return
+        }
+        runCatching {
+            target.parentFile?.mkdirs()
+            target.writeBytes(conf)
+            Log.i(TAG, "ensureFontConfig: wrote ${target.path}")
+        }.onFailure { Log.w(TAG, "ensureFontConfig failed: ${it.message}") }
+    }
+
+    /** 极简 XML 文本转义（路径里可能有 `&`，虽然 Android 上基本不会）。 */
+    private fun xmlEscape(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    /**
+     * 给 TeX 的 `web2c/mktex*` 补可执行位（缺陷 CW）。
+     *
+     * 症状：`xelatex` 找不到字体时会调 `mktextfm`，后者内部 exec
+     * `$TEXMFDIST/web2c/mktexnam`，报
+     *   `mktextfm: 1: .../texmf-dist/web2c/mktexnam: Permission denied`
+     * 于是字体永远建不出来。
+     *
+     * 根因是两层叠加：
+     *   ① `tools/build-runtime.mjs` 的 `bundleTexliveMacros` 确实把
+     *      `texmf-dist/web2c/mktex*` 的 zip 条目 mode 写成 0o755；
+     *   ② 但 [extract] 用 `ZipInputStream` + `FileOutputStream` 逐条写出，
+     *      **完全忽略 entry 的 unix mode**，落盘一律 0600/0644；
+     *   ③ 而 [restoreExecBits] 只扫 `bin/`、`usr/bin/`、`libexec/`、
+     *      `lib/node_modules`、`lib/jvm` 五处，`share/texlive/.../web2c` 不在其中。
+     *
+     * 为什么走「每次启动」：TeX 树随扩展重装重建，构建期改不到设备盘；
+     * 且这不是资产缺失，锚点表达不了。成本是一次 `listFiles` + 七个 `setExecutable`。
+     */
+    private fun ensureTexExecBits(root: File) {
+        runCatching {
+            val texlive = File(root, "share/texlive")
+            if (!texlive.isDirectory) return
+            var fixed = 0
+            texlive.listFiles()?.forEach { year ->
+                if (!year.isDirectory) return@forEach
+                val web2c = File(year, "texmf-dist/web2c")
+                if (!web2c.isDirectory) return@forEach
+                web2c.listFiles()?.forEach { f ->
+                    // 只认 `mktex*`：同目录下还有 `texmf.cnf`、`fmtutil.cnf`
+                    // 这类配置文件，不该有可执行位。
+                    if (!f.isFile || !f.name.startsWith("mktex")) return@forEach
+                    if (!f.canExecute() && f.setExecutable(true, false)) fixed++
+                }
+            }
+            if (fixed > 0) Log.i(TAG, "ensureTexExecBits: $fixed mktex* made executable")
+        }.onFailure { Log.w(TAG, "ensureTexExecBits failed: ${it.message}") }
+    }
+
+    /**
+     * 锚点 15 的安装前自愈：把 `corepack enable` / `corepack disable` 弄出来的
+     * 状态就地修好，而不是判假重装 741 MiB。
+     *
+     * 三种状态，全部来自 corepack 的官方命令（用户敲一次就触发，实测）：
+     *
+     *   ① **被删掉** —— `corepack disable` 直接 `unlink` 四个入口。实测
+     *      `ls: cannot access '…/bin/pnpm': No such file or directory`，
+     *      而 `bin/corepack` 本体还在。这里按构建期同一份内容补回 sh 包装器。
+     *   ② **被换成软链** —— `corepack enable` 建成
+     *      `bin/pnpm -> ../lib/node_modules/corepack/dist/pnpm.js`。软链本身没问题
+     *      （目标与 `lib/corepack.cjs` 同级，`require('./lib/corepack.cjs')` 按
+     *      `__dirname` 解析命中），但 `dist/` 下的 js 在 zip 里是 0644、被
+     *      `extract` 落成 0600，于是 `pnpm` 报 `Permission denied` ——
+     *      `restoreExecBits` 扫不到它（它只扫 `bin/` / `usr/bin/` / `libexec/`，
+     *      以及 `lib/node_modules` 与 `lib/jvm` 下路径含 `/bin/` 的）。这里给
+     *      软链目标补上可执行位。
+     *   ③ **可执行位丢了** —— 直接补。
+     *
+     * 只处理 corepack 管的四个。`bin/zipalign` / `bin/bundletool` 是自造的，
+     * 没有任何官方命令会动它们；它们缺失或变形就是真缺陷，留给 `isComplete()`
+     * 判假重装 —— 在那里补回来反而会掩盖构建问题。
+     *
+     * 幂等且只在 `bin/node` 存在时调用（见 [ensureInstalled]），全新安装不受影响。
+     */
+    private fun healPackagingWrappers(root: File) {
+        for (rel in COREPACK_SHIM_NAMES) {
+            val name = rel.substringAfterLast('/')
+            val target = File(root, rel)
+            if (Files.isSymbolicLink(target.toPath())) {
+                // ② 软链：给它指向的那份补可执行位（补不上不算错，isComplete 会判假）。
+                runCatching {
+                    val real = target.canonicalFile
+                    if (real.isFile && !real.canExecute() && real.setExecutable(true, false)) {
+                        Log.i(TAG, "healPackagingWrappers: made $rel target executable")
+                    }
+                }.onFailure { Log.w(TAG, "healPackagingWrappers: $rel link target failed: ${it.message}") }
+                continue
+            }
+            if (!target.exists()) {
+                // ① 被删掉：按构建期同一份内容补回。
+                val data = buildString {
+                    append("#!/system/bin/sh\n")
+                    append("# generated by dsh-kxxy build-runtime.mjs — do not edit\n")
+                    append("d=\${0%/*}\n")
+                    append("exec \"\$d/node\" \"\$d/../lib/node_modules/corepack/dist/$name.js\" \"\$@\"\n")
+                }.toByteArray(Charsets.UTF_8)
+                runCatching {
+                    target.parentFile?.mkdirs()
+                    target.writeBytes(data)
+                    target.setExecutable(true, false)
+                    Log.i(TAG, "healPackagingWrappers: restored $rel")
+                }.onFailure { Log.w(TAG, "healPackagingWrappers: restore $rel failed: ${it.message}") }
+                continue
+            }
+            // ③ 形态对、可执行位丢了。
+            if (target.isFile && !target.canExecute()) {
+                if (target.setExecutable(true, false)) Log.i(TAG, "healPackagingWrappers: made $rel executable")
+            }
+        }
+    }
+
+    /**
+     * 让 `dsh` 出现在 PATH 里（缺陷 CI，问题清单 P17）。
+     *
+     * 真机症状：`command -v dsh` 为空。包本体在
+     * `lib/node_modules/@deepseek-ai/dsh/lib/bin.js`（package.json 的
+     * `bin: { dsh: "lib/bin.js" }`），但 **npm 的 bin 软链只由 npm install
+     * 创建**；runtime.zip 是构建期从 deb 组装出来的，从来没有跑过 npm install，
+     * 所以 `bin/dsh` 这个入口根本不存在 —— 用户只能敲一长串
+     * `node lib/node_modules/@deepseek-ai/dsh/lib/bin.js`。
+     *
+     * 为什么用 `#!/system/bin/sh` 包装而不是把它物化成 `bin/node` 的副本：
+     * `lib/bin.js` 是 ESM、首行 `#!/usr/bin/env node`，直接当可执行文件跑要靠
+     * `LD_PRELOAD` 的 exec 拦截器把 `/usr/bin/env` 重写掉 —— 那条路能用，但
+     * 它对**每次**调用都是额外一层依赖。包装脚本只走一个 `exec`，且
+     * `/system/bin/sh` 在任何 Android 上都存在（与 [corepackWrappers] 同一取舍）。
+     *
+     * 幂等：内容一致就不写。`bin/` 在 runtime 重装时会被删空重建，所以这条必须
+     * 在快路径也跑一次，不能只在 extract 之后跑。
+     */
+    private fun ensureDshWrapper(root: File) {
+        val entry = File(root, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js")
+        if (!entry.isFile) {
+            Log.w(TAG, "ensureDshWrapper: ${entry.path} 不存在，跳过")
+            return
+        }
+        val data = buildString {
+            append("#!/system/bin/sh\n")
+            append("# generated by Kxxy RuntimeInstaller — do not edit\n")
+            append("# 缺陷 CI：npm 的 bin 软链只由 npm install 创建，runtime.zip 里没有它。\n")
+            append("d=\${0%/*}\n")
+            append("exec \"\$d/node\" \"\$d/../lib/node_modules/@deepseek-ai/dsh/lib/bin.js\" \"\$@\"\n")
+        }.toByteArray(Charsets.UTF_8)
+
+        val target = File(root, "bin/dsh")
+        if (target.isFile && target.length() == data.size.toLong()) {
+            val existing = runCatching { target.readBytes() }.getOrNull()
+            if (existing != null && existing.contentEquals(data)) {
+                if (!target.canExecute()) target.setExecutable(true, false)
+                return
+            }
+        }
+        runCatching {
+            target.parentFile?.mkdirs()
+            target.writeBytes(data)
+            target.setExecutable(true, false)
+            Log.i(TAG, "ensureDshWrapper: wrote ${target.path}")
+        }.onFailure { Log.w(TAG, "ensureDshWrapper failed: ${it.message}") }
+    }
+
+    /**
+     * 落一份 `<root>/etc/resolv.conf`（缺陷 CJ，问题清单 R2 / P4）。
+     *
+     * ── 为什么缺这个文件 ────────────────────────────────────────────────────
+     *
+     * bionic 的 `getaddrinfo` 不看 `/etc/resolv.conf`，它走 netd 的
+     * `android_getaddrinfofornet`（Binder 到 netd 进程）。所以 Node / curl /
+     * git / python 这些用 libc 解析的工具**一直都是好的**，`/etc/resolv.conf`
+     * 不存在这件事在它们身上完全暴露不出来。
+     *
+     * 但 **Go 的纯 Go resolver 是自己读文件的**：它按
+     * `/etc/resolv.conf` → `$GOROOT/../etc/resolv.conf` → Termux 前缀的顺序找。
+     * Termux 编的 go 把 `--prefix=/data/data/com.termux/files/usr` 编进了
+     * `net` 包，构建期的 PATH_REWRITES 会把那个路径改写成
+     * `@DSH_ROOT@/etc/resolv.conf`，落地后就是 `<root>/etc/resolv.conf`。
+     *
+     * strace 实证（真机，v0.9.1 + 本补丁）：
+     *   openat(AT_FDCWD, "/etc/hosts", O_RDONLY|O_CLOEXEC) = 3
+     *   openat(AT_FDCWD, "<root>/etc/resolv.conf", O_RDONLY|O_CLOEXEC) = 3
+     * —— 它确实打开了，只是文件不存在时 open 失败、fallback 到 `[::1]:53`，
+     * 于是 `dial tcp: lookup proxy.golang.org on [::1]:53: connection refused`。
+     *
+     * ── 内容从哪来 ─────────────────────────────────────────────────────────
+     *
+     * 不能在构建期写死：DNS 随网络（Wi-Fi / 蜂窝 / 热点 / 代理）变化，
+     * 写死的 nameserver 换网络就废。这里从 `ConnectivityManager` 当前
+     * **活动网络**的 `LinkProperties.dnsServers` 取，落成 `nameserver` 行。
+     *
+     * 取不到时**不写文件**（让 go 维持原样报错，比写一份错的更诚实），
+     * 只在日志里留一行。每次引擎启动都会重跑，换网后重启引擎即生效。
+     */
+    private fun ensureResolvConf(root: File) {
+        val target = File(root, "etc/resolv.conf")
+        val servers = runCatching { activeDnsServers() }.getOrElse {
+            Log.w(TAG, "ensureResolvConf: 读 DNS 失败：${it.message}")
+            emptyList()
+        }
+        if (servers.isEmpty()) {
+            Log.w(TAG, "ensureResolvConf: 没有可用的 DNS 服务器，跳过（Go 的纯 resolver 会不可用）")
+            return
+        }
+        val data = buildString {
+            append("# generated by Kxxy RuntimeInstaller — do not edit\n")
+            for (s in servers) append("nameserver $s\n")
+            // 搜索域留空：Go 的 resolver 对 `search` 的支持不完整（只认首个），
+            // 而 Android 上短名访问本来就不常见，写进去反而干扰 `hostLookupOrder`。
+            append("options edns0\n")
+        }.toByteArray(Charsets.UTF_8)
+
+        if (target.isFile && target.length() == data.size.toLong()) {
+            val existing = runCatching { target.readBytes() }.getOrNull()
+            if (existing != null && existing.contentEquals(data)) return
+        }
+        runCatching {
+            target.parentFile?.mkdirs()
+            target.writeBytes(data)
+            Log.i(TAG, "ensureResolvConf: wrote ${target.path} (${servers.size} servers)")
+        }.onFailure { Log.w(TAG, "ensureResolvConf failed: ${it.message}") }
+    }
+
+    /** 当前活动网络的 DNS 服务器（IPv4 与 IPv6 都收，去重保序）。 */
+    private fun activeDnsServers(): List<String> {
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return emptyList()
+        val network = cm.activeNetwork ?: return emptyList()
+        val props = cm.getLinkProperties(network) ?: return emptyList()
+        return props.dnsServers.mapNotNull { it.hostAddress }.distinct()
     }
 
     /**
@@ -1220,9 +2069,34 @@ class RuntimeInstaller(private val ctx: Context) {
         /** 别名条目的中央目录注释前缀。 */
         private const val LINK_PREFIX = "LINK:"
 
+        /**
+         * 别名清单资产（缺陷 DD），每行 `<别名相对路径>\t<本体相对路径>`。
+         *
+         * 构建期由 `tools/build-runtime.mjs` 与 runtime.zip 同时产出（同一份
+         * `merged` 计算），`tools/inject-apk-assets.mjs` 的白名单把它注入 APK。
+         * [healCopiedAliases] 在快路径上读它，把老设备上已复制成实体的别名
+         * 改回符号链接。
+         */
+        private const val ALIAS_LIST_ASSET = "alias-links.txt"
+
         /** 构建期占位符，与 build-runtime.mjs 的 ROOT_PLACEHOLDER 一致。 */
         private const val ROOT_PLACEHOLDER = "@DSH_ROOT@"
 
+        /**
+         * exec 族路径重写预加载库的名字（缺陷 CF，问题清单 P3）。
+         *
+         * 与 `android/app/src/main/cpp/CMakeLists.txt` 的 `add_library(kxxy_exec …)`
+         * 对应 —— CMake 会给产物加 `lib` 前缀与 `.so` 后缀，所以目标名是
+         * `kxxy_exec`、文件名是 `libkxxy_exec.so`。两处必须一致，否则
+         * `nativeLibraryDir` 下找不到它，P3 静默失效。
+         */
+        private const val EXEC_SHIM_NAME = "libkxxy_exec.so"
+
+        /**
+         * 占位符自愈只处理不大于这个尺寸的脚本（缺陷 CE）。
+         * 真机上残留占位符的都是脚本，最大的是 corepack.js（约 1 KB）。
+         */
+        private const val MAX_PLACEHOLDER_SCRIPT_BYTES = 64L * 1024
         /**
          * Termux 的 `$HOME`（`/data/data/com.termux/files/home`）。
          *
@@ -1335,8 +2209,15 @@ class RuntimeInstaller(private val ctx: Context) {
          * 版本时，必须同步递增此编号。
          *
          * 标记写成独立小文件而不是字体首行 —— TTF 的 sfnt 头部不能动。
+         *
+         * @2 —— wasm 引擎包 0.1.1 → 0.1.5（缺陷 CL，问题清单 R3 / P7）。
+         * kit 0.1.5 的 `ENGINE_VERSIONS.wasm` 就是 `"0.1.5"`，而 0.1.1 的
+         * `prebuilds.json` 里 `version` 是 `0.1.1`，两者不等 ⇒ kit 抛
+         * `Installed LibreOfficeKit wasm package has an incompatible or
+         *  incomplete manifest.`。不带标记的设备只靠重装 runtime 是拿不到
+         * 新引擎的，所以标记必须一起升。
          */
-        private const val OFFICE_LAYER_MARKER = "kxxy-office@1"
+        private const val OFFICE_LAYER_MARKER = "kxxy-office@2"
         private const val OFFICE_LAYER_MARKER_FILE =
             "lib/node_modules/kxxy-host/fonts/office-assets.version"
 
@@ -1396,8 +2277,14 @@ class RuntimeInstaller(private val ctx: Context) {
          *
          * 与锚点 12 同型：新增资产 + 版本戳不变 ⇒ 不加锚点老设备永不重装。
          * 标记与 tools/build-runtime.mjs 的 TEXLIVE_MARKER 逐字一致。
+         *
+         * @3：宏包闭包从「scheme-basic 原样」扩到「scheme-basic + 56 个日常宏包
+         * 的 WANT 清单，同时跳过 10 个互斥字库」（缺陷 CO，问题清单 R4 / P8）。
+         * @2 的树里 `tex/latex` 只有 54 个目录，连 `xcolor.sty` 都没有 ——
+         * pandoc 出 PDF 立刻 `! LaTeX Error: File 'xcolor.sty' not found.`。
+         * 涨版本号是让老设备把整棵 200 多包的树重装一遍。
          */
-        private const val TEXLIVE_MARKER = "kxxy-texlive@2"
+        private const val TEXLIVE_MARKER = "kxxy-texlive@3"
         private const val TEXLIVE_MARKER_FILE = "lib/node_modules/kxxy-host/texlive.version"
 
         /**
@@ -1413,6 +2300,75 @@ class RuntimeInstaller(private val ctx: Context) {
             "share/texlive/2026.0/texmf-dist/tex/plain/base/plain.tex",
             "share/texlive/2026.0/tlpkg/TeXLive/TLConfig.pm",
         )
+
+        /**
+         * 带 `resources.arsc` 的 android.jar 的版本标记（缺陷 CQ）。
+         *
+         * 与 `TEXLIVE_MARKER` 完全同型：`share/java/android.jar` 在上游（ecj 的
+         * deb）里是一份 4555 条目的精简 stub，没有 `resources.arsc` ——
+         * `aapt2 link` 处理任何 `@android:*` 引用都报
+         * `No package ID 01 found for resource ID 0x0101053d`。
+         * 构建期由 `tools/build-runtime.mjs` 的 `bundleAndroidJar()` 从本机
+         * SDK `platforms/android-36/android.jar` 裁出 arsc + 清单 + class 覆盖。
+         * 标记与 `ANDROID_JAR_MARKER` 逐字一致。
+         */
+        private const val ANDROID_JAR_MARKER = "kxxy-androidjar@1"
+        private const val ANDROID_JAR_MARKER_FILE = "lib/node_modules/kxxy-host/androidjar.version"
+
+        /**
+         * 打包工具包装器的版本标记（锚点 15，缺陷 CT）。
+         *
+         * 为什么这个锚点不能省：`bin/corepack` 的修复是**原地换掉一个文件的
+         * 形态**（`dist/corepack.js` 的副本 → 156 B 的 `#!/system/bin/sh`
+         * 包装器），既不改变 [RUNTIME_VERSION]，也不影响锚点 1–14 的任何判据。
+         * 没有这一条，老设备升级 APK 后前十四锚点全通过、`isComplete()` 判真、
+         * 跳过重装，corepack 继续报 `Cannot find module './lib/corepack.cjs'`。
+         *
+         * 标记与 `tools/build-runtime.mjs` 的 `PACKAGING_MARKER` 逐字一致。
+         */
+        private const val PACKAGING_MARKER = "kxxy-packaging@1"
+        private const val PACKAGING_MARKER_FILE =
+            "lib/node_modules/kxxy-host/packaging.version"
+
+        /**
+         * 包装器实体清单（锚点 15 的第二段判据）。
+         *
+         * 只探标记不够 —— 标记只能证明 zip 里带的是新版，证明不了 install 真把
+         * 它解出来了（锚点 14 的教训）。这五个文件在设备上都必须是可执行的
+         * sh 包装器：corepack 修缺陷 CT，zipalign / bundletool 补上 Termux
+         * 仓库里根本不存在的两个 Android 打包工具。
+         */
+        private val PACKAGING_WRAPPERS = listOf(
+            "bin/corepack",
+            "bin/npm",
+            "bin/npx",
+            "bin/pnpm",
+            "bin/zipalign",
+            "bin/bundletool",
+        )
+
+        /**
+         * 允许以「corepack dist 软链」形态出现的包装器。
+         *
+         * 只有 corepack 管的那四个 —— `corepack enable` 会自己接管它们，属于官方
+         * 文档行为。`zipalign` / `bundletool` 是自造的，没有这个合法形态：它们
+         * 一旦变成软链就说明被人动过，按缺陷处理。
+         */
+        private val COREPACK_SHIM_NAMES = setOf(
+            "bin/corepack",
+            "bin/npm",
+            "bin/npx",
+            "bin/pnpm",
+        )
+
+        /**
+         * android.jar 的下限体积。
+         *
+         * 旧 stub 是 3,881,757 B，裁剪后的新版是 10,576,708 B —— 取 6 MiB 作
+         * 分界：既能拦下没换过的旧 stub，也不会因为将来 platform 版本变化
+         * （arsc 大小随资源数量增长）而误判。
+         */
+        private const val MIN_ANDROID_JAR_BYTES = 6L * 1024 * 1024
 
         /** 读版本标记时探测的头部字节数；标记都写在首行，取小值即可。 */
         private const val COMPAT_MARKER_PROBE_BYTES = 256

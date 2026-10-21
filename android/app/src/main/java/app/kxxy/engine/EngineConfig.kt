@@ -679,6 +679,21 @@ object EngineConfig {
 
         val ldPath = File(root, "lib").absolutePath
 
+        // LD_PRELOAD 的两个成员（缺陷 CD/CF，问题清单 P1/P3）。
+        //
+        // 顺序即执行顺序：我们的 libkxxy_exec 排第一 —— 它负责把写死的
+        // Termux 绝对路径改写成真实路径；termux-exec 排第二 —— 它负责给
+        // 裸命令名补 `TERMUX__PREFIX` 前缀、并修 `#!/usr/bin/env` 的解释器。
+        // 反过来会先让 termux-exec 看到一个它不处理的绝对路径而直接放行。
+        //
+        // 只放**真实存在**的库：Android 的 linker 对加载失败的 preload 是
+        // 致命错误（直接 abort），不能把「可能不存在」的路径塞进去。
+        val preloadLibs = listOf(
+            File(root, "lib/libkxxy_exec.so"),
+            File(root, "lib/libtermux-exec-ld-preload.so"),
+        ).filter { it.isFile && it.length() > 0 }
+        val preload = preloadLibs.joinToString(":") { it.absolutePath }
+
         // 引擎自带的头文件目录（问题.txt【5】）。
         //
         // 实测：这个 clang 的默认系统头搜索路径**只有** `<root>/lib/clang/21/include`
@@ -730,8 +745,7 @@ object EngineConfig {
 
         val env = mutableListOf(
             "PATH=$path",
-            "LD_LIBRARY_PATH=$ldPath",
-            // 链接期库搜索路径（问题.txt【5】）。
+            "LD_LIBRARY_PATH=$ldPath",            // 链接期库搜索路径（问题.txt【5】）。
             //
             // 为什么非它不可：cc 的链接驱动把 LIBRARY_PATH 展开成 `-L`，而
             // **rustc 不认 RUSTFLAGS**（那个变量只对 cargo 生效）。rustc 的链接行
@@ -754,7 +768,20 @@ object EngineConfig {
             // 必须显式指回自带 bash。
             "SHELL=${File(root, "bin/bash").absolutePath}",
             "PORT=$port",
-            "NODE_ENV=production",
+            // 不设 NODE_ENV（缺陷 CG，问题清单 P10）。
+            //
+            // 原来这里是 `NODE_ENV=production`。它有两个副作用，第二个是致命的：
+            //   ① 引擎进程自己"看起来像"生产环境；
+            //   ② **所有子进程继承它**，于是 `npm i -D typescript` 会静默跳过
+            //      devDependencies（npm 在 NODE_ENV=production 下不装 dev 依赖，
+            //      退出码还是 0）。真机 A/B 实测：
+            //        NODE_ENV=production → `up to date in 3s`，node_modules 不存在；
+            //        去掉 NODE_ENV      → `added 1 package in 2s`，node_modules 存在。
+            //
+            // 保留它没有任何收益：引擎自己的「生产模式」是 `bin/lib/bin.js` 的
+            // 参数决定的，与这个环境变量无关；而它造成的"装了没效果"极难排查
+            // （npm 既不报错也不提示）。所以整条删掉 —— 不是改成 development，
+            // 因为那会让某些包启用调试分支，同样不是我们想要的。
             // 小写：AI 按文档写 [ "$DSH_ANDROID_PRIV_MODE" = "root" ] 才能成立
             "DSH_ANDROID_PRIV_MODE=$privMode",
             // Android 无 landlock/seatbelt，受限模式会让 shell 工具拒绝执行
@@ -768,6 +795,40 @@ object EngineConfig {
             // extinstall 会把每个扩展的 etc/ 与 share/ 逐项软链进引擎根的 etc/ 与
             // share/（见 buildViews），所以这里指回引擎根即可（问题.txt【6】）。
             "FONTCONFIG_PATH=${File(root, "etc/fonts").absolutePath}",
+            // fontconfig 的**主配置**（缺陷 CV）。只给 FONTCONFIG_PATH 是不够的：
+            // 那个变量只决定 `fonts.conf` 里 `<include>` 的相对根，而
+            // `<root>/etc/fonts/fonts.conf` 是扩展池落下来的软链（texlive 与
+            // ffmpeg 各带一份，合并视图先到者胜），它的 `<dir>` 里**没有**
+            // `lib/node_modules/kxxy-host/fonts` —— 随 runtime 走的 NotoSansSC
+            // 两个字体因此完全不在索引里，`fontspec` 报
+            // `The font "NotoSansSC-Regular" cannot be found`，中文 PDF 全丢字形。
+            //
+            // FONTCONFIG_FILE 优先级高于默认路径，指到 [RuntimeInstaller.ensureFontConfig]
+            // 生成的那份自建配置；那份配置自己 include 了扩展池的 conf.d，
+            // 所以抗锯齿等既有规则不受影响。
+            "FONTCONFIG_FILE=${File(root, "etc/fonts/kxxy-fonts.conf").absolutePath}",
+            // kpathsea 的字体目录（缺陷 CV 的第二层，问题.txt【5】的现象二）。
+            //
+            // 上面那条 FONTCONFIG_FILE 只解决「按**字体名**找」—— fontspec 走
+            // fontconfig，索引里有 NotoSansSC 就能解析。但**按文件名**找
+            // （`\setmainfont{NotoSansSC-Regular.ttf}`）走的是另一条完全不同的路：
+            // XeTeX 用 kpathsea 的 `kpsewhich` 查，而 kpsewhich 只看 `$OSFONTDIR`。
+            //
+            // 不设它时 `kpsewhich NotoSansSC-Regular.ttf` 返回空，真机日志逐字是：
+            //   ! Package fontspec Error: The font "NotoSansSC-Regular" cannot be found;
+            //   Missing character: There is no 中 ("4E2D) in font nullfont!
+            // 也就是说 PDF 照样生成、中文字符全丢——比直接报错更难发现。
+            //
+            // `kpsewhich --var-value=OPENTYPEFONTS` 会暴露这一点，值里带一句
+            // `/please/set/osfontdir/in/the/environment`（texmf.cnf 的占位符）。
+            //
+            // 真机 A/B（同一份 t.tex，只差这一个变量）：
+            //   不设   → pdf 无、`\setmainfont` 报 cannot be found、5 个缺字
+            //   设好后 → pdf 4,775 B、缺字 **0**
+            //
+            // 顺带把 `share/fonts` 也列进去（Termux 生态里扩展可能往那儿放字体），
+            // 与 fontconfig 的 `<dir>` 列表保持一致。
+            "OSFONTDIR=${officeFontsDir(ctx).absolutePath}:${File(root, "share/fonts").absolutePath}",
             "TESSDATA_PREFIX=${File(root, "share/tessdata").absolutePath}",
             // perl 的 @INC 修复（问题.txt【1】）。没有它，任何 `use strict` 的
             // perl 脚本都直接 BEGIN failed —— 包括 TeX Live 的 fmtutil.pl /
@@ -911,6 +972,96 @@ object EngineConfig {
             // pid / 内存 / 运行时长（**无兜底，缺了就是 null**）。
             "KXXY_ENGINE_ROOT=${root.absolutePath}",
             "KXXY_STATE_FILE=${File(root, STATE_FILE_NAME).absolutePath}",
+            // ── 缺陷 CD/CF：exec 族路径重写链（问题清单 P1 + P3）────────────
+            //
+            // 真机症状：`tsc` 之类任何 `#!/usr/bin/env node` 的脚本一律
+            // `//usr/bin/env: bad interpreter: No such file or directory`，
+            // 于是 npx / npm exec / node-gyp / tsx / vitest 全废。
+            //
+            // 为什么不能「建一个 /usr/bin/env」：① `/usr` 是系统只读分区，
+            // app 无权创建；② 引擎根下也**没有** `usr/` 这一层（runtime 的顶层
+            // 是 bin/lib/etc/var/share/libexec/include，那是 Termux 的
+            // `$PREFIX/usr` 残留写法，见上面 PATH 处的注释）。
+            //
+            // 正解是 termux-exec 的 LD_PRELOAD：它拦截 execve/execvp/execl 与
+            // shebang 解析，把「解释器路径」与「裸命令名」按 `TERMUX__PREFIX`
+            // 重定位。真机 A/B 实测（带引擎真实环境跑）：
+            //   · 只加 LD_PRELOAD、不给 TERMUX__PREFIX → 无效；
+            //   · 两个都给 → `#!/usr/bin/env node` 直接跑通。
+            // 两者缺一不可，所以下面成对出现。
+            //
+            // ⚠️ 变量名是两个下划线：`TERMUX__PREFIX`（termux-exec v2 的约定，
+            // 与 `TERMUX_APP__PACKAGE_NAME` 同族），写成单下划线不生效。
+            "TERMUX__PREFIX=${root.absolutePath}",
+            // 真正挂上两个库。preload 为空（库还没落盘）时不写这一行，
+            // 避免留下一个空 LD_PRELOAD 让 linker 报错。
+            *(
+                if (preload.isEmpty()) emptyArray()
+                else arrayOf("LD_PRELOAD=$preload")
+                ),
+            // 我们的 execve 重写器（缺陷 CF，问题清单 P3）。与 termux-exec 分工：
+            // termux-exec 只会给**裸命令名**加前缀、并修 shebang 的解释器路径，
+            // 它**不改写调用方传进来的绝对路径**；而 695 个 Termux 编译的二进制
+            // 里写死了 `/data/data/com.termux/files/usr/bin/sh`（make/tar/ninja/
+            // autoreconf/7z 全中），这些字符串绕开了它。自编的 libkxxy_exec.so
+            // 专门补这一半：拦截 execve/execv/execvp/posix_spawn，把以旧前缀开头的
+            // 路径就地换成 KXXY_ROOT 对应的真实路径。
+            //
+            // 顺序：**我们的在前**。先由 libkxxy_exec 改写绝对路径，再交给
+            // termux-exec 处理裸名与 shebang；反过来会让 termux-exec 先看到
+            // 一个它不认识的绝对路径而直接放行。
+            //
+            // 只把**真实存在**的库放进 LD_PRELOAD：Android 的 linker 对加载失败的
+            // preload 是致命错误（`couldn't find ... required or dlopen'd` 后 abort），
+            // 不能把「可能不存在」的路径塞进去。
+            "KXXY_ROOT=${root.absolutePath}",
+            // pkg-config 的搜索路径（问题清单 P11）。
+            //
+            // 真机症状：`pkg-config --cflags openssl` 报
+            // `Package openssl was not found in the pkg-config search path`，
+            // 而 `<root>/lib/pkgconfig` 下有 612 个 `.pc` 文件。根因是
+            // pkg-config 的 `pc_path` 是**编译期写死**的 Termux 前缀
+            // （实测 `pkg-config --variable pc_path pkg-config` 输出
+            // `/data/data/com.termux/files/usr/lib/pkgconfig:…/share/pkgconfig`）。
+            // 这两个变量是它唯一认可的运行期覆盖点；`PKG_CONFIG_LIBDIR` 还会
+            // 直接把默认路径**替换**掉（`PKG_CONFIG_PATH` 只是前置），两条都给
+            // 才是「先找我们的、且不再去死路径里空转」。
+            "PKG_CONFIG_PATH=${File(root, "lib/pkgconfig").absolutePath}:" +
+                "${File(root, "share/pkgconfig").absolutePath}",
+            "PKG_CONFIG_LIBDIR=${File(root, "lib/pkgconfig").absolutePath}:" +
+                "${File(root, "share/pkgconfig").absolutePath}",
+            // `file` 的魔数库（问题清单 P12）。
+            //
+            // 真机症状：`file foo` 报 `could not find any valid magic files!`。
+            // 根因同样是编译期路径：`file` 只按内置的 Termux 前缀找
+            // `share/misc/magic.mgc`，而真身在 `<root>/share/misc/magic.mgc`
+            // （10,793,952 B，实测存在）。`MAGIC` 是 libmagic 的标准覆盖点。
+            "MAGIC=${File(root, "share/misc/magic.mgc").absolutePath}",
+            // ruby 默认不加载 rubygems（问题清单 P13）。
+            //
+            // 真机症状：`ruby -e 'puts defined?(Gem)'` 输出 nil，`gem list` /
+            // `bundle` 全不可用。Termux 的 ruby 编译时没开 `--enable-rubygems`
+            // 的自动加载，靠 `RUBYOPT=-rrubygems` 显式 require 即可（真机实测：
+            // 加上后 `defined?(Gem)` → constant，`gem list` 正常列出
+            // `bundler (default: 4.0.20)`）。
+            "RUBYOPT=-rrubygems",
+            // git 的三条编译期路径（问题清单 P5）。
+            //
+            // 真机症状链：`git clone https://…` 先报
+            // `git: 'remote-https' is not a git command`（`--exec-path` 指向
+            // Termux 的 `libexec/git-core`），补上 exec-path 之后又撞
+            // `error adding trust anchors from file: …/com.termux/files/usr/etc/tls/cert.pem`，
+            // 最后还有 `warning: templates not found in …`。三条一起给才彻底通
+            // （真机实测 clone Hello-World 成功，rc=0）。
+            "GIT_EXEC_PATH=${File(root, "libexec/git-core").absolutePath}",
+            "GIT_TEMPLATE_DIR=${File(root, "share/git-core/templates").absolutePath}",
+            "GIT_SSL_CAINFO=${File(root, "etc/tls/cert.pem").absolutePath}",
+            // `TMP`/`TEMP` 与 TMPDIR 同指（问题清单 P16）。
+            // TMPDIR 已经指到 files/tmp，但少数工具只认 `TMP`（部分 Java 工具、
+            // 一些 shell 脚本模板），而 `/tmp` 在 Android 上归 root 且 `chmod 1777`
+            // 都没用 —— app 连创建它的权限都没有，唯一可行的就是让它们别去碰。
+            "TMP=${tmp.absolutePath}",
+            "TEMP=${tmp.absolutePath}",
         )
 
         // JAVA_HOME：kotlinc 与 gradle 都优先读它，比 PATH 更硬。
@@ -937,6 +1088,41 @@ object EngineConfig {
             env += "GOPATH=${File(home, "go").absolutePath}"
             env += "GOCACHE=${File(home, ".cache/go-build").absolutePath}"
             env += "GOTOOLCHAIN=local"
+            // GOPROXY 换成国内镜像（缺陷 CK，问题清单 P4 的后半段）。
+            //
+            // `lib/go/go.env` 里写的是上游默认 `https://proxy.golang.org,direct`。
+            // 真机实测：DNS 通了之后仍报
+            //   dial tcp [2404:6800:4012:2::2011]:443: i/o timeout
+            // —— 那个域名解析出来是 IPv6，国内基本不可达，且 `direct` 回退
+            // 要先把 proxy 的超时等满（默认 30 s/次），体感就是「卡死」。
+            // 换 goproxy.cn 后同一条 `go get github.com/pkg/errors@v0.9.1`
+            // 两秒内 `go: added github.com/pkg/errors v0.9.1`。
+            // 与 npm 侧用 npmmirror 是同一个取舍：默认值优先服务国内网络，
+            // 需要翻墙的用户可以自己 `go env -w GOPROXY=...` 覆盖。
+            env += "GOPROXY=https://goproxy.cn,direct"
+            // GOSUMDB 必须一起关掉（缺陷 CK 的第二半，问题清单 P1 的真凶）。
+            //
+            // `lib/go/go.env` 里除了 GOPROXY 还写着 `GOSUMDB=sum.golang.org`。
+            // 只换 GOPROXY 是不够的 —— 真机实测：
+            //
+            //   go: downloading github.com/google/uuid v1.6.0
+            //   go: github.com/google/uuid@v1.6.0: verifying module: missing GOSUMDB
+            //
+            // 包体**已经从 goproxy.cn 下载成功**（那条 `downloading` 就是证据），
+            // 卡在校验和这一步：sum.golang.org 在国内不可达，go 拿不到它的公钥，
+            // 于是报「missing GOSUMDB」而不是超时 —— 这个措辞很容易被误读成
+            // 「配置写错了」，实际是网络问题。
+            //
+            // 取舍：关掉校验和数据库意味着放弃「模块内容与官方一致」的保证。
+            // 这里接受它，理由与 GOPROXY 指向国内镜像同源 —— 在无法访问
+            // sum.golang.org 的网络里，开启它等于**完全不能装包**；用户若需要
+            // 校验，可以自己 `go env -w GOSUMDB=sum.golang.org`
+            // 或用 `GONOSUMDB`/`GOPRIVATE` 精确豁免。
+            env += "GOSUMDB=off"
+            // 顺带把 GOFLAGS 的 `-mod=mod` 显式化：Termux 的 go.env 未设，而
+            // 默认值随版本变过（1.16 前是 mod，之后在 vendor 目录存在时转 vendor）。
+            // 手机上没有 vendor/，这条只是把行为钉死，避免 Go 版本升级后漂移。
+            env += "GOFLAGS=-mod=mod"
         }
 
         // PHP 的 ini 与扩展目录（缺陷 BL）。
@@ -1050,7 +1236,18 @@ object EngineConfig {
         - id: sandbox-policy
           config:
             mode: danger-full-access
-            workspaceRoot: !!js process.cwd()
+            # 不要写 `!!js process.cwd()`（缺陷 CH，问题清单 P22）。
+            #
+            # 上游的 cordis 配置层**不认** `!!js` 这个 YAML 标签（它只处理
+            # `!js` 之类的自有标签），于是 `yaml` 解析器把它当成未知标签，
+            # 每次启动刷 8 行：
+            #   [TAG_RESOLVE_FAILED] YAMLWarning: Unresolved tag: tag:yaml.org,2002:js
+            # 而且 `!!js` 会让这个标量退化成**字符串字面量** `"process.cwd()"`，
+            # 对 workspaceRoot 来说等于一个不存在的相对路径。
+            #
+            # 引擎进程的 cwd 在 Java 侧已经钉死成 ${'$'}HOME/workspaces
+            # （见 EngineProcess.spawn 的 cwd 参数），所以直接写绝对路径即可。
+            workspaceRoot: ${workspaces(ctx).apply { mkdirs() }.absolutePath}
         - id: approval
           config:
             policy: never

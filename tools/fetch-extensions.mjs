@@ -80,7 +80,15 @@ async function fetchMergedIndex() {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PROJECT = resolve(HERE, "..");
 const CACHE = join(PROJECT, ".cache");
-const POOL_OUT = join(PROJECT, "android", "app", "src", "main", "assets", "ext-pool");
+/**
+ * 池输出目录。默认 assets/ext-pool（gradle 打包时会被 build-apk.ps1 挪到
+ * .cache/apk-assets-hold/ext-pool）。`KXXY_POOL_OUT` 可覆盖 —— 增量重打单个
+ * 条目时（`KXXY_POOL_ONLY=golang`）不该往空的 assets 目录里写一份孤零零的
+ * 池子，否则下次 build-apk 的 Move-Item 会把它当成新目录塞进 hold 里面。
+ */
+const POOL_OUT = process.env.KXXY_POOL_OUT
+  ? resolve(process.env.KXXY_POOL_OUT)
+  : join(PROJECT, "android", "app", "src", "main", "assets", "ext-pool");
 const CATALOG_OUT = join(PROJECT, "plugins", "kxxy-host", "extensions.json");
 const STAGE_DIR = join(CACHE, "stage");
 
@@ -100,6 +108,64 @@ const POOL_ONLY = (process.env.KXXY_POOL_ONLY ?? "")
   .map((s) => s.trim())
   .filter(Boolean);
 const wanted = (item) => POOL_ONLY.length === 0 || POOL_ONLY.includes(item.id);
+
+/**
+ * golang 池里的 `go` 必须换成「编译期钉死引擎根」的那份（缺陷：go 无法联网）。
+ *
+ * 为什么：Termux 官方 deb 里的 go 二进制写死了
+ * `/data/data/com.termux/files/usr/etc/resolv.conf`，而本项目的引擎根是
+ * `<filesDir>/engine`。该路径在设备上不存在 → `dnsReadConfig()` 读不到 →
+ * 退回 `defaultNS = {"127.0.0.1:53", "[::1]:53"}` → 只有恰好有 dnsmasq 监听
+ * 时才能解析，否则 `connection refused`。
+ *
+ * 为什么不能打包时改字符串：`tools/lib/poolextract.py` 与
+ * `tools/build-runtime.mjs` 都有「ELF 一律跳过」的硬约定（占位符比真实路径短，
+ * 改长度会让节偏移与重定位表错位）。只能源码期改对再编译。
+ *
+ * 由 `tools/build-go-android.ps1` 产出 `.cache/gotool/out/go-android`。
+ * 缺产物时这里**自动触发**该脚本 —— 让「按 README 顺序跑一遍」就能得到正确的
+ * go，而不是留一个要人记住的额外步骤（漏跑的后果是设备上 go 静默不能联网，
+ * 而构建过程一切正常，极难发现）。
+ *
+ * 失败时只告警不中断：26 个条目重打十几分钟，不该因为一项工具链没编就全废；
+ * 池里留 Termux 原件至少和其它条目一样可用。
+ */
+const GO_BINARY = join(CACHE, "gotool", "out", "go-android");
+const GO_BUILD_PS1 = join(HERE, "build-go-android.ps1");
+
+function ensureGoBinary() {
+  if (existsSync(GO_BINARY)) return true;
+
+  console.log("      golang: 缺交叉编译产物，自动调用 build-go-android.ps1 …");
+  if (!existsSync(GO_BUILD_PS1)) {
+    console.warn(`      ⚠️ 找不到 ${GO_BUILD_PS1}`);
+    return false;
+  }
+  // 本机只有 PowerShell 5.1（没有 pwsh），且脚本要求 -File 调用。
+  const ps = spawnSync(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", GO_BUILD_PS1],
+    { stdio: "inherit" },
+  );
+  if (ps.error || ps.status !== 0) {
+    console.warn(
+      `      ⚠️ build-go-android.ps1 失败（${ps.error?.message ?? `exit ${ps.status}`}）——` +
+      "golang 池里的 go 仍是 Termux 原件，设备上无法解析 DNS。",
+    );
+    return false;
+  }
+  return existsSync(GO_BINARY);
+}
+
+function goBinaryArgs() {
+  // 增量模式没点名 golang 时不传（poolextract.py 也只对 ext_id=golang 生效，
+  // 但少传一个参数能少读一次 15 MiB）。
+  if (POOL_ONLY.length && !POOL_ONLY.includes("golang")) return [];
+  if (!ensureGoBinary()) return [];
+  const size = statSync(GO_BINARY).size;
+  console.log(`      golang: 用交叉编译产物替换 bin/go 与 lib/go/bin/go（${human(size)}）`);
+  return ["--go-binary", GO_BINARY];
+}
 
 async function main() {
   const debsDir = process.env.KXXY_CACHE ?? join(CACHE, "debs");
@@ -235,6 +301,7 @@ async function main() {
     "--stage", STAGE_DIR,
     "--out", POOL_OUT,
     "--report", reportPath,
+    ...goBinaryArgs(),
   ], { stdio: "inherit" });
   if (run.error) {
     throw new Error(`无法启动 Python（${py}）：${run.error.message}`);

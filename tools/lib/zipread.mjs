@@ -22,6 +22,61 @@ const LOCAL_SIG = 0x04034b50
 const MAX_COMMENT = 66_000
 
 /**
+ * 逐条枚举 zip 内容，**保持原始压缩字节**。
+ *
+ * 与 [openZip] 的区别：这里不做解压，只把 `method` / `crc` / 压缩后的字节
+ * 原样交出来。用途是「过滤 + 重打包」——调用方先决定留哪些条目，再按自己的
+ * 压缩策略重新写一遍。
+ *
+ * 为什么不能只留下解压后的内容、重打包时一律 store：`aapt2` 解析
+ * `resources.arsc` 时会用条目头里的 `compressed_size` 做「data 是否被外层
+ * 截断」的健全性检查，store 化会让它算出 `chunk size is bigger than given
+ * data` 而拒绝加载（缺陷 CQ 实测）。
+ *
+ * @param {string} path zip 路径
+ * @returns {Array<{ name: string, method: number, crc: number, size: number, raw: Buffer }>}
+ *   `raw` 是**压缩后**的字节（method 0 时即原始内容），`size` 是解压后大小。
+ */
+export function readZipEntries(path) {
+  const buf = readFileSync(path)
+  let eocd = -1
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - MAX_COMMENT); i -= 1) {
+    if (buf.readUInt32LE(i) === EOCD_SIG) {
+      eocd = i
+      break
+    }
+  }
+  if (eocd < 0) throw new Error(`不是合法的 zip（找不到 EOCD）：${path}`)
+
+  const count = buf.readUInt16LE(eocd + 10)
+  const cdStart = buf.readUInt32LE(eocd + 16)
+
+  const out = []
+  let p = cdStart
+  for (let i = 0; i < count; i += 1) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) throw new Error(`中央目录签名错误（第 ${i} 项）`)
+    const method = buf.readUInt16LE(p + 10)
+    const crc = buf.readUInt32LE(p + 16)
+    const csize = buf.readUInt32LE(p + 20)
+    const size = buf.readUInt32LE(p + 24)
+    const nameLen = buf.readUInt16LE(p + 28)
+    const extraLen = buf.readUInt16LE(p + 30)
+    const commentLen = buf.readUInt16LE(p + 32)
+    const localOffset = buf.readUInt32LE(p + 42)
+    const name = buf.toString('utf8', p + 46, p + 46 + nameLen)
+
+    if (buf.readUInt32LE(localOffset) !== LOCAL_SIG) throw new Error(`local header 签名错误：${name}`)
+    const lNameLen = buf.readUInt16LE(localOffset + 26)
+    const lExtraLen = buf.readUInt16LE(localOffset + 28)
+    const start = localOffset + 30 + lNameLen + lExtraLen
+    out.push({ name, method, crc, size, raw: buf.subarray(start, start + csize) })
+
+    p += 46 + nameLen + extraLen + commentLen
+  }
+  return out
+}
+
+/**
  * 打开一个 zip 并建立中央目录索引。
  *
  * @param {string} path zip 路径
