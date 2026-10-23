@@ -1,8 +1,8 @@
-/* kxxy-webview-compat@9 */
+/* kxxy-webview-compat@10 */
 /**
  * dsh-kxxy WebView 兼容层（polyfill + CSS 回退 + URL 修正）
  *
- * 版本标记 `kxxy-webview-compat@9`（首行）：RuntimeInstaller 的锚点 6 按这个
+ * 版本标记 `kxxy-webview-compat@10`（首行）：RuntimeInstaller 的锚点 6 按这个
  * 字符串判定运行时的兼容层是否过期 —— 只判「文件存在」不足以让老设备在
  * 升级后拿到新版兼容层。改动本文件后必须同步递增编号（连同
  * RuntimeInstaller.COMPAT_LAYER_MARKER），否则旧设备会带着旧兼容层静默跳过重装。
@@ -464,8 +464,14 @@
     // 用直接子级 `> [class*="_label"]` 而不是后代：`_label` 这个片段在
     // subagent 的血缘行里也出现（`_3K3mEa_label`），那个不在 headerActions
     // 的直接子级，不能误伤。
+    // 用 `header [class*="_label"]` 而**不**限定 `_headerActions` 祖先：
+    // 2026-10-23 手机端截图显示官方会话头里那排芯片的容器类名并不是
+    // `_headerActions`（那是 dsh-web-mobile 的命名），限定祖先等于一条都不命中。
+    // 所以锚点只取两样：在 `header` 里 + 类名带 `_label` 片段。
+    // 误伤面可控：subagent 血缘行里的 `_3K3mEa_label` 不在 header 内；
+    // 而 header 里其它带 `_label` 的多是按钮内文字，540px 以下藏掉也无妨。
     '@media (max-width: 540px) {',
-    '  header [class*="_headerActions"] > [class*="_label"]:not(#kxxy) { display: none !important }',
+    '  header [class*="_label"]:not(#kxxy) { display: none !important }',
     '}',
   ].join('\n')
 
@@ -934,9 +940,27 @@
     var media = rest
       .replace(/\binline-size\b/g, 'width')
       .replace(/\bblock-size\b/g, 'height')
+    // 范围语法 → min/max 语法。
+    //
+    // `@container (width<=540px)` 里的 `<=` 是 Media Queries Level 4 的**范围
+    // 语法**。原样搬进 `@media (width<=540px)` 虽然「语法合法」，但它落在
+    // Chrome 104 的支持边界上 —— 而设备就是 104。既然要搬，就落到最保守的
+    // 写法：`(max-width: 540px)` 从 Chrome 1 起就能用，少一个「合法但浏览器
+    // 不认」的失败面。
+    //
+    // `<` 与 `<=` 都落到 `max-width`（`>` / `>=` 落到 `min-width`）：差一个
+    // 像素没有实际意义，而 `calc(N - 0.02px)` 这种精确写法在低版本 WebView 上
+    // 反而多一个不确定项。
+    media = media.replace(
+      /\(\s*(width|height)\s*(<=|>=|<|>)\s*([0-9.]+(?:px|em|rem|ch|vw|vh|vmin|vmax|%))\s*\)/gi,
+      function (whole, dim, op, value) {
+        var upper = op === '<=' || op === '<'
+        return '(' + (upper ? 'max-' : 'min-') + dim.toLowerCase() + ': ' + value + ')'
+      },
+    )
     // 转完必须真的提到宽度或高度；否则说明这是个我们读不懂的条件，
     // 搬进 @media 只会变成恒真或恒假。三种写法都要认：
-    //   `(width<=540px)`  `(min-width: 400px)`  `(height >= 500px)`
+    //   `(max-width: 540px)`  `(min-width: 400px)`  `(height >= 500px)`
     // 注意不能只写 `\bwidth\b`：`min-width` 里 `width` 前面是连字符，
     // `\b` 边界在 `-w` 之间成立但 `[^\w-]` 这种前置守卫会把整条否掉。
     if (!/((min|max)-)?(width|height)\s*[<>=:]/.test(media)) {

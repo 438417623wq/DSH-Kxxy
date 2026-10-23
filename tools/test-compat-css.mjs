@@ -229,9 +229,14 @@ check(
 
 console.log("\n[2b] @container → @media（Chrome 105+，2026-10-23 右上角压字的根因）");
 check(
-  "无容器名的 width 范围查询被搬成 @media",
+  "无容器名的 width 范围查询被搬成 @media，并落到 max-width",
   patch("@container (width<=540px){.a{display:none}}"),
-  "@media (width<=540px) {.a{display:none}}",
+  "@media (max-width: 540px) {.a{display:none}}",
+);
+check(
+  "严格小于也落到 max-width（差一像素无实际意义）",
+  patch("@container (width<360px){.a{color:red}}"),
+  "@media (max-width: 360px) {.a{color:red}}",
 );
 check(
   "min-width 形式同样能搬",
@@ -241,7 +246,7 @@ check(
 check(
   "inline-size 改写成 width（@media 不认盒维度名）",
   patch("@container (inline-size < 400px){.a{color:red}}"),
-  "@media (width < 400px) {.a{color:red}}",
+  "@media (max-width: 400px) {.a{color:red}}",
 );
 // 四条「宁可放过」。它们必须**逐字保留原文**而不是重建字符串：
 // 重建会让 patchCssText 认为「文本变了」，于是 MutationObserver 反复自激。
@@ -261,7 +266,7 @@ check("第二次跑不再变化", patch(containerOnce), containerOnce);
 check(
   "嵌套在 @media 里的 @container 也搬",
   patch("@media (max-width:767px){@container (width<=540px){.a{display:none}}}"),
-  "@media (max-width:767px){@media (width<=540px) {.a{display:none}}}",
+  "@media (max-width:767px){@media (max-width: 540px) {.a{display:none}}}",
 );
 
 console.log("\n[3] 幂等：已展开的文本再跑一次不变");
@@ -442,8 +447,16 @@ check(
   check(
     "最窄一档整块隐藏「标准模式」chip（阈值与上游 @container 的 540px 一致）",
     css.includes("@media (max-width: 540px)")
-      && css.includes('header [class*="_headerActions"] > [class*="_label"]:not(#kxxy) { display: none !important }'),
+      && css.includes('header [class*="_label"]:not(#kxxy) { display: none !important }'),
     true,
+  );
+  // 防回退：这条规则曾经被写成 `header [class*="_headerActions"] > [class*="_label"]`，
+  // 在真机上一条都没命中 —— 官方会话头的芯片容器是 `_727C8a_headerActions`，
+  // 芯片本身却挂在更外层，加祖先限定等于自断锚点。宁可放宽，不可收紧到类名结构。
+  check(
+    '「标准模式」隐藏规则不得再要求 _headerActions 祖先（2026-10-23 真机未命中的教训）',
+    css.includes('[class*="_headerActions"] > [class*="_label"]'),
+    false,
   );
   check(
     "headerActions 直接子级加溢出保护（压字的直接机制）",
