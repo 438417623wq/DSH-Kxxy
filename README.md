@@ -202,6 +202,20 @@ powershell -File tools\build-apk.ps1
 > **2.14 GB**（凭空多出 521 MB，恰好一整个旧 `runtime.zip`）。`build-apk.ps1` 每次都删
 > `app-debug.apk` 与 `intermediates/apk/debug` 就是这个原因。
 >
+> **注入断言曾经放走过一个缺运行时的包**：第 4 步原来只判「注入后 APK > 1GB」。清暂存目录时
+> 把 `runtime.zip` 一起删了，assets 里只剩 `ext-pool` 与 `meta`，而小包本身就有 1.19 GB ——
+> 断言照样通过，「成功」打出一个不含运行时的 APK（真机装上必然起不来，全程零报错）。现在改成
+> 先校验暂存目录非空且含 `runtime.zip`，再按「小包 + 暂存目录实际字节数 × 0.98」算期望值，
+> 低于期望直接抛错并打印两个数字。附带一条：**`build-apk.ps1` 跑完 `runtime.zip` 是留在
+> `.cache/apk-assets-hold` 的，别当垃圾清掉** —— 那是唯一副本，删了就得重跑一遍
+> `build-runtime`（十分钟）。
+>
+> **`tools/build-apk.ps1` 必须带 UTF-8 BOM**：Windows PowerShell 5.1 对无 BOM 的 `.ps1`
+> 按系统 ANSI（GBK）解码。脚本里的中文注释一旦打乱引号平衡，报出来的是
+> `Unexpected token '\bin'`、`MissingEndCurlyBrace` 这种和真实原因毫无关系的解析错，
+> 让人错以为是括号写漏了。补上 BOM 即恢复；`pwsh`(7) 不受影响，所以用 `[Parser]::ParseFile`
+> 自查时也要先按 UTF-8 读文本再 `ParseInput`，否则同样会被误读坑一次。
+>
 > ⚠️ **安装到真机后一般必须 `pm clear`**：设备上 `lib/node_modules/kxxy-host/patchset.version`
 > 若已是当前值，`RuntimeInstaller.isComplete()` 判真，会**跳过重装**，改动永远不生效。
 > 详见 `build-apk.ps1` 末尾打印的三条命令。
