@@ -1,8 +1,8 @@
-/* kxxy-webview-compat@10 */
+/* kxxy-webview-compat@11 */
 /**
  * dsh-kxxy WebView 兼容层（polyfill + CSS 回退 + URL 修正）
  *
- * 版本标记 `kxxy-webview-compat@10`（首行）：RuntimeInstaller 的锚点 6 按这个
+ * 版本标记 `kxxy-webview-compat@11`（首行）：RuntimeInstaller 的锚点 6 按这个
  * 字符串判定运行时的兼容层是否过期 —— 只判「文件存在」不足以让老设备在
  * 升级后拿到新版兼容层。改动本文件后必须同步递增编号（连同
  * RuntimeInstaller.COMPAT_LAYER_MARKER），否则旧设备会带着旧兼容层静默跳过重装。
@@ -468,10 +468,57 @@
     // 2026-10-23 手机端截图显示官方会话头里那排芯片的容器类名并不是
     // `_headerActions`（那是 dsh-web-mobile 的命名），限定祖先等于一条都不命中。
     // 所以锚点只取两样：在 `header` 里 + 类名带 `_label` 片段。
-    // 误伤面可控：subagent 血缘行里的 `_3K3mEa_label` 不在 header 内；
-    // 而 header 里其它带 `_label` 的多是按钮内文字，540px 以下藏掉也无妨。
+    // 误伤面评估（2026-10-23 校正）：subagent 血缘行里的 `_3K3mEa_label` 确实不在
+    // header 内，但 header 里带 `_label` 的**不只是按钮文字** —— 两个状态芯片自己的
+    // 文字也是这个后缀。所以这一条必须配下面那条 `display: revert` 才有正确语义，
+    // 单独存在会把「9 个子智能体」藏得只剩圆环。
     '@media (max-width: 540px) {',
     '  header [class*="_label"]:not(#kxxy) { display: none !important }',
+    // ↑ 这条会连 headerActions 里两个状态芯片的文字一起藏掉 —— 2026-10-23 落地竖排时
+    // 在预览里撞见：子智能体芯片只剩一个圆环，「9 个子智能体」六个字整个不见了。
+    // 原因是上游各插件的 label 类名共用 `_label` 后缀（`.f8BMvq_label` 是标准模式、
+    // `_3K3mEa_label` 是子智能体），按后缀锚根本分不开它们。上面「误伤面可控」那句
+    // 结论是错的：header 里带 `_label` 的不只是按钮文字，还有这两个芯片的文字。
+    //
+    // 修法：先全藏、再把「在 headerActions 里」的恢复回来。能这么切是因为结构差异
+    // 稳定 —— 标准模式的 label 挂在 titleRow 那一层（不在 headerActions 内），两个
+    // 状态芯片则是 headerActions 的直接子级。
+    // 恢复用 `display: revert` 而不是 `inline`：label 可能是 span 也可能是块级容器，
+    // revert 回落到 UA 默认值，比猜一个具体值安全（Chrome 84+ 支持，104 没问题）。
+    // 这条必须也带 `:not(#kxxy)`：同为 !important 时比特异性，低了就压不过上面那条。
+    '  header [class*="_headerActions"] [class*="_label"]:not(#kxxy) { display: revert !important }',
+    // ③ 两个状态芯片（后台任务 / 子智能体）改上下两行（2026-10-23 用户拍板「按 E 落地」）。
+    //
+    // 为什么不是「判断有几个芯片再竖排」：`flex-direction: column` 本身就是数量自适应
+    // —— 只有一个时排成一列等于一行，视觉与横排一致；两个时自然上下两行。用 `:has()`
+    // 数兄弟节点（104 不支持，要依赖垫片，且改写在 `_headerActions` 这种高特异性
+    // 上下文里不可靠）或 JS 测量（窗口尺寸变化要重算，且首帧会跳）都比这一行 CSS 脆。
+    //
+    // 顺序不写死：移动档里后台任务 chip 被上游 `order: 9` 推到末位，column 下 order
+    // 仍然生效，于是子智能体在上、后台任务在下。这里不抢这个 order —— 上游改回 0 时
+    // 顺序应随之变回，写死反而打架。
+    //
+    // `overflow: visible` 是必须的：上游手机档把 headerActions 做成 `overflow-x: auto`
+    // 的横向滚动盒（断点 A，2026-09-19）。column 主轴一换，这个 `auto` 会顺带把
+    // 纵向也变成滚动容器 —— 两行芯片被裁、还多出一条不可见的滚动缝。宁可放弃
+    // 「横排时能滑动」这条退路，因为竖排之后横排溢出这个前提已经不存在了。
+    //
+    // `:not(#kxxy)` 是为了提特异性：上游那条 `header:has([class*="_headerLeading"]) ...`
+    // 的规则带 4 个属性选择器 + `!important`，本层若只写 `header [class*="_headerActions"]`
+    // 会被压掉（同为 !important 时比特异性）。`:not(#kxxy)` 里的 id 让本规则升到 (1,1,1)，
+    // 稳定压过它，又不依赖宿主是否带 `data-mobile-nav` 属性。
+    '  header [class*="_headerActions"]:not(#kxxy) { flex-direction: column !important; align-items: flex-end !important; justify-content: center !important; gap: 0 !important; overflow: visible !important; max-width: none !important }',
+    // 紧凑尺寸（E 档）：17px 行高让两行的总高 ≈ 34px，header 只增高约 11px。
+    // 这确实牺牲了触摸热区（原 28px → 17px）；若真机实测难点，把 min-height
+    // 提到 22px 即可，总高仍比 D 档（28px 行）矮一截。
+    '  header [class*="_headerActions"] > *:not(#kxxy) { min-width: 0; min-height: 17px !important; padding-block: 0 !important; font-size: 11px !important; line-height: 15px !important }',
+    // 芯片内部文字自己带 font-size（`.f8BMvq_label` 之类），只改根元素管不到它们。
+    // 排除 svg：图标尺寸由下面那条单独定，继承 line-height 会把圆环类的 svg 拉变形。
+    '  header [class*="_headerActions"] > *:not(#kxxy) > *:not(svg) { font-size: inherit !important; line-height: inherit !important }',
+    '  header [class*="_headerActions"] svg { width: 11px !important; height: 11px !important }',
+    // corner（右上角文件夹图标）原来 `margin-right: -16px` 顶出 header 右内边距；
+    // 两行芯片之后它的负边距会把图标压到芯片列上，收一半。
+    '  header [class*="_headerCorner"]:not(#kxxy) { margin-left: 2px !important; margin-right: -6px !important }',
     '}',
   ].join('\n')
 

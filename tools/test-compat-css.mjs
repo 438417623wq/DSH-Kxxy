@@ -467,6 +467,58 @@ check(
   check("分隔符用兄弟选择器", css.includes("~ [class*=\"_sep\"]"), true);
   check("只在窄屏生效", css.includes("@media (max-width: 767px)"), true);
   check("不依赖 :has()", css.includes(":has("), false);
+
+  // 两个状态芯片改上下两行（2026-10-23 用户拍板「按 E 落地」）
+  check(
+    "窄屏下 headerActions 主轴改纵向（数量自适应，单芯片退化为一行）",
+    css.includes('header [class*="_headerActions"]:not(#kxxy) { flex-direction: column !important'),
+    true,
+  );
+  // 特异性守卫：上游手机档那条规则带 4 个属性选择器 + !important，本层只有
+  // 升到 id 级（`#kxxy`）才压得住；漏掉 `:not(#kxxy)` 就等于整条规则白写。
+  check(
+    "竖排规则必须带 :not(#kxxy) 提权（否则被上游 !important 压掉）",
+    /\[class\*="_headerActions"\]:not\(#kxxy\) \{ flex-direction: column !important/.test(css),
+    true,
+  );
+  // `overflow: visible` 是为了推翻上游手机档的 `overflow-x: auto` 横向滚动盒：
+  // 主轴换成 column 之后，那个 auto 会把纵向也变成滚动容器，两行被裁。
+  check(
+    "竖排同时解除 overflow-x:auto（否则两行被裁 + 多一条滚动缝）",
+    css.includes("gap: 0 !important; overflow: visible !important; max-width: none !important"),
+    true,
+  );
+  check(
+    "两行芯片压到 11px / 17px（E 档紧凑尺寸）",
+    css.includes("min-height: 17px !important; padding-block: 0 !important; font-size: 11px !important; line-height: 15px !important"),
+    true,
+  );
+  // 芯片内部文字自带 font-size，只改根元素管不到；但继承规则必须排除 svg，
+  // 否则圆环类图标会被 line-height 拉变形。
+  check(
+    "芯片内部文字继承紧凑字号，且排除 svg",
+    css.includes('header [class*="_headerActions"] > *:not(#kxxy) > *:not(svg) { font-size: inherit !important'),
+    true,
+  );
+  check(
+    "corner 负边距收窄，避免压到芯片列",
+    css.includes('header [class*="_headerCorner"]:not(#kxxy) { margin-left: 2px !important; margin-right: -6px !important }'),
+    true,
+  );
+  // 「标准模式」那条隐藏规则按 `_label` 后缀锚，会连 headerActions 里两个状态芯片的
+  // 文字一起藏掉（2026-10-23 落地竖排时在预览里撞见：子智能体只剩一个圆环）。
+  // 所以必须紧跟一条把 headerActions 内 label 恢复回来的规则。
+  check(
+    "headerActions 内的 label 必须恢复（否则子智能体文字被一起藏掉）",
+    css.includes('header [class*="_headerActions"] [class*="_label"]:not(#kxxy) { display: revert !important }'),
+    true,
+  );
+  // 恢复规则与隐藏规则同为 !important，只靠书写顺序不够 —— 特异性必须不低。
+  check(
+    "恢复规则必须带 :not(#kxxy) 提权（否则压不过隐藏规则）",
+    /\[class\*="_headerActions"\] \[class\*="_label"\]:not\(#kxxy\) \{ display: revert !important/.test(css),
+    true,
+  );
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
