@@ -69,7 +69,7 @@ const MIN_DSH_AI_FILES = 100;
  * 老设备升级 APK 时 RUNTIME_VERSION 不变，所以「文件存在」不足以判出兼容层
  * 过期；锚点 6 实际比对的是 compat.js 首行的版本标记。
  */
-const COMPAT_LAYER_MARKER = "kxxy-webview-compat@11";
+const COMPAT_LAYER_MARKER = "kxxy-webview-compat@12";
 
 /**
  * 与 RuntimeInstaller.MODERN_LAYER_MARKER 保持一致（锚点 6 的第二份资产）。

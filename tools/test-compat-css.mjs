@@ -502,7 +502,7 @@ check(
   );
   check(
     "corner 负边距收窄，避免压到芯片列",
-    css.includes('header [class*="_headerCorner"]:not(#kxxy) { margin-left: 2px !important; margin-right: -6px !important }'),
+    css.includes('header [class*="_headerCorner"]:not(#kxxy) { margin-left: 2px !important; margin-right: -6px !important; align-self: flex-start !important }'),
     true,
   );
   // 「标准模式」那条隐藏规则按 `_label` 后缀锚，会连 headerActions 里两个状态芯片的
@@ -510,13 +510,28 @@ check(
   // 所以必须紧跟一条把 headerActions 内 label 恢复回来的规则。
   check(
     "headerActions 内的 label 必须恢复（否则子智能体文字被一起藏掉）",
-    css.includes('header [class*="_headerActions"] [class*="_label"]:not(#kxxy) { display: revert !important }'),
+    css.includes('header [class*="_headerActions"] [class*="_label"]:not([class*="f8BMvq"]):not(#kxxy) { display: revert !important }'),
     true,
   );
   // 恢复规则与隐藏规则同为 !important，只靠书写顺序不够 —— 特异性必须不低。
   check(
     "恢复规则必须带 :not(#kxxy) 提权（否则压不过隐藏规则）",
-    /\[class\*="_headerActions"\] \[class\*="_label"\]:not\(#kxxy\) \{ display: revert !important/.test(css),
+    /\[class\*="_headerActions"\] \[class\*="_label"\]:not\(\[class\*="f8BMvq"\]\):not\(#kxxy\) \{ display: revert !important/.test(css),
+    true,
+  );
+  // 恢复规则必须**排除标准模式**（缺陷 DW）：@11 的恢复规则无差别恢复 headerActions
+  // 内所有 `_label`，把「标准模式」也带了回来 —— 真机右上角变成「后台任务 / corner /
+  // 标准模式 / 子智能体」四行散排。AgentPresetLabel 是 span.f8BMvq_label（图标+文字
+  // 一体，无外层容器），排除它才能整块消失。
+  check(
+    "恢复规则必须排除标准模式（f8BMvq），否则它参与竖排变成四行散排（缺陷 DW）",
+    css.includes(':not([class*="f8BMvq"]):not(#kxxy) { display: revert !important }'),
+    true,
+  );
+  // 标准模式整块隐藏的冗余兜底：全藏规则将来若被收窄锚点，这条保证它仍然消失。
+  check(
+    "标准模式芯片整块隐藏（含图标）——上游标注 read-only，藏掉零功能损失",
+    css.includes('header [class*="f8BMvq_label"]:not(#kxxy) { display: none !important }'),
     true,
   );
 }

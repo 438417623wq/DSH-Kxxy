@@ -1,4 +1,4 @@
-/* kxxy-webview-compat@11 */
+/* kxxy-webview-compat@12 */
 /**
  * dsh-kxxy WebView 兼容层（polyfill + CSS 回退 + URL 修正）
  *
@@ -480,13 +480,30 @@
     // `_3K3mEa_label` 是子智能体），按后缀锚根本分不开它们。上面「误伤面可控」那句
     // 结论是错的：header 里带 `_label` 的不只是按钮文字，还有这两个芯片的文字。
     //
-    // 修法：先全藏、再把「在 headerActions 里」的恢复回来。能这么切是因为结构差异
-    // 稳定 —— 标准模式的 label 挂在 titleRow 那一层（不在 headerActions 内），两个
-    // 状态芯片则是 headerActions 的直接子级。
+    // 修法：先全藏、再把「在 headerActions 里」的恢复回来——但**排除标准模式**。
+    //
+    // 「标准模式的 label 挂在 titleRow 那一层（不在 headerActions 内）」这个 @11 时的
+    // 判断是错的：真机截图（2026-10-23 晚）显示它就参与竖排列，恢复规则把它也恢复了，
+    // 于是右上角变成「后台任务 / corner 图标 / 标准模式 / 子智能体」四行散排 —— titleRow
+    // 是普通 flex（不换行预算），多出的两个盒子被挤到下一行，正是用户说的「排版有问题」。
+    // 源码取证（dsh-client-ui-agent-preset/lib/client.js）：AgentPresetLabel 渲染成
+    // `<span class="f8BMvq_label">`（图标 + 文字一体，无外层容器），且注释明写
+    // 「Read-only by construction —— Offering a control here would promise a switch
+    // the host refuses」：它只是只读标签，不是模式切换入口，模式选择在新会话屏。
+    // 所以手机上整块藏掉零功能损失（上游窄屏本来就在藏它的文字，这里只是藏得更彻底）。
+    //
+    // 锚点用 `f8BMvq_label` 完整片段而不是 `_label` 后缀：CSS module 哈希随上游重新
+    // 构建才会变，而上游依赖树钉死在本仓库的 runtime.zip 里，产物内恒定。哈希真变了
+    // 的症状是「标准模式重新出现」（恢复规则不再排除它），不是崩溃 —— 和 @11 之前一样，
+    // 不引入新的失败模式。
     // 恢复用 `display: revert` 而不是 `inline`：label 可能是 span 也可能是块级容器，
     // revert 回落到 UA 默认值，比猜一个具体值安全（Chrome 84+ 支持，104 没问题）。
     // 这条必须也带 `:not(#kxxy)`：同为 !important 时比特异性，低了就压不过上面那条。
-    '  header [class*="_headerActions"] [class*="_label"]:not(#kxxy) { display: revert !important }',
+    '  header [class*="_headerActions"] [class*="_label"]:not([class*="f8BMvq"]):not(#kxxy) { display: revert !important }',
+    // 标准模式整块藏（含图标）。上面那条全藏规则已经盖住它，这里是**冗余兜底**：
+    // 将来若有人收窄全藏规则的锚点（比如改回 `_headerActions` 直接子级），这条保证
+    // 标准模式仍然消失，而不是退回「四行散排」。
+    '  header [class*="f8BMvq_label"]:not(#kxxy) { display: none !important }',
     // ③ 两个状态芯片（后台任务 / 子智能体）改上下两行（2026-10-23 用户拍板「按 E 落地」）。
     //
     // 为什么不是「判断有几个芯片再竖排」：`flex-direction: column` 本身就是数量自适应
@@ -518,7 +535,10 @@
     '  header [class*="_headerActions"] svg { width: 11px !important; height: 11px !important }',
     // corner（右上角文件夹图标）原来 `margin-right: -16px` 顶出 header 右内边距；
     // 两行芯片之后它的负边距会把图标压到芯片列上，收一半。
-    '  header [class*="_headerCorner"]:not(#kxxy) { margin-left: 2px !important; margin-right: -6px !important }',
+    // `align-self: flex-start` 把它钉到第一行芯片的高度：titleRow 的默认垂直居中
+    // 会让 36px 的 corner 落在两行 17px 芯片的中间，看起来像「插进芯片列」；
+    // 顶到第一行后 corner 与「后台任务」行平齐，右缘形成一条整齐的竖线。
+    '  header [class*="_headerCorner"]:not(#kxxy) { margin-left: 2px !important; margin-right: -6px !important; align-self: flex-start !important }',
     '}',
   ].join('\n')
 
