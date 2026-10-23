@@ -36,21 +36,90 @@ if (-not (Test-Path "$Project\tools\build-runtime.mjs")) {
 }
 Push-Location $Project
 try {
-    $node = "C:\Users\XiaoXin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
-    if (-not (Test-Path $node)) { $node = "node" }
+    # ── 工具链探测（缺陷 DI）─────────────────────────────────────────────
+    #
+    # 这个脚本原来把三处路径**写死成另一台机器**的绝对路径：
+    #   node   = C:\Users\XiaoXin\.dsh\...\node.exe
+    #   sdk    = C:\Users\XiaoXin\AppData\Local\Android\Sdk
+    #   JAVA_HOME = C:\Program Files\Eclipse Adoptium\jdk-17.0.18.8-hotspot
+    # 在当前构建机上三者都不存在，于是脚本在第一步就 `node` 找不到而失败。
+    #
+    # 现在改成「按优先级探测」：环境变量优先，其次本机实测可用的固定位置
+    # （工具链放在 C:\KF\fbtools 下），最后才回落到 PATH。探测失败时给出
+    # 明确的补救提示，而不是让后面的 gradle 报一个不相干的错。
+    $nodeCandidates = @(
+        $env:KXXY_NODE,
+        "$env:USERPROFILE\.dsh\dsh-runtimes\dsh-plugin-desktop-primary-runtime\dependencies\node\bin\node.exe",
+        "C:\Users\XiaoXin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
+    ) | Where-Object { $_ }
+    $node = $null
+    foreach ($cand in $nodeCandidates) {
+        if (Test-Path $cand) { $node = $cand; break }
+    }
+    if (-not $node) {
+        $cmd = Get-Command node -ErrorAction SilentlyContinue
+        if ($cmd) { $node = $cmd.Source }
+    }
+    if (-not $node) {
+        throw "找不到 node.exe（试过：$($nodeCandidates -join '; ')）。用 KXXY_NODE 指定。"
+    }
 
     $assets   = "$Project\android\app\src\main\assets"
     $hold     = "$Project\.cache\apk-assets-hold"
     $apk      = "$Project\android\app\build\outputs\apk\debug\app-debug.apk"
     $aligned  = "$Project\android\app\build\outputs\apk\debug\app-aligned.apk"
     $signed   = "$Project\android\app\build\outputs\apk\debug\app-signed.apk"
-    $sdk      = "C:\Users\XiaoXin\AppData\Local\Android\Sdk"
 
-    # gradle：本机没有全局 `gradle`（`where.exe gradle` 找不到），只有 wrapper 分发包。
-    # 本项目没有 gradlew，所以直接从 ~/.gradle/wrapper/dists 里挑一个可用的。
-    # 8.10.2 是 AGP 8.5.2 的已验证组合（本仓库此前的成功构建都跑在它上面）。
+    $sdkCandidates = @(
+        $env:ANDROID_HOME,
+        $env:ANDROID_SDK_ROOT,
+        "C:\KF\fbtools\sdk",
+        "$env:LOCALAPPDATA\Android\Sdk",
+        "C:\Users\XiaoXin\AppData\Local\Android\Sdk"
+    ) | Where-Object { $_ }
+    $sdk = $null
+    foreach ($cand in $sdkCandidates) {
+        if (Test-Path (Join-Path $cand "build-tools")) { $sdk = $cand; break }
+    }
+    if (-not $sdk) {
+        throw "找不到 Android SDK（试过：$($sdkCandidates -join '; ')）。用 ANDROID_HOME 指定。"
+    }
+
+    # JDK：apksigner.bat 与 gradle 都需要。优先 JAVA_HOME，其次本机工具链目录。
+    $jdkCandidates = @($env:JAVA_HOME, "C:\KF\fbtools\jdk") | Where-Object { $_ }
+    $jdk = $null
+    foreach ($cand in $jdkCandidates) {
+        if (Test-Path (Join-Path $cand "bin\java.exe")) { $jdk = $cand; break }
+    }
+    if (-not $jdk) {
+        $adoptium = Get-ChildItem "C:\Program Files\Eclipse Adoptium" -Directory -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path (Join-Path $_.FullName "bin\java.exe") } | Select-Object -First 1
+        if ($adoptium) { $jdk = $adoptium.FullName }
+    }
+    if (-not $jdk) {
+        throw "找不到 JDK 17（试过：$($jdkCandidates -join '; ')、C:\Program Files\Eclipse Adoptium）。用 JAVA_HOME 指定。"
+    }
+
+    # JAVA_HOME 必须在 gradle **之前**就导出。原来只在第 6 步签名时设置，
+    # 于是 `gradle.bat` 一启动就报
+    # `ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH.`
+    # 并已 exit 9009 结束（本机 PATH 里没有 java）。
+    $env:JAVA_HOME = $jdk
+    $env:PATH = "$jdk\bin;$env:PATH"
+
+    Write-Host "      node = $node"
+    Write-Host "      sdk  = $sdk"
+    Write-Host "      jdk  = $jdk"
+
+    # gradle：优先本机工具链里的 8.10.2（AGP 8.5.2 的已验证组合），
+    # 其次 PATH，最后才是 ~/.gradle/wrapper/dists。本项目没有 gradlew。
     if (-not $gradle) {
-        $gradle = (Get-Command gradle -ErrorAction SilentlyContinue).Source
+        $fixed = "C:\KF\fbtools\gradle\gradle-8.10.2\bin\gradle.bat"
+        if (Test-Path $fixed) { $gradle = $fixed }
+    }
+    if (-not $gradle) {
+        $cmd = Get-Command gradle -ErrorAction SilentlyContinue
+        if ($cmd) { $gradle = $cmd.Source }
     }
     if (-not $gradle) {
         $wrapperRoot = "$env:USERPROFILE\.gradle\wrapper\dists"
@@ -67,7 +136,7 @@ try {
         }
     }
     if (-not $gradle -or -not (Test-Path $gradle)) {
-        throw "找不到 gradle（PATH 与 ~/.gradle/wrapper/dists 都没有）。请用 -SkipGradle 或自行安装。"
+        throw "找不到 gradle（C:\KF\fbtools\gradle、PATH 与 ~/.gradle/wrapper/dists 都没有）。请用 -SkipGradle 或自行安装。"
     }
     Write-Host "      gradle = $gradle"
 
@@ -134,12 +203,25 @@ try {
 
     # ── 6) 重签 ───────────────────────────────────────────────────────────
     Write-Host "[6/6] apksigner 重签 …" -ForegroundColor Cyan
-    $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.18.8-hotspot"
+    # 缺陷 DI：这里原来写死 `C:\Program Files\Eclipse Adoptium\jdk-17.0.18.8-hotspot`，
+    # 本机没有该目录。改用上面探测到的 $jdk（apksigner.bat 需要 JAVA_HOME 才能跑）。
+    $env:JAVA_HOME = $jdk
     $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
-    $signer = "$sdk\build-tools\36.0.0\apksigner.bat"
+    # build-tools 版本按目录探测（本机有 25.0.3 / 34.0.0 / 36.0.0），取最高的一个 ——
+    # 写死 36.0.0 在只有 34 的机器上会直接失败。
+    $signer = $null
+    $btRoot = Join-Path $sdk "build-tools"
+    $btDirs = Get-ChildItem $btRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName "apksigner.bat") } |
+        Sort-Object { [version]($_.Name -replace '[^0-9.].*$','') } -Descending
+    foreach ($d in $btDirs) {
+        $cand = Join-Path $d.FullName "apksigner.bat"
+        if (Test-Path $cand) { $signer = $cand; break }
+    }
     $ks = "$env:USERPROFILE\.android\debug.keystore"
-    if (-not (Test-Path $signer)) { throw "找不到 apksigner: $signer" }
+    if (-not $signer) { throw "找不到 apksigner（$btRoot 下没有任何 build-tools 带 apksigner.bat）" }
     if (-not (Test-Path $ks)) { throw "找不到 debug.keystore: $ks" }
+    Write-Host "      apksigner = $signer"
 
     Copy-Item -Force $aligned $signed
     & $signer sign --ks $ks --ks-pass pass:android --key-pass pass:android `

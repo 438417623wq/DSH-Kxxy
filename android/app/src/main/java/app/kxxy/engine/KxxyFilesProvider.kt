@@ -30,10 +30,21 @@ import java.io.FileNotFoundException
  *
  * ```
  * content://app.kxxy.files/engine/<相对 engineRoot 的路径>
+ * content://app.kxxy.files/home/<相对 kxxy-home 的路径>
  * ```
  *
- * 只接受 `engine/` 前缀 —— 不接受绝对路径，避免把 `/data/data/app.kxxy/`
- * 下的其他内容（比如 `tapi/` 通道、`kxxy-home/` 里的凭据）暴露出去。
+ * 两条前缀对应引擎树与用户树（缺陷 DG）。**为什么需要第二条**：交付给用户
+ * 的文件（APK、导出的文档、截图）都落在 `kxxy-home/workspaces/…`，而它不在
+ * `engine/` 下面 —— 只服务 `engine/` 的话，交付卡片上点「打开」会报
+ * 「只能打开引擎目录内的路径」，而用户要的正是打开自己刚拿到的文件。
+ *
+ * `home/` 前缀**排除 `profiles/`**：那里是引擎的凭证面（0600 的账号令牌、
+ * 插件配置），既不该被分享出去，也不该被任何外部应用经 URI 读到。这是本
+ * provider 唯一的内部黑名单，判定在 [resolve] 里做（规范化之后，挡不住穿越
+ * 的写法一律先被前缀校验拦掉）。
+ *
+ * 只接受上述两个前缀 —— 不接受绝对路径，避免把 `/data/data/app.kxxy/`
+ * 下的其他内容（比如 `tapi/` 通道）暴露出去。
  *
  * ## 安全
  *
@@ -49,6 +60,9 @@ class KxxyFilesProvider : ContentProvider() {
 
     private fun engineRoot(): File = EngineConfig.engineRoot(requireNotNull(context))
 
+    /** 用户树（`kxxy-home`），交付文件与工作区都在这里。 */
+    private fun homeRoot(): File = EngineConfig.dshHome(requireNotNull(context))
+
     /**
      * 把 URI 还原成受控的 File，越界返回 null。
      *
@@ -57,11 +71,22 @@ class KxxyFilesProvider : ContentProvider() {
      */
     private fun resolve(uri: Uri): File? {
         val segs = uri.pathSegments
-        if (segs.size < 2 || segs[0] != "engine") return null
-        val root = engineRoot().canonicalFile
+        if (segs.size < 2) return null
+        val root = when (segs[0]) {
+            "engine" -> engineRoot().canonicalFile
+            "home" -> homeRoot().canonicalFile
+            else -> return null
+        }
         val rel = segs.drop(1).joinToString(File.separator)
         val f = File(root, rel).canonicalFile
-        return if (f.path == root.path || f.path.startsWith(root.path + File.separator)) f else null
+        val inside = f.path == root.path || f.path.startsWith(root.path + File.separator)
+        if (!inside) return null
+        // 用户树里的凭证面绝不外发（见类注释）。
+        if (segs[0] == "home") {
+            val profiles = File(root, "profiles").canonicalPath
+            if (f.path == profiles || f.path.startsWith(profiles + File.separator)) return null
+        }
+        return f
     }
 
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
@@ -126,15 +151,47 @@ class KxxyFilesProvider : ContentProvider() {
         /**
          * 构造一个指向 `<engineRoot>/<rel>` 的 URI；越界或文件不存在返回 null。
          *
-         * 调用方（[TermuxApiServer.share]）负责把它放进 Intent 并加
-         * `FLAG_GRANT_READ_URI_PERMISSION`。
+         * 调用方（[TermuxApiServer.share] / `TermuxApiServer.open`）负责把它
+         * 放进 Intent 并加 `FLAG_GRANT_READ_URI_PERMISSION`。
          */
-        fun uriFor(rel: String): Uri? {
+        fun uriFor(rel: String): Uri? = build("engine", rel)
+
+        /**
+         * 构造一个指向 `<kxxy-home>/<rel>` 的 URI（缺陷 DG）。
+         *
+         * 交付文件（APK、导出的文档）与工作区都在用户树里，见类注释里
+         * `home/` 前缀的说明。
+         */
+        fun uriForHome(rel: String): Uri? = build("home", rel)
+
+        /**
+         * 把引擎树或用户树里的**绝对路径**转成 URI；不在任一树下返回 null。
+         *
+         * 这是 `TermuxApiServer.open` 的唯一入口 —— 它拿到的永远是绝对路径，
+         * 让「该用哪个前缀」的判断集中在这里，而不是散在调用方。
+         */
+        fun uriForAbsolute(context: android.content.Context, path: String): Uri? {
+            val target = runCatching { File(path).canonicalFile }.getOrNull() ?: return null
+            val engine = EngineConfig.engineRoot(context).canonicalFile
+            val home = EngineConfig.dshHome(context).canonicalFile
+            return when {
+                target.path == engine.path -> uriFor(".")
+                target.path.startsWith(engine.path + File.separator) ->
+                    uriFor(target.path.substring(engine.path.length + 1))
+                target.path == home.path -> uriForHome(".")
+                target.path.startsWith(home.path + File.separator) ->
+                    uriForHome(target.path.substring(home.path.length + 1))
+                else -> null
+            }
+        }
+
+        private fun build(prefix: String, rel: String): Uri? {
             val clean = rel.trimStart('/', '\\')
             if (clean.isEmpty()) return null
             return Uri.Builder()
                 .scheme("content")
                 .authority(AUTHORITY)
+                .appendPath(prefix)
                 // 逐段编码：文件名里可能有空格、括号、中文，整串 encode 会把
                 // 分隔符也编掉。
                 .apply { clean.split(File.separatorChar, '/').forEach { appendPath(it) } }
@@ -158,6 +215,11 @@ class KxxyFilesProvider : ContentProvider() {
             "gif" to "image/gif", "webp" to "image/webp", "bmp" to "image/bmp",
             "svg" to "image/svg+xml", "heic" to "image/heic",
             "pdf" to "application/pdf",
+            // 缺陷 DG：`.apk` 必须是这个 MIME，否则系统不会把 ACTION_VIEW
+            // 路由到 PackageInstaller —— 落到 octet-stream 时用户看到的是
+            // 「点了没反应」。TermuxApiServer.open 另有强制判定，这里同步一份
+            // 是为了让 query/getType 的外部调用方（分享、下载）也一致。
+            "apk" to "application/vnd.android.package-archive",
             "zip" to "application/zip", "gz" to "application/gzip",
             "tar" to "application/x-tar", "xz" to "application/x-xz",
             "7z" to "application/x-7z-compressed",

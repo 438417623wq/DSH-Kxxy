@@ -26,6 +26,13 @@ __pycache__/
 # 需要它的人请按 README「三、构建」自行生成。
 android/app/src/main/assets/runtime.zip
 
+# 构建清单（tools/build-runtime.mjs 每次构建重写，进 assets 是给 gradle 当输入读，
+# 不是源码）：内含 runtimeSha256 / 插件指纹 / 构建时刻 / 仓库地址。
+# 不入库的理由有两条：① 每次构建都变，提交它等于每包一次无意义 diff；
+# ② 缺它是**受支持的降级路径** —— gradle 的 metaString 会返回 unknown，
+# 探针据此放行、关于页把指纹行收起，但编译与安装都正常。
+android/app/src/main/assets/meta/
+
 # 扩展包池（tools/fetch-extensions.mjs 产物，约 1.0 GiB / 20 项），与 runtime.zip
 # 同理是构建产物；目录清单随包生成于 plugins/kxxy-host/extensions.json。
 android/app/src/main/assets/ext-pool/

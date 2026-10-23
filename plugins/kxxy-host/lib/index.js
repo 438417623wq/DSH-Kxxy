@@ -1,4 +1,4 @@
-/* kxxy-host@17 */
+/* kxxy-host@dev —— 打包时由 tools/build-runtime.mjs 改写成插件树内容指纹 */
 /**
  * kxxy-host — DSH Kxxy 宿主管理页插件。
  *
@@ -31,7 +31,7 @@
  * @module kxxy-host
  */
 
-import { readFileSync, existsSync, readdirSync, statSync, writeFileSync, mkdirSync, createReadStream } from 'node:fs'
+import { readFileSync, existsSync, readdirSync, statSync, writeFileSync, mkdirSync, createReadStream, renameSync, unlinkSync } from 'node:fs'
 import { join, dirname, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -568,10 +568,24 @@ function exportLogs(root) {
       files.push({ name: 'engine.log', data: buf.subarray(-2 * 1024 * 1024) })
     }
   } catch { /* 日志读不到就跳过，导出不因此失败 */ }
+  /*
+   * 原生层快照 + 从里面抠出构建元数据。
+   *
+   * 不从 `collectEngineState()` 取：那个函数要 ctx、会读偏好文件、还依赖
+   * 当前运行环境是否完整，而导日志恰恰发生在「环境可能已经坏了」的时候。
+   * 直接解析刚落盘的这份快照最稳 —— 它本来就随日志一起导出，解析失败也只
+   * 让 build 变成 null，不影响导出。
+   */
+  let buildMeta = null
   try {
     const stateFile = process.env.KXXY_STATE_FILE || join(root, 'kxxy-state.json')
     if (existsSync(stateFile)) {
-      files.push({ name: 'kxxy-state.json', data: readFileSync(stateFile) })
+      const raw = readFileSync(stateFile)
+      files.push({ name: 'kxxy-state.json', data: raw })
+      try {
+        // 容忍 BOM：外部工具（编辑器、adb push 的 Windows 版本）会补上
+        buildMeta = JSON.parse(raw.toString('utf8').replace(/^\uFEFF/, '')).build ?? null
+      } catch { /* 快照损坏：build 保持 null，导出继续 */ }
     }
   } catch { /* 同上 */ }
 
@@ -582,6 +596,14 @@ function exportLogs(root) {
     arch: process.arch,
     uptimeSec: Math.round(process.uptime()),
     engineRoot: root,
+    /*
+     * 构建元数据（缺陷 DP）：用户导日志时自带「他装的是哪一版」。
+     *
+     * 这是整条排障链路里最省事的一环 —— 有了它，收到一份日志就不必再问
+     * 「你装的是最新的吗」，也不会出现「前端版本 0.3.2 听起来很新、实际是三个月
+     * 前的包」这种误判。原生层没准备好时给 null，让字段在场但不撒谎。
+     */
+    build: buildMeta,
     extensions: collectExtensions().items
       .filter((i) => i.installed)
       .map((i) => ({ id: i.id, version: i.installedVersion })),
@@ -1025,6 +1047,178 @@ export function apply(ctx) {
               return
             }
             sendJson(res, 200, result)
+            return
+          }
+
+          // ── 需要你确认（方案 B3）─────────────────────────────────────
+          //
+          // 引擎侧（会话、工具、插件）需要用户做一个决定时，把请求写进
+          // `<engineRoot>/attention/request.json`；原生侧的 EngineSupervisor
+          // 每 500 ms 轮询一次，读到就发一条 HIGH 优先级通知。用户点通知上
+          // 的按钮后，AttentionReceiver 往同目录写 `response-*.json`，引擎
+          // 再用下面的第二个路由取回执。
+          //
+          // 为什么用文件而不是长连接：引擎会崩、会被重启，用户还可能锁着屏
+          // 才点通知。文件是唯一在「另一头不在」时也**不会丢**的通道 ——
+          // 与 restart / stdin / recovery 三种请求同一套设计，代价是延迟上限
+          // 等于一个轮询周期。
+          if (path === '/kxxy/api/attention' && req.method === 'POST') {
+            const payload = JSON.parse((await readBody(req)) || '{}')
+            const root = extinstall.engineRoot()
+            const id = String(payload.id ?? '')
+            if (!root || !id) {
+              sendJson(res, 400, { error: 'id required' })
+              return
+            }
+            const dir = join(root, 'attention')
+            mkdirSync(dir, { recursive: true })
+
+            const actions = Array.isArray(payload.actions)
+              ? payload.actions
+                  .filter((a) => a && a.key)
+                  // 通知栏最多放得下三个按钮，多出来的系统也不会显示。
+                  .slice(0, 3)
+                  .map((a) => ({ key: String(a.key), label: String(a.label ?? a.key) }))
+              : []
+
+            const request = {
+              schema: 1,
+              id,
+              sessionId: payload.sessionId == null ? null : String(payload.sessionId),
+              kind: String(payload.kind ?? 'question'),
+              title: String(payload.title ?? ''),
+              body: String(payload.body ?? ''),
+              actions,
+              createdAt: Number(payload.createdAt ?? Date.now()),
+            }
+
+            // 原子写：原生侧可能正好在同一毫秒轮询，看到半个 JSON 会把整条
+            // 请求丢掉（它会解析失败并删除文件）。
+            const target = join(dir, 'request.json')
+            const tmp = `${target}.tmp`
+            writeFileSync(tmp, `${JSON.stringify(request, null, 2)}\n`)
+            renameSync(tmp, target)
+
+            sendJson(res, 202, { accepted: true, id })
+            return
+          }
+
+          if (path === '/kxxy/api/attention/pending' && req.method === 'GET') {
+            // 前端刷新后要能回答「有没有还没处理的请求」，否则用户关掉页面
+            // 再打开就再也找不到那条待确认了。
+            //
+            // 注意返回的是**已经回答过的**回执（`response-*.json`）：请求本身
+            // （`request.json`）由原生侧读走后立刻删除，前端不需要也不该看到
+            // 它的副本 —— 否则会做出「在应用内回答一次、通知栏再回答一次」的
+            // 双重决定。
+            const root = extinstall.engineRoot()
+            const dir = root ? join(root, 'attention') : ''
+            const list = []
+            if (dir && existsSync(dir)) {
+              for (const name of readdirSync(dir)) {
+                if (!name.startsWith('response-') || !name.endsWith('.json')) continue
+                try {
+                  list.push(JSON.parse(readFileSync(join(dir, name), 'utf8')))
+                } catch {
+                  // 半截文件（正在写）直接跳过，下一轮就有了。
+                }
+              }
+            }
+            sendJson(res, 200, { responses: list })
+            return
+          }
+
+          if (path === '/kxxy/api/attention/active' && req.method === 'GET') {
+            // 尚未回答的请求（由原生侧在发通知时写下，用户回答后删除）。
+            // 控制台读它渲染「待确认」卡片。
+            const root = extinstall.engineRoot()
+            const dir = root ? join(root, 'attention') : ''
+            const list = []
+            if (dir && existsSync(dir)) {
+              for (const name of readdirSync(dir)) {
+                if (!name.startsWith('active-') || !name.endsWith('.json')) continue
+                try {
+                  list.push(JSON.parse(readFileSync(join(dir, name), 'utf8')))
+                } catch {
+                  // 跳过半截文件
+                }
+              }
+            }
+            // 新的排前面：用户最关心刚发生的那条。
+            list.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+            sendJson(res, 200, { active: list })
+            return
+          }
+
+          if (path === '/kxxy/api/attention/answer' && req.method === 'POST') {
+            // 从控制台界面里直接回答（不经过通知栏）。
+            //
+            // 写出来的文件与原生 AttentionReceiver 的格式**逐字一致** ——
+            // 引擎只认一种回执格式，两条来源（通知栏按钮 / 应用内按钮）必须
+            // 产出同构的文件，否则会出现「从通知点有用、从应用点没反应」。
+            const payload = JSON.parse((await readBody(req)) || '{}')
+            const root = extinstall.engineRoot()
+            const id = String(payload.id ?? '')
+            const action = String(payload.action ?? '')
+            if (!root || !id || !action) {
+              sendJson(res, 400, { error: 'id and action required' })
+              return
+            }
+            const dir = join(root, 'attention')
+            mkdirSync(dir, { recursive: true })
+            const safe = id.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64)
+            const target = join(dir, `response-${safe}-response.json`)
+            const tmp = `${target}.tmp`
+            const body = {
+              id,
+              action,
+              sessionId: payload.sessionId == null ? null : String(payload.sessionId),
+              answeredAt: Date.now(),
+              source: 'console',
+            }
+            writeFileSync(tmp, `${JSON.stringify(body, null, 2)}\n`)
+            renameSync(tmp, target)
+            // 与控制台「待确认」卡片保持一致：回答过的请求立刻从列表里消失。
+            try {
+              unlinkSync(join(dir, `active-${safe}.json`))
+            } catch {
+              // 本来就不存在（可能已被原生侧清掉）。
+            }
+            sendJson(res, 200, { ok: true })
+            return
+          }
+
+          if (path === '/kxxy/api/attention/response' && req.method === 'GET') {
+            // 取一条回执。**读后即删**：引擎处理完就该消失，
+            // 否则同名回执会在下次轮询里被当成新决定再处理一遍。
+            const id = new URL(req.url, 'http://127.0.0.1').searchParams.get('id') ?? ''
+            const root = extinstall.engineRoot()
+            const dir = root ? join(root, 'attention') : ''
+            if (!dir || !existsSync(dir)) {
+              sendJson(res, 404, { error: 'no response' })
+              return
+            }
+            const match = readdirSync(dir).find(
+              (name) => name.startsWith('response-') && name.endsWith('.json') &&
+                (id === '' || name.includes(id.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64)))
+            )
+            if (!match) {
+              sendJson(res, 404, { error: 'no response' })
+              return
+            }
+            const file = join(dir, match)
+            let body = null
+            try {
+              body = JSON.parse(readFileSync(file, 'utf8'))
+            } catch {
+              // 解析失败也要删：留着只会让每一次轮询都撞在同一块坏数据上。
+            }
+            try {
+              unlinkSync(file)
+            } catch {
+              // 忽略：可能被另一端抢先删了。
+            }
+            sendJson(res, body ? 200 : 409, body ?? { error: 'malformed response' })
             return
           }
 

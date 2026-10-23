@@ -928,6 +928,217 @@ function patchSharp(ctx) {
   return "sharp → ImageMagick 替身（原包无 android 预编译，必抛 android-arm64 加载失败）";
 }
 
+/**
+ * `@deepseek-ai/dsh-native-command`：Android 上「打开文件」整条链是**空**的。
+ *
+ * 真机症状（用户报）：对话里交付的 `*.apk` 点一下什么都不发生，只有一行
+ * 灰字「此主机没有可用的桌面，无法使用外部程序打开文件或文件夹」。用户要的
+ * 是**唤起系统安装器**（选择安装 / 允许安装未知来源）。
+ *
+ * 根因链（四环，缺一不成立，且每一环都独立地让功能不可用）：
+ *   1. `canOpenNativePath()` 只认 darwin / win32 / 有 DISPLAY 的 linux，
+ *      Android（`process.platform === "android"`）直接 `return false`；
+ *   2. `nativeFileManager()` 同理返回 `null`；
+ *   3. `dsh-api-session-controller` 的 `workspaceDesktop()` 把
+ *      `available` 算成 `fileManager !== null && canOpenPath()` ⇒ **恒 false**
+ *      ⇒ 前端 `dsh-client-ui-deliverables` 渲染 `presented.unavailable`，
+ *      `deliverables.file.actions` 槽位（open-in-app 的分体按钮）整块不挂载；
+ *   4. 即便强行打开，`openNativePathWithIntent()` 末尾
+ *      `throw new Error("native path opener is unsupported on <platform>")`。
+ *
+ * 修法分三处，全部落在本包内（不碰上游调用方）：
+ *   a) `canOpenNativePath()` / `nativeFileManager()` 放行 android；
+ *   b) `openNativePathWithIntent()` 增加 android 分支：调
+ *      `<root>/libexec/termux-api Open <path>` —— 那是 `TermuxApiServer`
+ *      每次引擎启动时写的脚本 shim（`installShim`），把路径送进应用进程，
+ *      由它用系统 `ACTION_VIEW` 打开：`.apk` 落到 PackageInstaller，其余
+ *      落到各自的关联应用；
+ *   c) `nativeFileApplications()` 在 android 上返回「系统默认打开方式」
+ *      一个条目，让 `deliverables.file.actions` 的分体按钮**有东西可渲染**
+ *      （`useFileApplications` 拿到空数组时按钮主键会退回「显示文件位置」，
+ *      而那个动作在 Android 上语义不对）。
+ *
+ * ⚠️ 为什么不用 `termux-open`：`bin/termux-open` 在 `build-runtime.mjs` 的
+ * `TERMUX_APP_SCRIPTS` 剔除清单里（它内部 exec `am start`，而 `bin/am` 也被
+ * 剔除了），设备上根本没有这个命令。`libexec/termux-api` 则相反 —— 它在
+ * 闭包里，而且**每轮引擎启动都会被换成 shim**（见
+ * `EngineSupervisor.supervisionLoop`），是唯一稳定可用的「引擎 → 应用进程」
+ * 执行器。因此这里给它加一个 `Open` 方法（见 `TermuxApiServer.open`）。
+ *
+ * 安全性：`Open` 只接受**引擎根内已存在**的文件路径（`KxxyFilesProvider`
+ * 也只服务 `engine/` 前缀），由应用进程用 `ACTION_VIEW` + `content://` +
+ * 临时读授权发出。`.apk` 会带上 `application/vnd.android.package-archive`，
+ * 交给系统安装器 —— 安装确认框由系统弹，本应用除了
+ * `REQUEST_INSTALL_PACKAGES` 之外不持有任何特权。
+ *
+ * 为便于离线预演（`tools/test-native-command.mjs` 用上游真实文件跑一遍），
+ * 这里 `export` 出去 —— 生产入口仍是 `applyAllPatches`。
+ */
+export function patchNativeCommandAndroid(ctx) {
+  const rel = "@deepseek-ai/dsh-native-command/lib/index.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无 dsh-native-command）";
+  let src = ctx.read(rel);
+
+  // a1) canOpenNativePath：android 也有「桌面」（系统 ACTION_VIEW）。
+  src = replaceOnce(
+    src,
+    `function canOpenNativePath(internals = {}) {
+	const platform = internals.platform ?? process.platform;
+	if (platform === "darwin" || platform === "win32") return true;
+	if (platform !== "linux") return false;`,
+    `function canOpenNativePath(internals = {}) {
+	const platform = internals.platform ?? process.platform;
+	if (platform === "darwin" || platform === "win32") return true;
+	/* Android：没有桌面环境，但有系统 Intent 解析器 —— 见 tools/lib/patches.mjs
+	   的 patchNativeCommandAndroid。这里返回 true 是「能不能把路径交出去」
+	   的判断，不是「有没有窗口系统」。 */
+	if (platform === "android") return true;
+	if (platform !== "linux") return false;`,
+    "native-command 的 canOpenNativePath",
+  );
+
+  // a2) nativeFileManager：android 走「目录」语义（打开所在文件夹）。
+  src = replaceOnce(
+    src,
+    `function nativeFileManager(internals = {}) {
+	const platform = internals.platform ?? process.platform;
+	if (platform === "darwin") return "finder";
+	if (platform === "win32" || platform === "linux" && isWsl(internals)) return "explorer";
+	return platform === "linux" ? "directory" : null;
+}`,
+    `function nativeFileManager(internals = {}) {
+	const platform = internals.platform ?? process.platform;
+	if (platform === "darwin") return "finder";
+	if (platform === "win32" || platform === "linux" && isWsl(internals)) return "explorer";
+	/* Android：既没有 Finder 也没有 Explorer，但「打开所在文件夹」可以交给
+	   系统文件管理器（DocumentsUI）。返回值必须是协议里的四个字面量之一，
+	   否则前端 isPresentedHost 校验会判非法。 */
+	if (platform === "android") return "directory";
+	return platform === "linux" ? "directory" : null;
+}`,
+    "native-command 的 nativeFileManager",
+  );
+
+  // b) openNativePathWithIntent：android 分支走 termux-open 脚本 shim。
+  src = replaceOnce(
+    src,
+    `	if (platform === "linux") {
+		if (wsl) {
+			await openWslPath(path, signal, run);
+			return;
+		}
+		await run("xdg-open", [path], signal, "hidden");
+		return;
+	}
+	throw new Error(\`native path opener is unsupported on \${platform}\`);`,
+    `	if (platform === "linux") {
+		if (wsl) {
+			await openWslPath(path, signal, run);
+			return;
+		}
+		await run("xdg-open", [path], signal, "hidden");
+		return;
+	}
+	if (platform === "android") {
+		/* 交给 <root>/libexec/termux-api 的脚本 shim：它把路径写进 <root>/tapi
+		   通道，由应用进程用系统 ACTION_VIEW 打开（.apk ⇒ PackageInstaller）。
+		   为什么不用 termux-open / am：那两个脚本在 build-runtime.mjs 的
+		   TERMUX_APP_SCRIPTS 剔除清单里，设备上不存在。 */
+		await run(androidOpener(), ["Open", path], signal, "hidden");
+		return;
+	}
+	throw new Error(\`native path opener is unsupported on \${platform}\`);`,
+    "native-command 的 openNativePathWithIntent 平台分派",
+  );
+
+  // b2) 打开器路径解析 + 「打开所在文件夹」的 android 分支。
+  src = replaceOnce(
+    src,
+    `	if (manager === "directory") {
+		await run("xdg-open", [dirname(path)], signal, "hidden");
+		return;
+	}
+	throw new Error(\`native file manager is unsupported on \${platform}\`);`,
+    `	if (manager === "directory") {
+		/* Android 上「显示文件位置」= 用系统文件管理器打开所在目录。 */
+		if (platform === "android") {
+			await run(androidOpener(), ["Open", dirname(path)], signal, "hidden");
+			return;
+		}
+		await run("xdg-open", [dirname(path)], signal, "hidden");
+		return;
+	}
+	throw new Error(\`native file manager is unsupported on \${platform}\`);`,
+    "native-command 的 revealNativePath 平台分派",
+  );
+
+  // b3) 打开器路径：<root>/libexec/termux-api（KXXY_ENGINE_ROOT 由 EngineConfig 注入）。
+  src = replaceOnce(
+    src,
+    `/** Documents a browser renders, as opposed to ones an editor merely edits. */`,
+    `/**
+* Android 上的「打开」执行器：引擎根下 libexec/termux-api 的脚本 shim。
+*
+* 为什么是它而不是 termux-open：后者在 build-runtime.mjs 的
+* TERMUX_APP_SCRIPTS 剔除清单里（设备上不存在），而 termux-api 每轮引擎
+* 启动都会被 TermuxApiServer.installShim 换成脚本，是唯一稳定的
+* 「引擎 → 应用进程」执行器。第一个参数是方法名（Open），与 termux-api 的
+* 命令行约定一致。
+* @returns the absolute path of the opener script.
+*/
+function androidOpener() {
+	const root = process.env.KXXY_ENGINE_ROOT ?? "";
+	return root === "" ? "termux-api" : \`\${root}/libexec/termux-api\`;
+}
+/** Documents a browser renders, as opposed to ones an editor merely edits. */`,
+    "native-command 的 androidOpener 注入点",
+  );
+
+  // c) nativeFileApplications：android 给一个「系统默认打开方式」条目。
+  src = replaceOnce(
+    src,
+    `	if (target.platform !== "win32") return [];`,
+    `	/* Android：没有可查询的关联表（PackageManager 的 queryIntentActivities 需要
+	   应用进程的 Context）。给一个「系统默认打开方式」条目，让前端的
+	   deliverables.file.actions 分体按钮有主键可渲染 —— 点击走 openNativePath，
+	   由系统自己选应用（.apk ⇒ 安装器）。 */
+	if (target.platform === "android") return [{
+		id: "android-default",
+		name: "系统默认打开方式",
+		default: true,
+		icon: null
+	}];
+	if (target.platform !== "win32") return [];`,
+    "native-command 的 queryFileApplications 平台分派",
+  );
+
+  // c2) openNativeFileApplication：android 忽略 application id，走默认打开。
+  src = replaceOnce(
+    src,
+    `	if (target.platform === "win32") {
+		await windowsFileApplications(target.path, application, signal, run);
+		return;
+	}
+	if (!(await queryFileApplications(path, signal, internals, false)).some((app) => app.id === application)) throw new Error("Application is not registered for this file");`,
+    `	if (target.platform === "win32") {
+		await windowsFileApplications(target.path, application, signal, run);
+		return;
+	}
+	/* Android：只有一个「系统默认」条目，application id 没有可校验的关联表，
+	   直接按默认方式打开（与用户在系统弹窗里再选一次等价）。 */
+	if (target.platform === "android") {
+		await openNativePathWithIntent(target.path, signal, "association", internals);
+		return;
+	}
+	if (!(await queryFileApplications(path, signal, internals, false)).some((app) => app.id === application)) throw new Error("Application is not registered for this file");`,
+    "native-command 的 openNativeFileApplication 平台分派",
+  );
+
+  must(src.includes('platform === "android"'), "native-command 的 android 补丁未生效");
+  ctx.write(rel, src);
+  return "dsh-native-command → Android 放行桌面能力（打开/显示位置走 termux-api shim）";
+}
+
 export function applyAllPatches(root, termuxRead) {
   const ctx = createPatchContext(root);
   const results = [
@@ -943,6 +1154,7 @@ export function applyAllPatches(root, termuxRead) {
     patchRipgrep(ctx, termuxRead),
     patchFsLocal(ctx),
     patchAttachmentLocal(ctx),
+    patchNativeCommandAndroid(ctx),
     patchDocumentPreviewUnicodeSets(ctx),
     patchLibreOfficeKitPlatform(ctx),
     patchLibreOfficeKitFontFallbacks(ctx),

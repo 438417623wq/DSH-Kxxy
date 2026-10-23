@@ -23,6 +23,7 @@ import android.os.Vibrator
 import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
+import app.kxxy.service.Notifier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -340,6 +341,11 @@ object TermuxApiServer {
             "Brightness" -> brightness(ctx, args)
             "Torch" -> torch(ctx, args)
             "Share" -> share(ctx, args, stdin)
+            // 宿主内建方法（Termux:API 没有这个名字）：把引擎根内的一个路径交给
+            // 系统打开。`.apk` 落到 PackageInstaller（「选择安装」），其余落到
+            // 关联应用。调用方是 dsh-native-command 的 Android 补丁
+            // （见 tools/lib/patches.mjs 的 patchNativeCommandAndroid）。
+            "Open" -> open(ctx, args, stdin)
             else -> 1 to errorJson(
                 "UNSUPPORTED",
                 "termux-api 方法「$method」在 DSH Kxxy 中未实现。" +
@@ -623,34 +629,49 @@ object TermuxApiServer {
         }
     }
 
+    /**
+     * `termux-notification`。
+     *
+     * 通知的构建整体委托给 [app.kxxy.service.Notifier] —— 改造前这里自己 new 一个
+     * Builder，与 `EngineService` 那份各写各的，结果是**同一台设备上两套通知风格**
+     * （图标不同、渠道不同、id 规则不同）。
+     *
+     * 三个行为变化，都是修正：
+     *   · id 兜底不再是 `currentTimeMillis() % 100000` —— 那个数每 100 秒必然
+     *     重复一次，后一条静默覆盖前一条，`remove` 还会撤错；
+     *   · `--channel` 缺省时按 `--priority` 推导（high/max → kxxy-attention）；
+     *   · `--ongoing` 不再依赖 `setAutoCancel` 反推（原来 `setAutoCancel(!ongoing)`
+     *     与 `setOngoing(ongoing)` 重复表达同一件事，真实语义只有后者生效）。
+     */
     private fun notification(ctx: Context, args: Args, stdin: String): Pair<Int, String> {
-        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            ?: return 1 to errorJson("NO_SERVICE", "设备没有通知服务")
         val content = args.str("content").ifEmpty { stdin.trim() }
         val title = args.str("title", "DSH Kxxy")
-        val channelId = args.str("channel", DEFAULT_CHANNEL)
-        ensureChannel(nm, channelId, "Termux API")
-        val id = args.str("id").ifEmpty { String.format("%d", System.currentTimeMillis() % 100_000) }
+        val channelId = args.str("channel").ifBlank { null }
+        val priority = args.str("priority").lowercase()
+        val ongoing = args.bool("ongoing")
+        val id = args.str("id").ifEmpty {
+            // 同一毫秒内连发两条时靠自增序号区分，避免覆盖。
+            "t${System.currentTimeMillis()}-${notifSeq.incrementAndGet()}"
+        }
 
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            android.app.Notification.Builder(ctx, channelId)
-        } else {
-            @Suppress("DEPRECATION")
-            android.app.Notification.Builder(ctx)
-        }
-        builder.setContentTitle(title)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setAutoCancel(!args.bool("ongoing"))
-            .setOngoing(args.bool("ongoing"))
-        if (content.isNotEmpty()) builder.setContentText(content)
-        if (args.bool("sound")) {
-            builder.setDefaults(android.app.Notification.DEFAULT_SOUND)
-        }
-        if (args.bool("vibrate")) {
-            builder.setDefaults(android.app.Notification.DEFAULT_VIBRATE)
-        }
+        // `--progress <0..100>`：注意不能用 args.bool("progress") 判断是否存在，
+        // 因为 `--progress 50` 走的是 ints 表、裸 `--progress` 才走 bools 表。
+        val progressValue = args.int("progress", -1)
+        val progress = if (progressValue in 0..100) progressValue else null
+
         return try {
-            nm.notify(id.hashCode(), builder.build())
+            Notifier.notifyGeneric(
+                context = ctx,
+                id = id,
+                title = title,
+                body = content,
+                channelId = channelId,
+                priority = priority,
+                ongoing = ongoing,
+                alertOnce = args.bool("alert-once"),
+                progress = progress,
+                sessionId = args.str("group").ifBlank { null },
+            )
             0 to id + "\n"
         } catch (e: Throwable) {
             1 to errorJson("NOTIFY_FAILED", e.message ?: e.javaClass.simpleName)
@@ -674,10 +695,11 @@ object TermuxApiServer {
     }
 
     private fun notificationRemove(ctx: Context, args: Args): Pair<Int, String> {
-        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            ?: return 1 to errorJson("NO_SERVICE", "设备没有通知服务")
         val id = args.str("id").ifEmpty { return 1 to errorJson("BAD_ARGS", "需要 --id <id>") }
-        nm.cancel(id.hashCode())
+        // 必须与写入端用同一套 id 映射，否则撤的是别人（这里曾经是
+        // `nm.cancel(id.hashCode())`，与写入端 `id.hashCode()` 恰好一致纯属巧合，
+        // 一旦任一侧改了映射就会静默失配）。
+        Notifier.cancelNotification(ctx, id)
         return 0 to ""
     }
 
@@ -826,10 +848,136 @@ object TermuxApiServer {
         }
     }
 
+    /**
+     * `Open <path>` —— 把引擎树或用户树里的一个路径交给系统打开（缺陷 DG）。
+     *
+     * 为什么需要它：官方前端的「交付文件」卡片（`dsh-client-ui-deliverables`
+     * 的 `deliverables.file.actions` 槽位）在 Android 上**整块不挂载** ——
+     * 上游 `dsh-native-command` 的 `canOpenNativePath()` / `nativeFileManager()`
+     * 只认 darwin / win32 / 有 DISPLAY 的 linux，`workspaceDesktop().available`
+     * 因此恒为 false。补丁放行 android 之后，真正的打开动作需要一个执行器，
+     * 而引擎进程里**没有任何可用的 am/xdg-open**（`bin/am` 与 `bin/termux-open`
+     * 都在 `build-runtime.mjs` 的剔除清单里）。本方法就是那个执行器：
+     * 引擎侧调 `libexec/termux-api Open <path>`，经既有的 tapi 文件通道回到
+     * 应用进程，由这里用系统 `ACTION_VIEW` 发出。
+     *
+     * `.apk` 走 PackageInstaller（系统弹出「是否安装」，含未知来源确认），
+     * 其余交给各自的关联应用 —— 与桌面版「用默认程序打开」语义一致。
+     *
+     * 安全边界：
+     *   - 只接受**引擎树或用户树**内的真实路径（规范化 + 前缀校验，挡住
+     *     `../` 穿越）；用户树的 `profiles/` 是凭证面，provider 侧已排除；
+     *   - URI 用 `content://app.kxxy.files/…`（[KxxyFilesProvider]），而不是
+     *     `file://` —— targetSdk>=24 后者会抛 FileUriExposedException；
+     *   - 只授出 `FLAG_GRANT_READ_URI_PERMISSION`，接收方拿不到别的能力；
+     *   - MIME 由本方法判定（不信任调用方），`.apk` 强制成
+     *     `application/vnd.android.package-archive`，否则安装器不会认。
+     */
+    private fun open(ctx: Context, args: Args, stdin: String): Pair<Int, String> {
+        val raw = args.positional.firstOrNull()?.trim().orEmpty().ifEmpty { stdin.trim() }
+        if (raw.isEmpty()) return 1 to errorJson("BAD_ARGS", "open 需要一个路径")
+
+        val target = try {
+            File(raw).canonicalFile
+        } catch (e: Throwable) {
+            return 1 to errorJson("BAD_ARGS", "路径非法：$raw")
+        }
+        // 目录也要能开（「显示文件位置」传的是父目录）。
+        val isDir = target.isDirectory
+        if (!isDir && !target.isFile) return 1 to errorJson("NO_FILE", "路径不存在：$raw")
+
+        if (isDir) return revealDirectory(ctx, target)
+
+        val uri = KxxyFilesProvider.uriForAbsolute(ctx, target.path)
+            ?: return 1 to errorJson(
+                "UNSUPPORTED",
+                "只能打开引擎目录或工作区（${
+                    EngineConfig.engineRoot(ctx).absolutePath
+                } / ${EngineConfig.dshHome(ctx).absolutePath}）内的路径，实际为 $target。",
+            )
+
+        val mime = mimeForOpen(target)
+
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return try {
+            ctx.startActivity(intent)
+            0 to ""
+        } catch (e: android.content.ActivityNotFoundException) {
+            1 to errorJson(
+                "NO_ACTIVITY",
+                "没有应用能打开 ${target.name}（MIME=$mime）。" +
+                    if (mime == APK_MIME) "请确认系统安装器可用、并已允许本应用安装未知来源应用。" else "",
+            )
+        } catch (e: Throwable) {
+            1 to errorJson("NO_ACTIVITY", e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    /**
+     * 「显示文件位置」在 Android 上的等价实现 —— 把路径如实显示出来。
+     *
+     * 为什么不能真的「在文件管理器中定位」：Android 没有 Finder/Explorer 的
+     * `reveal` 语义。系统 DocumentsUI 只认 `DocumentsProvider` 的 document
+     * URI，而本工程的 [KxxyFilesProvider] 是普通 ContentProvider（没有
+     * `DocumentsContract` 那一套），给它一个目录 URI 只会弹「无法打开」；
+     * 工作区又位于 app 私有目录，不在 DocumentsUI 的任何 root 里 —— 换任何
+     * 写法都定位不过去。
+     *
+     * 所以这里退化为**如实把路径告诉用户**：Toast 显示完整路径并返回成功。
+     * 这不是「假装成功」——用户确实拿到了位置（可以据此在终端里 `cd`）；
+     * 要打开文件本身，交付卡片的主按钮才是那个动作。
+     */
+    private fun revealDirectory(ctx: Context, dir: File): Pair<Int, String> {
+        val shown = dir.absolutePath
+        Handler(Looper.getMainLooper()).post {
+            runCatching {
+                Toast.makeText(
+                    ctx,
+                    "位置：$shown\n（Android 没有「在文件管理器中定位」，可在终端里进入该目录）",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+        Log.i(TAG, "reveal -> toast: $shown")
+        return 0 to ""
+    }
+
+    /**
+     * 打开动作的 MIME 判定。
+     *
+     * 刻意**不**直接用 `contentResolver.getType(uri)`：那会走
+     * [KxxyFilesProvider] 的 MIME 表，而那张表是给「分享出去」用的（未知
+     * 后缀一律 `application/octet-stream`）。`application/octet-stream` 会让
+     * 系统把 `.apk` 当成普通二进制、根本不唤起安装器 —— 这正是「点了没反应」
+     * 的另一个出口。所以这里对 `.apk` 强制指定，其余才回落到 MimeTypeMap /
+     * provider。
+     */
+    private fun mimeForOpen(file: File): String {
+        val ext = file.name.substringAfterLast('.', "").lowercase()
+        if (ext == "apk") return APK_MIME
+        android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)?.let { return it }
+        return "application/octet-stream"
+    }
+
     // ── 引擎侧 shim 安装 ─────────────────────────────────────────────────
 
     private const val DEFAULT_CHANNEL = "kxxy-termux-api"
 
+    /**
+     * 通知 id 的自增序号。
+     *
+     * 只用于「同一毫秒内连发两条且都没给 `--id`」这一种情况：以前 id 兜底是
+     * `currentTimeMillis() % 100000`，每 100 秒必然撞一次，后一条静默覆盖
+     * 前一条 —— 而且 `termux-notification-list` 里只能看到一条。
+     */
+    private val notifSeq = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** APK 的 MIME：少了它系统不会把 Intent 路由到 PackageInstaller。 */
+    private const val APK_MIME = "application/vnd.android.package-archive"
     /** 要替换掉的 ELF 转发层（两个都得删：后者是前者的软链目标）。 */
     private val SHIM_TARGETS = listOf(
         "libexec/termux-api",

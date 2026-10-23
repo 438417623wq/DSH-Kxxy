@@ -2,6 +2,8 @@ package app.kxxy.engine
 
 import android.content.Context
 import android.util.Log
+import app.kxxy.R
+import app.kxxy.service.Notifier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -77,6 +79,15 @@ class EngineSupervisor(private val ctx: Context) {
 
     private val _installProgress = MutableStateFlow(0f)
     val installProgress: StateFlow<Float> = _installProgress.asStateFlow()
+
+    /**
+     * 构建元数据快照（缺陷 DP）。
+     *
+     * 取一次缓存住：`publishState()` 每 5 秒被心跳调一次，而快照里的
+     * versionName / 指纹在整个进程生命周期内不可能变。`lazy` 而非 `val` 直接
+     * 算，是因为它要读 assets —— 构造函数里做 IO 会让 Activity 启动多一次阻塞。
+     */
+    private val buildSnapshot: BuildMeta.Snapshot by lazy { BuildMeta.snapshot(ctx) }
 
     @Volatile
     private var process: EngineProcess? = null
@@ -194,8 +205,174 @@ class EngineSupervisor(private val ctx: Context) {
                         continue
                     }
                 }
+
+                // 「需要你确认」的请求（方案 B3）。排最后，因为它最轻：
+                // 只是发一条通知，不影响引擎生命周期。
+                consumeAttentionRequests()
+                sweepStaleAttention()
             }
         }
+    }
+
+    /**
+     * 消费引擎写来的 attention 请求（方案 B3）。
+     *
+     * 协议与另外三种请求同构 —— 引擎往 `engine/attention/request.json` 写一个
+     * JSON，原生这边读走、删掉、发通知；用户点按钮时由
+     * [app.kxxy.service.AttentionReceiver] 往同目录写 `response-*.json`，引擎
+     * 自己轮询取走。全程没有任何长连接或 AIDL：引擎可能重启、可能崩，
+     * 文件交换是唯一不会因为「另一头不在」而失败的方式。
+     *
+     * 为什么一次只取一个：请求文件是**单槽**的，引擎连发两条会互相覆盖。
+     * 这是有意的取舍 —— 通知栏本来就该合并同类项，真需要排队的情况
+     * （批量权限请求）由引擎自己合并成一条「N 个请求」再发。
+     */
+    /** 上次清理 `attention/` 目录的时刻，用来给逐轮轮询做节流。 */
+    private var attentionSweepAt = 0L
+
+    /**
+     * 清理 `attention/` 下的过期文件。
+     *
+     * 这个目录里堆的东西只有两种来源：`active-*.json`（原生发通知时写的待办
+     * 副本）与引擎没取走的回执。前者正常情况会被「用户回答」删掉，但用户锁屏
+     * 走开、通知被系统清掉、或者应用被杀，都会留下永远没人删的记录 ——
+     * 攒多了以后控制台每次轮询都要把它们全读一遍，而且会看到一堆早已作废的
+     * 「待确认」卡片。
+     *
+     * 24 小时是刻意的宽松值：跨夜还在的请求，用户第二天点进去也还是有意义的；
+     * 再久就纯属垃圾。节流两分钟一次，扫的只是几个小文件，开销可以忽略。
+     */
+    private fun sweepStaleAttention() {
+        val now = System.currentTimeMillis()
+        if (now - attentionSweepAt < 2 * 60 * 1000L) return
+        attentionSweepAt = now
+        runCatching {
+            val dir = File(EngineConfig.engineRoot(ctx), "attention")
+            if (!dir.isDirectory) return@runCatching
+            val cutoff = now - 24 * 60 * 60 * 1000L
+            dir.listFiles()?.forEach { f ->
+                if (f.isFile && f.lastModified() < cutoff) {
+                    Log.i(TAG, "attention sweep: drop stale ${f.name}")
+                    f.delete()
+                }
+            }
+        }.onFailure { Log.w(TAG, "attention sweep failed: ${it.message}") }
+    }
+
+    private fun consumeAttentionRequests() {
+        val file = File(EngineConfig.engineRoot(ctx), "attention/request.json")
+        if (!file.isFile) return
+
+        val raw = runCatching { file.readText() }.getOrNull()
+        runCatching { file.delete() }
+        if (raw.isNullOrBlank()) return
+
+        val parsed = runCatching { org.json.JSONObject(raw) }.getOrNull()
+        if (parsed == null) {
+            Log.w(TAG, "attention.request malformed, dropped")
+            return
+        }
+
+        val id = parsed.optString("id")
+        if (id.isBlank()) {
+            Log.w(TAG, "attention.request without id, dropped")
+            return
+        }
+
+        val actionsRaw = parsed.optJSONArray("actions")
+        val actions = buildList {
+            if (actionsRaw != null) {
+                for (i in 0 until actionsRaw.length()) {
+                    val a = actionsRaw.optJSONObject(i) ?: continue
+                    val key = a.optString("key")
+                    if (key.isBlank()) continue
+                    add(
+                        Notifier.Action(
+                            key = key,
+                            label = a.optString("label").ifBlank { key },
+                        )
+                    )
+                }
+            }
+        }
+
+        // 没给按钮时补一对默认的「允许 / 拒绝」：权限类请求最怕的就是
+        // 通知上只有一条正文，用户点了才发现要回应用里再点一次。
+        val finalActions = actions.ifEmpty {
+            if (parsed.optString("kind") == "permission") {
+                listOf(
+                    Notifier.Action("allow", ctx.getString(R.string.notif_action_allow)),
+                    Notifier.Action("deny", ctx.getString(R.string.notif_action_deny)),
+                )
+            } else {
+                emptyList()
+            }
+        }
+
+        val attention = Notifier.Attention(
+            id = id,
+            sessionId = parsed.optString("sessionId").ifBlank { null },
+            kind = parsed.optString("kind").ifBlank { "question" },
+            title = parsed.optString("title").ifBlank { ctx.getString(R.string.notif_title) },
+            body = parsed.optString("body"),
+            actions = finalActions,
+            createdAt = parsed.optLong("createdAt", System.currentTimeMillis()),
+        )
+
+        Log.i(TAG, "attention.request consumed: id=$id kind=${attention.kind}")
+        Notifier.notifyAttention(ctx, attention)
+
+        // 留一份「待办」副本（方案 B3 的配套）。
+        //
+        // 为什么需要它：`request.json` 是单槽的，原生读走后必须立刻删除，
+        // 否则下一轮轮询会把同一条请求再发一次通知。但这样一来，用户从通知
+        // 正文点进应用后，控制台就再也找不到「刚才那条请求是什么」了 ——
+        // 只剩通知栏里那条通知。
+        //
+        // 所以这里另存一份按 id 命名的 active 记录：控制台读它渲染待确认卡片，
+        // 用户回答后由 AttentionReceiver 删掉。写入者与删除者都只有原生侧，
+        // 不存在两边各写一份导致的不一致。
+        runCatching {
+            val dir = File(EngineConfig.engineRoot(ctx), "attention").apply { mkdirs() }
+            val safe = id.replace(Regex("[^A-Za-z0-9._-]"), "_").take(64)
+            val target = File(dir, "active-$safe.json")
+            val tmp = File(dir, "${target.name}.tmp")
+            tmp.writeText(
+                buildString {
+                    append("{\n")
+                    append("  \"id\": ").append(jsonString(id)).append(",\n")
+                    attention.sessionId?.let { append("  \"sessionId\": ").append(jsonString(it)).append(",\n") }
+                    append("  \"kind\": ").append(jsonString(attention.kind)).append(",\n")
+                    append("  \"title\": ").append(jsonString(attention.title)).append(",\n")
+                    append("  \"body\": ").append(jsonString(attention.body)).append(",\n")
+                    append("  \"createdAt\": ").append(attention.createdAt).append(",\n")
+                    append("  \"source\": \"notification\"\n")
+                    append("}\n")
+                }
+            )
+            if (!tmp.renameTo(target)) {
+                target.writeText(tmp.readText())
+                tmp.delete()
+            }
+        }.onFailure { Log.w(TAG, "attention active record failed: ${it.message}") }
+    }
+
+    /** 最小 JSON 字符串转义（只处理我们自己会写出的字符）。 */
+    private fun jsonString(value: String): String {
+        val sb = StringBuilder(value.length + 2)
+        sb.append('"')
+        for (ch in value) {
+            when (ch) {
+                '"' -> sb.append("\\\"")
+                '\\' -> sb.append("\\\\")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                '\t' -> sb.append("\\t")
+                else -> if (ch < ' ') sb.append("\\u%04x".format(ch.code)) else sb.append(ch)
+            }
+        }
+        sb.append('"')
+        return sb.toString()
     }
 
     /**
@@ -590,6 +767,30 @@ class EngineSupervisor(private val ctx: Context) {
                 append("  \"effectivePrivMode\": \"$effectivePrivMode\",\n")
                 append("  \"permissions\": ${permissionSnapshot()},\n")
                 append("  \"privAvailable\": ${privAvailability()},\n")
+                /*
+                 * 构建元数据（缺陷 DP）。
+                 *
+                 * 四个值缺一不可，且**必须由原生侧给出**：引擎跑在自己的进程里，
+                 * 它连「APK 是哪个 versionCode」都看不到，而用户排障时第一句
+                 * 永远是「你装的是哪一版」。
+                 *
+                 * 契约：kxxy-host 的 `/kxxy/api/state` 用 `Object.assign` 把这份
+                 * JSON 摊平后返回，所以 `build.*` 会原样出现在响应里 —— 前端
+                 * 不需要为它改任何路由。
+                 */
+                append("  \"build\": ${buildSnapshot.toJson()},\n")
+                /*
+                 * 通知可用性（方案 B5）。
+                 *
+                 * 控制台体检页需要这三个值才能解释一种最难自查的故障：
+                 * 引擎明明在跑、请求也确实发出来了，但用户手机上一次都没响过 ——
+                 * 因为通知权限被系统或 ROM 关掉了。没有这三个值，体检页只能说
+                 * 「一切正常」，把问题甩回给用户。
+                 *
+                 * 与上面 `build` 同理：kxxy-host 用 Object.assign 摊平，
+                 * 前端拿到的是 `notifications.enabled` 之类。
+                 */
+                append("  \"notifications\": ${notificationSnapshot()},\n")
                 append("  \"updatedAt\": ${System.currentTimeMillis()}\n")
                 append("}\n")
             }
@@ -605,6 +806,34 @@ class EngineSupervisor(private val ctx: Context) {
             }
         }.onFailure { Log.w(TAG, "publishState failed: ${it.message}") }
     }
+
+    /**
+     * 通知可用性快照（方案 B5，控制台体检页的数据源）。
+     *
+     * 三个值分别回答三个不同的问题：
+     *
+     *   · `enabled` —— 应用级通知总开关。关掉后**所有**通知都发不出去，
+     *     包括常驻状态条。
+     *   · `attentionImportance` —— 「需要你确认」这条渠道的当前重要性。
+     *     Android 允许用户单独把某条渠道静音，此时 `enabled` 仍是 true，
+     *     但最重要的那类通知已经不响了。
+     *   · `attentionBlocked` —— 上面那条的布尔化，前端不必知道重要性常量表。
+     *
+     * 全部即时查询，不做缓存：用户可能在设置里改完就切回来，缓存会给出
+     * 与事实相反的结论。
+     */
+    private fun notificationSnapshot(): String = runCatching {
+        val st = Notifier.status(ctx)
+        buildString {
+            append("{")
+            append("\"enabled\": ").append(st.enabled).append(", ")
+            append("\"attentionImportance\": ").append(st.attentionImportance).append(", ")
+            append("\"attentionBlocked\": ").append(st.attentionBlocked)
+            append("}")
+        }
+    }.getOrDefault(
+        "{\"enabled\": true, \"attentionImportance\": -1, \"attentionBlocked\": false}"
+    )
 
     /**
      * Android 能力开关快照（设置页「系统权限」卡片的数据源）。

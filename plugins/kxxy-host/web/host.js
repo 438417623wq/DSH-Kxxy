@@ -46,6 +46,17 @@
   /** 最近一次 /kxxy/api/state 快照（权限可用性灰化用）。 */
   let lastStateSnapshot = null;
 
+  /**
+   * 原生层给的构建元数据（`engine.build`）。
+   *
+   * 单独存一份而不是每次去翻 lastStateSnapshot：关于弹窗打开时要立刻渲染，
+   * 而 lastStateSnapshot 的结构随 API 演进而变，隔离出来以后这边不受影响。
+   */
+  let lastBuild = null;
+
+  /** 上一次渲染用的 build 序列化串 —— 轮询每几秒一次，值没变就别碰 DOM。 */
+  let lastBuildKey = '';
+
   const CATEGORY_LABELS = {
     toolchain: '语言与编译链',
     media: '媒体与文档',
@@ -60,6 +71,15 @@
     headerPulseDot: document.getElementById('header-pulse-dot'),
     headerStatusLabel: document.getElementById('header-status-label'),
     toastContainer: document.getElementById('toast-container'),
+
+    // 通用确认弹窗
+    confirmDialog: document.getElementById('confirm-dialog'),
+    confirmPanel: document.getElementById('confirm-panel'),
+    confirmTitle: document.getElementById('confirm-title'),
+    confirmDesc: document.getElementById('confirm-desc'),
+    confirmStats: document.getElementById('confirm-stats'),
+    btnConfirmOk: document.getElementById('btn-confirm-ok'),
+    btnConfirmCancel: document.getElementById('btn-confirm-cancel'),
 
     // 概览视图元素
     engineStatusText: document.getElementById('engine-status-text'),
@@ -99,6 +119,14 @@
     aboutEntry: document.getElementById('about-entry'),
     aboutDialog: document.getElementById('about-dialog'),
     aboutDialogVersion: document.getElementById('about-dialog-version'),
+    aboutVersionCode: document.getElementById('about-version-code'),
+    aboutCommit: document.getElementById('about-commit'),
+    aboutBuildTime: document.getElementById('about-buildtime'),
+    aboutFpBlock: document.getElementById('about-fp-block'),
+    aboutRuntimeFp: document.getElementById('about-runtime-fp'),
+    aboutHostFp: document.getElementById('about-host-fp'),
+    aboutRepoLink: document.getElementById('about-repo-link'),
+    headerVersion: document.getElementById('header-version'),
     btnAboutClose: document.getElementById('btn-about-close'),
     btnAboutDismiss: document.getElementById('btn-about-dismiss'),
     btnRestartEngine: document.getElementById('btn-restart-engine'),
@@ -123,6 +151,7 @@
     healthBusyDesc: document.getElementById('health-busy-desc'),
     btnHealthRefresh: document.getElementById('btn-health-refresh'),
     btnHealthUndo: document.getElementById('btn-health-undo'),
+    attentionHost: document.getElementById('attention-host'),
 
     // 导航 Tab
     tabItems: document.querySelectorAll('.tab-item'),
@@ -157,6 +186,85 @@
   }
 
   // ==========================================
+  // 确认弹窗（替代原生 confirm）
+  // ==========================================
+  /**
+   * 应用内确认弹窗，语义与 window.confirm 一致但返回 Promise<boolean>。
+   *
+   * 为什么不用原生 confirm：Android WebView 会在弹窗顶部加一行
+   * 「网址为 http://127.0.0.1 的网页显示：」—— 那是浏览器给「不可信页面」
+   * 的提示，出现在自家控制台里既吓人又像出了故障；而且原生弹窗只能吃一段
+   * 纯文本，没法把「26 个扩展 / 约 1.2 GB / 逐个解包」拆成好读的摘要。
+   *
+   * @param {object} opts
+   * @param {string} opts.title    标题（一行，短）
+   * @param {string} opts.desc     说明正文，可含 \n
+   * @param {Array<{label:string,value:string}>} [opts.stats] 统计胶囊
+   * @param {'default'|'warning'} [opts.tone] 强调色，warning 用于卸载/危险操作
+   * @param {string} [opts.okText] 确认按钮文案
+   * @param {string} [opts.cancelText] 取消按钮文案
+   */
+  function confirmDialog(opts) {
+    const o = opts || {};
+    if (!dom.confirmDialog) {
+      // 极端情况（DOM 未就绪）：退回原生，保证操作不会静默失效
+      return Promise.resolve(window.confirm(`${o.title || '确认操作'}\n\n${o.desc || ''}`));
+    }
+
+    return new Promise((resolve) => {
+      const panel = dom.confirmPanel;
+      panel.setAttribute('data-tone', o.tone === 'warning' ? 'warning' : 'default');
+      dom.confirmTitle.textContent = o.title || '确认操作';
+      dom.confirmDesc.textContent = o.desc || '';
+      dom.confirmDesc.hidden = !o.desc;
+      dom.btnConfirmOk.textContent = o.okText || '确定';
+      dom.btnConfirmCancel.textContent = o.cancelText || '取消';
+
+      // 统计胶囊：没有就整行隐藏，避免留一条空白间距
+      if (Array.isArray(o.stats) && o.stats.length > 0) {
+        dom.confirmStats.innerHTML = o.stats
+          .filter((s) => s && s.value)
+          .map((s) => `<span class="confirm-stat">${escapeHtml(s.label || '')}<b>${escapeHtml(s.value)}</b></span>`)
+          .join('');
+        dom.confirmStats.hidden = dom.confirmStats.innerHTML === '';
+      } else {
+        dom.confirmStats.innerHTML = '';
+        dom.confirmStats.hidden = true;
+      }
+
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        dom.confirmDialog.setAttribute('data-open', 'false');
+        dom.btnConfirmOk.removeEventListener('click', onOk);
+        dom.btnConfirmCancel.removeEventListener('click', onCancel);
+        dom.confirmDialog.removeEventListener('click', onBackdrop);
+        document.removeEventListener('keydown', onKey);
+        resolve(ok);
+      };
+      const onOk = () => finish(true);
+      const onCancel = () => finish(false);
+      // 点遮罩（而不是卡片本身）等同取消；点到卡片内部不算
+      const onBackdrop = (e) => {
+        if (e.target === dom.confirmDialog) finish(false);
+      };
+      const onKey = (e) => {
+        if (e.key === 'Escape') finish(false);
+      };
+
+      dom.btnConfirmOk.addEventListener('click', onOk);
+      dom.btnConfirmCancel.addEventListener('click', onCancel);
+      dom.confirmDialog.addEventListener('click', onBackdrop);
+      document.addEventListener('keydown', onKey);
+
+      dom.confirmDialog.setAttribute('data-open', 'true');
+      // 焦点给「确定」：外接键盘 / 无障碍场景下回车即可继续
+      try { dom.btnConfirmOk.focus({ preventScroll: true }); } catch { /* 老 WebView 无参签名 */ }
+    });
+  }
+
+  // ==========================================
   // 辅助格式化函数
   // ==========================================
   function escapeHtml(str) {
@@ -182,6 +290,8 @@
     const n = Number(bytes) || 0;
     if (n <= 0) return '';
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+    // 批量激活一次可能选满 26 项（合计 1.2 GiB+），只有 MB 档会印成「1228.8 MB」
+    if (n >= 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
     return `${(n / 1024 / 1024).toFixed(1)} MB`;
   }
 
@@ -354,6 +464,17 @@
       if (dom.infoNodeVer && engine.node) {
         dom.infoNodeVer.textContent = engine.node;
       }
+
+      // 5b) 构建元数据（缺陷 DP）：值变了才重渲染 —— 轮询是最秒级的，
+      // 每轮都去写六七个 textContent 会让「关于」弹窗打开时闪一下。
+      if (engine.build && typeof engine.build === 'object') {
+        const buildKey = JSON.stringify(engine.build);
+        if (buildKey !== lastBuildKey) {
+          lastBuildKey = buildKey;
+          lastBuild = engine.build;
+          renderAboutBuild(lastBuild);
+        }
+      }
       // 主题偏好：随轮询刷新（官方设置页改了外观，控制台几秒内跟随）
       if (engine.themePreference && engine.themePreference !== themePreference) {
         themePreference = engine.themePreference;
@@ -366,6 +487,8 @@
       }
       // 6) 系统权限卡片
       renderPermissions(engine);
+      // 6b) 待确认请求（方案 B3）：与状态同一个轮询周期，不额外开定时器
+      refreshAttention();
       // 终端 shell 缓存自愈（原「终端」页已删，这里静默处理）
       repairShellCache(runtime.engineRoot);
     } catch {
@@ -461,8 +584,43 @@
   function renderPermissions(engine) {
     if (!dom.permList) return;
     const perms = engine.permissions || {};
+
+    /*
+     * 通知这一行有三种状态，混成「已授权 / 未授权」两种会掩盖最麻烦的那种：
+     *
+     *   ① 未授权 —— 请求系统对话框；
+     *   ② 已授权，但「需要你确认」这条渠道被单独静音 —— 应用级开关和权限都是
+     *      对的，可最重要的通知就是不响。用户自己几乎不可能想到是渠道级设置，
+     *      所以这里要主动点出来，并把按钮直送渠道列表；
+     *   ③ 都正常。
+     */
+    const notifEnabled = perms.notifications === true;
+    const attentionBlocked = engine.notifications && engine.notifications.attentionBlocked === true;
+    const notifRow = (notifEnabled && !attentionBlocked)
+      ? {
+          label: '通知',
+          desc: '引擎状态常驻通知与待确认请求（正常）',
+          value: true,
+          action: null,
+        }
+      : notifEnabled
+        ? {
+            label: '通知',
+            desc: '「需要你确认」渠道被静音 —— 有请求时不会响。点右侧去系统设置恢复。',
+            value: true,
+            action: 'notification-channels',
+            actionLabel: '去设置',
+          }
+        : {
+            label: '通知',
+            desc: '引擎状态常驻通知（Android 13+ 需授权）',
+            value: false,
+            action: 'notifications',
+            actionLabel: '去授权',
+          };
+
     const rows = [
-      { label: '通知', desc: '引擎状态常驻通知（Android 13+ 需授权）', value: perms.notifications, action: 'notifications', actionLabel: '去授权' },
+      notifRow,
       { label: '所有文件访问', desc: '导出日志写入 Download/kxxy/（Android 11+，系统设置页开启）', value: perms.allFiles, action: 'all-files', actionLabel: '去开启' },
       { label: '电池优化白名单', desc: '防止后台引擎被系统休眠策略中止', value: perms.battery, action: 'battery', actionLabel: '去设置' },
     ];
@@ -481,7 +639,9 @@
           <span class="setting-desc">${escapeHtml(row.desc)}</span>
         </div>
       `;
-      if (!granted && row.action) {
+      // 注意条件里没有 granted：渠道被静音时 value 仍是 true，
+      // 但用户恰恰需要一个按钮去修它。
+      if (row.action) {
         const btn = el(`<button class="button button-subtle button-sm">${escapeHtml(row.actionLabel)}</button>`);
         btn.addEventListener('click', () => {
           // kxxy:// 由原生层拦截（应设置页在 WebView 内，权限请求必须由 Activity 发起）
@@ -491,6 +651,133 @@
       }
       dom.permList.appendChild(div);
     });
+  }
+
+  // ==========================================
+  // 待确认请求（方案 B3）
+  //
+  // 数据来自 engine/attention/active-*.json：原生侧在发出通知时写下、
+  // 用户回答后删除。这里只做「展示 + 回答」两件事，回答写出的回执格式
+  // 与通知栏按钮完全一致（都由 kxxy 后端落盘），所以两条路径不会打架。
+  // ==========================================
+
+  /** 上一次渲染用的 id 列表，用来避免每 5 秒重播一次入场动画。 */
+  let attentionKey = '';
+
+  async function refreshAttention() {
+    if (!dom.attentionHost) return;
+    let data = null;
+    try {
+      // 刻意不用 apiGet：它在失败时会弹 toast，而这个接口在旧版引擎
+      // （没有 attention 路由）上必然 404，每 5 秒弹一次会把用户逼疯。
+      const res = await fetch('/kxxy/api/attention/active', {
+        headers: { Accept: 'application/json' },
+        cache: 'no-store',
+      });
+      if (!res.ok) return;
+      data = await res.json();
+    } catch {
+      return;
+    }
+
+    const list = data && Array.isArray(data.active) ? data.active : [];
+    const key = list.map((x) => x.id).join('|');
+    if (key === attentionKey) return;
+    attentionKey = key;
+    renderAttention(list);
+  }
+
+  function renderAttention(list) {
+    const host = dom.attentionHost;
+    if (!host) return;
+
+    if (!list.length) {
+      host.hidden = true;
+      host.innerHTML = '';
+      return;
+    }
+
+    host.hidden = false;
+    host.innerHTML = '';
+    // 最多展示三条：再多就不是「提醒」而是「第二个待办清单」了，
+    // 剩下的留给通知栏。
+    list.slice(0, 3).forEach((item) => host.appendChild(attentionCard(item)));
+  }
+
+  function attentionCard(item) {
+    const kind = String(item.kind || 'question');
+    const card = el(`
+      <div class="attention-card" data-kind="${escapeHtml(kind)}">
+        <div class="attention-glyph" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 9v4M12 17h.01"/>
+            <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/>
+          </svg>
+        </div>
+        <div class="attention-main">
+          <div class="attention-top">
+            <span class="attention-kicker">${escapeHtml(attentionKindLabel(kind))}</span>
+            <span class="attention-time">${escapeHtml(formatRelativeTime(item.createdAt))}</span>
+          </div>
+          <div class="attention-title">${escapeHtml(item.title || '需要你确认')}</div>
+          ${item.body ? `<div class="attention-body">${escapeHtml(item.body)}</div>` : ''}
+          <div class="attention-actions"></div>
+        </div>
+      </div>
+    `);
+
+    const slot = card.querySelector('.attention-actions');
+    const actions = Array.isArray(item.actions) && item.actions.length
+      ? item.actions
+      // 没有按钮时给一个「知道了」：至少让用户能把这条清掉，
+      // 否则卡片会一直挂在那儿，看起来像页面坏了。
+      : [{ key: 'ack', label: '知道了' }];
+
+    actions.forEach((action, index) => {
+      const btn = el(`<button class="button button-sm ${index === 0 ? 'button-primary' : 'button-subtle'}">${escapeHtml(action.label || action.key)}</button>`);
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          const res = await fetch('/kxxy/api/attention/answer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ id: item.id, action: action.key, sessionId: item.sessionId ?? null }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          showToast('已回复', 'success');
+          attentionKey = '';
+          refreshAttention();
+        } catch (err) {
+          btn.disabled = false;
+          showToast(`回复失败: ${err.message}`, 'error');
+        }
+      });
+      slot.appendChild(btn);
+    });
+
+    return card;
+  }
+
+  function attentionKindLabel(kind) {
+    switch (kind) {
+      case 'permission': return '需要授权';
+      case 'question': return '需要回答';
+      case 'failed': return '执行失败';
+      case 'done': return '已完成';
+      default: return '需要确认';
+    }
+  }
+
+  /** 相对时间：通知栏与卡片用同一套措辞，避免「3 分钟前」和「20:31」混用。 */
+  function formatRelativeTime(ts) {
+    const value = Number(ts) || 0;
+    if (!value) return '';
+    const diff = Date.now() - value;
+    if (diff < 60_000) return '刚刚';
+    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+    const d = new Date(value);
+    return `${d.getMonth() + 1} 月 ${d.getDate()} 日`;
   }
 
   function renderRuntimeChecks(checks) {
@@ -766,8 +1053,14 @@
     jobPollTimers.add(timer);
   }
 
-  function removeExtension(id, name) {
-    if (!confirm(`确定要卸载扩展 ${name} 吗？其命令会从 PATH 中移除。`)) return Promise.resolve();
+  async function removeExtension(id, name) {
+    const ok = await confirmDialog({
+      title: '卸载扩展',
+      desc: `将从运行时中移除「${name}」，其命令会从 PATH 中移除。`,
+      tone: 'warning',
+      okText: '卸载',
+    });
+    if (!ok) return;
     return apiPost('/kxxy/api/extensions/remove', { id })
       .then((res) => {
         showToast(`扩展 ${name} 已卸载（清理 ${res.removedBins || 0} 个命令 / ${res.removedLibs || 0} 个库）`, 'success');
@@ -823,7 +1116,22 @@
         .map((id) => renderedItems.find((i) => i.id === id))
         .filter((i) => i && !i.installed && i.bundled);
       if (!targets.length) return;
-      if (!confirm(`确定要批量激活 ${targets.length} 个扩展吗？将在后台依次本地解包。`)) return;
+
+      // 统计胶囊：数量 / 总体积 / 解包来源。体积取包池里 .pool 的真实字节数，
+      // 比「26 个扩展」这种纯数量提示更能让人判断要不要现在动手。
+      const totalBytes = targets.reduce((sum, i) => sum + (Number(i.sizeBytes) || 0), 0);
+      const totalLabel = totalBytes > 0 ? formatSize(totalBytes) : '';
+      const ok = await confirmDialog({
+        title: `激活 ${targets.length} 个扩展`,
+        desc: '将在后台依次本地解包，全程无需联网。\n解包期间可以继续使用其他页面，完成情况会汇总提示。',
+        stats: [
+          { label: '扩展', value: `${targets.length} 个` },
+          totalLabel ? { label: '解包体积', value: totalLabel } : null,
+          { label: '来源', value: '内置包池' },
+        ].filter(Boolean),
+        okText: `激活 ${targets.length} 个`,
+      });
+      if (!ok) return;
 
       dom.btnExtBatchInstall.disabled = true;
       let done = 0;
@@ -857,7 +1165,14 @@
         .map((id) => renderedItems.find((i) => i.id === id))
         .filter((i) => i && i.installed);
       if (!targets.length) return;
-      if (!confirm(`确定要卸载所选的 ${targets.length} 个扩展吗？其命令会从 PATH 中移除。`)) return;
+      const ok = await confirmDialog({
+        title: `卸载 ${targets.length} 个扩展`,
+        desc: '这些扩展的命令会从 PATH 中移除。已生成的文件与工作区内容不受影响。',
+        stats: [{ label: '扩展', value: `${targets.length} 个` }],
+        tone: 'warning',
+        okText: `卸载 ${targets.length} 个`,
+      });
+      if (!ok) return;
       dom.btnExtBatchRemove.disabled = true;
       let done = 0;
       for (const item of targets) {
@@ -904,14 +1219,148 @@
   // 只是控制台不再暴露测速/切换 UI）。
   // 原「宿主环境参数」卡片的内容整体移进了这个弹窗。
 
-  /** 打开「关于」弹窗（版本号从页头同步，避免两处各写一份）。 */
+  /**
+   * 打开「关于」弹窗。
+   *
+   * 这里**不再**从页头 `.header-version` 抄版本号：那是 DSH 前端（引擎里那套
+   * React 应用）的版本，与 APK 毫无关系 —— 用户报障时说「XX 坏了」，两边拿
+   * 这个号去对，谁都对不上。现在显示原生层给的 versionName（见
+   * renderAboutBuild），真值要等第一次轮询回来，所以这里先按手头缓存渲染
+   * 一遍，避免弹出瞬间是空的。
+   */
   function openAboutDialog() {
     if (!dom.aboutDialog) return;
-    const headerVersion = document.querySelector('.header-version');
-    if (dom.aboutDialogVersion && headerVersion) {
-      dom.aboutDialogVersion.textContent = headerVersion.textContent.trim();
-    }
+    renderAboutBuild(lastBuild);
     dom.aboutDialog.setAttribute('data-open', 'true');
+  }
+
+  /**
+   * 把原生层的构建元数据铺进关于弹窗。
+   *
+   * 数据来源：`EngineSupervisor.publishState()` 写进 `kxxy-state.json` 的
+   * `build` 对象 → `/kxxy/api/state` 的 `engine.build`。
+   *
+   * 为什么这事必须由原生层做：引擎跑在自己的进程里，它连「APK 是哪个
+   * versionCode」都看不到。而排障第一句永远是「你装的是哪一版」。
+   */
+  function renderAboutBuild(build) {
+    if (!build || typeof build !== 'object') return;
+
+    const versionName = String(build.versionName || '').trim();
+    if (dom.aboutDialogVersion && versionName) {
+      dom.aboutDialogVersion.textContent = versionName;
+    }
+    if (dom.aboutVersionCode) {
+      dom.aboutVersionCode.textContent =
+        build.versionCode !== undefined && build.versionCode !== null
+          ? `#${build.versionCode}`
+          : '—';
+    }
+    if (dom.aboutCommit) {
+      const commit = String(build.commit || '').trim();
+      dom.aboutCommit.textContent = commit
+        ? `${commit.slice(0, 7)}${build.dirty ? ' · 未提交' : ''}`
+        : '无 git 信息';
+      dom.aboutCommit.title = build.dirty
+        ? '构建时工作区有未提交改动'
+        : '构建时工作区干净';
+    }
+    if (dom.aboutBuildTime) {
+      dom.aboutBuildTime.textContent = formatBuildTime(build.buildTime);
+      dom.aboutBuildTime.title = String(build.buildTime || '');
+    }
+
+    // 指纹行：展示前 16 位（够区分），完整值挂在 title 上。
+    // 两个都拿不到（旧 APK / 原生层未就绪）时整块收起，而不是显示两行「—」。
+    const rt = normaliseFp(build.runtimeFingerprint);
+    const host = normaliseFp(build.hostPluginFingerprint);
+    if (dom.aboutFpBlock) {
+      dom.aboutFpBlock.dataset.empty = rt || host ? 'false' : 'true';
+      // 运行时体积/条目数顺手放进 title，省一行 UI，排查时又能看到
+      if (dom.aboutFpBlock && build.runtimeSize > 0) {
+        dom.aboutFpBlock.title =
+          `runtime.zip ≈ ${(build.runtimeSize / 1048576).toFixed(1)} MiB · `
+          + `${build.runtimeEntries} 条目`;
+      }
+    }
+    setFpText(dom.aboutRuntimeFp, rt, build.runtimeFingerprint);
+    setFpText(dom.aboutHostFp, host, build.hostPluginFingerprint);
+
+    // 页头左上角与仓库链接也在这里一起更新 —— 三处必须是同一个数据源，
+    // 否则就会重演「关于里是 0.9.2、页头还写着 v0.3.2-android」。
+    renderHeaderVersion(build);
+    renderRepoLink(build);
+  }
+
+  /**
+   * 页头左上角的版本号。
+   *
+   * 改造前它写死在 index.html 里（`v0.3.2-android`）：那是**插件自己的**版本，
+   * 与 APK 无关，所以用户升级 APK 之后页头永远不变 —— 这正是「左上角版本没
+   * 跟上」那条缺陷。
+   *
+   * 宽度只有十几像素的余地，所以只放主版本 + versionCode；带 `+commit` 的完整
+   * 串、以及 dirty 标记，都挂在 title 上（长按/悬停能看到）。
+   */
+  function renderHeaderVersion(build) {
+    if (!dom.headerVersion) return;
+    const versionName = String((build && build.versionName) || '').trim();
+    if (!versionName || versionName === 'unknown') return;
+    const base = versionName.split('+')[0];
+    const code = build.versionCode !== undefined && build.versionCode !== null
+      ? ` · #${build.versionCode}`
+      : '';
+    dom.headerVersion.textContent = `v${base}${code}`;
+    dom.headerVersion.title = [
+      versionName,
+      build.dirty ? '构建时工作区有未提交改动' : '',
+      build.commit ? `commit ${build.commit}` : '',
+    ].filter(Boolean).join(' · ');
+  }
+
+  /**
+   * 关于弹窗里的源码仓库链接。
+   *
+   * URL 来自构建期（`git remote get-url origin` → build.json → 原生 state），
+   * 不在前端写死：换仓库、加镜像都只改一处。拿不到就整条隐藏 —— 一个点不通
+   * 的死链比没有链接更糟。
+   */
+  function renderRepoLink(build) {
+    const link = dom.aboutRepoLink;
+    if (!link) return;
+    const url = String((build && build.repoUrl) || '').trim();
+    if (!/^https?:\/\//i.test(url)) {
+      link.hidden = true;
+      return;
+    }
+    link.href = url;
+    link.title = url;
+    link.hidden = false;
+  }
+
+  /** `unknown` / 空串统一当作「没有」处理。 */
+  function normaliseFp(value) {
+    const s = String(value || '').trim();
+    return s && s !== 'unknown' ? s : '';
+  }
+
+  function setFpText(el, shortSource, fullValue) {
+    if (!el) return;
+    if (!shortSource) {
+      el.textContent = '—';
+      el.title = '';
+      return;
+    }
+    el.textContent = shortSource.length > 16 ? `${shortSource.slice(0, 16)}…` : shortSource;
+    el.title = String(fullValue || shortSource);
+  }
+
+  /** ISO-8601（带时区偏移）→ `2026-10-22 20:01`；认不出来就原样返回。 */
+  function formatBuildTime(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return '—';
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+    return m ? `${m[1]} ${m[2]}` : s;
   }
 
   function closeAboutDialog() {
@@ -1122,9 +1571,14 @@
     const target = selectedPrivMode;
     if (!target) return;
 
-    if (target === 'root' &&
-        !confirm('确定要以 Root 模式运行引擎吗？\n\n· 启动前会自动备份并修复数据目录属主\n· 引擎将拥有系统级权限，任何由它执行的命令都不再受沙箱限制')) {
-      return;
+    if (target === 'root') {
+      const ok = await confirmDialog({
+        title: '以 Root 模式运行引擎',
+        desc: '启动前会自动备份并修复数据目录属主。\n引擎将拥有系统级权限，由它执行的命令不再受沙箱限制。',
+        tone: 'warning',
+        okText: '以 Root 运行',
+      });
+      if (!ok) return;
     }
 
     dom.btnPrivApply.disabled = true;
@@ -1155,7 +1609,12 @@
     // 重启引擎进程（真通道：restart.request → 原生层轮询消费）
     if (dom.btnRestartEngine) {
       dom.btnRestartEngine.addEventListener('click', async () => {
-        if (!confirm('确定要重启 DSH Harness 引擎进程吗？这可能会短暂中断当前任务。')) {
+        const ok = await confirmDialog({
+          title: '重启引擎进程',
+          desc: '引擎将重新启动，正在进行的任务会短暂中断。',
+          okText: '重启',
+        });
+        if (!ok) {
           return;
         }
         dom.btnRestartEngine.disabled = true;
@@ -1445,10 +1904,13 @@
 
     // L3 会重建 node_modules（联网 + 耗时长），必须二次确认。
     if (level === 'L3') {
-      const ok = confirm(
-        'L3 会备份并重建插件目录，需要联网重新下载依赖，可能需要几分钟。\n'
-        + '会话记录、工作区文件不受影响。\n\n确定继续吗？'
-      );
+      const ok = await confirmDialog({
+        title: 'L3 深度修复',
+        desc: '将备份并重建插件目录，需要联网重新下载依赖，可能需要几分钟。\n会话记录与工作区文件不受影响。',
+        stats: [{ label: '预计耗时', value: '数分钟' }, { label: '需要联网', value: '是' }],
+        tone: 'warning',
+        okText: '开始修复',
+      });
       if (!ok) return;
     }
 
@@ -1532,7 +1994,13 @@
   }
 
   async function undoLastRecovery() {
-    if (!confirm('撤销上次修复会把移走的配置文件放回去、恢复原来的插件列表，然后重启引擎。\n\n如果原来的配置本来就是坏的，撤销后引擎会再次起不来。确定继续吗？')) {
+    const ok = await confirmDialog({
+      title: '撤销上次修复',
+      desc: '会把移走的配置文件放回去、恢复原来的插件列表，然后重启引擎。\n如果原来的配置本来就是坏的，撤销后引擎会再次起不来。',
+      tone: 'warning',
+      okText: '撤销并重启',
+    });
+    if (!ok) {
       return;
     }
     setHealthBusy(true, '正在撤销…', '引擎会重启，完成后页面自动刷新');

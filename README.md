@@ -87,6 +87,7 @@ dsh-kxxy/
 │   ├── test-modern.mjs           modern.js 补齐层单测（104 行为沙箱 + blob 作用域）
 │   ├── test-archive-providers.mjs 归档 provider 单测（zip 中央目录 + epub OPF）
 │   ├── test-media-providers.mjs 媒体 provider 单测（video/audio 槽位与状态机）
+│   ├── check-mobile-layout.mjs   布局微调层叠校验（铺真实宿主 CSS + 插件 !important，无头 Chrome 读 computed style）
 │   ├── prebuilt/                 自研原生产物（Android arm64）与注入片段
 │   │   ├── documentpreview-archive/  zip / epub provider 注入片段
 │   │   └── documentpreview-media/    video / audio provider 注入片段
@@ -106,32 +107,64 @@ dsh-kxxy/
 > 所以完整重建需要本机装有 DSH 桌面版（提供 `dsh` 的 JS 依赖树与前端 dist）。
 
 ```powershell
-$node = "F:\dsh-desktop\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
-$gradle = "C:\Users\XiaoXin\.gradle\wrapper\dists\gradle-8.10.2-bin\a04bxjujx95o3nb99gddekhwo\gradle-8.10.2\bin\gradle.bat"
+$node = "C:\Users\13907\.dsh\dsh-runtimes\dsh-plugin-desktop-primary-runtime\dependencies\node\bin\node.exe"
+$py   = "C:\Users\13907\.dsh\dsh-runtimes\dsh-plugin-desktop-primary-runtime\dependencies\python\python.exe"
+$gradle = "C:\KF\fbtools\gradle\gradle-8.10.2\bin\gradle.bat"
 
-# 1) 拉取 Termux 运行时（④ 全能精选档闭包 220 包，约 310 MiB，可续跑）
+# 0) 打 app.asar（首次或上游桌面版更新后）
+
+#    从**解包形态**的 DSH 桌面版目录生成；产物约 800 MiB，后续步骤都读它。
+& $node tools/pack-asar.mjs --app "C:\KF\deepseek harness\DSH Desktop\resources\app"
+
+# 0.5) bundletool fat jar（必须在 2) 之前！）
+
+#      缺了它 build-runtime 只打一行 `! 跳过 bundletool` 就继续跑，
+
+#      runtime.zip 照样产出、APK 照样打包成功，但设备上 `bundletool`
+
+#      会 127 退出（缺陷 DL）。这一行不能挪到 2) 之后。
+if (-not (Test-Path .cache\bundletool-all.jar)) {
+  Invoke-WebRequest -UseBasicParsing -OutFile .cache\bundletool-all.jar `
+    https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar
+}
+
+# 1) 拉取 Termux 运行时（④ 全能精选档闭包 232 包，约 310 MiB，可续跑）
 & $node tools/fetch-runtime.mjs
 
 # 1.5) 解 stage（poolextract/build-runtime 依赖它；Python 3.12 标准库解 data.tar.xz）
-& "C:\Users\XiaoXin\AppData\Local\Programs\Python\Python312\python.exe" tools/lib/debextract.py --debs .cache\debs --out .cache\stage
+& $py tools/lib/debextract.py --debs .cache\debs --out .cache\stage
 
-# 1.6) 取 TeX Live 宏包树（CTAN scheme-basic，118 包 ≈ 19.9 MiB xz → 解包 84 MiB）
-& "C:\Users\XiaoXin\AppData\Local\Programs\Python\Python312\python.exe" tools/fetch-texlive.py
+# 1.6) 取 TeX Live 宏包树（CTAN scheme-basic，202 包 ≈ 46.5 MiB xz → 解包 170.9 MiB）
+& $py tools/fetch-texlive.py
 
-# 2) 装配 runtime.zip（从 app.asar 抽取 dsh 依赖树 + 打 19 个兼容补丁
+# 2) 装配 runtime.zip（从 app.asar 抽取 dsh 依赖树 + 打兼容补丁
 #    + 打包 LibreOffice wasm / CJK 字体 / 移动端插件 / 中文语言包 / TeX Live 宏包树）
-& $node tools/build-runtime.mjs
 
+#    --asar 必须显式给：脚本默认值指向不存在的 F:/dsh-desktop/resources/app.asar。
+& $node --max-old-space-size=6144 tools/build-runtime.mjs --asar .cache\app.asar --manifest .cache\manifest.json
 # 2.4) 交叉编译 android/arm64 的 go（把 <root>/etc/resolv.conf 钉进二进制）
 #      必须在 2.5 之前：fetch-extensions.mjs 会用它替换 golang.pool 里的 bin/go。
 #      幂等，约 20 秒（首次要下载 79 MB 的宿主 Go）；漏跑不会报错，但设备上
 #      `go get` 会因读不到 resolv.conf 而静默退回 127.0.0.1:53。
 powershell -File tools\build-go-android.ps1
 
-# 2.5) 构建扩展包池（J/K 组边际闭包 → assets/ext-pool/*.tar.gz + 扩展目录 extensions.json）
+# 2.5) 构建扩展包池（J/K 组边际闭包 → assets/ext-pool/*.pool + 扩展目录 extensions.json）
+
+#      脚本自带 Python 探测；本机 PATH 没有 python，用 KXXY_PYTHON 指定。
+$env:KXXY_PYTHON = $py
 & $node tools/fetch-extensions.mjs
 
-# 3) 十一套验证
+# 3) 十三套验证
+
+#    verify-runtime 与 simulate-install 的 zip 路径是**可选的**：不给就走
+
+#    「assets/runtime.zip → .cache/apk-assets-hold/runtime.zip」的探测链
+
+#    （打完 APK 后资源已被搬走，见缺陷 DJ）。
+
+#    test-extinstall 需要本机能建符号链接：Windows 上要「开发者模式」或管理员，
+
+#    两者都没有时它会打印 SKIP 并以 0 退出（不是失败，是环境缺能力，见缺陷 DM）。
 & $node tools/verify-runtime.mjs
 & $node tools/simulate-install.mjs
 & $node tools/smoke-plugin.mjs
@@ -144,6 +177,8 @@ powershell -File tools\build-go-android.ps1
 & $node tools/test-media-providers.mjs
 & $node tools/test-extinstall.mjs
 
+& $node tools/test-compat-open.mjs& $node tools/test-native-command.mjs
+& $node tools/check-mobile-layout.mjs   # 只在需要看布局层叠时跑：它会写出夹具并让你用 chrome --headless --dump-dom 读回
 # 4) 打包 APK
 #    大资源（runtime.zip + ext-pool/*.pool）必须移出 assets，构建完用流式追加器注入，
 #    再 zipalign、重签。已固化为一条命令：
@@ -191,7 +226,7 @@ powershell -File tools\build-apk.ps1
 | 3 | 路径归一化 | **1122** 个脚本的 `com.termux` 绝对路径改写成占位符（`@DSH_ROOT@` / `@DSH_HOME@` / `@DSH_TMP@` / `@DSH_FILES@` / `@DSH_DATA@`）；剔除 39 个死解释器脚本 |
 | — | 目录链接展开 | `lib/clang/latest`(316) / `lib/icu/current`(2) / `lib/terminfo`(40) 是目录型链接，必须逐成员展开 |
 | 4 | 闭包解析 | 从 asar 递归 **524 个包**；**按包实例建模**（含嵌套 node_modules） |
-| 5 | 兼容补丁 | 19 个补丁（见下） |
+| 5 | 兼容补丁 | 20 个补丁（见下） |
 | 6 | 注入 | corepack 包装器 + `kxxy-host` 插件 + 悬空 LINK 清扫 |
 | 6.5 | 打包引擎资产 | LibreOffice wasm 引擎（49 文件，剥离 `os` 字段）+ 两份 CJK 字体 |
 | 6.6 | 打包移动端插件 | 第三方 `dsh-web-mobile`（209 文件）整包塞进 `lib/node_modules/`（它进「已安装」列表靠的是启动时 `EngineConfig.ensureProfileManifest` 写 profile manifest，见缺陷 AB） |
@@ -201,8 +236,7 @@ powershell -File tools\build-apk.ps1
 | 7 | 合并 | 目录 5239 / 实体文件 52062 / LINK 1618（未压缩 1.76 GiB） |
 | 8 | 写出 | 条目 **58,920**，zip **707.22 MiB** |
 
-### 19 个兼容补丁
-
+### 20 个兼容补丁
 | 补丁 | 原因 |
 |---|---|
 | `koffi` | 换用 Android 预编译（需 ≥3.3.2） |
@@ -215,6 +249,7 @@ powershell -File tools\build-apk.ps1
 | `ripgrep` | 指向 Termux 的 aarch64 `rg` |
 | `fs-local` | 剥离 kernel32 / LibreOffice 平台分支 |
 | `attachment-local` | `link()` 退化为 `copyFile` + 目录 fsync 容忍跳过 |
+| `native-command-android` | 放行 android 的「打开/显示位置」（`canOpenNativePath` / `nativeFileManager` / `nativeFileApplications`），打开动作走 `<root>/libexec/termux-api Open`（缺陷 DG） |
 | `document-preview-unicode-sets` | PDF 分块的 `v` 标志正则（Chrome 111+）在 104 上是 `SyntaxError`，改写为 `u` 模式 |
 | `libreoffice-kit-platform` | 三处 `platform !== "linux"` 放行 `android`，启用 wasm 后端（缺陷 X） |
 | `libreoffice-kit-font-fallbacks` | 给 `FONT_FALLBACKS` 追加 Android 实存族 + 13 组 Windows/macOS 族（缺陷 X） |
@@ -226,8 +261,7 @@ powershell -File tools\build-apk.ps1
 
 ---
 
-## 五、移植过程中发现并修掉的 106 个真实缺陷
-
+## 五、移植过程中发现并修掉的 120 个真实缺陷
 这些都是**只在真机/端到端路径上才会暴露**的问题，构建全绿时完全看不出来：
 
 | # | 缺陷 | 症状 | 根因 |
@@ -261,15 +295,11 @@ powershell -File tools\build-apk.ps1
 | AA | 自研移动端适配层与官方 UI 冲突，改为内置第三方客户端插件 | 缺陷 O 的第一版修法是**注入 CSS**（`mobile.css` + `mobile.js` 打进 `</head>`），能治「设置面板挤压」与「侧栏遮挡」两件事，但覆盖面有限（弹层、状态栏安全区、软键盘顶起、触控目标尺寸都要自己补），且每处规则都靠 `[class*="语义名"]` 匹配官方运行时类名，官方一升级就可能失效 | 根因是**选错了扩展点**：官方前端本来就是可插拔的（`dsh-client-modules` 会扫 Loader entries，对每个声明了 `package.json` → `dsh.client.platform === "web"` 的包，把它的 `exports["./client"]` 挂进页面 module 图），所以正确的做法是**写一个客户端插件**，而不是从外面往里灌样式。修复：① **整体删除**自研适配层 —— 删 `android/app/src/main/java/app/kxxy/AdaptLayer.kt`（466 行）、`plugins/kxxy-host/web/mobile.css`（16,080 B）与 `mobile.js`（10,816 B）、`plugins/kxxy-host/lib/index.js` 里的 `mobileCss()`/`mobileScript()`/`injectMobileUi()` 与 `ctx.webServer.tapIndex(injectMobileUi)`，以及 `RuntimeInstaller` 的锚点 9（`kxxy-mobile-ui@N`）；② 新增**阶段 6.6** 从 npmmirror 拉 `dsh-web-mobile@3.1.0`（`unpackedSize` 4,159,505，209 文件）整包解进 `lib/node_modules/dsh-web-mobile/`，并在包内写一份 `plugin.version`（内容 `kxxy-mobile-plugin@1`）作为**锚点 10** 的探针；③ `patchDshManifest` 除 `kxxy-host` 外再写一行 `dsh-web-mobile` 进 `@deepseek-ai/dsh/package.json` 的 `dependencies` —— **这一步是决定性的**：`dsh-app-boot` 的 `collectInstallationScopePackages()` 从该 manifest 出发 BFS `dependencies` + `peerDependencies` 产出 installation scope，**只有进了 scope 的包才会被 `routeScoped` 判成 `{kind:"interception"}`**；漏掉它的话插件文件全都在设备上，但永远不产生 Loader entry，`dsh-client-modules` 扫不到，表现与「没打包」一模一样；④ 先按 `EngineConfig.overlayContent()` 的 `insert:` 列表补一行 `- id: dsh-web-mobile` / `name: dsh-web-mobile`（**不是**加进 `plugins/kxxy-host/cordis.patch.yml` —— kxxy-host 本身不是 profile bundle，那个文件在设备上根本没被加载，真正生效的一直是 `--patch android-overlay.yml`）—— **但这一步真机验收时被证明不够**：插件能跑，官方「插件」页却完全不显示它，用户仍然以为没装上；最终改为**登记进 profile manifest**（`EngineConfig.ensureProfileManifest`），并撤掉 overlay 那一行以免重复注册，详见缺陷 AB。三条硬约束：① 客户端半区通过 `package.json` 的 `dsh.client` **声明**被发现，不是通过 `cordis.patch.yml`（后者只让宿主 Loader 里有一行，且宿主半区可以是空 `apply`）；② `exports` 必须给出 `./client`，否则 `dsh-client-modules` 直接抛 `declares dsh.client but exports no "./client" bundle`；③ 内置第三方插件的整包必须**原样**落盘（含 `lib/client.js` 814,043 B 的预构建产物），构建期不重新打包 —— 它的客户端 bundle 是自研打包器（`scripts/build-client.mjs`）的产物，`require()` 的 56 个相对模块 + 3 个外部名（`react` / `react/jsx-runtime` / `@deepseek-ai/dsh-client-ui-primitives`）都依赖那个打包格式 |
 | AB | 内置插件只在 overlay 里 insert 时，官方「插件」页完全不显示它 | 插件确实在运行、移动端布局也已生效，但侧栏「插件」页只有「官方 8」一段，**没有「已安装」分组**；用户据此判定「根本没装进去」（插件页截图里 `dsh-web-mobile` 完全不出现） | 官方「插件」页（`dsh-client-ui-plugin-manager`）「已安装」分组的数据源是 `pluginManager.listBundles()`（`dsh-plugin-manager/lib/index.js:1456`）：名单 = profile 的 `dsh.profile.bundles` ∪ profile `dependencies` ∪ 安装锚点（`@deepseek-ai/dsh/package.json`）的 `dependencies`，其中 **`installed` 判据是「名字出现在 profile 的 `.dependencies` 里」、`enabled` 判据是「出现在 `dsh.profile.bundles` 里」**；解析不到 `dsh.bundle` 的包只有 `enabled` 为真时才以 `error.code = "not-bundle"` 入列。客户端再过滤一遍（`dsh-client-ui-plugin-manager/lib/client.js:3342`）：`!BUILTIN_PROFILE_BUNDLES.has(name) && (installed \|\| optional \|\| error)`，`:3343` 的 `mine = listed.filter((pkg) => pkg.installed \|\| !pkg.optional)` 就是「已安装」。而上游 `dsh-app-boot` 的 `initProfile`（`dsh-app-boot/lib/index.js:26125`）**只在 `package.json` 不存在时才写模板**，设备上 profile 早已存在 ⇒ 永远不会被改写，只靠 overlay insert 的 Loader entry 在页面上完全不可见。修复：新增 `EngineConfig.ensureProfileManifest(ctx)`（`android/app/src/main/java/app/kxxy/engine/EngineConfig.kt:320-368`），由 `EngineSupervisor.ensureDirs()` 调用，**读-改-写** `$HOME/profiles/web/package.json`：`dependencies` 补 `"dsh-web-mobile": "3.1.0"`、`dsh.profile.bundles` 补 `"dsh-web-mobile"`，并**撤掉 `overlayContent(ctx)` 里与之重复的 insert 行**（否则同一插件被注册两次）。一条硬约束：**绝不能整体覆盖该文件** —— 用户通过插件页自装的插件写在同一 `dependencies` 里，覆盖会抹掉用户插件；只做「确保存在」式补写 |
 | AC | 旧 ROM WebView 不支持 `:has()`（Chrome 105） | 内置插件 `dsh-web-mobile` 的样式表在真机上被解析器**成片丢弃** —— 278,723 字符的表只解析出 **39 条**顶层规则，设置面板仍是桌面两栏布局、「权限」「语言」「字号大小」逐字竖排，症状与缺陷 O 一模一样，极易误判成「插件根本没装上」 | 真机探针：`CSS.supports('selector(div:has(span))')` 为 **false**，注入三条规则只有不带 `:has()` 的那条存活；插件表里 `:has(` 出现 **301** 次，遍历 CSSOM 得到的 `selectorText` 含 `:has(` 的规则 **0 条**。修复：在 `compat.js` 里把 `:has(X)` 于 **CSS 文本层**改写为属性选择器 `[data-kxxy-has~="hN"]`（按实参特异性重复若干次以补齐权重），再用 `MutationObserver` 在真实 DOM 上维护标记 —— 由子代/兄弟/后代三种前导分别精确求值（`E:has(A B)` ⇔ E 是匹配 `A B` 元素的祖先；`E:has(> A B)` 再用 `:scope >` 验证；`+`/`~` 走 `previousElementSibling`；`:not(:has(X))` 必须精确故一律回落到 `matches()` 过滤）；递归进 `@media`/`@supports`/`@layer`/`@container`，`@keyframes`/`@font-face` 内部原样保留。修后真机复测：`rewrittenTags=17`、插件表 `remainHas` 从 **301 降到 22**、注入标记 **339 个**、**27 个元素**带标记、CSSOM 里 **189 条**规则恢复生效，设置面板变成移动端布局。**中途踩的最深的坑**：垫片里调用的 `matchParen` **从未定义**（全文 5 处调用、0 处定义），首次调用即抛 `ReferenceError`，而 `patchAllStyles()` 没有任何异常隔离 ⇒ 异常冒泡把 `observeStyles()` 一起带崩，**整层 CSS 改写（包括 v0.1.6 已验收过的 `dvh` 与 `@scope`）全部静默失效**；补上 `matchParen` 并给 `patchStyleTag` 加 `try/catch` 后才恢复。三条可复用教训：① 探针必须 `setTimeout` **延时**（15 s / 30 s）才看得到插件 append 之后的样式表，同步探针读到 `styleTags=0` 是假阴性；② 一个未定义标识符足以让整层适配静默失效，「改了没效果」要先去查有没有异常，而不是先怀疑选择器写错；③ Android WebView 未开 `setWebContentsDebuggingEnabled`、`onConsoleMessage` 又收不到未捕获异常 ⇒ **logcat 干净不能证明没有 JS 报错** |
-
 | AD | 内置插件的 CSS 锚点锁死在宿主**旧代** class hash 上 | 对话界面右上角**多出一个侧栏图标** —— 插件自己的「文件浏览」按钮与宿主的「打开右侧边栏」按钮**重叠绘制**成一个「文件夹 + 双栏框」的怪图标；「开始」空态页顶栏本该有的三枚按钮**全部消失**。用户 m19951（逐字）：「你看对话界面右上角，我给你发的图片是正常的渲染，怎么现在给到的结果会多一个侧边栏图标呢，还有第二个人界面也不对，是不是插件没完全挂载啊」，随后 m20235 给出正确判据：「这个是我让你内置的插件，按道理插件只要完全生效，这些问题是不会出现的」 | 新版官方前端给每个 CSS module 生成**随机 hash 前缀**（本次为 `Dc7zOa_`），而 `dsh-web-mobile` 是按某一代宿主构建的，选择器里写死了那一代的 hash —— 真机实测插件样式表 **451 条规则里 320 条** `selectorText` 在 DOM 上零命中。其中要命的是插件用来**隐藏宿主 headerCorner** 的那条 `… header:has([class*="_headerLeading"]) [class*="wSkVaW_titleRow"] > [class*="_headerCorner"] { display: none !important }`（`layout.css.ts:2027-2035`，注释明确写着「新宿主把右侧栏入口放进了 titleRow 的 headerCorner，和插件的文件按钮是同一个面板的两个入口」，其**上一代写法** `wSkVaW_titleRow` 与真机的 `Dc7zOa_titleRow` 不匹配 ⇒ 整条失效 ⇒ 宿主按钮没被隐藏，与插件按钮叠在一起）。插件作者自己也知道这批锚点「代际脆弱」——`docs/upstream/compat-contracts.json` 里 28 条契约每条都标了 owner 包名与 `lazy` 标记，另备了一批结构化 marker 作兜底。**为什么不能改成「补样式」**：用户要的是「插件完全生效」，手工补规则只能治眼前这一处，宿主再升级一次又要补；正解是**把插件写死的旧代 hash 在运行时归一化到宿主当前代**。修复：`compat.js` 新增第 4 段（在 `dvh` / `@scope` / `:has(` **之前**）—— `hashScan` 从插件样式表收集旧锚点的**后缀集合**，`hashLivePrefixes` 只从 `style[data-plugin^="@deepseek-ai/"]` 的**宿主样式表**（带完整类名清单，比当前 DOM 全）取候选代，**后缀集合被候选完整包含且候选唯一**才建立映射（模糊宁可不映射 —— 真机上 `QsffPG_root` 有 23 个候选，按设计放弃），随后 `hashRewrite` 把 `[class*="OLD_` 与 `.OLD_` 两种写法一并替换。映射建立后主动调一次 `patchAllStyles()`，并挂 300 ms 去抖的 `MutationObserver`（`attributeFilter: ['class']`，上限 40 轮）跟随宿主渐进渲染。**两个关键细节**：① `hashLivePrefixes()` 必须只认 `@deepseek-ai/` 前缀的样式表 —— 插件自己那张表也带 hash，混进来会把锚点「并到同代」；② 判据用**唯一超集**而非最大交集 —— 只按交集打分会让 `_root` / `_label` 这类常见后缀成群误配。**定位手法（可复用）**：症状是「多出一个图标 / 少了一排图标」，第一直觉会去查插件是不是没挂载；正确的第一步是**把「插件样式表里有多少条规则在 DOM 上零命中」打出来**（探针遍历 `style[data-plugin]` 的 `cssRules` 逐个 `document.querySelector(selectorText)`），再对每条零命中规则提取 `[class*="H_s"]` 里的 `H_s`，按「后缀集合 ⊆ 宿主某个模块的前缀后缀集合」反查 owner 包 —— 一眼就能看出是**整代 hash 全都对不上**，而不是某条选择器写错 |
-
 | AE | 控制台扩展页的信息架构自相矛盾，且展开态每 5 秒被抹掉 | ① 页顶挂着「镜像源加速」卡，而本页扩展**全部**来自 APK 内置包池（每张卡都写着「内置包池 · 零联网」）—— 用户原话：「现在好像完全内置了，上方那个，镜像源加速为我去除……现在没有下载入口，但是又有这个镜像源，这不是很冲突吗？」；②「已激活」分组点开后再看，自己折叠回去了 —— 用户原话：「我展开以后，他会自动折叠，你点击这个展开，他又自动折叠，这不行」 | ② 是纯状态管理 bug：`renderExtensions()` 开头就 `dom.extensionsList.innerHTML = ''` 重建整个 DOM，而 `startPolling()` 每 `POLL_INTERVAL = 5000` ms 调一次 `fetchExtensions()`，展开态只存在 DOM 的 `class="collapsed"` 上 ⇒ 最多 5 秒就被重置。修复：模块级 `const expandedGroups = new Set()` 记住展开的分组 key，渲染时按它决定是否加 `collapsed`，点击时同步增删，并用 `title.classList.toggle('expanded', …)` 驱动 CSS 里的 `▸/▾` 箭头。① 不是 bug 而是**放错了位置**：镜像源的真实用途是给官方插件页的「+ 添加插件」（`ctx.remote.pluginManager.installBundle`）下载第三方插件时加速，它服务的是**对话页**而不是内置扩展页。修法：把整张卡（连同 `#mirror-results`，**id 一个不改**，`host.js` 的 `initMirrorActions`/`fetchMirror` 零改动）搬到「设置」页，扩展页原位换成一句 `.builtin-note-card` 说明「全部内置 · 零联网，要装第三方插件请去对话页侧栏 →「插件」→「+ 添加插件」」。**为什么不是按字面「删除」**：用户原话给了「去除，或者……给我添加一个下载入口」二选一，而下载入口官方**早就有**（`dsh-client-ui-plugin-manager` 的 `installSpecLabel: "包名或地址"` / `installSpecPlaceholder: "例如 dsh-plugin-whale-pet"`），只是它在对话页侧栏而不在控制台 —— 直接删掉镜像源会让那个入口失去加速能力，所以保留能力、消除误导 |
 | AF | 控制台「终端」页是伪终端（只是 `engine.log` 的尾巴查看器） | 页面上有 `.terminal-container`、`.terminal-bar`、`.terminal-viewport`、六个快捷键按钮，看起来像终端，实际只能看日志、不能输入 —— 用户原话：「这个控制台的终端界面好像完全没用呀，直接为我去除」 | 该视图的全部能力是 `fetchLog()` 的 `GET /kxxy/api/log` 轮询 + `initTerminalActions()` 的 `term-key` 按钮（`POST /kxxy/api/action {action:'term-key'}`，往引擎 PTY 写一个键），**没有任何输入通道**。真终端在对话页侧栏（官方 `sidebar-terminal`），控制台这个页签只会让人以为「终端坏了」。修复：整体删除 —— `index.html` 的 `data-view="terminal"` 整段与底部 tabbar 的对应按钮、`host.js` 的 `renderAnsi`/`fetchLog`/`scrollTerminalToBottom`/`initTerminalActions`/`prefersReducedMotion` 与 `dom` 表里的五个引用、`host.css` 的整段终端样式（含 16 条 `--term-*` 变量）与 `.shell-diag-card`。**顺带清掉一个只服务于该页签的隐患**：原 `renderShellDiagnostics()` 在发现 `localStorage['dsh.terminal.shell']` 是失效值时，会弹 toast 让用户「到终端页一键清除」—— 页签没了就没有这个入口了，改成 `repairShellCache()` **静默自愈**：判据仍是「值必须在引擎根下且 basename 是已知 shell」，不满足就直接 `removeItem` 并提示已自动清理 |
 | AG | 权限卡的长徽章把标题列挤成逐字竖排 | Root 卡的文字**一行一个字**竖直排列（「经 / su / 整 / 体 / 提 / 权 / 启 / 动 / 引 / 擎」），Shizuku 卡却正常 | `.priv-card-head` 是 `display:flex` 且**不换行**，`.priv-badge` 又是 `flex-shrink: 0; white-space: nowrap` ⇒ 徽章宽度完全不可压缩。Shizuku 徽章「不可用 · 未检测到 Shizuku 管理器」在 412px 竖屏下勉强放得下，Root 徽章「不可用 · 未检测到可用的 su（需 Magisk / KernelSU）」更长 ⇒ 徽章把 `.priv-titles` 挤到 `min-width: 0` 允许的最小宽度，中文于是逐字换行成一列。修复：`.priv-card-head` 加 `flex-wrap: wrap`，`.priv-titles` 改 `flex: 1 1 60%; min-width: 8em`，`.priv-badge` 改 `flex-shrink: 1; max-width: 100%; white-space: normal; overflow-wrap: anywhere` —— 徽章先尝试与标题同行，放不下就整块掉到下一行。**合成复现为什么失败、真机探针为什么成功**（可复用教训）：用无头 Chrome 按 412px 宽复现时，旧 CSS 只量到 `titlesW=130.6`，**复现不出竖排** —— 因为合成页面里 `.priv-card` 直接是 `body` 的子元素、吃满了整屏宽度；真机上它嵌在 `.view-pane > .card > .priv-cards` 三层 padding 里，可用宽度只有 **350.2px**。改在真机页面里注入探针（`probe-priv.js`，先切到设置视图再量，因为非激活视图是 `display:none` 会量到 0）才拿到决定性对照：旧 CSS `titlesW=0, titlesH=527, vertical=true`，新 CSS `titlesW=285.2, titlesH=56, vertical=false`。**教训：布局类缺陷的合成复现必须复刻真实容器的宽度链路，否则「复现不出」会被误读成「不是这个原因」** |
-
 | AH | 删页签时漏改底栏列数，留下一个空列 | 底栏右侧多出一块很显眼的空白 —— 用户原话：「现在不是三个板块吗？概览扩展设置为什么之前删除的板块导致右下方有一个很明显的空白？」 | 缺陷 AF 删掉「终端」页时改了三处（HTML 的视图段、HTML 的页签按钮、`host.js` 的五个引用），**漏了第四处**：`.tabbar-inner` 的 `grid-template-columns: repeat(4, 1fr)` 是照着当时四个页签写死的。页签从四个变三个后，网格仍是四列，第四列没有子元素 ⇒ 底栏右侧空出整整四分之一。修复：改成 `grid-auto-flow: column` + `grid-auto-columns: 1fr`，列数由子元素个数决定，以后再增删页签都不会留下空列。**教训（与缺陷 AF 同源）**：这类「删掉一块东西」的改动，真正要清理的是**所有引用它的地方**，而 CSS 里的布局参数最容易漏 —— 它不在 JS 的调用图里，grep 页签 id 也搜不到。同一个删除动作实际涉及四处：视图段、页签按钮、JS 逻辑、**布局网格**。这个 bug 不报错、HTTP 层完全看不出异常、只有肉眼能发现，所以在 `smoke-plugin.mjs` 里补了两条断言把它钉死：① 解析 `index.html` 的 `data-target` 与 `data-view`，数量不等或页签指向不存在的视图就报错；② `.tabbar-inner` 出现 `grid-template-columns: repeat(N,` 就报错，且必须存在 `grid-auto-flow: column` |
-
 | AI | 视频与音频完全没有渲染器，点开只显示「该格式文件暂时无法预览」 | 文件树里 12 种视频（`3gp/avi/flv/m4v/mkv/mov/mp4/mpg/ogv/ts/webm/wmv`）与 17 种音频全部只有 unsupported 空态 —— 用户原话：「查看我现在的手机界面，视频跟音频无法打开，无法预览，给我优化一下」 | 这是**上游能力缺口**（与缺陷 Z 同类，桌面版同样没有），不是 Android 特有：`dsh-client-ui-sidebar-documentpreview` 的 `documentPreviews.register` 只注册了 text / markdown / html / image / pdf / code / office 七种，而 `UNVIEWABLE_BINARY_EXTENSIONS`（65 项）**开头 16 项就是音视频**（`mp4, mov, avi, mkv, webm, flv, wmv, m4v, mp3, wav, flac, ogg, m4a, aac, wma, opus`）⇒ 无候选 + 命中黑名单 ⇒ `candidates` 返回空数组 ⇒ 直接渲染 unsupported 空态。修复分两半：**① 宿主侧新增 `/kxxy/media` 流式路由**（官方 `/api/file` 无 Range/206、全量读进内存、上限复用的是**图片附件上限 20 MiB**，对视频偏小）；**② 客户端注入 video / audio 两个 provider**（`tools/prebuilt/documentpreview-media/providers.js`，与归档 provider 同构）。**WebView 104 解码能力实测**（探针 `[kxxy-media]`）：`video/mp4; codecs="avc1.42E01E"` / `vp8` / `vp9` / `audio/mpeg` / `audio/aac` / `audio/flac` / `ogg; codecs="opus"` 等 13 项 `probably`，`video/mp4` / `video/webm` / `audio/wav` 等 10 项 `maybe`，`mkv/avi/wmv/flv/mpeg/mp2t/quicktime/aiff/midi/amr` 等 17 项 `no` ⇒ **缺的不是解码器，是 provider**。**真实播放验证**：2,848,208 B 的 `sample-5s.mp4` 走 `/kxxy/media` 得 `video-OK dur=5.759 rs=1 seekable=1`。真机验收：`real-sample.mp4` 出播放器（`0:00 / 0:05` + 进度条 + 音量 + 全屏 + 倍速菜单），`silence.mp3` 出音频控件（`0:00 / 0:02`）。**为什么不走 `bytes-complete`**：那条路要先全量下载进内存（受 20 MiB 上限约束）才出画面；新 provider 用 `loading: "renderer"` 模式 —— 该模式**不需要任何字节加载，provider 声明即被自动触发**，只需拿到 `version` 后调一次 `request.loaded(version)` 让 `hasContent` 为真，`<video src>` 直接指向流式 URL。**失败文案必须分开**：`MediaError.code === 4`（`MEDIA_ERR_SRC_NOT_SUPPORTED`）与「文件损坏」是两回事，前者报「当前系统的浏览器内核不支持 `{ext}` 格式」+ 转码提示，后者报错误码；混在一起会让用户对着不支持的容器反复重试 |
 | AJ | 扩展包池里的 Termux 绝对路径从未被改写（问题.txt【1】） | 扩展装好之后成批的工具起不来、或指向不存在的目录：`bin/kotlinc` 首行是 `#!/data/data/com.termux/files/usr/bin/env bash`，内核解析 shebang 失败，直接报脚本自身路径的 ENOENT（比「版本不对」更难判断）；`tesseract --list-langs` 报 `No such file or directory ["/data/data/com.termux/files/usr/share/tessdata/"]`；gdb 找不到 Guile 的 Scheme 源；perl 的 `Config_heavy.pl` 里 sysroot 是 Termux 路径 | `normaliseStageFiles()` 只处理 runtime stage（`SCRIPT_TOP_DIRS` 白名单 + 非 ELF + 含 `com.termux` 才改），**扩展包池完全不走它** —— `tools/lib/poolextract.py` 只剥 tar 成员名的前缀（`rel[len(TERMUX_PREFIX):]`），**从不改写内容**。自建扫描器全量实测：runtime.zip 侧只有 19 处命中且 18 处无害（C 头注释 / `libbfd.a` / PyPI 元数据），**ext-pool 侧 1296 处**（texlive 562 / imagemagick 163 / ffmpeg 112 / autotools 72 / gnuplot 70 / tesseract 57 / golang 49 / ghostscript 45 / poppler 44 / exiftool 35 / perl 34 / kotlin 14 / emacs 11 / gdb 10 / sox 8 / qpdf 3 / rust 3 / gradle 2 / mediainfo 2 —— 用户「697 处」的估算偏低）。修法分两半：**构建期**在 `poolextract.py` 的写出循环里做同一套替换（`merged[path]` 已是整块 bytes，在那里改最省事），**跳过 ELF / ar 静态库 / 任何含 NUL 的数据** —— 占位符比原串短，改长度会让节偏移与重定位表整体错位（RUNPATH 优先级低于 `LD_LIBRARY_PATH`，留着无害）；并把被改写的文件清单写进 pool 内的 **`.pool-manifest.json`**（**清单必须随包走**：安装可能在任何一次运行时由用户点「获取」触发，构建期 report 那时早已不在设备上）。**设备端**由 `extinstall.applyPlaceholders()` 在解包后按清单回填真实路径、然后删掉清单（老 APK 没有清单，读不到即静默跳过，不是错误）。另外新增 `@DSH_FILES@` / `@DSH_DATA@` 两条**裸父目录**规则：perl 的 `Config_heavy.pl` 把 sysroot 记成 `-Dsysroot=-I/data/data/com.termux/files`（**不带 `/usr`**），三条长规则一条都匹配不到 —— 重打后仅剩的 3 处残留全是这同一个文件（autotools / perl / exiftool 各带一份）。终局：20/20 pool 清单齐备、合计改写 1285 个文件、文本残留 **0**（跳过 ELF 1629 个） |
 | AK | 扩展装完后 `bin/texlive` 是一个空目录，PATH 里一个 TeX 引擎都没有（问题.txt【4】） | 装完 texlive 后 `pdflatex` / `xelatex` / `latex` 全部 command not found；更早的现象是设备上 `bin/texlive/` 里一个文件都没有 | 两层原因叠加。**第一层（写死的实现缺陷）**：`extinstall.buildLinks()` 对 `<extDir>/bin` 只做**一层** `readdirSync` 且**不递归** ⇒ `bin/texlive` 这个**目录**被整体软链成 `engine/bin/texlive`，其下 411 个引擎永远进不了 PATH（`<root>/bin` 是 PATH 的唯一入口）。**第二层（认知陷阱）**：`pdflatex` / `xelatex` / `latex` 在 TeX Live 里**从来不是真实文件** —— 它们是 `texlinks` 从 `pdftex`（2,063,464 B）/ `xetex`（794,176 B）+ `-fmt` 生成的符号链接，上游 `texlive-bin` deb 里就没有，全池 grep 只命中 6 处**文本提及**（`latexmk` / `purifyeps` 的注释）。所以「81 MB 里一个 TeX 引擎都没有」这个判断本身是错的 —— 引擎全都在，是**链接没建、目录进不了 PATH**。修法：`buildLinks` 重写为 `buildViews`，`collectBins` **递归展平**（浅层名字优先拿干净命令名，同扩展内重名退回 `sub_foo` 形态；**先处理文件再下潜目录** —— 反过来的话先递归 `bin/texlive/` 会占掉 411 个引擎名，之后 `bin/` 顶层同名文件拿不到干净名只能被丢弃），同时**保留目录软链**让 `texlinks` / `fmtutil` 这类「按自己所在目录找兄弟程序」的脚本仍工作。**顺带修掉一个完全同型的隐蔽缺陷**：扩展 `lib/` 下的**子目录**（实测 14 个）原本是「目标已存在就跳过」，其中 `pkgconfig`（12 个扩展贡献）、`cmake`（9 个）、`girepository-1.0`（6 个）与 runtime 自带目录同名 ⇒ 同样静默丢内容，现在走同一套递归合并 |
@@ -338,11 +368,26 @@ powershell -File tools\build-apk.ps1
 | CX | texlive / perl 扩展是**按需安装**的：装完 `xelatex --version` 正常，一编译就 `I can't find the format file 'xelatex.fmt'!`，pandoc 全链路失败 | 全新设备上安装期那一趟跑得比扩展解包早，`bin/xetex` 还不存在，`ensureTexFormats` 打一句「pdftex/xetex/luahbtex 全缺，跳过格式生成」就放弃了 —— 而它只在安装期跑过一次，之后用户装了 texlive 也没人来补 | 上游是缺陷 AS（perl 的 `@INC` 指到 Termux 死路径，见 `EngineConfig.buildEnv` 的 `PERL5LIB`）。修法：把 `ensureTexLinks` 与 `ensureTexFormats` 移进**每次启动**的路径，顺序固定 texlinks 先、formats 后（texlinks 建出 `bin/xelatex` 这类标准名，formats 用引擎本名 `xetex` 生成 `.fmt`）。两趟都幂等：四个标准名齐了只剩 4 次 `exists()`，三个 `.fmt` 齐了只剩 3 次 `stat`（判据含体积，`MIN_FMT_BYTES = 1_000_000`，拦「生成到一半被杀」） |
 | CZ | Go 的**纯 Go resolver** 读不到 DNS：`GODEBUG=netdns=go go get …` 报 `dial tcp: lookup proxy.golang.org on [::1]:53: connection refused`（问题清单(1).txt 的 P0 建议：给 `libkxxy_exec.so` 补 `open`/`openat` 重定向） | 分两层，**结论与报告不同**。① **路径本身不需要运行期修**：`strace -f -e trace=openat` 实录 `openat(AT_FDCWD, "/data/user/0/app.kxxy/files/engine/etc/resolv.conf", O_RDONLY\|O_CLOEXEC) = 3` —— 构建期 `PATH_REWRITES` 已把 `--prefix=/data/data/com.termux/files/usr` 编进 `net` 包的那个字面量改写成了 `@DSH_ROOT@/etc/resolv.conf`。② **文件内容才是缺口**：bionic 的 `getaddrinfo` 走 netd，所以 Node/curl/git/python 全都正常，`<root>/etc/resolv.conf` 不存在这件事在它们身上完全暴露不出来；只有纯 Go resolver 自己读文件。黑洞实验证实因果：把它改成 `nameserver 127.0.0.9`，cgo 模式仍 `OK: 8`，`netdns=go` 立刻 `ERR: lookup goproxy.cn on 127.0.0.9:53`。③ 该 go 并非报告里那个「compiled without support for the cgo resolver」的旧二进制：`go1.27.2 android/arm64`、`CGO_ENABLED=1`、`GODEBUG=netdns=go+2` 打印 `confVal.netCgo = true netGo = false`；但 `readelf -sW …/lib/go/bin/go \| grep -c getaddrinfo` = **0**，默认仍走 cgo。 | 主修是既有的 `RuntimeInstaller.ensureResolvConf(root)`（`RuntimeInstaller.kt:1425`）：从 `ConnectivityManager` 当前活动网络的 `LinkProperties.dnsServers` 落成 `nameserver` 行写进 `<root>/etc/resolv.conf`，取不到就**不写**（宁可报错也不写错的），`:115` 与 `:173` 两处调用。**兜底**按报告的 P0 补上：`kxxy_exec.c` 新增 `open`/`open64`/`openat`/`openat64` 四个包装，但**只拦一个针孔** —— 常量 `CONFIG_PREFIX[] = "/data/data/com.termux/files/usr/etc/"`（`CONFIG_PREFIX_LEN = sizeof(CONFIG_PREFIX) - 1`），`rewrite_config_path()` 首行 `memcmp` 不中就立即返回 NULL，热路径只多一次常量比较；**不做全量 open 拦截**（`git status` 一条命令就是几千次 `openat`，全量拦会把代价摊到每个进程每次文件访问）。四个包装统一走 `do_open(path, flags, mode, has_mode, dirfd, use_at)`，`NEEDS_MODE(flags)` 判 `O_CREAT` 或 `O_TMPFILE` 决定要不要 `va_arg(ap, int)` 取 mode；重写失败且 `errno` 是 `ENOENT`/`ENOTDIR` 时用原路径重试（与 exec 族回落语义一致，**不检查存在性**）。真机验证：随包库 14,248 B，导出 `open/open64/openat/openat64` 齐全；`LD_PRELOAD=<root>/lib/libkxxy_exec.so cat /data/data/com.termux/files/usr/etc/resolv.conf` → `nameserver 8.8.8.8`；去掉 preload → `No such file or directory`；非 `etc` 的旧路径即使 preload 也 `ENOENT`（针孔不扩大）；引擎原生组合（本库 + `libtermux-exec-ld-preload.so`）同样命中；`GODEBUG=netdns=go` 的 go 进程回归 `OK: 6` 不破。 |
 | DA | TeX 按**文件路径**找不到中文：`\setmainfont{NotoSansSC-Regular.ttf}` 出 PDF 但**中文字全丢**（`pdf=Y 缺字=5`、`nullfont` 计数 5），比报错更难发现；`\usepackage{xeCJK}` 同因失败 | `kpsewhich --var-value=OPENTYPEFONTS` 的值以 `/please/set/osfontdir/in/the/environment` 结尾 —— 那是 TeX Live 的 `texmf.cnf` 在 `OSFONTDIR` 未设时留的**占位符**。于是 `kpsewhich NotoSansSC-Regular.ttf` 返回空，`fontspec` 走 kpathsea 找不到文件，**静默退化成 nullfont**。注意这是**另一条路**：`FONTCONFIG_FILE`（缺陷 AX 系列）只让「按字体名找」（走 fontconfig）成立，`\setmainfont{名字}` 好用不代表 `\setmainfont{名字.ttf}` 好用。A/B 实证（同一份 `t.tex`）：不设 → `The font "NotoSansSC-Regular" cannot be found` + 5 个缺字；设 `OSFONTDIR=<root>/lib/node_modules/kxxy-host/fonts` → kpsewhich 命中、pdf 4775 B、**缺字 0**。 | `EngineConfig.buildEnv` 紧跟 `"FONTCONFIG_FILE=…"` 那一行之后新增 `"OSFONTDIR=${officeFontsDir(ctx).absolutePath}:${File(root, "share/fonts").absolutePath}"`（`officeFontsDir` 定义在 `EngineConfig.kt:209-210`，即 `<root>/lib/node_modules/kxxy-host/fonts`）。两条路径都给：前者是 `bundleOfficeAssets` 落的 NotoSansSC，后者是 runtime 自带的 `share/fonts`。真机：`kpsewhich NotoSansSC-Regular.ttf` → `/data/user/0/app.kxxy/files/engine/lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf`；按字体名 pandoc → 9625 B；按文件路径 xelatex → 4775 B、**缺字 0**。 |
-
+| DF | 侧栏「更多」→「登录」→ **整页变白**，无任何报错、返回键也回不来（用户报） | 不是 WebView 版本问题，是**宿主没有多窗口 WebView**。官方账号登录在「非 Desktop」分支走 `BrowserLogin.begin()`：`this.popup = window.open("about:blank", "_blank")`。`MainActivity` 既没有 `setSupportMultipleWindows(true)` 也没有 `onCreateWindow`，Android WebView 在这种配置下对 `window.open` 的语义是「**在当前 WebView 里导航到该 URL**」—— 主框架被导航到 `about:blank`，整个 SPA 就此消失，所以是白屏而不是报错。`BrowserLogin.follow()` 里 `this.popup && !this.popup.closed` 的 null 守卫能挡住空引用，但挡不住「页面已经没了」。<br>同一根因还打断另外三处：`contactUs`（意见反馈）、文档预览的「在浏览器打开」外链、聊天气泡里的链接预览 —— 它们全都 `window.open(..., "_blank")`。 | 在 Web 层把 `window.open` 接住（`compat.js` 的 `installWindowOpenBridge`），而不是在原生层再造一套窗口栈（官方前端是 SPA，弹窗里还要跑 React 登录页；而这一层真正要做的事只有一件 —— **把授权页交给系统浏览器**，这也正是 Desktop 版 `platform-login.js` 的 `action:"open", external:true` 语义）。规则三条：① `about:blank` / 空串 → 返回一个**惰性弹窗桩**，它的 `location.replace(url)` 触发过桥，桩自身随即 `closed = true`；② 真实 http(s) → 直接过桥并返回 `null`（调用方全部有 null 守卫）；③ 非 http(s)（`file:` / `javascript:` / `intent:` / `data:`）→ 一律不过桥。过桥走 `kxxy://open?url=<encodeURIComponent>`，由 `MainActivity.handleOpenBridge` 用 `ACTION_VIEW` 交给系统浏览器，**原生侧再校验一次 scheme 必须是 http/https**（`file:` / `intent:` 会被系统解释成任意组件调用，等于把「打开网页」放大成「拉起任意应用」）。版本标记同步递增到 `kxxy-webview-compat@7`（否则老设备带着旧兼容层静默跳过重装）。 |
+| DG | 对话里交付的 `*.apk` 点一下**什么都不发生**，只有一行灰字「此主机没有可用的桌面，无法使用外部程序打开文件或文件夹」；用户要的是**唤起系统安装器**（用户报） | 上游 `@deepseek-ai/dsh-native-command` 在 Android 上把整条「打开文件」链判成不可用，四环相扣：① `canOpenNativePath()` 只认 darwin / win32 / 有 `DISPLAY` 的 linux，`process.platform === "android"` 直接 `return false`；② `nativeFileManager()` 同理返回 `null`；③ `dsh-api-session-controller` 的 `workspaceDesktop()` 把 `available` 算成 `fileManager !== null && canOpenPath()` ⇒ **恒 false** ⇒ 前端 `dsh-client-ui-deliverables` 渲染 `presented.unavailable`，`deliverables.file.actions` 槽位（open-in-app 的分体按钮）整块不挂载；④ 即便强行打开，`openNativePathWithIntent()` 末尾就是 `throw new Error("native path opener is unsupported on <platform>")`。<br>另有第二层：`.apk` 若以 `application/octet-stream` 发出，系统**不会**路由到 PackageInstaller，症状同样是「点了没反应」；而 `KxxyFilesProvider` 的 MIME 表原本没有 `apk` 项。 | 三处补丁（`tools/lib/patches.mjs` 的 `patchNativeCommandAndroid`）+ 一处原生实现：① `canOpenNativePath()` / `nativeFileManager()` 放行 android（后者返回 `"directory"`，必须是协议里那四个字面量之一，否则前端 `isPresentedHost` 校验判非法）；② `openNativePathWithIntent()` / `revealNativePath()` 增加 android 分支，调 `<root>/libexec/termux-api Open <path>`；③ `nativeFileApplications()` 返回单个「系统默认打开方式」条目，让分体按钮**有主键可渲染**（空数组时主键会退回「显示文件位置」，语义不对）。<br>**为什么走 `libexec/termux-api` 而不是 `termux-open`**：`bin/termux-open` 与 `bin/am` 都在 `build-runtime.mjs` 的 `TERMUX_APP_SCRIPTS` 剔除清单里，设备上根本不存在；而 `libexec/termux-api` 每轮引擎启动都会被 `TermuxApiServer.installShim` 换成脚本 shim，是唯一稳定的「引擎 → 应用进程」执行器。因此 `TermuxApiServer` 新增 `Open` 方法：只接受**引擎树或用户树**内的真实路径（规范化 + 前缀校验挡 `../` 穿越），用 `content://app.kxxy.files/…` + `FLAG_GRANT_READ_URI_PERMISSION` 发出 `ACTION_VIEW`；`.apk` 强制 `application/vnd.android.package-archive`（不信调用方），于是系统弹出「是否安装」→ 选「安装」→ 未知来源确认。<br>**用户树必须一起放行**：交付文件落在 `kxxy-home/workspaces/…`，只服务 `engine/` 的话点「打开」会报「只能打开引擎目录内的路径」。`KxxyFilesProvider` 因此新增 `home/` 前缀，并**排除 `home/profiles/`**（账号令牌与插件配置在那里，绝不经 URI 外发）。<br>「显示文件位置」在 Android 上没有对应语义（DocumentsUI 只认 `DocumentsProvider`，本工程的 provider 不是；工作区又在 app 私有目录），退化为 Toast **如实显示完整路径**并返回成功 —— 不假装定位成功。<br>`AndroidManifest.xml` 补 `REQUEST_INSTALL_PACKAGES`（Android 8.0+ 的「安装未知来源」是按应用授权的特殊权限，缺声明时连选择框都不出现）。补丁集标记递增到 `kxxy-patchset@6`。 |
 | DB | 缺陷 CZ 的结论是**错的**：`go get` 在设备上「看起来能用」，实际上从未读过 `<root>/etc/resolv.conf` —— 它读的是 `/data/data/com.termux/files/usr/etc/resolv.conf`（不存在），解析成功纯属侥幸 | 用户在 m00002 报的第 1 项：`go get github.com/google/uuid` 报 `dial tcp: lookup goproxy.cn on [::1]:53: read udp …: connection refused`，并给出判据「`grep -ac "engine/etc/resolv.conf" $GOROOT/bin/go` 应为 1」。**复验完全支持用户的判断，CZ 的结论错在两处**：<br>① 扩展池里那份 `go` 二进制（`ext-pool/golang.pool` 的 `bin/go` 与 `lib/go/bin/go`，均 16,112,616 B）里 `grep -aob` 只能命中**旧 Termux 串**（47 B，偏移 6862579，命中 1 次），`engine/etc/resolv.conf` 命中 **0**；<br>② CZ 说 `confVal.netCgo = true netGo = false`、默认走 cgo —— 实测 `GODEBUG=netdns=go+2` 打印 `confVal.netCgo = false  netGo = true`，且 `readelf -d` 的 `NEEDED` 为空（静态 Go 二进制），`net` 包编进去的就是纯 Go resolver。<br>**「能用」的假象来源**：旧二进制读不到 conf ⇒ `dnsReadConfig()` 返回空 ⇒ 落回 `lib/go/src/net/dnsconfig.go:26` 的 `var defaultNS = []string{"127.0.0.1:53", "[::1]:53"}` ⇒ 本机**恰好**有 dnsmasq（pid 20180）监听 `127.0.0.1:53` 与 `[::1]:53` ⇒ 解析成功。dnsmasq 一起不来就变成用户看到的 `connection refused`。**这就是为什么黑洞实验对旧二进制无效**：把 `<root>/etc/resolv.conf` 改成 `nameserver 127.0.0.9` 或直接移走，旧 `go get` 照样成功 —— 它压根没读那个文件。 | **只能源码期改对再编译**，不能在打包时打二进制补丁：`tools/lib/poolextract.py:116` 与 `tools/build-runtime.mjs:369` 都有「ELF 一律跳过」的硬约定（占位符比真实路径短，改长度会让节偏移与重定位表错位）。<br>**新增 `tools/build-go-android.ps1`**（7 步，约 20 秒，幂等）：① 从 `android/app/build.gradle.kts` 的 `applicationId` 推出 `/data/user/0/<appId>/files/engine`（不能拼 `/data/data/` —— 那只是别名，`ctx.filesDir` 实测给的是 `/data/user/0/`）；② **优先从 `.cache/debs/golang_*.deb` 取源码**，pool 兜底（**顺序不能反**：pool 里的 `go` 正是本脚本的产物，从 pool 取源码会形成「建池→要 go→编 go→要池」的死锁，全新仓库第一次构建必然撞上）；③ 解 `lib/go/src/**` + `go.env` + `VERSION`（手解 ar 头取 `data.tar.xz`，标准库没有 ar 模块）；④ 宿主 Go 版本必须与 Termux 一致（否则 `go build cmd/go` 会用宿主标准库而非改过的源码），缺则从 `go.dev/dl` 下载；⑤ 宿主 GOROOT + Termux `src` 叠加成 `build-android`（官方 Windows 发行版**删掉了 4 个 android-only 文件**：`net/dnsclient_android.go`、`net/conf_android.go`、`net/interface_android.go`、`syscall/netlink_android.go`）；⑥ 把 4 个文件里的前缀换成引擎根 —— **两种形态都要认**（deb 里是原始 Termux 前缀，pool 里是 `@DSH_ROOT@`）；⑦ `GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o out/go-android cmd/go`（**必须 `cd` 进 `build-android\src`**，用宿主 `go.exe` 但 `GOROOT` 指向 build-android）。<br>**产物 16,187,686 B**（与池里 16,112,616 B 只差 75 KB，`-s -w` 后体积吻合 ⇒ 原件也是 strip 过的）。末尾硬校验：目标路径命中 1 / 旧串 0 / `@DSH_ROOT@` 0 / `linker64` 1 / ELF magic `7f454c46` / `e_machine=0x00b7`。<br>**接入流水线**：`poolextract.py` 新增 `--go-binary`（替换 `bin/go` 与 `lib/go/bin/go` **两份**，跳过 `rewrite_prefixes`），`fetch-extensions.mjs` 新增 `goBinaryArgs()` 并在**缺产物时自动调用** `build-go-android.ps1` —— 否则漏跑不会报错、设备上 go 静默不能联网，极难发现。README 流水线补了 2.4 步。<br>**真机验收**（走用户真正执行的 `$R/bin/go` 与 `$R/lib/go/bin/go`，装进 `extensions/golang/` 并备份原件）：`go version` → `go1.27.2 android/arm64`；strace → `openat(AT_FDCWD, "/data/user/0/app.kxxy/files/engine/etc/resolv.conf", O_RDONLY\|O_CLOEXEC) = 3`；黑洞实验（换用缓存里没有的 `github.com/rs/zerolog`）→ 立刻 `lookup goproxy.cn on 127.0.0.9:53: … connection refused`；恢复后 `go get` 成功；`GODEBUG=netdns=go+2` → `netCgo = false netGo = true`。<br>**两条验证手法的教训**（两次假失败都出在探针而非产品）：① strace 的目标要用**绝对路径**（cwd 已切走时相对路径静默不执行，日志为空会被读成「命中 0」）；② **用 `go get` 验证网络必须先确认 `GOMODCACHE` 里没有目标模块** —— 缓存命中不发 DNS 请求，黑洞实验会永远「成功」。 |
 | DC | `ensureResolvConf` 永远写不出 `resolv.conf` | 真机日志 `W KxxyRuntime: ensureResolvConf: 读 DNS 失败：ConnectivityService: Neither user 10385 nor current process has android.permission.ACCESS_NETWORK_STATE.` → `W ensureResolvConf: 没有可用的 DNS 服务器，跳过（Go 的纯 resolver 会不可用）`。影响面很窄所以长期没被发现：bionic 的 `getaddrinfo` 走 netd，Node/curl/git/python 全不受影响，**只有 Go 的纯 Go resolver 读 `<root>/etc/resolv.conf`**，症状只表现为 `go get` 失败 —— 和缺陷 CZ/DB 叠在一起，看起来像同一个问题。 | `RuntimeInstaller.kt:1454-1461` 的 `activeDnsServers()` 走 `cm.activeNetwork`，而 `AndroidManifest.xml` 原有的 10 条 uses-permission 里**没有 `ACCESS_NETWORK_STATE`**（`INTERNET` / `FOREGROUND_SERVICE` / `POST_NOTIFICATIONS` / `WAKE_LOCK` / `MANAGE_EXTERNAL_STORAGE` / `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` / `VIBRATE` / `ACCESS_WIFI_STATE` 等，独缺这一条）。修法：`AndroidManifest.xml:9` 的 `INTERNET` 之后加 `<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />`（normal 权限，安装即授予）。真机验收：`I KxxyRuntime: ensureResolvConf: wrote /data/user/0/app.kxxy/files/engine/etc/resolv.conf (4 servers)`，文件 177 B，内容是真实运营商 DNS（`43.239.172.1` / `43.239.172.2` / `2409:8080:2000:3::1` / `2409:8080:2000:3::2`）而不是原来手写的 38 B `8.8.8.8`。 |
 | DD | 所有跨目录别名都被复制成实体文件 | `bin/java` 报 `CANNOT LINK EXECUTABLE "java": library "libjli.so" not found`；`bin/mvn` 报 `Error: Could not find or load main class org.codehaus.plexus.classworlds.launcher.Launcher`。规模：runtime.zip 中央目录的 `LINK:` 条目共 **1618** 条（跨目录 1049 / 同目录 569），跨目录里目标为脚本 11 条、ELF 171 条、其它 867 条。 | `RuntimeInstaller.kt` 的 `materialiseLinks()` 用 `realFile.copyTo(aliasFile, overwrite = true)`，类注释 `:26-30` 断言「Android 的 linker 在 app 域既不认硬链接也不认符号链接，所以别名只能复制」——**这条结论是错的**。真机 `run-as app.kxxy`（`u:r:runas_app:s0:c129,c257,c512,c768`）A/B 实测：绝对软链、相对软链、跨目录软链、多级软链（`latex -> pdftex`）四种形态全部可 exec、可被 linker 跟随；硬链接确实不可用（SELinux 拒 `avc: denied { link }`），但那是另一回事。破坏机理：`bin/java` 的 RUNPATH 含 `$ORIGIN:$ORIGIN/../lib`，副本落在 `<root>/bin` 后 `$ORIGIN` 变错，`libjli.so` 实在 `<root>/lib/jvm/java-21-openjdk/lib/`；`mvn` 脚本用 `MAVEN_HOME=$(dirname "$PRG")/..`，副本从 `<root>/bin` 上溯得到 `<root>`。换成软链后分别得到 `openjdk version "21.0.12"` 与 `Apache Maven 3.10.0` / `Maven home: <root>/opt/maven`。修法：`materialiseLinks` 改为 `Files.createSymbolicLink` + `parent.toPath().relativize(realFile.toPath())`（相对链接，root 搬迁不断链），带「长度一致才改」的安全检查防止误删扩展放的同名真文件；新增 `healCopiedAliases()` 在快路径（`isComplete` 分支）把老设备上已被复制成实体的别名自愈回软链，别名清单由构建期产出的 `alias-links.txt`（119,215 B，1618 条）提供 —— 不能写进 runtime.zip 的 manifest，因为 `ZipFile` 只吃文件路径、`ZipInputStream` 读不到 comment，快路径要读就得先把 741 MiB 拷到 cacheDir。`materialiseSonameAliases()` **保持不变**：linker 找 SONAME（如 `libz.so.1`）时只按 `LD_LIBRARY_PATH` 目录查找，`$ORIGIN` 不参与，复制与软链等效。真机验收：`I KxxyRuntime: materialiseLinks: 1618 created, 0 reused, 0 failed`（全新安装）/ `healCopiedAliases: 1616 个别名由实体副本改回符号链接，0 个失败`（老设备升级不重装），`bin/java -> ../lib/jvm/java-21-openjdk/bin/java`、`bin/git-receive-pack -> git`、`bin/vimtutor -> ../libexec/vim/vimtutor` 均为相对软链。 |
 | DE | 交叉编译把宿主 Windows 路径烧进 `runtime.defaultGOROOT` | 真机不设 `GOROOT` 时 `go env GOROOT` 报 `go: cannot find GOROOT directory: F:\KF\DSKX\dsh-kxxy\.cache\gotooluild-android`（注意 `\b` 被当成退格符，路径里的 `build-android` 少了首字母）。影响面被掩盖了：`EngineConfig.buildEnv` 会给引擎进程设 `GOROOT=<root>/lib/go`，所以日常使用不受影响 —— 但**新版引擎进程实测根本没有 `GOROOT`**（`/proc/<node pid>/environ` 里没有这一项），一旦走 `os.Executable()` 上溯就踩雷。 | 根因链：`cmd/link/internal/ld/main.go:183-189` 的 `if buildcfg.GOROOT == "" { /* 省略 */ } else { addstrdata1(ctxt, "runtime.defaultGOROOT="+buildcfg.GOROOT) }`，而 `internal/buildcfg/cfg.go:23` 的 `GOROOT = os.Getenv("GOROOT")` 在交叉编译时就是宿主的构建目录。修法（`tools/build-go-android.ps1` 第 7 步）：`go build -trimpath -ldflags="-s -w -X runtime.defaultGOROOT=<root>/lib/go" cmd/go`。两个开关缺一不可：`-trimpath` 让 `buildcfg.GOROOT` 为空从而**不写** `runtime.defaultGOROOT`（消除 Windows 路径）；但只加 `-trimpath` 会退化成靠 `os.Executable()` 猜 —— 从 `<root>/lib/go/bin/go` 跑猜得对，从 `<root>/bin/go`（PATH 入口，软链到 `extensions/golang/bin/go`）跑会报 `go: cannot find GOROOT directory: 'go' binary is trimmed and GOROOT is not set`，所以必须 `-X` 显式写死。代价：`applicationId` 被编码进二进制，换包名就得重编（本项目固定 `app.kxxy`，无 `applicationIdSuffix`，且脚本第 1 步就是从 `build.gradle.kts` 读它）。脚本的字面量校验从 4 条扩到 6 条，新增「宿主构建目录残留（`build-android`）必须为 0」与「设备 GOROOT 默认值必须为 1」——这类缺陷不加断言就会静默漏过。真机验收（引擎真实环境，`GOROOT` 与 `GOPROXY` **都未设**）：`go env GOROOT` → `/data/user/0/app.kxxy/files/engine/lib/go`、`go version` → `go1.27.2 android/arm64`、`go get github.com/google/uuid@v1.6.0` / `github.com/pkg/errors@v0.9.1` 成功、`go run .` → `DNS OK: 8` / `uuid: c2240993` / `errors: hello`、strace 见 `openat(AT_FDCWD, "/data/user/0/app.kxxy/files/engine/etc/resolv.conf", O_RDONLY\|O_CLOEXEC)` 命中 1 次、旧 Termux 路径 0 次。 |
+| DH | 换构建机后 `build-runtime.mjs` 在 `[6.5/8]` 直接抛 `下载失败 https://registry.npmmirror.com/@deepseek-ai/libreoffice-kit-wasm/-/libreoffice-kit-wasm-0.1.5.tgz: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>`，整套装配中断 | 脚本里三个 npm 包（`libreoffice-kit-wasm` / `noto-sans-sc` / `dsh-web-mobile`）各自只有**一个写死的下载地址**，全部指向 `registry.npmmirror.com`。那台机器上 npmmirror 是唯一可达源，于是没人加备用地址。换到当前构建机后**恰好反过来**：`registry.npmmirror.com` 在 TLS 握手阶段被直接断开（`基础连接已经关闭: 发送时发生错误`，不是 404、不是超时），而 `registry.npmjs.org` 通畅 —— 于是三处下载全挂，且失败点在装配链中段，前面的 `[0]`–`[6]` 白跑。 | `fetchTgz(pkg)` 改为接受 `pkg.fallbacks`：先主地址，失败逐个换备用地址，**全部失败才抛错并列出试过的每一个 URL 与最后一条错误**。三个包常量各补一条 `registry.npmjs.org` 的备用地址。**sha256 断言原样保留**（`4d5dda19…` / `e18cd1a1…` / `6881c6d0…`）—— 这正是关键：换源不能变成「换个源就接受任何字节」，内容一变立刻失败。教训：**任何「只有一个下载源」的构建步骤都是可移植性缺陷**，即使当时那个源是唯一可用的。 |
+| DI | 在新构建机上跑 `tools\build-apk.ps1`，第一步就 `找不到 node`；修好 node 后 gradle 又报 `ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH`（exit 9009） | 脚本把四个路径**写死成另一台机器**的绝对值：`$node = "C:\Users\XiaoXin\.dsh\...\node.exe"`、`$sdk = "C:\Users\XiaoXin\AppData\Local\Android\Sdk"`、`$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.18.8-hotspot"`、`$signer = "$sdk\build-tools\36.0.0\apksigner.bat"`；gradle 只从 `~/.gradle/wrapper/dists` 里找（本机没有 wrapper，只有独立安装的 8.10.2）。四个路径在本机**一个都不存在**。另有一个独立的顺序错误：`JAVA_HOME` 只在第 6 步签名时设置，而第 3 步的 `gradle.bat` 启动就要它 —— 于是即使路径对了，gradle 也会先失败。 | 四处写死路径改成「环境变量 → 本机工具链目录 → PATH」的探测链：node 试 `$env:KXXY_NODE` / `%USERPROFILE%\.dsh\...\node.exe` / 旧路径，再回落 `Get-Command node`；SDK 试 `ANDROID_HOME` / `ANDROID_SDK_ROOT` / `C:\KF\fbtools\sdk` / `%LOCALAPPDATA%\Android\Sdk`，判据是子目录 `build-tools` 存在；JDK 试 `JAVA_HOME` / `C:\KF\fbtools\jdk` / `Eclipse Adoptium` 下带 `bin\java.exe` 的子目录；gradle 先试 `C:\KF\fbtools\gradle\gradle-8.10.2\bin\gradle.bat`。apksigner 不再写死 `36.0.0`，改为扫描 `build-tools` 下所有带 `apksigner.bat` 的目录按版本降序取第一个（本机有 25.0.3 / 34.0.0 / 36.0.0）。**`JAVA_HOME` 与 `PATH` 提到探测完成后立刻导出**，让第 3 步 gradle 与第 6 步 apksigner 共用同一份。每个探测失败都抛带「试过哪些路径」的明确错误，而不是让下游报不相干的错。<br>**附带的编码坑**：这个 `.ps1` 含大量中文注释且是 **UTF-8 无 BOM**。Windows PowerShell 5.1 读无 BOM 脚本按 **ANSI(GBK)** 解码，中文注释变乱码后**把后面的引号与花括号吃掉**，报出一串假语法错误（`Missing closing '}'`、`The Try statement is missing its Catch or Finally block`、`Unexpected token`）—— 看起来像脚本结构坏了，实际一行都没错。修法是存成 **UTF-8 with BOM**。用编辑工具改完 `.ps1` 后必须复查 BOM（`[System.IO.File]::ReadAllBytes` 前 3 字节应为 `EF BB BF`），否则下一次编辑会把它重新写成无 BOM。 |
+| DJ | 直接跑 `node tools/verify-runtime.mjs` 报 `Error: ENOENT: no such file or directory, open 'F:\KF\DSKX\dsh-kxxy\android\app\src\main\assets\runtime.zip'`（`at file:///C:/KF/DSH%20KXXY/tools/verify-runtime.mjs:150:15`） | `const zipPath = process.argv[2] ?? "F:/KF/DSKX/dsh-kxxy/android/app/src/main/assets/runtime.zip";` —— 默认值是**作者的盘符与目录名**，`F:` 盘在本机根本不存在。这是 DI 的同一个病（绝对路径写死）在 Node 脚本里的第二处。<br>**还有第二个坑，比路径本身更隐蔽**：即使把默认值改成仓库相对路径，**刚打完包**这个最想校验的时刻它依然会 ENOENT —— 因为 `build-apk.ps1` 的第 1 步会把 `assets/runtime.zip` 整个 `Move-Item` 到 `.cache/apk-assets-hold/`（大资源不能进 assets，见缺陷 BL 的 `compressDebugAssets` OOM）。所以「构建完 → 立刻校验」这条最自然的动作路径，在旧写法下**永远失败**。 | 默认值改为按仓库相对路径推出，并**按顺序探测两个位置**：`android/app/src/main/assets/runtime.zip` → `.cache/apk-assets-hold/runtime.zip`，取第一个存在的（`zipCandidates.find(p => existsSync(p))`）。这与脚本里已有的 `resolvePool()` 完全同型 —— 它早就为扩展池处理过同一个问题（`assets/ext-pool` 会被移到 hold），只是 zip 本体这一处漏了。显式传参仍然优先，行为不变。教训：**同一个「资源会被搬走」的事实，脚本里有一处处理了、另一处没处理，说明当时的修复只治了症状**；这类问题应当一次性抽成公共函数。 |
+| DK | `verify-runtime.mjs` 在产物明明完好的情况下报 `✗ lib/node_modules/koffi/package.json`，结论「1 个关键条目缺失」 | `NEED` 列表里那条断言钉的是 `lib/node_modules/koffi/package.json`（**顶层**绝对路径）。而当前装配下 koffi **根本没有顶层副本** —— 它是 7 份嵌套拷贝：<br>`lib/node_modules/@deepseek-ai/dsh-fs-local/node_modules/koffi/package.json`、`…/dsh-session-persistence-jsonl/…`、`…/dsh-subprocess-local/…`、`…/dsh-host-directory-picker-native/…`、`…/libreoffice-kit/…`、`…/dsh-sandbox-windows-acl/…`、`…/dsh-win32-process/…`（zip 内 `koffi` 相关条目共 546 条）。<br>旧版 `.cache/app.asar`（旧桌面资源）装出来是顶层形态，换新版后变成嵌套 —— **上游 hoisting 策略一变，断言就假报警**。 | 新增 `NEED_ANY` 表，语义是「**按后缀匹配，至少命中一份**」：`[["koffi/package.json", "koffi 原生 FFI 包"]]`，命中后打印份数与样例路径。真正该守的契约只有一条 —— **koffi 这个原生 FFI 包跟着 runtime 一起发下去了**；它在哪一层、叫什么路径由 npm 的 hoisting 决定，不是我们能保证的。`NEED` 里那条顶层断言随之删除。<br>通用原则：**断言要么钉在契约上，要么钉在事实上**。钉死一个上游可能随时改变的路径，就是在埋一条只会在换机器/换上游版本时爆的假警报。 |
+| DL | `build-runtime.mjs` 在 `[6.5/8]` 只打一行 `! 跳过 bundletool：C:\KF\DSH KXXY\.cache\bundletool-all.jar 不存在` 就**继续跑完全部 8 个阶段、正常写出 682 MiB 的 runtime.zip**；直到 `verify-runtime.mjs` 才报 `打包工具包装器：✗ 缺 lib/node_modules/kxxy-host/packaging/bundletool-all.jar`，而 `bin/bundletool` 包装器**照样被写进去了** | 缺 jar 时脚本走的是 `console.warn(...)` 分支（注释写明「允许离线/无网环境构建其余部分」），这是有意的降级设计。但降级的后果是**产物残缺且自相矛盾**：`bin/bundletool` 包装器在、它要 exec 的 `bundletool-all.jar` 不在，设备上 `bundletool` 必然 127 退出。<br>更麻烦的是**发现得太晚**：这次的实际时序是「先跑 build-runtime（jar 还没下）→ 再补下 jar → 再打 APK」，于是 APK 里打的是**没有 bundletool 的 runtime.zip**，而全程没有任何一步失败。打包脚本末尾的安装指引照样打印，用户装上去才会在用到时发现。 | 分两层修：<br>① **补上缺失资产**，从 `https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar` 下到 `.cache/bundletool-all.jar`（32,520,401 B），然后**重跑 build-runtime** —— zip 条目 62764 → **62765**，未压缩 1.76 → **1.79 GiB**，asar 侧 543.90 → **574.91 MiB**，zip 682.39 → **713.40 MiB**（差的正是 32.5 MiB 的 jar 本身，且 jar 内部本就是 deflate，`ZipWriter` 按「已压缩」直接 store，没有二次膨胀）。<br>② **把降级变成可判定的事实**：`verify-runtime.mjs` 早就有一条硬断言（`打包工具包装器` 段，检查 `bin/bundletool` 的 0755 / LF / 非 LINK，且 `bundletool-all.jar` 必须是 zip、≥1 MiB、中央目录含 `META-INF/MANIFEST.MF`），所以缺件不会漏网 —— 但**它跑在 build-runtime 之后**，中间那段空窗期正是这次踩的坑。<br>教训：**「允许离线构建」不该等于「允许静默产出残缺产物」**。正确做法是让构建期就记下「本次缺哪些可选资产」，写进 manifest，再由 verify 与打包脚本按 manifest 逐条核对 —— 而不是靠一条容易被滚屏冲掉的 `console.warn`。 |
+| DM | `node tools/test-extinstall.mjs` 在 Windows 上**不是失败，是崩**：先一片 `FAIL`（`bin/pdftex 出现在引擎 bin 里`、`展开出的命令数 —— 期望 4，实得 0`、`bin/texlive 目录软链存在` …），随后 `Error: ENOENT: no such file or directory, readlink 'C:\Users\…\Temp\kxxy-extinstall-LEKVza\r1\bin\texlive'` 直接中断整轮，**后面 10 组与本限制无关的断言一条都没跑** | 本机**不是管理员**（`WJZ8\13907`，`IsInRole(Administrator)=False`），注册表 `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock\AllowDevelopmentWithoutDevLicense` **为空** ⇒ 没有「开发者模式」。实测 `symlinkSync` 抛 `EPERM: operation not permitted, symlink '…\nowhere' -> '…\link'`。<br>而 `extinstall.mjs` 的**整套视图机制就是软链**（`buildViews` / `relinkAll` / `materialise` 里 8 处 `symlinkSync`，每一处都被 `try { … } catch { /* 单条失败继续 */ }` 包着）—— 建不出链接时它**不报错，只是什么都不建**，于是 `links.bins.length` 是 0、`bin/foo` 不存在，满屏 FAIL 看起来像被测代码有 bug。<br>旧脚本对此毫无防备：注释还写着「本机实测可用」，且 `[11]` 段直接 `symlinkSync` 手工造悬空链接、随后 `readlinkSync` 断言 —— 没有链接能力时这一步必然 ENOENT 崩掉。 | 脚本开头**真建一条链接探测能力**（`SYMLINKS_OK`：在临时目录 `symlinkSync` 一个悬空目标再删掉，不猜注册表、不猜管理员），**没有就整轮 SKIP**：打印原因（缺开发者模式/管理员，实测 EPERM）、影响（视图全靠软链，被测逻辑整条走不通，本轮 0 条断言执行）、说明（Android/Linux 恒有该能力，真机不受影响；Windows 上开「开发者模式」后重跑），并以 **0 退出**。<br>为什么是 SKIP 而不是降级成「只校验路径存在」：降级判定的是一半事实 —— `existsSync` 能过只说明视图建出来了，而 `extinstall.mjs` 建不出链接时**根本不会退化成副本**（`materialise` 也只走软链），所以降级断言必然假绿。**半真半假的断言比不跑更误导人。**<br>为什么以 0 退出：这是环境缺能力，不是代码缺陷；以 1 退出会让任何 CI 把「构建机没开开发者模式」当成产品坏了。 |
+| DN | `node tools/smoke-plugin.mjs` 报 **4 项失败**：`✗ 夹具缺失：C:\KF\DSH KXXY\android\app\src\main\assets\runtime.zip 不存在，无法解出 js-yaml`，随后 `坏 YAML 应判 BAD，实为 UNKNOWN` / `非数组应判 BAD，实为 UNKNOWN` / `非 mapping 条目应判 BAD，实为 UNKNOWN` 三条连带失败（`✓ 带 BOM → BAD` 仍绿，因为那条不依赖解析器） | 与缺陷 DJ **是同一个病、同一个文件位置、同一类后果**：`tools/smoke-plugin.mjs:924` 写死 `join(HERE, '..', 'android', 'app', 'src', 'main', 'assets', 'runtime.zip')`。打完 APK 后该文件已被 `build-apk.ps1` 搬到 `.cache/apk-assets-hold/`，于是「刚打完包 → 立刻跑冒烟」时夹具取不到。<br>**为什么它比 DJ 更值得记一笔**：这里的夹具不是可选项 —— `require('js-yaml')` 在开发机上必然失败（仓库里没有 `node_modules`），所以缺 zip 时所有 YAML 判定项**全部退化成 UNKNOWN**，而 UNKNOWN 既不是 pass 也不是 fail，测试表面上「跑完了」，实际那三条判定逻辑**一行都没被测到**。<br>这正是 DJ 那条教训说的「同一个事实有一处处理了、另一处没处理」—— 当时只修了 `verify-runtime.mjs` 与 `simulate-install.mjs`，**没有全仓搜同一模式**，于是它在第三个脚本里原地复发。 | 与 DJ 同一条探测链：`[assets/runtime.zip, .cache/apk-assets-hold/runtime.zip].find(p => existsSync(p))`，两处都没有时报一条明确的 `fail(...)`（把两个候选路径都写进消息，而不是只报一个）。修完 `✓ 夹具：从 runtime.zip 解出 js-yaml（35 个文件）`，结论回到 **插件冒烟测试全部通过**。<br>教训：**修完一个「写死路径」缺陷后必须全仓搜一遍同型写法**（`Select-String -Pattern "assets[\\\\/]runtime\.zip"`），否则修的是症状不是病。 |
+| DO | 控制台里所有二次确认都弹**系统原生框**：顶部顶着「网址为 http://127.0.0.1 的网页显示：」这行不可去除的系统标题，正文只能是一坨纯文本（换行靠 `\n` 硬塞），按钮是灰底系统样式，与「DSH Kxxy 控制台」的整套视觉体系完全脱节（用户报：批量激活弹窗要美化） | 全仓 `host.js` 有 **7 处** `confirm(...)`（卸载单个扩展 :770 / 批量激活 :826 / 批量卸载 :860 / Root 模式 :1126 / 重启引擎 :1158 / L3 修复 :1448 / 撤销修复 :1535），全部直调 `window.confirm`。那行「网址为 …」是 **WebView 的固有行为**：`onJsConfirm` 由 `WebChromeClient` 转成 `AlertDialog`，标题固定拼 `getUrl()`，宿主不接管就一个像素都改不了。<br>更实质的问题是**信息密度**：原生框只有一句 `确定要批量激活 26 个扩展吗？将在后台依次本地解包。`，而用户真正想知道的「多少个 / 占多大体积 / 从哪来」全都没有 —— 26 个扩展合计 1.16 GiB，这个数字不摊出来，用户根本无从判断要不要现在动手。 | 新建通用 `confirmDialog(opts)`（`host.js:187`，返回 `Promise<boolean>`，语义与 `window.confirm` 一致所以调用点只改 `if (!confirm(x))` → `if (!(await confirmDialog(x)))`），DOM 在 `index.html` 的 `#confirm-dialog`（复用既有 `.kxxy-dialog-backdrop` 的 fixed 定位与 `z-index:190`，样式 `.confirm-dialog` 在 `host.css`）。结构是「图标徽章 + 标题 + 说明 + 统计胶囊行 + 双按钮」，`opts` 为 `{title, desc, stats:[{label,value}], tone, okText, cancelText}`。<br>**四个实现要点**：<br>① **强调色收进 CSS 变量**（`--confirm-accent` / `--confirm-accent-rgb`），`tone="warning"` 只改变量、各元素自己引用。第一版写的是 `.confirm-dialog[data-tone="warning"] #btn-confirm-ok { background-color: … }` —— 预览截图里 warning 态的确定按钮**还是蓝的**，因为那条规则压根没命中（预览页的按钮没有 id）。这不只是预览的问题：**用 ID 选择器去压 `.button-primary`，权重赢得很脆**，任何类名调整都会静默失效。<br>② **`.confirm-stats[hidden]` 必须显式 `display:none`**：`.confirm-stats` 写了 `display:flex`，而 UA 样式里 `[hidden]{display:none}` 优先级更低 —— 不补这条，没有统计项的弹窗（卸载单个扩展）底部会多留一条空白。<br>③ **图标随 tone 换**：默认用问号（「请你确认」），只有 warning 才用警告三角。给「激活 26 个扩展」这种正常操作挂个警告三角，会让人以为要出事。两个 `<svg>` 都写进 DOM，用 `display` 切换，不用 JS 改 `innerHTML`。<br>④ **保留 `window.confirm` 兜底**（`if (!dom.confirmDialog)` 分支）：DOM 万一没就绪，宁可弹难看的原生框，也不能 `resolve(false)` 让操作静默失效。<br>另把 `formatSize()` 补上 GB 档（原来只有 KB/MB，26 项合计会印成「1228.8 MB」）。<br>**防回归**：`tools/smoke-plugin.mjs` 新增三段断言 —— index.html 的 7 个 `#confirm-*` id 齐备、host.css 有 `.confirm-dialog` 且含 `.confirm-stats[hidden]` 的 `display:none`、host.js 有 `confirmDialog()` 且**全仓无裸 `confirm(` 残留**（按行扫描排除注释）。<br>**验证手法**：用本机 Chrome 无头渲染真实 DOM 块截图比对（`--headless=new --window-size=500,900 --force-device-scale-factor=2`），覆盖深色/浅色/默认/warning 四态。**踩过的坑**：`--window-size=390` 不被 headless 采纳，实际视口仍是 500 —— 第一张截图看着像「弹窗偏右被裁掉」，其实是**截图窗口比视口窄**，测量 `getBoundingClientRect()` 后 `panel.left=80 = (500-340)/2` 证明布局本来就居中。**截图前先量几何，别凭截图下结论。** |
+| DP | 改完 `plugins/kxxy-host/web/` 下的 `index.html` / `host.css` / `host.js` 并重打 APK，**老设备升级后新弹窗不会出现** —— 设备上跑的还是旧 web 层，且整个升级链路**没有任何一步会报错或提示** | 锚点 8（`RuntimeInstaller.isComplete()` 的 `HOST_PLUGIN_MARKER`）判的是 `lib/node_modules/kxxy-host/lib/index.js` 首行的 `kxxy-host@N`。这个标记**名义上属于插件入口，实际管辖整个 `plugins/kxxy-host/` 目录** —— `web/*.js`、`web/*.css`、`web/*.html`、`lib/*.mjs` 全在里面。本次改的三个文件一个都不在 `index.js` 里，标记自然没动，于是前十六锚点全通过、`isComplete()` 判真、跳过重装。<br>**为什么这次特别危险**：缺陷 DO 的全部改动都在 web 层，如果漏了递增，用户装上新 APK 后会**看不到任何变化**，第一反应必然是「你根本没改」。而这类漏递增在真机上完全静默（`pm install -r` 成功、应用正常启动、控制台正常打开）。<br>**根因不是「忘了」而是「没有守护」**：全仓搜 `kxxy-host@` 只有两处（`plugins/kxxy-host/lib/index.js:1` 与 `RuntimeInstaller.kt:2178`），**没有任何测试校验这两处一致**。README 里写着「改动 plugins/kxxy-host/ 下任何文件后都要递增编号」（`RuntimeInstaller.kt:2175` 的注释也是这么写的），但这条约定完全靠人记。 | ① 把 `HOST_PLUGIN_MARKER` 与 `lib/index.js` 首行同步递增到 **`kxxy-host@18`**。<br>② **给这条约定加机器守护**（`tools/smoke-plugin.mjs`）：读 `lib/index.js` 的**前 256 字节**（= `COMPAT_MARKER_PROBE_BYTES`，与真机探针同一口径，防止标记被写到探针够不着的地方）取出 `kxxy-host@N`，再正则读 `RuntimeInstaller.kt` 的 `HOST_PLUGIN_MARKER = "kxxy-host@N"`，**两者不一致即 FAIL**，并直接打印「老设备不会重装新插件」这句后果。<br>③ **做了反向验证**（这一步不能省）：临时把 `.kt` 里的常量改回 `@17`，断言立刻报 `✗ 锚点 8 标记不一致：lib/index.js 是 kxxy-host@18，RuntimeInstaller.kt 是 kxxy-host@17` 且 `结论：1 项失败`、`EXIT=1`；改回后恢复全绿。**没做反向验证的断言，等于不知道它会不会永远绿。**<br>④ 重跑 `build-runtime` → `verify-runtime` → `build-apk`，并用一次性脚本 `.cache/check-apk-web.mjs` 直接开 `runtime.zip` 核对：四个 web 文件的 **sha256 与仓库逐字节相同**、zip 内 `lib/index.js` 前 256 字节含 `kxxy-host@18`、`#confirm-dialog` / `#btn-confirm-ok` / `.confirm-dialog` / `.confirm-stats[hidden]` / `confirmDialog(opts)` 五项全在、且无裸 `confirm(` 残留 ⇒ `结论：产物与源码一致`。<br>教训：**「改 A 目录必须递增 B 文件的标记」这种跨文件约定，只要没有测试，迟早会漏**；而它漏掉时的症状是「什么都没发生」，比报错难查得多。同类约定（锚点 6 的 `kxxy-webview-compat@N`、锚点 7 的 pty 标记、锚点 10 的 mobile 标记、锚点 13 的 patchset）都值得照此加断言。 |
+| DQ | 手机上**顶栏右上角多出两个图标**（与插件自己的文件按钮挤在一起）、**底部状态行三段被省略号切掉**（用户报：右上角又出现了两个图标；底部字体太大显示不全） | 三处都是内置移动端插件 `dsh-web-mobile@3.1.0` 与**本宿主这一代 DOM** 对不上，而不是「字号真的太大」——实测底部那行换算下来只有 ≈12 CSS px：<br>① **右侧栏入口重复**：插件自己有文件按钮（`[data-mobile-nav="files"]`，手机档座位 30px），宿主 `dsh-client-ui-sidebar-right` 另有一个入口挂在 titleRow 的 `headerCorner` 上（`margin-right:-16px`，36px 盒子在窄视口会从文件按钮右侧漏出一角，实测 corner `[332,2 36x36]`、图标 `343..358` 外露）。插件本来有规则藏它，但那条规则用 `:has()` 门控（`header:has([class*="_headerLeading"]) > :first-child > :last-child[class*="_headerCorner"]`），还要压过插件里另一条**方向相反**的 `display:flex !important`（那个是给 0.1.6 那一代宿主用的）；本宿主这一代的 `:has()` 全靠兼容层 `hasRewriteCss` 兜底，改写一变就惰性化 ⇒ 表现为「右上角多出一个侧栏图标」。<br>② **「标准模式」chip 的 14px 图标本该被藏掉**：`dsh-client-ui-agent-preset` 自己写着 `@container (width<=540px){.f8BMvq_label{display:none}}`，但 `@container` 是 Chrome 105+ 特性，目标 WebView 104 把整块规则丢掉 ⇒ 窄屏反而常显（连同图标）。<br>③ **状态行截断**：`StatsPills` 的 label 是 `text-overflow:ellipsis;overflow:hidden;min-width:0`，横向 flex 一被压缩就截断；字号是 `calc(--dsh-content-font-size-secondary,13px - 1px)` 即 12px，叠加 8px 内边距 + 6px 分隔符，在 400px 视口里 `1 轮 23 步 · 15 秒` 与 `396K tok · 缓存 91%` 两段一起被切。插件另有一整套 `[data-mobile-nav="stats"]` 规则（字号压到 10px、只让最后一组出省略号），但**本宿主这一代没被打上那个标记**（否则不会是 12px），整套是惰性的。 | 在兼容层 `compat.js` 新增 `installMobileLayoutTweaks()`（注入 `<style data-kxxy-mobile-layout>`，标记用于幂等与真机排查），**锚点全部换成宿主自己写在 DOM 上的稳定属性**（`data-conversation-header-corner` / `data-composer-stat`），不碰 class hash、也不依赖插件打的标记：<br>① corner 用 `header [data-conversation-header-corner]:not(#kxxy){display:none!important}`；② chip 图标用 `header [class*="_headerActions"] [class*="_label"] svg{display:none!important}` —— **只隐图标、保留「标准模式」文字**（用户明确要求留文字；不补 `@container`，补了整块就没了）——**这一条已被 2026-10-23 的缺陷 DT 推翻**：三张真机截图证明保留文字会让整行压字（三个芯片的 min-content 宽度之和超过「标题保底 30%」之后剩下的空间，数学上装不下）。DT 的做法是先把 `@container` 垫起来（让上游自己的 540px 折叠生效），再用同一阈值兜底；③ 状态行把字号收到 11px、pill 内边距 8→4、分隔符 6→1、图标 14→12。<br>**`!important` + `:not(#kxxy)` 是承重的**：要压过插件那条 (0,6,1) 的 `!important` 反向规则，只能抬一级 id 特异性（页面上没有 id 为 `kxxy` 的元素，匹配集不变）。<br>**四条踩坑与教训**：<br>① 第一版三条状态行规则全写成 `[data-composer-stat] [class*="_sep"]` —— 分隔符是**同一行的兄弟节点**、不是指标的后代，选择器压根没命中。**这类失误在真机上只表现为「看起来没生效」，不会有任何报错**，只有用无头 Chromium 读 computed style 才能当场抓到（实测 `statSep.marginLeft` 仍是 `2px`）。现在三种关系各用对的形式：指标自己 `[data-composer-stat]`、指标内部 `[data-composer-stat] [class*="_pill"]`、指标旁边的分隔 `[data-composer-stat] ~ [class*="_sep"]`。<br>② 刻意**不用** `:has()`：目标 WebView 104 没有它，靠 `patchAllStyles`/`hasRewriteCss` 垫着活的规则一遇改写变化就惰性化（插件那几条正是先例）。<br>③ 三条状态行规则第一版写在 `@media` **外面**，桌面档会跟着一起缩小 —— 用户只要手机档，桌面本来有空间。现在全部收进 `@media (max-width: 767px)`。<br>④ 同批把 `kxxy-webview-compat@7` → **`@8`**（`compat.js` 首行 + `RuntimeInstaller.COMPAT_LAYER_MARKER` + `tools/simulate-install.mjs` 三处同步），否则老设备带着旧兼容层跳过重装、改了个寂寞（同缺陷 DP 的教训）。<br>**验证体系**：新增 `tools/check-mobile-layout.mjs` —— 从 `compat.js` 里把 `MOBILE_LAYOUT_CSS` 数组字面量**求值取出**（保证验的是随产物发出去的那份文本，不是手抄版），铺进「模仿真实宿主 DOM + 模仿插件那几条 `!important` 规则」的夹具，用无头 Chromium 读 computed style；夹具做 **a/b 两份**（a 带插件打的 `data-mobile-nav="stats"`、b 不带），两份结果必须一致，否则「插件改了属性名就静默失效」这条退路是假的；视口跑 **500 / 1000** 两档，确认窄屏生效、桌面不受影响（实测 500→`corner.display=none` / `11px` / `4px` / `1px`，1000→`block` / `12px`，桌面档状态行仍是宿主的 `8px` / `6px`）。`tools/smoke-plugin.mjs` 另加字符串级断言（`installMobileLayoutTweaks` 调用、三个锚点常量、`@media (max-width: 767px)` 存在、`:not(#kxxy)` ≥4 处）。 |
+| DR | `node tools/verify-runtime.mjs` 在**产物完好**时报 `宿主插件版本标记：✗ lib/index.js 头部不含 kxxy-host@N`，结论「1 个关键条目缺失」，把整轮打包验证判红 | 锚点 8 的判据本来是「`lib/index.js` 首行手写 `kxxy-host@N`，`RuntimeInstaller.HOST_PLUGIN_MARKER` 拿同一条字符串比对」，后来升级成**构建期内容指纹**：对整棵插件树按「路径 + 内容」求 sha256 → 写进 `lib/.fingerprint`，入口首行改写成 `kxxy-host@<指纹前 12 位>`，设备侧拿 gradle 从 `.cache/build-meta.json` 生成的 `BuildConfig.HOST_PLUGIN_FINGERPRINT` 与设备上的 `.fingerprint` 比对。但 `verify-runtime.mjs` 仍用 `/HOST_PLUGIN_MARKER\s*=\s*"([^"]+)"/` 去 `.kt` 里抓常量。常量被指纹机制取代之后，**那条正则命中了注释里的示例值** `HOST_PLUGIN_MARKER = "kxxy-host@N"`（`android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt:2232` 的历史说明），于是它到产物里找字面量 `kxxy-host@N` —— 永远找不到，永远报缺失，而真机升级链路其实一直是好的。 | 断言改写成验**指纹契约**：`lib/.fingerprint` 必须含 `algorithm:sha256`、`fingerprint:<64 位小写 hex>`、`files:<n>`、`marker:kxxy-host@<指纹前 12 位>`，再交叉核对三件事 —— ① marker 行与指纹前 12 位相符；② `lib/index.js` 首行真的含该 marker（`markerIsCurrent()` 只读前 256 字节，这正是它要读的东西）；③ 与 `.cache/build-meta.json` 的 `kxxyHostFingerprint` 相等（gradle 就是从这里生成 `BuildConfig`，两边不等即「新 APK 里塞了旧 runtime.zip」）。做了反向验证：把清单里的指纹临时改成 64 个 0，断言立刻报 `✗ 与 .cache/build-meta.json 的 kxxyHostFingerprint 不符（清单 000000000000…）` 且结论变「1 个关键条目缺失」，还原后恢复 `✓ 445eda19112b…，24 个文件（与 build-meta.json 一致）`。<br>**教训**：用正则在源码里抓常量必须锚在语句上（`^(?:private )?const val NAME =`），不能让它在注释里命中；**断言所验的对象换代了，断言本身也得跟着换代** —— 否则它会一直红，而下一个人改它时往往连产物一起怀疑进去。 |
+| DS | `node tools/test-compat-css.mjs` 在补上布局微调那一层之后**整轮崩**：`TypeError: document.querySelector is not a function`，栈顶是 `compat.js:443` 的 `installMobileLayoutTweaks` → `apply`，而这条路径在真实 WebView 里永远走不到 | 新加的 `installMobileLayoutTweaks()` 直接调 `document.querySelector(...)`，只在**极简 DOM 桩**（测试夹具的 `document` 只有 `querySelectorAll` 与 `documentElement`）里抛。两个问题叠在一起才致命：<br>① 那段代码**没有 try/catch** —— 而它在 IIFE 的第 463 行，后面还有一千多行（dvh→vh、`@scope` 展开、`:has()` 改写、hash 代际归一化、API 补丁）。本文件自己的设计约束是「任何一张样式表改写失败都不能拖垮整层」，这一处破了例：真机上只要 `head.appendChild` 或 `querySelector` 在某个中间态抛异常，**整层补丁全静默失效**，症状只是「某些适配没生效」，不留任何痕迹。<br>② 夹具与真实 DOM 差得太远 —— 缺 `head` / `createElement` / `querySelector` / `appendChild`。于是注入路径**一次都没被验过**：等真机上「顶栏多两个图标」的规则不生效时，这套测试本该报错却是绿的。 | ① `installMobileLayoutTweaks` 的 `apply()` 整段包 try/catch，并给 `document.querySelector` 加 `typeof` 守卫、给 `head.appendChild` 加函数判定 —— 缺谁都返回 false 走 `DOMContentLoaded` 兜底，**不抛**；<br>② 夹具补齐真实 DOM 形状（`head` / `createElement` / `querySelector` / `appendChild` / `addEventListener`），并让 `createElement` 记录属性，便于断言注入的 `<style data-kxxy-mobile-layout>`；<br>③ 新增 8 条断言（`test-compat-css.mjs` 的 `[8]` 段，总数 45 → 53）：注入恰好一张 style、带 `data-kxxy-mobile-layout`、含隐藏宿主重复侧栏入口的规则、含隐 chip 图标的规则、字号 11px、分隔符用 `~` 兄弟选择器、只在 `@media (max-width: 767px)` 内、**且不含 `:has(`**（那会重新依赖 WebView 104 不支持的垫片）。 |
+| DT | 手机上**会话页右上角三组芯片互相压字**、标题被挤到只剩两个字（用户报，附三张截图） | 不是「太挤了、调调间距」能救的排版问题，而是**兼容层漏掉了唯一还没垫的现代 CSS 特性**：<br>① 真机探针（与缺陷 AC 同批）早已测出 `@scope` / `:has()` / `@starting-style` / **`@container`** 四者的 `cssRules.length` 全是 0；前三者都垫过，`@container` 一次也没垫。<br>② 上游 `dsh-client-ui-agent-preset` 的样式表里明写着 `@container (width<=540px){.f8BMvq_label{display:none}}` —— 窄屏本该把「标准模式」整块藏掉，`@container` 被整块丢弃后反而**常显**，与右侧两个可点芯片抢同一行。<br>③ 内置移动端插件 `dsh-web-mobile@3.1.0` 整族窄屏折叠同样建在 `@container` 上，一起失效。<br>④ 压字的**直接机制**是 `headerActions` 的 `flex:0 1 auto; min-width:0`：盒子能缩到内容宽度以下，文字却照旧绘制，于是盖在邻居身上。 | ① 在 `compat.js` 新增 `containerRewriteCss`，把 `@container [name] (cond){R}` 在文本层搬成 `@media (cond){R}`（两者 range 语法一致），接进 `patchCssText` 改写链，位置在 `@scope` 之后、`:has()` 之前（容器查询块里常带 `:has()`，先搬成 `@media` 能少改一遍选择器文本）。<br>**四条「宁可放过」**：带容器名的不翻（问的是某个命名盒子，`@media` 问的是视口）、`style()` / `scroll-state()` 不翻（`@media` 里没有对应物，硬翻会恒真）、`not (...)` 不翻（Media Queries Level 4 里 `not` 只能修饰整条 query）、转完若一个宽度/高度都没提到也不翻。<br>**幂等靠「翻不了就逐字保留原文」**：重建字符串会让 `patchCssText` 认为文本变了，`MutationObserver` 反复自激 —— 这是这类垫片最容易写错的一处。<br>② `MOBILE_LAYOUT_CSS` 补两条兜底：`> *:not(#kxxy){min-width:0;overflow:hidden}` 把「压字」降级成「截断」；`@media (max-width:540px)` 下整块隐藏「标准模式」芯片（阈值抄上游的 540px）。<br>③ 版本标记 `@8` → **`@9`**（`compat.js` 首行 + `RuntimeInstaller.COMPAT_LAYER_MARKER` + `tools/simulate-install.mjs` + 本文档表格，四处同步）。<br>**验证**：`test-compat-css.mjs` 新增 [2b] 段（三种可翻形态 + 四种逐字保留 + 幂等 + `@media` 嵌套）；`smoke-plugin.mjs` 新增三条字符串级防回退断言（垫片存在 / 已接进改写链 / 保守跳过还在）。 |
+| DU | 控制台**左上角版本号永远是 `v0.3.2-android`**，与关于页里的真版本（`0.9.2+caf7a90.dirty`）对不上；关于页里也**没有仓库入口**（用户报） | 两个问题同一个病根：**前端里存在与原生版本无关的写死值**。<br>① `plugins/kxxy-host/web/index.html:31` 那行 `<span class="header-version">v0.3.2-android</span>` 是**插件自己的**版本号，插件随 runtime 打包、一个 APK 生命周期内不变，所以用户升级 APK 后页头纹丝不动。缺陷 DP 已经把「真版本」接进了关于弹窗（`engine.build.*`），但页头这条老路径没跟着改 —— 同一个界面里出现两个互相矛盾的版本号，比只有一个错的更误导。<br>② 关于页里没有仓库入口，用户想反馈只能自己去搜。 | ① 页头版本改为**与关于弹窗同源**：`index.html` 只留 `<span id="header-version">&nbsp;</span>` 作占位（`&nbsp;` 是为了避免拿到数据前把行高撑一下又缩回去），`host.js` 的 `renderHeaderVersion(build)` 从 `engine.build` 取，只显示 `v<主版本> · #<versionCode>`（页头宽度只够这么多），带 `+commit` 的完整串与 dirty 标记挂在 `title` 上。<br>② 关于页作者行加 `.about-repo-link`（GitHub 图标 + 文字），`href` 由 `renderRepoLink(build)` 按 `engine.build.repoUrl` 填。URL 走构建期链路（见第九节第 4 条），拿不到就 `hidden`。两个新函数都在 `renderAboutBuild` 末尾统一调用 —— **三处版本号必须同一个数据源**，否则这缺陷必然复发。<br>③ CSS 两处坑：`.about-author` 原先是 `justify-content: space-between`，三个子项会被均分到「两端 + 中间」，改成 `flex-start` + 链接 `margin-left:auto`；`.about-repo-link` 自己声明了 `display:inline-flex`，会盖掉 UA 对 `[hidden]` 的 `display:none`，必须显式补 `.about-repo-link[hidden]{display:none}`（同 `.attention-host[hidden]` 的教训）。 |
 
 **关于缺陷 Q 的额外结论（终端功能本身是好的）**：`dsh.terminal.shell` 这个键**已被官方废弃** —— 在四个运行时 bundle（`sidebar-terminal` / `client.terminal` / `terminal-bash` / `terminal`）里对 `/terminal\.shell/` 与 `/localStorage/` 的命中数**都是 0**；官方新建终端走 `webTerminals.selectShell(path)` → 开 tab 时把 `shellPath` 作为参数传下去（`terminal-bash` 的默认值是 `DEFAULT_BASH_SHELL = "/bin/bash"`，可被 `config.shellPath` 覆盖，而该配置由引擎侧注入）。所以那张卡显示的 `bin/cmd` 只是**历史遗留值**，不影响终端；真机上终端本身工作正常（`uname -a` 正常、提示符显示当前目录），即缺陷 K 的修复仍然有效（提示符一栏见缺陷 S）。对照实验也证明**官方终端天然跟随主题**：浅色下 `.xterm-viewport` 背景透明、文字 `rgb(15,17,21)`，官方 `sidebar-terminal` 插件全部用 `var(--dsw-alias-*)` 官方 token。
 
@@ -456,16 +501,18 @@ about:blank 再回来**（无发起者的跨站导航不带 Strict cookie → 40
 |---|---|---|
 | `verify-runtime.mjs` | zip 结构（条目数 / LINK 注释 / 占位符残留 / 版本标记 / ELF 校验 / 字体 sfnt 魔数）**+ 打开 zip 里真实的 documentpreview `client.js` 断言注入片段真的写进去了、且上游音视频黑名单 16 项全被 provider 认领**；另有三段针对「资产在包里、环境变量却没配上」这类**半修复**的断言：① C++ 标准库头（`include/c++/v1/iostream` 在包内、条目数 ≥1000、**且 `EngineConfig.kt` 的 `includeDirs` 真的含 `include/c++/v1`**、`SONAME_ALIASES` 有 `libc++.so` 且快路径调了 `materialiseSonameAliases`）；② 扩展目录（解 zip 里的 `extensions.json`，断言 ≥25 项且 `maven php ruby erlang yarn` 五项俱全）；③ jansi native 剥离（遍历 25 个 `.pool` 里的全部 jar，解析 **zip 中央目录**断言无 `org/fusesource/jansi/internal/native/` 条目）。另有第四段「打包工具包装器」（缺陷 CT / CN）：四个 corepack 系入口 + `bundletool` + `zipalign` 必须是**实体条目**（`comment` 不以 `LINK:` 开头）、首行 `#!/system/bin/sh`、无 `\r`、`modeOf === 0o755`，且 `bin/corepack` **不得与 `dist/corepack.js` 字节相同**、正文不得含 `lib/corepack.cjs`（反例闸门 —— 少了这条，一个「复制回来的 dist 副本」也能全绿通过）；`bundletool-all.jar` 必须是 zip 且中央目录含 `META-INF/MANIFEST.MF`；最后从 `RuntimeInstaller.kt` 正则读 `PACKAGING_MARKER` / `PACKAGING_MARKER_FILE` / `PACKAGING_WRAPPERS` 逐个比对，并核对 `COREPACK_SHIM_NAMES` **恰好**是 `bin/corepack` / `bin/npm` / `bin/npx` / `bin/pnpm` 四个（多一个就等于放弃了「自造包装器不许变成软链」这条判据，而 zip 侧断言查不出来）；并核 `healPackagingWrappers` 存在**且调用点在 `isComplete()` 之前**（`corepack disable` 删掉入口后，快路径会直接返回，自愈放后面就永远跑不到 —— 顺序是判据成立的前提，不是风格问题）—— 这一段守的是「修复能不能到达老设备」，不是「产物对不对」 | 产物完整性。后两条是补上来的：锚点判定只证明 `patchset.version` 标记文件在、与 Kotlin 常量一致，**不证明补丁内容真的落进 bundle** —— 真机出过一次「标记在、全锚点过、`isComplete()` 判真跳过重装，而设备上仍是未打补丁的旧文件」。三段新断言对应三种**同型半修复**：资产在包里但环境变量漏一项（症状与资产缺失完全一样）、池文件生成了但目录没进 zip（扩展页一张卡都没有）、jar 里 native 剥了但目录条目还留着（`hasResource` 判的是目录，等于没剥）。③ 的判定**必须读 zip 中央目录，不能搜字节** —— 首版搜字节时被 `kotlin-compiler-embeddable` 里 shade 后的类常量池字符串报过假阳性 |
 | `simulate-install.mjs` | 复刻 `RuntimeInstaller` 的 7 步解包与十五锚点判定（锚点 15 的包装器形态按双形态判：sh 包装器，或 `corepack enable` 生成的 corepack/dist 软链） | 结构对 ≠ 设备上能装出可启动的树 |
-| `smoke-plugin.mjs` | 复刻官方 `WebServer` 路由契约起真实 HTTP，并断言兼容层/现代内建补齐层的关键实现在场、版本标记与 Kotlin 常量一致 | 文件铺对了 ≠ 插件能挂起来 |
+| `smoke-plugin.mjs` | 复刻官方 `WebServer` 路由契约起真实 HTTP，并断言兼容层/现代内建补齐层的关键实现在场、版本标记与 Kotlin 常量一致；另含控制台 UI 三层断言（#confirm-dialog 的 7 个 id 齐备 / .confirm-dialog 与 .confirm-stats[hidden] 的 display:none 覆盖 / confirmDialog() 存在且**全仓无裸 confirm( 残留**），以及**锚点 8 标记一致性**（读 lib/index.js 前 256 字节的 kxxy-host@N 与 RuntimeInstaller.kt 的 HOST_PLUGIN_MARKER 比对，不一致即 FAIL 并打印「老设备不会重装新插件」，见缺陷 DP） | 文件铺对了 ≠ 插件能挂起来；而「改了 web 层却忘递增标记」的症状是**装完什么变化都没有**，比报错难查得多 |
 | `check-bundle.mjs` | 用**真实** `dsh-app-boot` 走解析链 | 插件能跑 ≠ DSH 能发现它 |
 | `test-pty-patch.mjs` | 2 个补丁的离线单测（`patchSubprocessInspector` / `patchNodePty`），自带**逐字节照抄上游**的 fixture，不依赖仓库外文件；手上有真 `runner-launch-*.js` 时可用 `DSH_RUNNER_LAUNCH` 换上真文件跑 | 补丁改错了构建照样全绿，只有点开终端才炸 |
 | `test-compat-url.mjs` | 在「WebView 104 行为沙箱」里跑真实 `compat.js`，断言 URL 补丁的 25 组取值与 8 组回归 | `smoke-plugin` 只能验「实现在场」，验不了语义边界（特殊协议、空 authority、userinfo/port）—— 而边界恰恰最容易改坏 |
-| `test-compat-css.mjs` | 断言 `dvh → vh`、`@scope` 展开器、`:has()` 标记改写与插件 hash 锚点代际归一化共 45 组取值（含嵌套 `@media`/`@supports`/`@layer`、`@keyframes` 内部原样保留、真机设置面板门控形态、哈希映射的「唯一超集才采纳」边界） | 三段器都是纯文本重写，一个括号配平错误或一个标识符未定义就会让**整层**样式改写失效（缺陷 AC 的 `matchParen` 事故） |
+| `test-compat-css.mjs` | 断言 `dvh → vh`、`@scope` 展开器、`:has()` 标记改写与插件 hash 锚点代际归一化共 45 组取值，外加 8 条布局微调注入断言（合计 53 组）（含嵌套 `@media`/`@supports`/`@layer`、`@keyframes` 内部原样保留、真机设置面板门控形态、哈希映射的「唯一超集才采纳」边界） | 三段器都是纯文本重写，一个括号配平错误或一个标识符未定义就会让**整层**样式改写失效（缺陷 AC 的 `matchParen` 事故） |
 | `test-modern.mjs` | 每个用例一个**独立 vm realm** 的「104 沙箱」，跑真实 `modern.js`，断言补齐结果 + `URL.createObjectURL` 对 script/html 两类 blob 的前置注入 + 幂等 | 补齐层最危险的失败模式是「本地全绿、真机只显示渲染进程无法继续」—— 补齐源码要被 `Function.prototype.toString()` 搬进 worker 执行，引用本文件作用域里任何变量都不会在本地报错 |
+| `test-compat-open.mjs` | 在「没有多窗口」的 WebView 沙箱里跑真实 `compat.js`，断言 `window.open` 桥的三条规则：`about:blank` → 惰性弹窗桩（主框架**不**被导航）、http(s) → 过桥并返回 null、非 http(s) → 不过桥；外加幂等（重复注入不叠加包装，一次调用只过一次桥） | 缺陷 DF 的症状是**整页白屏**，而它由一行 `window.open` 触发 —— 没有这个测试，任何一次 compat.js 重构都可能让「登录」重新变成白屏，而本地任何其它测试都发现不了 |
+| `test-native-command.mjs` | 把**上游真实**的 `dsh-native-command/lib/index.js` 灌进补丁上下文，跑 `patchNativeCommandAndroid`，用 `vm` 求值补丁后的模块并断言：android 放行、打开/显示位置走 `<root>/libexec/termux-api Open …`、关联查询返回单个可渲染条目、**非 android 平台行为逐字不变**；另验重复打补丁硬失败 | 缺陷 DG 的四个环分布在四个互不相邻的函数里，任何一处锚点漂移都会让「点 APK 没反应」在设备上静默复现，而构建日志里只有一行「跳过（依赖树无 dsh-native-command）」。只验「文件里出现了 android 字样」对语义一无所知 |
 | `test-archive-providers.mjs` | 在 `vm` 沙箱里跑 `tools/prebuilt/documentpreview-archive/providers.js`，断言 ZIP 中央目录解析（含 ZIP64、目录项、加密位）、`kxxyInflateRaw`、EPUB OPF/spine 解析、内联资源与预算控制 | 归档 provider 是**注入进 26 万字符扁平 bundle 作用域**的片段，本地没有模块边界兜底；ZIP 解析器的边界（EOCD 扫描窗口、ZIP64 扩展字段顺序）只有单测能覆盖 |
 | `test-media-providers.mjs` | 在自建 hooks 运行时里跑 `tools/prebuilt/documentpreview-media/providers.js`：13+17 个后缀覆盖、src 构造（loopback 走 `/kxxy/media`、`dsh-app://` 退回 `api/file`）、失败归因（code 4 报 unsupported / 其它报错误码）、`loaded` 上报幂等、三态兜底（unavailable / noPath / loading）、注册形状（1 字典 + 2 provider + 2 槽位 + 5 effect） | 媒体 body 有 5 条互相独立的分支（元数据未到 / 无绝对路径 / 加载中 / 就绪 / 失败），少写一条就变成**永远转圈**且不报任何错；`renderer` 模式还要求恰好上报一次 `loaded`，否则 `hasContent` 不为真、body 根本不渲染 |
-| `test-extinstall.mjs` | 在临时目录里跑真实的 `extinstall.mjs`，断言扩展装配的 13 组行为：`bin/**` 递归展平（TeX Live 的 411 个引擎必须进 PATH）与同扩展内重名退回、`opt/<name>/lib → <extDir>/lib` 布局软链、`etc/`+`share/`+`lib/` 的**递归合并**（与 runtime 同名、多扩展同名、叶子同名记 `shadowed`）、占位符回填（五规则、幂等、老包无清单静默跳过）、卸载只回收自己的资源并把被遮蔽的文件补回、`relinkAll` 与悬空链接自愈 | 装配链是把「一堆互不知情的 tar 包」缝成一套可用工具树的地方，三类冲突（与 runtime 同名 10 处、多扩展同名 15 处、`lib/` 子目录同名 3 处）全都只在真机装完才暴露，而**静默丢内容**没有任何报错；另外 `existsSync` 跟随软链、悬空链接会让「先删后建」变成 EEXIST，这类语义陷阱必须用单测钉住 |
-
+| `test-extinstall.mjs` | 在临时目录里跑真实的 `extinstall.mjs`，断言扩展装配的 13 组行为：`bin/**` 递归展平（TeX Live 的 411 个引擎必须进 PATH）与同扩展内重名退回、`opt/<name>/lib → <extDir>/lib` 布局软链、`etc/`+`share/`+`lib/` 的**递归合并**（与 runtime 同名、多扩展同名、叶子同名记 `shadowed`）、占位符回填（五规则、幂等、老包无清单静默跳过）、卸载只回收自己的资源并把被遮蔽的文件补回、`relinkAll` 与悬空链接自愈。**开头先真建一条链接探测本机能力，没有就整轮 SKIP 并以 0 退出**（见缺陷 DM） | 装配链是把「一堆互不知情的 tar 包」缝成一套可用工具树的地方，三类冲突（与 runtime 同名 10 处、多扩展同名 15 处、`lib/` 子目录同名 3 处）全都只在真机装完才暴露，而**静默丢内容**没有任何报错；另外 `existsSync` 跟随软链、悬空链接会让「先删后建」变成 EEXIST，这类语义陷阱必须用单测钉住 |
+| `check-mobile-layout.mjs` | 从 `compat.js` 里把 `MOBILE_LAYOUT_CSS` 字面量求值取出来（`new Function('return ' + 字面量)()` —— 验的必须是随产物发出去的那份文本，手抄一份等于没验），铺进一个复刻真实宿主的 HTML（含 `._727C8a_*` / `.ueqFMa_*` / `.f8BMvq_*` 原样样式，以及插件那几条会抢属性的 `!important` 规则原文），写出两份夹具（有/无 `data-mobile-nav="stats"`），用本机无头 Chrome 在 500px 与 1000px 两个视口 `--dump-dom` 读回 computed style | 这一层写错**不会报错**，只会「看起来没生效」：首版把分隔符写成 `[data-composer-stat] [class*="_sep"]`（后代）而 `_sep` 是**兄弟节点**，实测 margin 仍是 2px；同理「500px 该藏、1000px 不该藏」这种双向断言只有真浏览器能给，靠读 CSS 只能证明规则在场，证明不了它赢 |
 外加**端到端实测**：用宿主 node 直接跑装配产物，验证
 `/`（官方前端 + token 认证）、`/kxxy`（管理页）、`/kxxy/api/*`（API）、
 `/kxxy/media`（媒体流）、
@@ -501,4 +548,161 @@ about:blank 再回来**（无发起者的跨站导航不带 Strict cookie → 40
    所以走 Termux 的 aarch64 包 + `LD_LIBRARY_PATH`，而不是 Termux 原生环境。
 3. **Node 24.18.0** —— Termux 的 `nodejs-lts`；DSH 的 Node 矩阵是 22/24/26，
    nodejs-mobile（Node 18）不满足。
-4. **registry 只能是 `registry.npmmirror.com`** —— `registry.npmjs.org` 在本机不可达。
+4. **npm registry 在构建机之间会互换** —— 原先那台机器只有 `registry.npmmirror.com`
+   可达；**当前构建机正好相反**：`registry.npmmirror.com` 在 TLS 握手阶段直接断连
+   （`基础连接已经关闭: 发送时发生错误`），而 `registry.npmjs.org` 通。
+   所以 `build-runtime.mjs` 里三个 npm 包（`libreoffice-kit-wasm` / `noto-sans-sc` /
+   `dsh-web-mobile`）的地址都带 `fallbacks`，主地址失败自动换备用地址，**sha256 断言
+   不变**（换源若换出不同内容会立刻失败）。同样地 `raw.githubusercontent.com` 当前
+   不可达，tessdata 走 `ghproxy.net` 镜像；`mirrors.ustc.edu.cn` / `mirror.ctan.org`
+   返回 403，TeX Live 实际走 `mirrors.tuna.tsinghua.edu.cn`。
+5. **构建脚本不许写死绝对路径** —— `build-apk.ps1` 曾经把 node / SDK / JAVA_HOME /
+   apksigner 全写死成另一台机器的路径（缺陷 DI），换机器即 `node` 找不到、
+   `JAVA_HOME is not set`（gradle exit 9009）。现在全部改为「环境变量 → 本机工具链
+   目录 → PATH」的探测链，并在开头把 `JAVA_HOME` 导出（原来只在签名阶段设，   gradle 一启动就失败）。
+6. **Windows 上跑 `simulate-install.mjs` 需要符号链接权限** —— 它要按包内 LINK 表
+   建相对软链；没有「管理员 / 开发者模式」时 `symlinkSync` 抛 `EPERM`。早先这里直接
+   崩，导致占位符改写、权限位、目录结构等断言一条都跑不到。现在退化为复制并在结尾
+   明确标注「链接本身是链而非副本这一条未实测」，其余断言照常执行。
+7. **PowerShell 5.1 读脚本按 ANSI 解码** —— 含中文注释的 `.ps1` 必须存成
+   **UTF-8 with BOM**，否则会被按 GBK 解码成乱码并引发一串假语法错误
+   （`Missing closing '}'`、`Unexpected token`）。`build-apk.ps1` 与
+   `build-go-android.ps1` 都已加 BOM；用 `edit` 工具改完 `.ps1` 后务必复查 BOM。
+
+---
+
+## 九、版本与构建元数据（单一事实源）
+
+### 问题：三套编号互不知情
+
+改造前，同一个 APK 里存在三个各自维护、互不校验的版本标识：
+
+| 编号 | 位置 | 维护方式 | 失效后的表现 |
+| --- | --- | --- | --- |
+| `versionCode` / `versionName` | `android/app/build.gradle.kts` | 手写 `1` / `"0.1.0"` | 与 git tag 早已脱节（仓库到 v0.9.2 时 APK 仍自称 0.1.0），且**永久是 1**，`adb install -r` 覆盖安装无版本比较可用 |
+| 运行时资产版本 | 无 | 无 | 换了 runtime.zip 无法判断设备上是新的还是旧的 |
+| 宿主插件版本 | `RuntimeInstaller.kt` 的 `HOST_PLUGIN_MARKER = "kxxy-host@18"` | 手工递增 | **最危险**：`plugins/kxxy-host/` 改了但忘了 +1，真机上旧插件照跑，七个锚点全部通过，永不自愈 |
+
+第三行是真实事故：改完 `host.js` 装机，界面纹丝不动，日志里没有任何异常。
+
+### 现在的四条来源
+1. **应用版本 ← git**（`android/app/build.gradle.kts`）
+   - `versionCode = maxOf(major*10000 + minor*100 + patch + ahead, 提交数 + 1000)`
+     —— 两个来源取大，保证**严格单调**（否则 `INSTALL_FAILED_VERSION_DOWNGRADE`）；
+     同时恒大于老设备上已装的 `versionCode = 1`，可以直接 `adb install -r` 覆盖。
+   - `versionName` 形如 `0.9.2+12.3b24a6d`（`+` 之后是「距 tag 的提交数.短 commit」），     worktree 脏时追加 `.dirty`。
+   - **本仓库目前一个 tag 都没有**（`git tag -l` 为空，版本号只活在提交信息里）。
+     所以 `git describe` 必然失败，脚本会退到第二层：扫最近 200 条提交信息，
+     找第一条 `vX.Y.Z` 当基线，`ahead` 用 `rev-list --count <sha>..HEAD` 算。
+     `printVersionInfo` 会打印实际用的是哪一层（`git-tag` / `commit-subject@<7位>`）。
+   - 浅克隆或 CI 无 git 时，用 `KXXY_VERSION_CODE` / `KXXY_VERSION_NAME` 覆盖。
+   - Git 可执行文件**必须自己找**：gradle daemon 的 PATH 里通常没有 `Git\cmd`
+     （本机实测），于是 git 全部失败、结果被吞成空串，表现为
+     「versionName 变成 `0.9.0+nogit` 这种看起来正常的错值」。
+     探测顺序：`KXXY_GIT` → `C:\Program Files\Git\cmd\git.exe` → … → PATH。
+   - 自查：`cd android && gradle printVersionInfo`（纯 ASCII 输出，Windows 控制台不乱码）。
+2. **运行时资产指纹 ← runtime.zip 的 sha256**（`tools/build-runtime.mjs`）
+   边写 zip 边喂 digest，结尾同时写两处清单：
+   `android/app/src/main/assets/meta/build.json`（给原生读期望值）与
+   `.cache/build-meta.json`（给人看）。`build.json` 是**扁平键**，gradle 用正则直接取。
+3. **宿主插件指纹 ← 插件树内容哈希**（`tools/build-runtime.mjs` 的 `stampHostPluginFingerprint`）
+   遍历 `lib/node_modules/kxxy-host/` 下的每个文件，按 `相对路径\0sha256(内容)` 排序后再做
+   一次 sha256，写 `lib/.fingerprint`，并把入口首行改写成 `/* kxxy-host@<前12位> */`。
+   两个必须注意的细节：
+   - **排除 `.fingerprint` 自身**，否则自指；
+   - 计算入口文件前**先剥掉首行的标记行**，否则「改标记行 → 哈希变 → 标记变」也自指。
+     `RuntimeInstaller` 的锚点 8 因此从「比字符串」变成「比指纹」：读设备上
+     `lib/node_modules/kxxy-host/lib/.fingerprint` 的 `fingerprint:` 行，与
+     `BuildConfig.HOST_PLUGIN_FINGERPRINT` 比对。取不到期望值（`unknown` / 空）时**放行**，
+     避免探针误判导致每次冷启动都重解 713 MiB。
+4. **源码仓库地址 ← `git remote get-url origin`**（`tools/build-runtime.mjs` 的 `readRepoUrl`）
+   关于弹窗里那条「GitHub」链接的 `href`。构建期取、规范化成 https（SSH 形态换协议头、
+   去掉结尾 `.git`），写进 `build.json` 的 `repoUrl` → gradle 注入 `BuildConfig.REPO_URL`
+   → `BuildMeta.Snapshot.repoUrl` → `/kxxy/api/state` 的 `build.*` → 前端渲染。
+   **不在前端写死**：换仓库、加镜像只改一处。取不到（没装 git / 无 origin / 本地路径克隆）
+   就传空串，前端把整条链接隐藏 —— 一个点不通的死链比没有更糟。
+   之所以在构建期取：设备上没有 git，运行期无从推断。
+
+### build.json 为什么要放两份
+
+原生侧的探针要判断的是「**APK 换了吗、设备上的插件换了吗**」。设备上那份 `build.json`
+躺在旧的 runtime 里 —— 读它等于让被检查者自证清白。所以期望值必须来自 APK 自己
+（`assets/meta/build.json` → `BuildConfig`），而 runtime 内那份是给引擎侧读的。
+
+### 升级后果（写进发布说明）
+
+老设备上的 runtime 没有 `.fingerprint` → 判为过期 → **触发一次全量重解压与插件重装**。这是期望行为，不是缺陷。
+
+### 还没归一的几处手工标记（已知债）
+
+`kxxy-host@18` 只是同一类坑里被踩到的那个。目前仓库里还有这些**仍然靠人手递增**的标记：
+
+| 标记 | 位置 | 覆盖的资产 |
+| --- | --- | --- |
+| `COMPAT_LAYER_MARKER = "kxxy-webview-compat@9"` | `RuntimeInstaller.kt:2197` | `kxxy-host/web/compat.js` |
+| `MOBILE_PLUGIN_MARKER = "kxxy-mobile-plugin@1"` | `RuntimeInstaller.kt:2277` 与 `build-runtime.mjs` | `lib/node_modules/dsh-web-mobile/` |
+| `OFFICE_FONTS_MARKER`（`@2`） | 两侧逐字一致 | LibreOffice wasm + 两套 CJK 字体 |
+| `RUNTIME_VERSION = "v0.1.0-arm64"` | `RuntimeInstaller.kt:2185` | 首次安装写的戳，之后从不比较 |
+
+这些标记**不是纯负债**：它们的意义是「细粒度触发重装」。如果直接拿 `runtimeSha256`
+当唯一判据，那每次 APK 升级（哪怕只改了 Kotlin）都会让设备重解 713 MiB。但风险同样
+是真实的：改了资产、忘了递增编号 → 设备跳过重装、静默用旧文件，症状与 `kxxy-host@18`
+那次完全一样。统一路径已经有了模板（就是本项目对 `kxxy-host` 做的那套）：
+**构建期算内容哈希 → 同时写进 runtime 内的小文件（设备侧实际值）与
+`assets/meta/build.json`（APK 侧期望值）→ 原生比对两个哈希**。一个可以立刻做的简化：
+`COMPAT_LAYER_MARKER` 其实已经被 kxxy-host 的树指纹完全覆盖（`compat.js` 就在那棵树里），
+锚点 6 可以并入 `hostPluginIsCurrent()` 一起判 —— 留它单独一份，只是多一个会忘记递增的地方。
+
+---
+
+## 十、通知体系
+
+### 四条渠道
+
+| 渠道 id | 名称 | 重要性 | 用途 |
+| --- | --- | --- | --- |
+| `kxxy-engine` | 引擎状态 | LOW（无声、无徽标） | 常驻状态条 + 「退出」按钮 |
+| `kxxy-attention` | 需要你确认 | **HIGH**（横幅 + 锁屏可见，`VISIBILITY_PRIVATE`） | 权限请求、提问、失败中断 |
+| `kxxy-task` | 任务进度 | DEFAULT | 长任务进度与完成提示 |
+| `kxxy-ext` | 扩展安装 | LOW | 扩展装/更新的静默提示 |
+
+> **通道建成后重要性不可改**（`createNotificationChannel` 对已存在的 id 是空操作）。
+> 一旦 HIGH 上线，想降级只能换新 id 并接受老用户的旧通道残留 —— 所以重要性必须在
+> 上线前定准。
+
+### 「需要你确认」的完整回路
+
+```
+引擎/工具            原生                      系统通知栏            用户
+   │  POST /kxxy/api/attention                                    │
+   │  → engine/attention/request.json                             │
+   │                     │ 轮询 500ms 读到、立即删除               │
+   │                     │ 发 HIGH 通知 + 写 active-<id>.json     │
+   │                     │ ─────────────────────────────────────► │ 点按钮
+   │                     │  AttentionReceiver（广播）写           │
+   │                     │  response-<id>-response.json           │
+   │  GET /kxxy/api/attention/response?id=…                       │
+   │  ← 读到并删除回执                                             │
+
+```要点：
+- **按钮用 `getBroadcast`，不用 `getService`**。Android 12+ 禁止后台启动前台服务，
+  `getService` 会抛 `ForegroundServiceStartNotAllowedException` —— 而且是在系统
+  弹通知的时候抛，应用侧看不到崩溃，表现为「点了没反应」。
+- **`request.json` 是单槽**。引擎连发两条会互相覆盖，批量请求必须由引擎自己合并。
+  这是刻意的取舍：多槽要处理排序、超时、孤儿清理，而真实场景里同时待确认很少有两条以上。
+- **回执文件同名即覆盖**，所以引擎取回执时**读后立即删除**；否则下一次轮询会把同一个
+  决定当成新决定再处理一遍。
+- **控制台也能回答**（`POST /kxxy/api/attention/answer`），写出的文件与广播按钮**逐字
+  同构**。两条来源必须产出一致的格式，否则会出现「从通知点有用、从应用点没反应」。
+  控制台列表读 `active-*.json`（原生在发通知时写下、用户回答后删除）。
+- 点通知正文进应用后，`MainActivity.onNewIntent` 会注入 `location.hash` +  `CustomEvent('kxxy-attention')`（**用 `evaluateJavascript` 而不是 `loadUrl`** ——
+  后者会重载整个文档，把正在进行的会话刷掉）。落到哪个界面由前端决定，原生不硬编码路由。
+
+### 降级与自检
+
+- 通知被关 / 「需要你确认」渠道被静音 → 设置页「系统权限」卡片会指出**具体是哪一种**，
+  按钮直送系统通知设置（`notification-channels` 分支）。这两种状态混成一句「通知已关闭」
+  会让人根本查不到原因：权限都给了、开关也开着，可通知就是不响。
+- 同类 attention 5 秒窗口内只留最新；单会话最多 3 条（`setGroup` 合并）。
+- 勿扰模式不绕过，但会带 `setTimeoutAfter`，避免过期请求永远占着通知栏。
+- 防回退断言在 `tools/smoke-plugin.mjs`：四段（渠道 / getBroadcast / Manifest 注册 /  kxxy-host 三路由）任一段被删都会立刻失败。

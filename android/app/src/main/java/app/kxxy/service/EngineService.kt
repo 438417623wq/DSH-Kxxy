@@ -53,7 +53,10 @@ class EngineService : Service() {
     override fun onCreate() {
         super.onCreate()
         running = this
-        createChannel()
+        // 四条通知渠道统一由 Notifier 建（含 attention/task/ext）。
+        // 这里不再自己 createNotificationChannel —— 渠道重要性一次定终身，
+        // 散在两处建迟早会出现「同一个 id 两种重要性」的分裂。
+        Notifier.ensureChannels(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -138,48 +141,14 @@ class EngineService : Service() {
         is EngineSupervisor.State.Stopped -> getString(R.string.status_exiting)
     }
 
-    private fun buildNotification(text: String): Notification {
-        val open = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val exit = PendingIntent.getService(
-            this, 1,
-            Intent(this, EngineService::class.java).setAction(ACTION_EXIT),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-
-        return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.notif_title))
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentIntent(open)
-            .setOngoing(true)
-            .addAction(
-                Notification.Action.Builder(
-                    android.graphics.drawable.Icon.createWithResource(
-                        this, android.R.drawable.ic_menu_close_clear_cancel
-                    ),
-                    getString(R.string.notif_action_exit),
-                    exit,
-                ).build()
-            )
-            .build()
-    }
-
-    private fun createChannel() {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-            nm.createNotificationChannel(
-                NotificationChannel(
-                    CHANNEL_ID,
-                    getString(R.string.notif_channel),
-                    NotificationManager.IMPORTANCE_LOW,
-                ).apply { setShowBadge(false) }
-            )
-        }
-    }
+    /**
+     * 常驻通知的构建交给 [Notifier]。
+     *
+     * 这里只保留「怎么发」（`startForeground`）—— 因为常驻通知必须走
+     * `startForeground` 才会被系统认作前台服务标识，`notify()` 在 Android 13+
+     * 常被静默忽略。
+     */
+    private fun buildNotification(text: String): Notification = Notifier.engineNotification(this, text)
 
     /**
      * 退出：三步走，全部避开主线程阻塞。
@@ -224,8 +193,13 @@ class EngineService : Service() {
 
     companion object {
         private const val TAG = "KxxyEngineService"
-        private const val CHANNEL_ID = "kxxy-engine"
-        private const val NOTIF_ID = 42
+
+        /**
+         * 常驻通知 id。数值写死在 [Notifier.ID_ENGINE]，因为 `TermuxApiServer`
+         * 的通知实现、体检页的状态查询都用它，改一处会静默断开另一处。
+         */
+        private const val NOTIF_ID = Notifier.ID_ENGINE
+
         const val ACTION_EXIT = "app.kxxy.service.action.EXIT"
 
         @Volatile

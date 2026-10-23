@@ -3,6 +3,9 @@
  * 占位符改写结果与关键文件存在性。
  *
  * 用法：node tools/verify-runtime.mjs [zip 路径]
+ *
+ * 不给路径时依次找 `android/app/src/main/assets/runtime.zip` 与
+ * `.cache/apk-assets-hold/runtime.zip`（打完包后资源被移走，见下方说明）。
  */
 import { existsSync, createReadStream, readdirSync, readFileSync, openSync, readSync, closeSync, fstatSync } from "node:fs";
 import { createGunzip, gunzipSync, inflateRawSync } from "node:zlib";
@@ -124,7 +127,26 @@ async function scanPoolTar(poolPath, want, onEntry) {
   }
 }
 
-const zipPath = process.argv[2] ?? "F:/KF/DSKX/dsh-kxxy/android/app/src/main/assets/runtime.zip";
+/*
+ * zip 路径的默认值必须是**相对本仓库**推出来的，不能写死。
+ *
+ * ── 为什么（缺陷 DJ）──────────────────────────────────────────────────────
+ * 首版写死 `F:/KF/DSKX/dsh-kxxy/android/app/src/main/assets/runtime.zip` ——
+ * 那是作者的盘符与目录名。换机器后直接跑就是
+ *
+ *     Error: ENOENT: no such file or directory, open
+ *       'F:\KF\DSKX\dsh-kxxy\android\app\src\main\assets\runtime.zip'
+ *
+ * 更要紧的是**第二个坑**：`build-apk.ps1` 打完包会把
+ * `assets/runtime.zip` 整个 `Move-Item` 到 `.cache/apk-assets-hold/`，
+ * 于是「刚打完包」这个最想校验的时刻，`assets/` 下恰恰什么都没有。
+ * 所以两个位置都要认（与 resolvePool 同一套逻辑）。
+ */
+const zipCandidates = [
+  join(HERE, "..", "android", "app", "src", "main", "assets", "runtime.zip"),
+  join(HERE, "..", ".cache", "apk-assets-hold", "runtime.zip"),
+];
+const zipPath = process.argv[2] ?? zipCandidates.find((p) => existsSync(p)) ?? zipCandidates[0];
 
 /*
  * 用 fd + 偏移随机读，**不**把整个 zip 读进内存。
@@ -224,7 +246,6 @@ const NEED = [
   "lib/node_modules/@deepseek-ai/dsh-base/cordis.patch.yml",
   "lib/node_modules/@deepseek-ai/dsh-web-app/cordis.patch.yml",
   "lib/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html",
-  "lib/node_modules/koffi/package.json",
   "lib/node_modules/node-addon-require-builtin/lib/index.js",
   "lib/node_modules/@vscode/ripgrep-android-arm64/bin/rg",
   "lib/node_modules/@vscode/ripgrep-android-arm64/package.json",
@@ -292,6 +313,43 @@ for (const n of NEED) {
   if (!e) { console.log(`  ✗ ${n}`); missing += 1; continue; }
   const kind = e.comment.startsWith("LINK:") ? `LINK→${e.comment.slice(5)}` : `${e.usize}B`;
   console.log(`  ✓ ${n}  ${kind}`);
+}
+
+/*
+ * 被提升/去重过的关键条目：**只要求存在，位置不限**。
+ *
+ * ── 为什么（缺陷 DK）──────────────────────────────────────────────────────
+ * 这条断言原来写的是 `lib/node_modules/koffi/package.json`（顶层绝对路径），
+ * 在当前装配下必然报 ✗ —— 因为 koffi 根本不是顶层依赖，而是 7 份嵌套拷贝：
+ *
+ *     lib/node_modules/@deepseek-ai/dsh-fs-local/node_modules/koffi/package.json
+ *     lib/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/node_modules/koffi/package.json
+ *     lib/node_modules/@deepseek-ai/dsh-subprocess-local/node_modules/koffi/package.json
+ *     lib/node_modules/@deepseek-ai/dsh-host-directory-picker-native/node_modules/koffi/package.json
+ *     lib/node_modules/@deepseek-ai/libreoffice-kit/node_modules/koffi/package.json
+ *     lib/node_modules/@deepseek-ai/dsh-sandbox-windows-acl/node_modules/koffi/package.json
+ *     lib/node_modules/@deepseek-ai/dsh-win32-process/node_modules/koffi/package.json
+ *
+ * （`.cache/app.asar` 是旧版桌面资源，装出来的是顶层形态；换新版后变成嵌套。）
+ * 我们真正关心的只有一件事：**koffi 这个原生 FFI 包跟着 runtime 一起发下去了**。
+ * 它在哪一层、叫什么路径，是 npm 的 hoisting 策略决定的，不是我们能保证的契约，
+ * 所以这里退化为「按后缀匹配，至少命中一份」。
+ *
+ * 同一类问题的通用原则：**断言要么钉在契约上，要么钉在事实上**。钉死一个
+ * 上游可能随时改变的路径，就是在给自己埋一条只会在换机器/换版本时爆的假警报。
+ */
+const NEED_ANY = [
+  ["koffi/package.json", "koffi 原生 FFI 包"],
+];
+console.log("\n可提升/可去重的关键条目（按后缀匹配）：");
+for (const [suffix, label] of NEED_ANY) {
+  const hits = entries.filter((e) => e.name.endsWith(suffix) && !e.comment.startsWith("LINK:"));
+  if (hits.length === 0) {
+    console.log(`  ✗ ${label}：没有任何条目以 ${suffix} 结尾`);
+    missing += 1;
+  } else {
+    console.log(`  ✓ ${label}：${hits.length} 份，样例 ${hits[0].name}`);
+  }
 }
 
 // ---------------------------------------------------------------- 兼容层版本标记
@@ -617,27 +675,64 @@ for (const n of NEED) {
   }
 }
 
-// ---------------------------------------------------------------- 宿主插件版本标记
-// 同锚点 6/7 的道理：锚点 5 只判 kxxy-host/package.json 存在，而它从 v0.1.0 起
-// 内容未变；「改了 host.js 却只重装 APK」的设备会一直跑旧插件。
-// 断言 zip 里插件入口首行的标记与 RuntimeInstaller.HOST_PLUGIN_MARKER 一致。
+// ---------------------------------------------------------------- 宿主插件内容指纹
+// 锚点 8 的判据已经从「人工递增的 kxxy-host@N」换成**内容指纹**：构建期对
+// 整棵插件树（路径 + 内容）求 sha256，写进 `lib/.fingerprint`，同时把入口
+// 首行改写成 `kxxy-host@<指纹前 12 位>`；设备侧拿 `BuildConfig.HOST_PLUGIN_FINGERPRINT`
+// （gradle 从 `.cache/build-meta.json` 生成）与设备上的 `.fingerprint` 比对。
+//
+// 这里原本用正则在 RuntimeInstaller.kt 里抓 `HOST_PLUGIN_MARKER = "…"` 常量。
+// 常量被指纹机制取代后，那条正则转而命中了**注释里**的示例值 `"kxxy-host@N"`，
+// 于是断言从此永远报 `lib/index.js 头部不含 kxxy-host@N` —— 产物完好却一路
+// 判缺失。教训：用正则在源码里抓常量必须锚在语句上，别让它命中注释。
 {
-  const markerNeed = /HOST_PLUGIN_MARKER\s*=\s*"([^"]+)"/.exec(
-    readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
-  );
   const entry = byName.get("lib/node_modules/kxxy-host/lib/index.js");
-  if (!entry) {
-    console.log("宿主插件版本标记：✗ 条目缺失，跳过");
-  } else if (markerNeed === null) {
-    console.log("宿主插件版本标记：✗ RuntimeInstaller.kt 未定义 HOST_PLUGIN_MARKER");
+  const fpEntry = byName.get("lib/node_modules/kxxy-host/lib/.fingerprint");
+  if (!entry || !fpEntry) {
+    const lack = [!entry && "lib/index.js", !fpEntry && "lib/.fingerprint"].filter(Boolean).join(" / ");
+    console.log(`宿主插件内容指纹：✗ 条目缺失（${lack}）`);
     missing += 1;
   } else {
+    const fpText = readLocal(fpEntry).toString("utf8");
+    const fp = /^fingerprint:([0-9a-f]{64})$/m.exec(fpText);
+    const hasAlg = /^algorithm:sha256$/m.test(fpText);
+    const markerLine = /^marker:(kxxy-host@[0-9a-f]+)$/m.exec(fpText);
+    const files = /^files:(\d+)$/m.exec(fpText);
     const head = readLocal(entry).toString("utf8").slice(0, 256);
-    if (!head.includes(markerNeed[1])) {
-      console.log(`宿主插件版本标记：✗ lib/index.js 头部不含 ${markerNeed[1]}`);
-      missing += 1;
+    const short = fp === null ? null : fp[1].slice(0, 12);
+    const problems = [];
+    if (!hasAlg) problems.push("缺 algorithm:sha256");
+    if (fp === null) problems.push("fingerprint 行不是 64 位小写十六进制");
+    if (markerLine === null) {
+      problems.push("marker 行格式不对");
+    } else if (short !== null && markerLine[1] !== `kxxy-host@${short}`) {
+      problems.push(`marker 行 ${markerLine[1]} 与指纹前 12 位不符（应为 kxxy-host@${short}）`);
+    }
+    if (short !== null && !head.includes(`kxxy-host@${short}`)) {
+      problems.push(`入口首行不含 kxxy-host@${short}`);
+    }
+    // 与 APK 侧的期望值对账：gradle 从 .cache/build-meta.json 取
+    // kxxyHostFingerprint 生成 BuildConfig，两边不等就是「装了新 APK，
+    // 里面却是旧 runtime.zip」这类事故的指纹版。
+    const metaPath = join(HERE, "..", ".cache", "build-meta.json");
+    let expected = null;
+    if (existsSync(metaPath)) {
+      try {
+        expected = JSON.parse(readFileSync(metaPath, "utf8")).kxxyHostFingerprint ?? null;
+      } catch {
+        expected = null;
+      }
+      if (expected !== null && fp !== null && expected !== fp[1]) {
+        problems.push(`与 .cache/build-meta.json 的 kxxyHostFingerprint 不符（清单 ${expected.slice(0, 12)}…）`);
+      }
+    }
+    if (problems.length === 0) {
+      const suffix =
+        expected === null ? "（未找到 build-meta.json，未与 APK 侧对账）" : "（与 build-meta.json 一致）";
+      console.log(`宿主插件内容指纹：✓ ${short}…，${files === null ? "?" : files[1]} 个文件${suffix}`);
     } else {
-      console.log(`宿主插件版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
+      console.log(`宿主插件内容指纹：✗ ${problems.join("；")}`);
+      missing += 1;
     }
   }
 }

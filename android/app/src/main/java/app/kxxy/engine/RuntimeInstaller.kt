@@ -3,6 +3,7 @@ package app.kxxy.engine
 import android.content.Context
 import android.net.ConnectivityManager
 import android.util.Log
+import app.kxxy.BuildConfig
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
@@ -358,9 +359,9 @@ class RuntimeInstaller(private val ctx: Context) {
         // 新版 Shizuku 权限卡片（含「请求授权」按钮）在 APK 安装后仍不可见，
         // 设备上的 host.js 停在 55168 字节的旧版，必须手工 push 才生效。
         //
-        // 标记写在插件入口 lib/index.js 首行（`kxxy-host@N`），改动
-        // plugins/kxxy-host/ 下任何文件后都要递增编号，并同步本常量。
-        if (!markerIsCurrent(root, HOST_PLUGIN_ENTRY, HOST_PLUGIN_MARKER)) {
+        // 判据是**内容指纹**而不是人手编号，理由见 [HOST_PLUGIN_FP_FILE] 的注释：
+        // 这一个人工数字实际管辖整个插件目录，漏递增的症状是「装完什么都没变」。
+        if (!hostPluginIsCurrent(root)) {
             Log.w(TAG, "runtime probe: kxxy-host plugin outdated, forcing reinstall")
             return false
         }
@@ -598,6 +599,61 @@ class RuntimeInstaller(private val ctx: Context) {
         } catch (e: Exception) {
             ""
         }
+
+    /**
+     * 锚点 8：设备上的 kxxy-host 插件树是否与**这个 APK** 构建出来的一致。
+     *
+     * 判据是 `lib/.fingerprint` 里的 `fingerprint:` 行（构建期对整个插件树求的
+     * sha256）与 `BuildConfig.HOST_PLUGIN_FINGERPRINT`（gradle 从
+     * `assets/meta/build.json` 注入）是否相等。
+     *
+     * ── 三个失败路径的处理不一样，逐个说明 ──────────────────────────────
+     *
+     * 1. **期望值是 `unknown`**（没跑 `build-runtime.mjs` 就直接打包）：
+     *    放行。此时没有任何可信的期望值，判假会让设备每次启动都去解压
+     *    713 MiB 的 runtime，把一个构建疏漏放大成灾难。宁可放过一次旧插件，
+     *    也不要让应用变成不能启动。
+     * 2. **设备上没有 `.fingerprint`**（老版本 runtime）：判假，触发重装。
+     *    这是**期望行为** —— 从 `kxxy-host@N` 时代升上来的设备本来就该换一次
+     *    插件，否则永远拿不到新 web 层。代价是一次 700 MiB 解压，只需一次。
+     * 3. **两边都有但不等**：判假。这是本锚点存在的全部理由。
+     */
+    private fun hostPluginIsCurrent(root: File): Boolean {
+        val expected = BuildConfig.HOST_PLUGIN_FINGERPRINT
+        if (expected.isBlank() || expected == "unknown") {
+            Log.w(TAG, "runtime probe: host plugin fingerprint unknown (build.json missing), skipping")
+            return true
+        }
+        val fpFile = File(root, HOST_PLUGIN_FP_FILE)
+        if (!fpFile.isFile) {
+            Log.w(TAG, "runtime probe: host plugin .fingerprint missing (pre-fingerprint runtime)")
+            return false
+        }
+        val actual = try {
+            // 文件只有几十字节，整份读完最省事；按行找前缀而不是固定第 2 行，
+            // 这样以后往前面插字段不会把解析弄坏。
+            fpFile.readLines(Charsets.UTF_8)
+                .firstOrNull { it.startsWith("fingerprint:") }
+                ?.removePrefix("fingerprint:")
+                ?.trim()
+        } catch (e: Exception) {
+            Log.w(TAG, "runtime probe: cannot read host plugin fingerprint: ${e.message}")
+            null
+        }
+        if (actual.isNullOrEmpty()) {
+            Log.w(TAG, "runtime probe: host plugin .fingerprint has no fingerprint line")
+            return false
+        }
+        if (actual != expected) {
+            Log.w(
+                TAG,
+                "runtime probe: host plugin fingerprint mismatch " +
+                    "device=${actual.take(16)}… apk=${expected.take(16)}…",
+            )
+            return false
+        }
+        return true
+    }
 
     /**
      * 软链形态的包装器是否指向 corepack 的 `dist/`。
@@ -2138,7 +2194,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 光判「文件存在」会让它们带着不含新补丁的旧兼容层跳过重装，症状
          * 静默复现。改动 compat.js 时必须同步递增此处的编号。
          */
-        private const val COMPAT_LAYER_MARKER = "kxxy-webview-compat@6"
+        private const val COMPAT_LAYER_MARKER = "kxxy-webview-compat@9"
 
         /** 兼容层脚本路径，锚点 6 与 [compatLayerIsCurrent] 共用。 */
         private const val COMPAT_LAYER_FILE = "lib/node_modules/kxxy-host/web/compat.js"
@@ -2169,13 +2225,37 @@ class RuntimeInstaller(private val ctx: Context) {
         private const val PTY_NODE_MARKER = "kxxy-pty-node@1"
 
         /**
-         * 宿主插件版本标记（锚点 8），写在 kxxy-host/lib/index.js 首行。
+         * 宿主插件内容指纹文件（锚点 8，`kxxy-host/lib/.fingerprint`）。
          *
-         * 与锚点 6/7 同理：runtime 版本戳不变，只判文件存在会让老设备带着
-         * 旧插件跳过重装。改动 plugins/kxxy-host/ 下任何文件后递增编号。
+         * ── 为什么不再用人手编号 ──────────────────────────────────────────
+         *
+         * 这里原本是 `HOST_PLUGIN_MARKER = "kxxy-host@N"`，靠人工在
+         * `plugins/kxxy-host/lib/index.js` 首行与本常量里同步递增。它管辖的
+         * 其实是**整个 `plugins/kxxy-host/` 目录**：web 层那四个文件、lib 下
+         * 全部 `.mjs`、样式与图标，一个都不例外。只要漏递增一次，设备上就会
+         * 带着旧 web 层继续跑 —— 而且前十六个锚点全通过、`isComplete()` 判真、
+         * 跳过重装，**整条链路一声不响**。真机踩过一次（缺陷 DP：新版弹窗
+         * 怎么都不出现），根因不是「忘了」而是「没有守护」：全仓只有两处写着
+         * 那个数字，任何改动都要人工同步。
+         *
+         * ⚠️ 写注释时注意：这里不能出现「星号紧跟斜杠」的连写（例如把
+         * 「web 目录下的星号点 html」原样敲出来）。Kotlin 的块注释是可嵌套的，
+         * 那两个字符会开启一层新注释，把文件后半段全吃掉 —— 编译报的是
+         * 「Unclosed comment」和一堆莫名其妙的 Unresolved reference，位置却
+         * 指向几百行之外。本文件已经因为这个踩了三次。
+         *
+         * 现在改成构建期算的内容指纹（`tools/build-runtime.mjs` 的
+         * `stampHostPluginFingerprint()`）：对整棵插件树按「路径 + 内容 sha256」
+         * 求一次总哈希，写进本文件。改动任何一个字节，指纹必变。
+         *
+         * ── 期望值从哪来 ────────────────────────────────────────────────
+         *
+         * 从 **APK 的 BuildConfig**（`HOST_PLUGIN_FINGERPRINT`）来，由 gradle
+         * 在配置阶段读 `assets/meta/build.json` 注入。绝不能读设备上那份 ——
+         * 老 runtime 里躺着的 `build.json` 是旧插件自己带的，读它等于让嫌疑人
+         * 自证清白。
          */
-        private const val HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js"
-        private const val HOST_PLUGIN_MARKER = "kxxy-host@17"
+        private const val HOST_PLUGIN_FP_FILE = "lib/node_modules/kxxy-host/lib/.fingerprint"
 
         /**
          * 移动端 UI 插件（第三方 dsh-web-mobile）版本标记（锚点 10）。
@@ -2246,7 +2326,7 @@ class RuntimeInstaller(private val ctx: Context) {
          *
          * 改动 patches.mjs 里任何补丁、或增删补丁时，必须同步递增此编号。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@5"
+        private const val PATCHSET_MARKER = "kxxy-patchset@6"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**

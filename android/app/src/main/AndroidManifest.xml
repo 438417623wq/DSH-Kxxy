@@ -35,6 +35,12 @@
         android:maxSdkVersion="29" />
     <!-- 设置页「系统权限」卡片请求电池优化白名单（kxxy://perm/request?name=battery） -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 缺陷 DG：在应用内「点开」自己构建的 APK（交付文件卡片 / 终端里 apk 路径）
+         必须唤起系统安装器。Android 8.0+ 的「安装未知来源应用」是**按应用授权**的
+         特殊权限：没有这条声明，PackageInstaller 连选择框都不会出现，用户看到的是
+         「点了没反应」；有它之后系统仍会弹「是否允许来自此来源」，由用户决定。
+         这是普通声明（安装即登记），运行时开关在「安装未知应用」设置页。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- ===== Termux:API 原生桥（缺陷 BE）所需的权限 =====
          这些都是普通（normal）权限，安装即授予，不弹窗、无需运行时请求。
@@ -124,6 +130,20 @@
             android:authorities="app.kxxy.files"
             android:exported="false"
             android:grantUriPermissions="true" />
+
+        <!--
+          通知按钮的回执接收器（方案 B3）。
+
+          为什么是广播而不是 service：Android 12 起禁止从后台启动前台服务，
+          通知按钮的 PendingIntent 若用 getService 会抛
+          ForegroundServiceStartNotAllowedException —— 而且这个异常发生在系统
+          进程里，应用侧连崩溃日志都看不到，只表现为「点了没反应」。
+
+          exported="false"：只有本应用自己发出的 PendingIntent 能触发它。
+        -->
+        <receiver
+            android:name=".service.AttentionReceiver"
+            android:exported="false" />
 
     </application>
 </manifest>

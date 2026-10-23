@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    「需要你确认」的通知栏小图标。
+
+    与 ic_notification_engine 同族但**刻意不同形**：外轮廓仍是控制台的六边形，
+    但改成描边而不是实心，中间塞一个实心感叹号。状态栏图标只有 24dp、还常被
+    ROM 压到 18dp，两条信息（「是 DSH」+「需要你动手」）必须靠形状差异而不是
+    颜色差异来传达 —— 颜色在这里完全不可用，系统只取 alpha 通道。
+
+    为什么不复用 engine 那个图标：常驻状态条与待确认请求的通知会同时出现在
+    通知栏里，图标一样的话用户只能靠读文字分辨，而这类通知的全部价值就在于
+    「扫一眼就知道有事」。
+
+    ⚠️ 通知小图标必须是**纯白 + 透明**的 Alpha 图。这里 strokeColor/fillColor
+    写死 #FFFFFFFF 是正确的，不要换成主题色。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- 六边形外轮廓（描边，与实心的 engine 图标形成区分） -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineJoin="round"
+        android:pathData="M12,3.2L20,7.6v8.8L12,20.8L4,16.4V7.6L12,3.2z" />
+
+    <!-- 感叹号竖条 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M11.05,7.2h1.9v6.6h-1.9z" />
+
+    <!-- 感叹号圆点 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,16.15m-1.15,0a1.15,1.15 0 1,0 2.3,0a1.15,1.15 0 1,0 -2.3,0" />
+</vector>

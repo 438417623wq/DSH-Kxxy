@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    通知栏小图标（状态栏那种单色图标）。
+
+    以前全项目都用 `android.R.drawable.stat_notify_sync` —— 那是系统自带的
+    「同步」箭头，和 DSH 毫无关系，而且不同 ROM 上它的形状/大小都不一样，
+    在 MIUI、ColorOS 上经常被显示成一个白色方块。
+
+    形状沿用控制台 logo 的六边形轮廓（12,2 → 21,7 → …），中间挖空：单色填充
+    时轮廓比实心块更容易在深色状态栏上辨认。fillType=evenOdd 让内层成为孔洞。
+
+    ⚠️ 通知小图标必须是**纯白 + 透明**的 Alpha 图：系统只取 alpha 通道，
+    着色由通知栏主题决定。这里 fillColor 写死 #FFFFFFFF 是正确的。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M12,2L21,7v10l-9,5l-9,-5V7L12,2zM12,6.4L6.6,9.4v5.2L12,17.6l5.4,-3V9.4L12,6.4z" />
+</vector>

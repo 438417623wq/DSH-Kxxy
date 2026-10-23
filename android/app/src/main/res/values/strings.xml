@@ -4,8 +4,32 @@
 
     <!-- 引擎状态通知 -->
     <string name="notif_channel">引擎状态</string>
+    <string name="notif_channel_engine_desc">常驻通知，显示引擎当前状态。可以退出引擎。</string>
     <string name="notif_title">DSH Kxxy 引擎</string>
     <string name="notif_action_exit">退出</string>
+
+    <!-- 通知体系（方案 B）：四条渠道 -->
+    <string name="notif_channel_attention">需要你确认</string>
+    <string name="notif_channel_attention_desc">权限请求、提问与中断。优先级最高，会横幅提醒。</string>
+    <string name="notif_channel_task">任务进度</string>
+    <string name="notif_channel_task_desc">长任务的进度与完成提示。</string>
+    <string name="notif_channel_ext">扩展安装</string>
+    <string name="notif_channel_ext_desc">扩展的安装与更新，静默提示。</string>
+
+    <!-- 锁屏上只显示这一行，不含会话内容 -->
+    <string name="notif_attention_locked">DSH Kxxy</string>
+    <string name="notif_attention_locked_hint">有新的请求等你处理</string>
+    <string name="notif_attention_group">待处理请求</string>
+
+    <!-- 权限类请求没带按钮时的兜底按钮 -->
+    <string name="notif_action_allow">允许</string>
+    <string name="notif_action_deny">拒绝</string>
+
+    <!-- 体检页：通知状态 -->
+    <string name="notif_status_ok">通知正常</string>
+    <string name="notif_status_off">通知已关闭</string>
+    <string name="notif_status_attention_off">「需要你确认」渠道已被关闭</string>
+    <string name="notif_status_open_settings">去设置</string>
 
     <string name="status_idle">空闲</string>
     <string name="status_installing">正在安装运行时 %1$d%%</string>

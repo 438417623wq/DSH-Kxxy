@@ -40,7 +40,20 @@ import { fileURLToPath } from "node:url";
 /** 本脚本所在目录（`tools/`）。静态检查 Kotlin 源码时要用绝对路径。 */
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-const zipPath = process.argv[2] ?? "F:/KF/DSKX/dsh-kxxy/android/app/src/main/assets/runtime.zip";
+/*
+ * zip 路径默认值不能写死（缺陷 DJ）。
+ *
+ * 首版是 `"F:/KF/DSKX/dsh-kxxy/android/app/src/main/assets/runtime.zip"` ——
+ * 作者的盘符与目录名，换机器直接 ENOENT。而且 `build-apk.ps1` 打完包会把
+ * `assets/runtime.zip` 整个 `Move-Item` 到 `.cache/apk-assets-hold/`，
+ * 所以「刚打完包就想校验」这个最自然的时刻，assets 下恰恰是空的。
+ * 两个位置都要认（与 verify-runtime.mjs、resolvePool 同一套逻辑）。
+ */
+const zipCandidates = [
+  join(HERE, "..", "android", "app", "src", "main", "assets", "runtime.zip"),
+  join(HERE, "..", ".cache", "apk-assets-hold", "runtime.zip"),
+];
+const zipPath = process.argv[2] ?? zipCandidates.find((p) => existsSync(p)) ?? zipCandidates[0];
 const target = resolve(process.argv[3] ?? join(tmpdir(), "kxxy-sim-install"));
 
 /** 与 RuntimeInstaller 的 companion object 保持一致。 */
@@ -56,7 +69,7 @@ const MIN_DSH_AI_FILES = 100;
  * 老设备升级 APK 时 RUNTIME_VERSION 不变，所以「文件存在」不足以判出兼容层
  * 过期；锚点 6 实际比对的是 compat.js 首行的版本标记。
  */
-const COMPAT_LAYER_MARKER = "kxxy-webview-compat@6";
+const COMPAT_LAYER_MARKER = "kxxy-webview-compat@9";
 
 /**
  * 与 RuntimeInstaller.MODERN_LAYER_MARKER 保持一致（锚点 6 的第二份资产）。
@@ -78,25 +91,33 @@ const MODERN_LAYER_MARKER = "kxxy-modern@2";
 const PTY_NODE_MARKER = "kxxy-pty-node@1";
 
 /**
- * 与 RuntimeInstaller.HOST_PLUGIN_MARKER 保持一致（锚点 8）。
+ * 锚点 8 的期望值：宿主插件的**内容指纹**（早期是人工递增的 `kxxy-host@N`）。
  *
  * 锚点 5 只判 kxxy-host/package.json 存在，而那个文件从 v0.1.0 起内容未变；
- * 于是「改了 host.js / lib/index.js 却只重装 APK」的设备一直跑旧插件，
- * 且七锚点全通过、永不重装。标记写在插件入口 lib/index.js 首行。
+ * 于是「改了 host.js / lib/index.js 却只重装 APK」的设备会一直跑旧插件。
+ * 最早靠 `lib/index.js` 首行手写 `kxxy-host@N` + `RuntimeInstaller.HOST_PLUGIN_MARKER`
+ * 比对，现在改成构建期对整棵插件树（路径 + 内容）求 sha256：写进
+ * `lib/.fingerprint`，入口首行改写成 `kxxy-host@<指纹前 12 位>`，设备侧读
+ * `BuildConfig.HOST_PLUGIN_FINGERPRINT`（gradle 从 `.cache/build-meta.json` 生成）
+ * 与它比对。
  *
- * 这里**从 Kotlin 源码读**而不是抄一份字面量：抄的那一份是纯冗余，
- * 每次递增标记都要记得改两处，忘一次就是「模拟安装报失败、真机却正常」的
- * 假红灯（本次缺陷 BM 递增 @13→@14 时就踩了）。verify-runtime.mjs 对
- * COMPAT_LAYER_MARKER 等标记早就是这么读的，这里统一成同一范式。
+ * 这里**不抄字面量、也不再用正则在 Kotlin 源码里抓常量**：那个常量已被删除，
+ * 旧正则（`/HOST_PLUGIN_MARKER\s*=\s*"([^"]+)"/`）会命中 `RuntimeInstaller.kt:2232`
+ * 注释里的示例值 `"kxxy-host@N"`，于是拿字面量 `kxxy-host@N` 去产物里找，
+ * 永远找不到（缺陷 DR）。期望值改从构建清单读 —— 那正是 gradle 写进
+ * `BuildConfig` 的同一份数据，读它就是读设备侧的判据。
  */
-const HOST_PLUGIN_MARKER = (() => {
-  const kt = readFileSync(
-    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
-    "utf8",
-  );
-  const m = /HOST_PLUGIN_MARKER\s*=\s*"([^"]+)"/.exec(kt);
-  if (m === null) throw new Error("RuntimeInstaller.kt 未定义 HOST_PLUGIN_MARKER");
-  return m[1];
+const HOST_PLUGIN_FP_FILE = "lib/node_modules/kxxy-host/lib/.fingerprint";
+const HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js";
+const HOST_PLUGIN_FINGERPRINT = (() => {
+  const metaPath = join(HERE, "..", ".cache", "build-meta.json");
+  if (!existsSync(metaPath)) return null;
+  try {
+    const value = JSON.parse(readFileSync(metaPath, "utf8")).kxxyHostFingerprint;
+    return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : null;
+  } catch {
+    return null;
+  }
 })();
 
 /**
@@ -150,7 +171,7 @@ const OFFICE_FONT_FILES = [
  * `grep -c kxxyArchiveApply` 仍是 0 —— 前面的锚点全通过，isComplete()
  * 判真，补丁根本没解出来。标记由 build-runtime.mjs 写在 kxxy-host 目录下。
  */
-const PATCHSET_MARKER = "kxxy-patchset@5";
+const PATCHSET_MARKER = "kxxy-patchset@6";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**
@@ -380,6 +401,7 @@ console.log(`[1] extract：写出 ${extracted} 个文件，跳过 ${skippedLinks
 // `MAVEN_HOME`。这里用 symlinkSync 如实模拟，才能在校验阶段就发现「别名
 // 指向了不存在的本体」这类问题。
 let madeLinks = 0;
+let copiedLinks = 0;
 const missingLinkTargets = [];
 for (const [alias, targetRel] of linkTargets) {
   const src = join(target, targetRel);
@@ -390,12 +412,33 @@ for (const [alias, targetRel] of linkTargets) {
   }
   mkdirSync(dirname(dst), { recursive: true });
   // 相对路径软链：与 Kotlin 侧 `Path.relativize` 等价，root 搬迁后不断链。
-  symlinkSync(relative(dirname(dst), src), dst);
-  madeLinks += 1;
+  //
+  // Windows 上建符号链接要「管理员」或「开发者模式」，否则抛
+  // `EPERM: operation not permitted, symlink`。这是**校验宿主的限制**，
+  // 与被校验的包无关 —— 早先这里直接抛异常，于是整轮校验在 [2] 就崩掉，
+  // 后面「占位符改写 / 权限位 / 目录结构」等真正想验的东西一条都没跑到。
+  // 所以退化成复制：链接语义验不了（会在结尾说明），但其余断言照常执行。
+  try {
+    symlinkSync(relative(dirname(dst), src), dst);
+    madeLinks += 1;
+  } catch (error) {
+    if (error?.code !== "EPERM" && error?.code !== "EACCES") throw error;
+    copyFileSync(src, dst);
+    copiedLinks += 1;
+  }
 }
-console.log(`[2] materialiseLinks：软链 ${madeLinks}/${linkTargets.size} 个别名`);
+console.log(
+  `[2] materialiseLinks：软链 ${madeLinks}/${linkTargets.size} 个别名` +
+    (copiedLinks ? `（${copiedLinks} 条因宿主不支持 symlink 退化为副本）` : ""),
+);
 if (missingLinkTargets.length) fail(`LINK 目标缺失 ${missingLinkTargets.length} 条：${missingLinkTargets.slice(0, 5).join(", ")}`);
 else ok("全部 LINK 目标都在包内（可软链）");
+if (copiedLinks) {
+  console.log(
+    "    ⚠️ 本机未启用符号链接权限（Windows 需管理员或开发者模式），" +
+      "链接**指向正确性**已在上面按目标存在性校验过，但「链接本身是链而非副本」这一条未能实测。",
+  );
+}
 
 // ---------------------------------------------------------------- rewriteRootPlaceholder
 const placeholders = manifest.placeholderPaths ?? [];
@@ -794,12 +837,38 @@ for (const [label, f] of anchors) {
   }
 }
 {
-  // 锚点 8 的第二段判定：宿主插件版本标记（写在 lib/index.js 首行）。
-  const entry = join(target, "lib/node_modules/kxxy-host/lib/index.js");
-  if (existsSync(entry)) {
-    const head = readFileSync(entry, "utf8").slice(0, 256);
-    if (!head.includes(HOST_PLUGIN_MARKER)) fail(`锚点 8 版本标记过期：lib/index.js 头部不含 ${HOST_PLUGIN_MARKER}`);
-    else ok(`锚点 8 版本标记匹配（${HOST_PLUGIN_MARKER}）`);
+  // 锚点 8 的第二段判定：宿主插件内容指纹（`.fingerprint`）+ 入口首行标记。
+  // 设备侧 `markerIsCurrent()` 只读入口前 256 字节，读的正是这条 `kxxy-host@<指纹前 12>`。
+  const entry = join(target, HOST_PLUGIN_ENTRY);
+  const fpFile = join(target, HOST_PLUGIN_FP_FILE);
+  if (!existsSync(fpFile)) {
+    fail(`锚点 8 缺内容指纹文件：${HOST_PLUGIN_FP_FILE}（老式 runtime，设备会一直判不完整）`);
+  } else {
+    const fpText = readFileSync(fpFile, "utf8");
+    const fp = /^fingerprint:([0-9a-f]{64})$/m.exec(fpText);
+    const short = fp === null ? null : fp[1].slice(0, 12);
+    if (fp === null) {
+      fail("锚点 8 指纹文件不合格：fingerprint 行不是 64 位小写十六进制");
+    } else if (!/^algorithm:sha256$/m.test(fpText)) {
+      fail("锚点 8 指纹文件不合格：缺 algorithm:sha256");
+    } else if (HOST_PLUGIN_FINGERPRINT === null) {
+      console.log("  ~ 锚点 8 跳过期望值对账：.cache/build-meta.json 缺席或指纹不合法");
+    } else if (HOST_PLUGIN_FINGERPRINT !== fp[1]) {
+      fail(
+        `锚点 8 指纹与构建清单不符：产物 ${short}… / 清单 ${HOST_PLUGIN_FINGERPRINT.slice(0, 12)}…` +
+          "（gradle 用清单那份生成 BuildConfig，设备会判过期并重装）",
+      );
+    } else {
+      ok(`锚点 8 内容指纹匹配（${short}…，与 build-meta.json 一致）`);
+    }
+    if (short !== null && existsSync(entry)) {
+      const head = readFileSync(entry, "utf8").slice(0, 256);
+      if (!head.includes(`kxxy-host@${short}`)) {
+        fail(`锚点 8 入口标记不一致：lib/index.js 头部不含 kxxy-host@${short}`);
+      } else {
+        ok(`锚点 8 入口标记匹配（kxxy-host@${short}）`);
+      }
+    }
   }
 }
 {

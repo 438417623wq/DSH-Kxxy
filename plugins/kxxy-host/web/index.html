@@ -28,7 +28,12 @@
           </div>
           <div class="brand-text">
             <h1 class="header-title">DSH Kxxy 控制台</h1>
-            <span class="header-version">v0.3.2-android</span>
+            <!-- 版本号由 host.js 按原生层的构建元数据填（renderHeaderVersion），
+                 这里只留占位。改造前它是写死的 "v0.3.2-android"：那是插件自己的
+                 版本，与 APK 无关，用户升级后页头永远不变 —— 正是「左上角版本
+                 没跟上」的那个缺陷。占位用 &nbsp; 而不是空串，避免文字在拿到
+                 数据之前把整行高度撑一下又缩回去。 -->
+            <span class="header-version" id="header-version">&nbsp;</span>
           </div>
         </div>
 
@@ -56,6 +61,13 @@
     <main class="app-main">
       <!-- 1. 概览视图 -->
       <section class="view-pane active" data-view="overview" id="view-overview">
+        <!--
+          待确认请求（方案 B3）。有请求时出现在最上方，并且**压在引擎状态卡
+          之上** —— 引擎在跑、但有个权限请求挂在那里时，用户真正要处理的是
+          后者，把它塞在下面会让人以为「一切正常」。
+        -->
+        <div class="attention-host" id="attention-host" hidden></div>
+
         <!-- 引擎状态主卡 -->
         <div class="card hero-status-card">
           <div class="hero-header">
@@ -583,9 +595,12 @@
          id 全部沿用原「宿主环境参数」卡片（info-node-ver 仍由 fetchState 实时写入 Node 版本），
          所以移进弹窗后动态信息照常刷新。 -->
     <div class="kxxy-dialog-backdrop" id="about-dialog" data-open="false">
-      <div class="kxxy-dialog" role="dialog" aria-modal="true" aria-labelledby="about-dialog-title">
-        <div class="kxxy-dialog-head">
-          <div class="about-entry-logo" aria-hidden="true">
+      <div class="kxxy-dialog about-dialog" role="dialog" aria-modal="true" aria-labelledby="about-dialog-title">
+        <!-- 头部：logo 徽章 + 标题 + 主版本胶囊。
+             `about-dialog-version` 这个 id 必须留着 —— host.js 早先按它同步页头版本，
+             现在改为显示原生层给的真版本（versionName），见 openAboutDialog()。 -->
+        <div class="kxxy-dialog-head about-head">
+          <div class="about-entry-logo about-head-logo" aria-hidden="true">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
               <path d="M12 2L3 7V17L12 22L21 17V7L12 2Z" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
               <path d="M12 22V12" style="stroke:var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -593,9 +608,9 @@
               <circle cx="12" cy="12" r="3" style="fill:var(--accent-cyan)" />
             </svg>
           </div>
-          <div class="kxxy-dialog-titles">
+          <div class="kxxy-dialog-titles about-head-titles">
             <h3 class="kxxy-dialog-title" id="about-dialog-title">DSH Kxxy 控制台</h3>
-            <span class="kxxy-dialog-version" id="about-dialog-version">v0.3.2-android</span>
+            <span class="about-head-sub">DeepSeek Harness · Android 原生移植</span>
           </div>
           <button class="kxxy-dialog-close" type="button" id="btn-about-close" aria-label="关闭">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -604,14 +619,41 @@
           </button>
         </div>
 
-        <div class="kxxy-dialog-body">
-          <div class="about-author">
-            <span class="about-author-label">作者</span>
-            <span class="about-author-name">开心小元</span>
+        <div class="kxxy-dialog-body about-body">
+          <!-- ① 主版本卡：整个弹窗的视觉重心。
+               版本号用等宽大字，右侧是 versionCode 胶囊 —— 用户报障时这两样
+               是唯一能对上的信息，比「DSH 前端版本」有用得多（那个和 APK 无关）。 -->
+          <div class="about-hero">
+            <div class="about-hero-top">
+              <span class="about-hero-label">应用版本</span>
+              <span class="about-version-code" id="about-version-code" title="versionCode">—</span>
+            </div>
+            <div class="about-hero-version code-font" id="about-dialog-version">加载中…</div>
+            <div class="about-hero-meta">
+              <span class="about-meta-chip" id="about-commit" title="git 提交">—</span>
+              <span class="about-meta-dot" aria-hidden="true"></span>
+              <span class="about-meta-chip" id="about-buildtime" title="构建时间">—</span>
+            </div>
           </div>
 
+          <!-- ② 运行时与插件指纹：两行等宽短哈希。
+               「APK 换了、设备上的插件没换」是本项目最隐蔽的一类事故（缺陷 DP），
+               把两个指纹摊在这里，一眼就能看出设备上跑的是哪一份资源。 -->
+          <div class="about-section-title">运行时与插件指纹</div>
+          <div class="about-fp-card" id="about-fp-block" data-empty="true">
+            <div class="about-fp-row">
+              <span class="about-fp-label">运行时</span>
+              <span class="about-fp-value code-font" id="about-runtime-fp" title="">—</span>
+            </div>
+            <div class="about-fp-row">
+              <span class="about-fp-label">宿主插件</span>
+              <span class="about-fp-value code-font" id="about-host-fp" title="">—</span>
+            </div>
+          </div>
+
+          <!-- ③ 宿主环境参数（原有内容，id 全部沿用：info-node-ver 仍由 fetchState 实时写入） -->
           <div class="about-section-title">宿主环境参数</div>
-          <div class="info-table">
+          <div class="info-table about-info-table">
             <div class="info-row">
               <span class="info-key">Target SDK</span>
               <span class="info-val">28 (Android 9.0 · W^X 保护兼容)</span>
@@ -622,25 +664,74 @@
             </div>
             <div class="info-row">
               <span class="info-key">Node.js 版本</span>
-              <span class="info-val" id="info-node-ver">v20.11.1 (LTS/Iron)</span>
+              <span class="info-val code-font" id="info-node-ver">v24.18.0</span>
             </div>
             <div class="info-row">
               <span class="info-key">pnpm 版本</span>
-              <span class="info-val" id="info-pnpm-ver">v8.15.4</span>
+              <span class="info-val code-font" id="info-pnpm-ver">—</span>
             </div>
             <div class="info-row">
               <span class="info-key">应用包名</span>
-              <span class="info-val">app.kxxy</span>
+              <span class="info-val code-font">app.kxxy</span>
             </div>
             <div class="info-row">
               <span class="info-key">执行目录</span>
               <span class="info-val code-font">/data/user/0/app.kxxy/files</span>
             </div>
           </div>
+
+          <!-- ④ 作者 + 源码仓库 -->
+          <div class="about-author">
+            <span class="about-author-label">作者</span>
+            <span class="about-author-name">开心小元</span>
+            <!-- 仓库链接：href 由 host.js 按 engine.build.repoUrl 填（构建期从
+                 git remote 取，见 tools/build-runtime.mjs）。拿不到就整条隐藏
+                 —— 宁可没有，也不要给一个点不通的死链。 -->
+            <a class="about-repo-link" id="about-repo-link" href="#" target="_blank" rel="noopener noreferrer" hidden>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.62.07-.62 1 .07 1.53 1.05 1.53 1.05.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.27 2.75 1.05.8-.23 1.65-.34 2.5-.34s1.7.11 2.5.34c1.91-1.32 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.35 4.8-4.58 5.05.36.32.68.94.68 1.9 0 1.37-.01 2.48-.01 2.82 0 .27.18.6.69.49A10.03 10.03 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"/>
+              </svg>
+              <span id="about-repo-label">GitHub</span>
+            </a>
+          </div>
         </div>
 
         <div class="kxxy-dialog-foot">
-          <button class="button button-subtle button-block" type="button" id="btn-about-dismiss">关闭</button>
+          <button class="button button-primary button-block about-close-button" type="button" id="btn-about-dismiss">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 通用确认弹窗：替代 WebView 原生 confirm。
+         原生弹窗顶部会带「网址为 http://127.0.0.1 的网页显示：」这行系统标题，
+         既不能改、也和「DSH Kxxy 控制台」的视觉体系完全不搭；更关键的是它只能
+         塞一段纯文本，没法把「多少个 / 多大体积 / 走哪条路径」摊成可读的摘要。 -->
+    <div class="kxxy-dialog-backdrop confirm-backdrop" id="confirm-dialog" data-open="false">
+      <div class="confirm-dialog" id="confirm-panel" role="alertdialog" aria-modal="true"
+           aria-labelledby="confirm-title" aria-describedby="confirm-desc" data-tone="default">
+        <div class="confirm-icon" aria-hidden="true">
+          <!-- 两个图标都放进来，由 data-tone 决定显示哪个：
+               默认用「问号」表达「请你确认」，warning 才用警告三角。
+               激活扩展这种正常操作挂个警告三角，会让人以为要出事。 -->
+          <svg class="confirm-icon-ask" width="22" height="22" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M9.5 9.2a2.6 2.6 0 1 1 3.4 2.5c-.6.2-.9.8-.9 1.4v.6" />
+            <path d="M12 17h.01" />
+          </svg>
+          <svg class="confirm-icon-warn" width="22" height="22" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 9v4" />
+            <path d="M12 17h.01" />
+            <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+          </svg>
+        </div>
+        <h3 class="confirm-title" id="confirm-title">确认操作</h3>
+        <p class="confirm-desc" id="confirm-desc"></p>
+        <div class="confirm-stats" id="confirm-stats" hidden></div>
+        <div class="confirm-actions">
+          <button class="button button-subtle confirm-btn" type="button" id="btn-confirm-cancel">取消</button>
+          <button class="button button-primary confirm-btn confirm-btn-ok" type="button" id="btn-confirm-ok">确定</button>
         </div>
       </div>
     </div>

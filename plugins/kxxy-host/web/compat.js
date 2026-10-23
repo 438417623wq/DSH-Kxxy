@@ -1,8 +1,8 @@
-/* kxxy-webview-compat@6 */
+/* kxxy-webview-compat@9 */
 /**
  * dsh-kxxy WebView 兼容层（polyfill + CSS 回退 + URL 修正）
  *
- * 版本标记 `kxxy-webview-compat@6`（首行）：RuntimeInstaller 的锚点 6 按这个
+ * 版本标记 `kxxy-webview-compat@9`（首行）：RuntimeInstaller 的锚点 6 按这个
  * 字符串判定运行时的兼容层是否过期 —— 只判「文件存在」不足以让老设备在
  * 升级后拿到新版兼容层。改动本文件后必须同步递增编号（连同
  * RuntimeInstaller.COMPAT_LAYER_MARKER），否则旧设备会带着旧兼容层静默跳过重装。
@@ -30,6 +30,18 @@
  * 5) 内置插件按宿主「某一代」构建，选择器里写死了那一代的 CSS-module hash
  *    前缀 —— 见 `hashRefresh` 处的详细说明 —— 表现为插件 451 条规则里 330 条
  *    零命中（含「隐藏标题行 headerCorner」那条）。
+ * 6) `window.open` 在本宿主里**不新开窗口**（见 `installWindowOpenBridge`）——
+ *    表现为点「更多 → 登录」整页变白。这不是 WebView 版本问题，而是宿主
+ *    WebView 没有 `setSupportMultipleWindows(true)` + `onCreateWindow`，
+ *    于是 `window.open('about:blank','_blank')` 返回 null，官方账号登录的
+ *    `BrowserLogin.begin()` 拿到 null 后 `follow()` 里那句
+ *    `this.popup.location.replace(...)` 直接抛 TypeError，整个 SignInDialog
+ *    的渲染树崩掉。
+ * 7) 两类「宿主与内置移动端插件各自以为对方会处理」的布局重复/溢出 ——
+ *    见 `installMobileLayoutTweaks` 处的详细说明 —— 表现为对话界面右上角
+ *    多出一个与文件按钮重叠的侧栏图标，「标准模式」chip 左侧多出一个本该
+ *    被 `@container` 藏掉的图标（`@container` 是 Chrome 105+，本 WebView
+ *    整块丢弃），以及底部状态指标行三段被省略号截断。
  *
  * 任何一张样式表改写失败都不能拖垮整层（`patchStyleTag` 用 try/catch 隔离）：
  * 本层是「一次异常 = 全部 CSS 回退静默失效」的结构，曾经因为一个未定义的
@@ -244,6 +256,254 @@
       })()
     }
   }
+
+  // ── window.open 桥（宿主 WebView 无多窗口）★ 已证实致命项 ──────────────
+  //
+  // 真机事故（用户报，Android 真机 + ROM 自带 WebView）：
+  //   侧栏「更多」→「登录」→ **整页变白**，没有任何错误提示，返回键也回不来。
+  //
+  // 根因链（三环，缺一不成立）：
+  //   1. 官方账号登录在「非 Desktop」分支走 `BrowserLogin.begin()`：
+  //          this.popup = window.open("about:blank", "_blank");
+  //      —— 它假定宿主能开新窗口。
+  //   2. 本宿主 MainActivity **没有** `setSupportMultipleWindows(true)` +
+  //      `onCreateWindow`，Android WebView 在这种配置下对 `window.open`
+  //      的语义是「在当前 WebView 里导航到该 URL」：于是**主框架被导航到
+  //      about:blank** ⇒ 整个 SPA 没了 ⇒ 白屏。返回值同样是 null。
+  //   3. 随后 `BrowserLogin.follow()` 里：
+  //          if (this.popup && !this.popup.closed) this.popup.location.replace(...)
+  //      虽然对 null 有守卫，但登录框组件自身依赖 attempt 状态机推进；
+  //      而主页面已经变成 about:blank，任何后续渲染都不存在了。
+  //
+  // 为什么不在原生层补 `onCreateWindow`：那需要再造一个 WebView + 窗口栈
+  // （官方前端是 SPA，弹窗里还要跑 React 登录页），而这一层要做的事只有
+  // 一件 —— **把授权页交给系统浏览器**。这也正是 Desktop 版的行为
+  // （`platform-login.js` 的 `watchPlatformLogin` 走 `action: "open",
+  // external: true`）。所以最省事、也最贴近官方语义的做法是在 Web 层把
+  // `window.open` 接住：
+  //   · `about:blank` / 空串 → 返回一个**惰性弹窗桩**，它的
+  //     `location.replace(url)` 触发「用系统浏览器打开」；
+  //   · 真实 http(s) URL → 直接交给系统浏览器，返回 null（调用方全部有
+  //     null 守卫：BrowserLogin、contactUs、文档预览的外链、聊天里的
+  //     链接预览）。
+  //
+  // 打开动作走 `kxxy://open?url=…`，由 MainActivity 的
+  // `handleOpenBridge` 用 ACTION_VIEW 交给系统浏览器（与既有的
+  // `kxxy://perm/request` 同一条桥，见 MainActivity）。
+  //
+  // 安全性：只放行 http/https，且 `encodeURIComponent` 整串编码 —— 桥的
+  // 另一端（Kotlin）会再 `Uri.parse` + scheme 校验一次，不接受 file:/intent:
+  // 这类会被系统解释成任意组件的协议。
+  //
+  // 幂等：装上后在 window 上留一个标记，重复注入直接跳过；宿主若将来真的
+  // 支持多窗口，把标记置真即可绕过本层，不必改代码。
+  var kxxyOpenInSystemBrowser = function (url) {
+    if (typeof url !== 'string') return false
+    var target = url.trim()
+    if (target === '' || target === 'about:blank') return false
+    if (!/^https?:\/\//i.test(target)) return false
+    try {
+      window.location.href = 'kxxy://open?url=' + encodeURIComponent(target)
+      return true
+    } catch (error) {
+      return false
+    }
+  }
+
+  var installWindowOpenBridge = function () {
+    if (typeof window === 'undefined') return
+    if (window.__kxxyWindowOpenBridge === true) return
+    if (typeof window.open !== 'function') return
+
+    // 惰性弹窗桩：只实现 BrowserLogin 用到的那几个成员。
+    var makePopupStub = function () {
+      var stub = {
+        closed: false,
+        opener: null,
+        name: '',
+        focus: function () {},
+        blur: function () {},
+        postMessage: function () {},
+        document: {
+          open: function () {},
+          write: function () {},
+          writeln: function () {},
+          close: function () {},
+        },
+      }
+      var open = function (target) {
+        kxxyOpenInSystemBrowser(target)
+        // 页面已经交给系统浏览器，这个「窗口」在我们这里就结束了 ——
+        // 置 closed 让调用方走「弹窗已关闭」的分支，而不是继续等一个
+        // 永远不会出现的导航。
+        stub.closed = true
+      }
+      stub.location = {
+        href: 'about:blank',
+        replace: open,
+        assign: open,
+        reload: function () {},
+        toString: function () { return 'about:blank' },
+      }
+      stub.close = function () { stub.closed = true }
+      return stub
+    }
+
+    try {
+      window.open = function (url, name, features) {
+        void name
+        void features
+        var target = typeof url === 'string' ? url.trim() : ''
+        if (target === '' || target === 'about:blank') return makePopupStub()
+        kxxyOpenInSystemBrowser(target)
+        return null
+      }
+      window.__kxxyWindowOpenBridge = true
+    } catch (error) {
+      // window.open 不可写（部分 WebView 的 host object）：保持原样，
+      // 主框架仍会被导航成 about:blank，但至少不额外抛错。
+    }
+  }
+
+  installWindowOpenBridge()
+
+  // ── 移动端布局微调：顶栏重复入口 + 底部状态行放不下 ───────────────────
+  //
+  // 两处症状都不是插件写错了，而是「内置插件 dsh-web-mobile 3.1.0 + 本宿主
+  // 这一代」叠加 WebView 104 的能力缺口后剩下的坑。三条都要落在这里（而不是
+  // 改插件包），原因见下：插件是 npm 上的第三方包，构建期整包塞进 asar，
+  // 它的样式表在 `lib/client.js` 里是压缩成一行的字符串，改它等于改别人
+  // 110 KB 的编译产物；而这三条全是**我们这台设备**的取舍。
+  //
+  // ① 右上角多出一个图标（与插件自己的文件按钮重叠）。
+  //    插件自己有文件按钮（`[data-mobile-nav="files"]`，手机档座位 30px）；
+  //    宿主 `dsh-client-ui-sidebar-right` 另有一个「右侧栏入口」挂在会话标题行
+  //    的 `headerCorner` 上。手机档的右侧栏就是同一个 Files 面板 —— 两个入口
+  //    指向同一处，而且 corner 带 `margin-right:-16px`，36px 的盒子在窄视口下
+  //    会从文件按钮右侧漏出一角（插件注释里 2026-09-22 实测：corner
+  //    [332,2 36x36]、图标 343..358 外露）。插件本来有规则藏它，但那条规则
+  //    用 `:has()` 门控 —— 本宿主这一代的 `:has()` 全靠本层的 `hasRewriteCss`
+  //    兜底，改写一变就惰性化，表现为「右上角多出一个侧栏图标」。
+  //    这里改锚在宿主自己写在 DOM 上的稳定属性
+  //    `data-conversation-header-corner`（见
+  //    `dsh-client-ui-conversation/lib/client.js` 的 titleRow 渲染），不碰 hash。
+  //    为什么要 `!important` + `:not(#kxxy)`：插件里有一条方向相反的规则
+  //    （`... > :first-child > :last-child[class*="_headerCorner"]` 把 corner
+  //    `display:flex` 放出来，给的是 0.1.6 那一代宿主用），特异性 (0,6,1)
+  //    且带 `!important`；这一代宿主两个入口都活着，只能靠抬一级 id 特异性
+  //    压过它。页面上没有 id 为 `kxxy` 的元素，匹配集不变。
+  //
+  // ② 「标准模式」chip 左侧那个 14px 图标。
+  //    该 chip 由 `dsh-client-ui-agent-preset` 渲染，它自己的样式表写着
+  //    `@container (width<=540px){.f8BMvq_label{display:none}}` —— 窄屏本来
+  //    整块隐藏。但 `@container` 是 Chrome 105+ 特性，目标 WebView 104 会把
+  //    整块丢掉，于是手机上反而常显（连同图标）。用户要保留「标准模式」这个
+  //    文字、只去掉图标，所以这里不补容器查询（补了整块就没了），只隐掉 chip
+  //    内的 svg。
+  //
+  // ③ 底部状态行三段被省略号截断。
+  //    宿主 `StatsPills` 的 label 是 `text-overflow:ellipsis;overflow:hidden;
+  //    min-width:0`，在横向 flex 里一旦被压缩就截断；字号是
+  //    `calc(--dsh-content-font-size-secondary,13px - 1px)`，即 12px。
+  //    插件另有一整套 `[data-mobile-nav="stats"]` 规则（字号压到 10px + 只让
+  //    最后一组出省略号），但那套规则依赖插件自己给那一行打的标记 —— 本宿主
+  //    这一代没被打上（否则不会是 12px，也不会前两组一起截断），所以整套是
+  //    惰性的。这里改用宿主写在每个指标上的稳定属性 `data-composer-stat`
+  //    （`dsh-client-ui-chat` 的 PlainPill / DialogPill 都带）做锚点，把字号
+  //    收到 11px、内边距 8→4、分隔符 6→1、图标 14→12，抠出的宽度让三段都
+  //    放得下；仍然保留省略号作为兜底（真放不下时宁可截尾，也不要溢出到
+  //    看不见的地方）。
+  // 为什么状态行要「分两种关系写」：字号挂在指标自己身上，但分隔符与内边距
+  // 在**同一行的兄弟节点**上，不是指标的后代。第一版三条全写成
+  // `[data-composer-stat] [class*="_sep"]`，无头 Chromium 实测 computed
+  // margin 仍是 6px —— 选择器压根没命中，而这类失误在真机上只表现为
+  // 「看起来没生效」，不会有任何报错。现在三种关系各用对的形式：
+  //   指标自己        → `[data-composer-stat]`
+  //   指标内部的内层  → `[data-composer-stat] [class*="_pill"]`
+  //   指标旁边的分隔  → `[data-composer-stat] ~ [class*="_sep"]`（后续兄弟）
+  // 刻意**不用** `:has()`：目标 WebView 104 没有它（Chrome 105+），而本层的
+  // `patchAllStyles` 会把所有 `<style>` 过一遍 `hasRewriteCss` —— 靠垫片活着
+  // 的规则一改写变化就惰性化（插件那几条 `[data-mobile-nav="stats"]` 规则正是
+  // 这么失灵的先例）。这里只用 104 就认得的选择器，不给自己加依赖。
+  var MOBILE_LAYOUT_CSS = [
+    '@media (max-width: 767px) {',
+    '  header [data-conversation-header-corner]:not(#kxxy) { display: none !important }',
+    // ① 溢出保护：允许芯片盒子收缩（min-width:0），但不许文字画出盒子。
+    //
+    // 这是 2026-10-23 那三张截图里「压字」的**直接机制**：headerActions 是
+    // `flex:0 1 auto; min-width:0`（dsh-web-mobile 自己的规则），盒子会缩到
+    // 内容宽度以下，而文字照旧绘制，于是盖在邻居身上 —— 不是「太挤」，是
+    // 「画到了盒子外面」。上游各芯片大多自带 `overflow:hidden`（agent-preset
+    // 的 `.f8BMvq_label` 就有），但不是每个都带，且尺寸一旦被外部规则改写
+    // 就会漏。
+    //
+    // 菜单不受影响：jobs / subagent 的下拉都用 portal 挂到 document.body，
+    // 不是芯片后代，这里裁不到。
+    '  header [class*="_headerActions"] > *:not(#kxxy) { min-width: 0; overflow: hidden }',
+    '  [data-composer-stat]:not(#kxxy) { font-size: 11px !important; line-height: 18px !important }',
+    '  [data-composer-stat] [class*="_pill"]:not(#kxxy) { padding-left: 4px !important; padding-right: 4px !important; gap: 4px !important }',
+    '  [data-composer-stat]:not(#kxxy) ~ [class*="_sep"] { margin: 0 1px !important }',
+    '  [data-composer-stat] svg { width: 12px !important; height: 12px !important }',
+    '}',
+    // ② 「标准模式」芯片在最窄一档整个不显示 —— 阈值 540px 抄的是上游自己的
+    // 数（`@container (width<=540px){.f8BMvq_label{display:none}}`）。
+    //
+    // 这条**推翻了 2026-09-22 的旧取舍**（当时只隐芯片内图标、按用户要求
+    // 保留「标准模式」文字）。推翻的理由是实测：这一行要同时装「标准模式」
+    // 「N 个后台任务」「N 个子智能体」三个芯片，在 393dp 宽的竖屏上，
+    // 三者加起来的 min-content 宽度已经超过「标题保底 30%」之后剩下的空间
+    // —— 数学上装不下，不是调间距能救的。保留文字的代价是整行压字、
+    // 连标题都只剩两个字，比少一个只读的芯片更糟。
+    //
+    // 为什么现在才敢这么做：上游这条 `@container` 原本在 WebView 104 上
+    // 被整块丢弃（见 containerRewriteCss 的注释），所以「照上游意图隐藏」
+    // 这条路以前根本走不通。垫片补上后它自己也会生效，这条规则因此是冗余
+    // 的兜底 —— 留着是因为垫片只翻「无容器名的 width 查询」，上游哪天换成
+    // 命名容器就会退回失效，而这里不能退回「压字」。
+    //
+    // 用直接子级 `> [class*="_label"]` 而不是后代：`_label` 这个片段在
+    // subagent 的血缘行里也出现（`_3K3mEa_label`），那个不在 headerActions
+    // 的直接子级，不能误伤。
+    '@media (max-width: 540px) {',
+    '  header [class*="_headerActions"] > [class*="_label"]:not(#kxxy) { display: none !important }',
+    '}',
+  ].join('\n')
+
+  var installMobileLayoutTweaks = function () {
+    // 整段包 try/catch：本层的位置在 IIFE 开头附近（所有 CSS 回退、API 补丁都在
+    // 它后面），这里一旦抛异常，后面几百行补丁一条都不会执行 —— 而症状只是
+    // 「手机上某些适配没生效」，不会留任何痕迹。test-compat-css 的极简 DOM 桩
+    // 就踩过：它的 `document` 没有 `querySelector`，`TypeError` 直接从这一行
+    // 冒出去，整层静默失效（缺陷 DS）。
+    var apply = function () {
+      try {
+        var head = document.head || document.documentElement
+        if (!head) return false
+        if (typeof head.appendChild !== 'function') return false
+        if (
+          typeof document.querySelector === 'function' &&
+          document.querySelector('style[data-kxxy-mobile-layout]') !== null
+        ) {
+          return true
+        }
+        var tag = document.createElement('style')
+        tag.setAttribute('data-kxxy-mobile-layout', '')
+        tag.textContent = MOBILE_LAYOUT_CSS
+        head.appendChild(tag)
+        return true
+      } catch (error) {
+        return false
+      }
+    }
+    // 注入点在 <head> 里，`document.head` 一定已存在；保留 DOMContentLoaded
+    // 兜底是为了「inline script 被搬到 body」这种改法不会静默失效。
+    if (apply()) return
+    if (typeof document.addEventListener === 'function') {
+      document.addEventListener('DOMContentLoaded', apply)
+    }
+  }
+
+  installMobileLayoutTweaks()
 
   // ── URL：非特殊协议的 authority 解析 ★ 已证实致命项 ──────────────────
   //
@@ -616,6 +876,107 @@
       if (close === -1) { out += text.slice(cursor); break }
       out += text.slice(cursor, at)
       out += expandScopeBody(text.slice(open + 1, close).trim(), scopeRootOf(text.slice(at + 6, open)))
+      cursor = close + 1
+    }
+    return out
+  }
+
+  // ── `@container` → `@media` 垫片（Chrome 105+）★ 已证实致命项 ───────
+  //
+  // 真机事故（2026-10-23，用户三张截图）：会话页右上角「标准模式」「N 个
+  // 后台任务」「N 个子智能体」互相压字，标题被挤到只剩两个字。
+  //
+  // 根因在 `dsh-client-ui-agent-preset` 自己的样式表里：
+  //     .f8BMvq_label{ …max-width:180px; white-space:nowrap; overflow:hidden… }
+  //     @container (width<=540px){ .f8BMvq_label{ display:none } }
+  // 上游的意思很明确 —— 窄于 540px 就把「标准模式」整个藏掉。但 `@container`
+  // 是 Chrome 105+ 才有的（本机 WebView 104），CSS 解析器把整块丢弃，于是
+  // 本该隐藏的芯片反而常显，和右边两个可点的芯片抢同一行宽度。
+  //
+  // 同一次探测里 `@scope` / `:has()` / `@starting-style` / `@container` 的
+  // cssRules.length 全是 0（见上文两处记录）。前两个已经垫过，`@container`
+  // 是唯一被漏掉的 —— 而 dsh-web-mobile 3.1.0 整族窄屏折叠都建在它上面。
+  //
+  // 修法：把 `@container [<name>] (<cond>) { R }` 在文本层改写成
+  // `@media (<cond>) { R }`。`@media` 与 `@container` 的 range 语法完全一致，
+  // 条件可以逐字搬。
+  //
+  // 四条收紧（都是「宁可放过」的取舍）：
+  //   1. **带容器名的查询不翻**。`@container card (width > 400px)` 问的是
+  //      某个命名盒子的宽度，`@media` 问的是视口 —— 猜错比不翻更糟。宁可
+  //      维持现状（反正现在也是整块丢弃），等 WebView 升级后它自己会生效。
+  //   2. `style()` / `scroll-state()` 查询不翻：这两个在 `@media` 里没有对应
+  //      物，硬翻会变成恒真。
+  //   3. `not (...)` 开头的条件不翻。Media Queries Level 4 里 `not` 只能修饰
+  //      整个 media query、不能修饰单个条件，直接搬会静默失效。
+  //   4. `inline-size` / `block-size` 换成 `width` / `height`（横排书写模式下
+  //      两者等价），但转完若条件里一个宽度/高度都不用，仍然不翻。
+  //
+  // 精度说明：`@media` 量视口、`@container` 量容器。本项目的会话头部、
+  // 侧栏、composer 容器宽度都等于视口宽度，误差为零；只有「窄容器里的卡片」
+  // 会被提前折叠 —— 这是可接受的偏差，也是这条垫片唯一的失真来源。
+  //
+  // 幂等：翻成功的输出里不再有 `@container`；翻不了时**逐字保留原文**
+  // （不是重建字符串），否则文本不变也会被判定为「改过了」，让
+  // MutationObserver 自激。这一条是这类垫片最容易写错的地方。
+  var CONTAINER_OPAQUE = /(^|[^\w-])(style|scroll-state)\s*\(/
+
+  var containerPreludeToMedia = function (prelude) {
+    var rest = prelude.replace(/\s+/g, ' ').trim()
+    if (rest === '') return null
+    // 命名容器：`<name> (<cond>)` 或 `<name> not (<cond>)`。
+    // 判据是「第一个字符不是左括号」—— 条件本身一定以 `(` 或 `not` 开头。
+    if (rest.charAt(0) !== '(') {
+      if (!/^not\s*\(/.test(rest)) return null
+    }
+    if (/^not\s*\(/.test(rest)) return null
+    if (CONTAINER_OPAQUE.test(rest)) return null
+    var media = rest
+      .replace(/\binline-size\b/g, 'width')
+      .replace(/\bblock-size\b/g, 'height')
+    // 转完必须真的提到宽度或高度；否则说明这是个我们读不懂的条件，
+    // 搬进 @media 只会变成恒真或恒假。三种写法都要认：
+    //   `(width<=540px)`  `(min-width: 400px)`  `(height >= 500px)`
+    // 注意不能只写 `\bwidth\b`：`min-width` 里 `width` 前面是连字符，
+    // `\b` 边界在 `-w` 之间成立但 `[^\w-]` 这种前置守卫会把整条否掉。
+    if (!/((min|max)-)?(width|height)\s*[<>=:]/.test(media)) {
+      return null
+    }
+    return media
+  }
+
+  var containerRewriteCss = function (text) {
+    var out = ''
+    var cursor = 0
+    var n = text.length
+    while (cursor < n) {
+      var at = text.indexOf('@container', cursor)
+      if (at === -1) { out += text.slice(cursor); break }
+      var prev = at === 0 ? '' : text.charAt(at - 1)
+      if (/[A-Za-z0-9_-]/.test(prev) || insideComment(text, at)) {
+        out += text.slice(cursor, at + 10)
+        cursor = at + 10
+        continue
+      }
+      var open = text.indexOf('{', at)
+      if (open === -1) { out += text.slice(cursor); break }
+      var close = matchBrace(text, open)
+      if (close === -1) { out += text.slice(cursor); break }
+
+      out += text.slice(cursor, at)
+
+      var prelude = text.slice(at + 10, open).trim()
+      var body = text.slice(open + 1, close)
+      var media = containerPreludeToMedia(prelude)
+
+      if (media === null) {
+        var innerKept = containerRewriteCss(body)
+        out += innerKept === body
+          ? text.slice(at, close + 1)
+          : '@container ' + prelude + ' {' + innerKept + '}'
+      } else {
+        out += '@media ' + media + ' {' + containerRewriteCss(body) + '}'
+      }
       cursor = close + 1
     }
     return out
@@ -1262,6 +1623,9 @@
     }
     if (next.indexOf('dvh') !== -1) next = patchDvhUnits(next)
     if (next.indexOf('@scope') !== -1) next = expandScopeBlocks(next)
+    // `@container` 必须在 `:has()` 之前：容器查询块里常带 `:has()`，
+    // 先搬成 `@media` 能少改一遍选择器文本（改得越少越不容易出岔）。
+    if (next.indexOf('@container') !== -1) next = containerRewriteCss(next)
     if (next.indexOf(':has(') !== -1) {
       var fixedHas = hasRewriteCss(next)
       if (fixedHas !== null) next = fixedHas

@@ -871,8 +871,11 @@ html, body {
 .about-author {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  /* 三件套（作者标签 / 作者名 / 仓库链接）之后的排法：前两个贴左成一组，
+     链接用 margin-left:auto 推到右端 —— 所以这里不能再写 space-between，
+     否则三个子项会被均分到「两端 + 中间」。 */
+  justify-content: flex-start;
+  gap: 8px;
   padding: 10px 12px;
   margin-bottom: 14px;
   border-radius: 10px;
@@ -890,6 +893,48 @@ html, body {
   color: var(--text-primary);
 }
 
+/* 源码仓库链接：与作者同处一块，但视觉上是「次级可点目标」——
+   12px + 次级文字色 + 细边框，只在悬停/按下时抬到强调色。 */
+.about-repo-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  padding: 5px 9px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-secondary);
+  text-decoration: none;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  -webkit-tap-highlight-color: transparent;
+  transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.about-repo-link svg {
+  flex: 0 0 auto;
+  opacity: 0.75;
+}
+
+.about-repo-link:hover,
+.about-repo-link:active {
+  color: var(--accent-blue);
+  border-color: rgba(65, 118, 230, 0.36);
+  background-color: rgba(65, 118, 230, 0.08);
+}
+
+.about-repo-link:hover svg,
+.about-repo-link:active svg {
+  opacity: 1;
+}
+
+/* hidden 必须显式抬起来：.about-repo-link 自己写了 display:inline-flex，
+   会盖掉 UA 对 [hidden] 的 display:none（同 .attention-host[hidden] 那条教训）。 */
+.about-repo-link[hidden] {
+  display: none;
+}
+
 .about-section-title {
   font-size: 12px;
   font-weight: 600;
@@ -900,6 +945,375 @@ html, body {
 .kxxy-dialog-foot {
   padding: 12px 16px 16px;
   border-top: 1px solid var(--border-subtle);
+}
+
+/* ── 关于弹窗（版本归一后重做）──────────────────────────────────────────
+   改造前这里只有一张六行表 + 一行「v0.3.2-android」，而那个版本号抄的是 DSH
+   前端页头，与 APK 毫无关系 —— 用户报障时两边对不上任何东西。现在信息分三层，
+   层次靠「视觉重量」区分，而不是靠加分隔线：
+     ① 主版本卡：大字号 versionName + versionCode 胶囊 + 提交/构建时间
+     ② 指纹卡：运行时 / 宿主插件两个内容哈希（等宽小字，一眼比对）
+     ③ 环境参数表：Target SDK / Node / 包名 …（原内容一字未改）
+
+   配色全部走 token（--bg-elevated / --border-subtle / --accent-blue），
+   深浅主题自动跟随；氛围渐变只铺在顶部 46% 且最高 12% 透明度 —— 暗色下像
+   一层极淡的辉光，亮色下不至于糊成一块蓝。 */
+.about-dialog {
+  /* 比通用 .kxxy-dialog 的 380px 略宽：指纹行要放得下 16 位等宽哈希而不折行 */
+  max-width: 404px;
+  background-image: linear-gradient(
+    180deg,
+    rgba(65, 118, 230, 0.1),
+    rgba(65, 118, 230, 0) 46%
+  );
+}
+
+.about-head {
+  padding: 18px 16px 14px;
+}
+
+/* 头部 logo 比入口卡上的大一号：弹窗里它是唯一的图形元素，太小会显得空 */
+.about-head-logo {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  border: 1px solid rgba(65, 118, 230, 0.28);
+  background-color: rgba(65, 118, 230, 0.1);
+}
+
+.about-head-titles {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.about-head-sub {
+  display: block;
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kxxy-dialog-body.about-body {
+  padding: 12px 16px 4px;
+}
+
+/* ① 主版本卡 */
+.about-hero {
+  padding: 14px 16px 15px;
+  margin-bottom: 18px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 16px;
+  background-color: var(--bg-elevated);
+  background-image: linear-gradient(
+    135deg,
+    rgba(65, 118, 230, 0.14),
+    rgba(34, 211, 238, 0.06) 58%,
+    rgba(34, 211, 238, 0) 82%
+  );
+}
+
+.about-hero-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 7px;
+}
+
+.about-hero-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.about-version-code {
+  flex: 0 0 auto;
+  padding: 3px 9px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--accent-blue);
+  background-color: rgba(65, 118, 230, 0.16);
+  border: 1px solid rgba(65, 118, 230, 0.3);
+  border-radius: 999px;
+}
+
+/* 22px 等宽大字：`0.9.2+12.3b24a6d` 这种形态用比例字体读起来会跳字 */
+.about-hero-version {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.22;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.about-hero-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.about-meta-chip {
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+}
+
+.about-meta-dot {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background-color: var(--text-muted);
+  opacity: 0.5;
+}
+
+/* ② 指纹卡 */
+.about-fp-card {
+  margin-bottom: 18px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  background-color: var(--bg-elevated);
+  overflow: hidden;
+}
+
+/* 没有 build 元数据（旧 APK / 引擎未就绪）时整块收起来，而不是显示两行「—」 */
+.about-fp-card[data-empty="true"] {
+  display: none;
+}
+
+.about-fp-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+}
+
+.about-fp-row + .about-fp-row {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.about-fp-label {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.about-fp-value {
+  font-size: 11.5px;
+  color: var(--text-primary);
+  text-align: right;
+  word-break: break-all;
+}
+
+/* ③ 分区小标题：加大字距做「标签」感，与下面卡片拉开节奏 */
+.about-body .about-section-title {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.about-info-table {
+  margin-bottom: 18px;
+}
+
+/* ④ 作者 + 底部主按钮 */
+.about-body .about-author {
+  margin-bottom: 14px;
+}
+
+.about-close-button {
+  font-weight: 600;
+}
+
+/* ── 通用确认弹窗 ───────────────────────────────────────────────────────
+   替代 WebView 原生 confirm()。原生弹窗会顶一行「网址为 http://127.0.0.1
+   的网页显示：」，既不可定制也与控制台视觉体系脱节；这里改成居中小卡：
+   图标 + 标题 + 说明 + 统计胶囊 + 双按钮，tone 决定强调色。 */
+.confirm-backdrop {
+  /* 190 → 但 z-index 要比 toast 的 200 低，理由同 .kxxy-dialog-backdrop */
+  animation: confirmBackdropIn 0.18s ease-out;
+}
+
+.confirm-dialog {
+  width: 100%;
+  max-width: 340px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+  padding: 22px 20px 18px;
+  border-radius: 20px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.42);
+  animation: confirmPopIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  /* 让底色透出一点点主色调，tone 换色时整卡氛围跟着变 */
+  background-image: linear-gradient(180deg, rgba(65, 118, 230, 0.08), transparent 62%);
+
+  /* 强调色全部收进这两个变量：tone 只改变量，各元素自己引用。
+     不用 `#btn-confirm-ok` 这类 ID 选择器覆盖 .button-primary —— 那要靠
+     选择器权重去赢（.confirm-dialog[data-tone] #id 才压得过 .button-primary），
+     一旦按钮没有 id 或类名调整就静默失效，改样式的人根本看不出为什么。 */
+  --confirm-accent: var(--accent-blue);
+  --confirm-accent-rgb: 65, 118, 230;
+}
+
+/* 图标徽章：描边与底色都跟着 --confirm-accent 走 */
+.confirm-icon {
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  margin-bottom: 14px;
+  color: var(--confirm-accent);
+  background-color: rgba(var(--confirm-accent-rgb), 0.12);
+  border: 1px solid rgba(var(--confirm-accent-rgb), 0.22);
+}
+
+/* 默认显示问号，warning 显示警告三角。用 display 切换而不是换 innerHTML ——
+   切图标时不用碰 JS，也不会因为一次 setAttribute 的时机问题闪一下。 */
+.confirm-icon-ask,
+.confirm-icon-warn {
+  display: block;
+}
+
+.confirm-icon-warn {
+  display: none;
+}
+
+.confirm-dialog[data-tone="warning"] .confirm-icon-ask {
+  display: none;
+}
+
+.confirm-dialog[data-tone="warning"] .confirm-icon-warn {
+  display: block;
+}
+
+.confirm-title {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-align: center;
+  color: var(--text-primary);
+  margin: 0 0 8px;
+}
+
+.confirm-desc {
+  font-size: 13px;
+  line-height: 1.6;
+  text-align: center;
+  color: var(--text-secondary);
+  margin: 0;
+  /* 说明可能带换行（卸载提示等），保留但不允许撑破卡片 */
+  white-space: pre-line;
+  word-break: break-word;
+}
+
+/* 统计胶囊行：把「26 个 / 约 1.2 GB」这类数字摊开，比塞进一句话里好读 */
+.confirm-stats {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* 显式 display:flex 会盖掉 hidden 属性默认的 display:none（UA 样式优先级更低），
+   没有统计项时必须手动压掉，否则弹窗底部会留一条空白间距。 */
+.confirm-stats[hidden],
+.confirm-desc[hidden] {
+  display: none;
+}
+
+.confirm-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 6px 11px;
+  border-radius: var(--radius-pill);
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1;
+}
+
+.confirm-stat b {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  /* 数字等宽，多个胶囊并排时不跳字 */
+  font-variant-numeric: tabular-nums;
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  margin-top: 20px;
+}
+
+.confirm-btn {
+  flex: 1 1 0;
+  min-height: 44px;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+}
+
+/* tone：warning（卸载 / 危险）/ default（激活 / 常规确认） */
+.confirm-dialog[data-tone="warning"] {
+  --confirm-accent: var(--accent-red);
+  --confirm-accent-rgb: 239, 68, 68;
+  background-image: linear-gradient(180deg, rgba(239, 68, 68, 0.08), transparent 62%);
+}
+
+/* 危险操作的确定按钮跟着变红：只换底色/描边，不改 .button-primary 的布局属性 */
+.confirm-dialog[data-tone="warning"] .confirm-btn-ok {
+  background-color: var(--confirm-accent);
+  border-color: var(--confirm-accent);
+  color: #FFFFFF;
+}
+
+@keyframes confirmBackdropIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes confirmPopIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* 系统开启「减少动态效果」时不做位移，只保留淡入 */
+@media (prefers-reduced-motion: reduce) {
+  .confirm-backdrop,
+  .confirm-dialog {
+    animation-duration: 0.01s;
+  }
 }
 
 /* 分类标签横排 */
@@ -2151,6 +2565,170 @@ input, textarea, select {
   font-size: 11px;
   color: var(--text-muted);
   margin-top: 2px;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   待确认请求卡片（方案 B3）
+
+   设计取向与「确认弹窗」（.confirm-dialog）保持一致：卡片本身是中性底色，
+   语义色只通过 --attention-accent 与 --attention-accent-rgb 两个变量表达，
+   换 kind 时只改变量、不改结构 —— 这样四种状态看起来是同一套东西的四种
+   语气，而不是四张各画各的卡片。
+
+   刻意放在 prefers-reduced-motion 之前：让「减少动效」的系统设置能覆盖
+   下面这条入场动画。
+   ══════════════════════════════════════════════════════════════════════ */
+
+.attention-host {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+/* 显式写 display:none：UA 的 [hidden] 只是 display:none 的低优先级声明，
+   一旦上面给了 display:flex 就会被盖掉 —— 这是「隐藏了却还占位」的经典坑。 */
+.attention-host[hidden] {
+  display: none;
+}
+
+.attention-card {
+  --attention-accent: var(--accent-orange);
+  --attention-accent-rgb: 245, 158, 11;
+
+  position: relative;
+  display: flex;
+  gap: 12px;
+  padding: 14px 14px 14px 17px;
+  border-radius: var(--radius-lg);
+  background-color: var(--bg-card);
+  background-image: linear-gradient(
+    135deg,
+    rgba(var(--attention-accent-rgb), 0.12),
+    rgba(var(--attention-accent-rgb), 0.03) 46%,
+    transparent 74%
+  );
+  border: 1px solid rgba(var(--attention-accent-rgb), 0.24);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.20);
+  overflow: hidden;
+  animation: attentionCardIn 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 左侧强调条：一眼分辨「这条是要我动手的」而不是普通信息卡。
+   用伪元素而不是 border-left，因为需要渐变淡出。 */
+.attention-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: linear-gradient(
+    180deg,
+    var(--attention-accent),
+    rgba(var(--attention-accent-rgb), 0.22)
+  );
+}
+
+.attention-card[data-kind="permission"] {
+  --attention-accent: var(--accent-blue);
+  --attention-accent-rgb: 65, 118, 230;
+}
+
+.attention-card[data-kind="failed"] {
+  --attention-accent: var(--accent-red);
+  --attention-accent-rgb: 239, 68, 68;
+}
+
+.attention-card[data-kind="done"] {
+  --attention-accent: var(--accent-green);
+  --attention-accent-rgb: 34, 197, 94;
+}
+
+.attention-glyph {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  color: var(--attention-accent);
+  background: rgba(var(--attention-accent-rgb), 0.14);
+  border: 1px solid rgba(var(--attention-accent-rgb), 0.26);
+}
+
+.attention-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.attention-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.attention-kicker {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--attention-accent);
+}
+
+.attention-time {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.attention-title {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--text-primary);
+  /* 标题最多两行：再长就把按钮挤出屏幕了 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.attention-body {
+  margin-top: 3px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.attention-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 11px;
+}
+
+/* 卡片里的按钮比常规按钮矮一点：手机上这个卡片要尽量少占竖向空间。 */
+.attention-actions .button {
+  min-height: 34px;
+  padding: 0 14px;
+  border-radius: var(--radius-pill);
+  font-size: 13px;
+}
+
+@keyframes attentionCardIn {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 
 /* 动效降级偏好支持 */

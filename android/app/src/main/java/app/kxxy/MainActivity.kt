@@ -66,6 +66,16 @@ class MainActivity : Activity() {
      */
     private var filePathCallback: android.webkit.ValueCallback<Array<android.net.Uri>>? = null
 
+    /**
+     * 待投递的 attention 目标。
+     *
+     * 用户点通知时应用可能还在冷启动（WebView 一个字都没加载），此时调用
+     * evaluateJavascript 会静默失败。所以先把意图存下来，等 `onPageFinished`
+     * 再送 —— 这也是「点了通知却停在首页」这个 bug 的根因。
+     */
+    private var pendingAttentionId: String? = null
+    private var pendingSessionId: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -101,6 +111,10 @@ class MainActivity : Activity() {
                 }
             }
         }
+
+        // 冷启动时带过来的 attention 意图（用户点了通知栏里的「需要你确认」）。
+        // 此时 WebView 还没开始加载，所以只会存进 pending，由 onPageFinished 消费。
+        handleLaunchIntent(intent)
     }
 
     private fun setupWebView() {
@@ -171,7 +185,9 @@ class MainActivity : Activity() {
             ): Boolean {
                 val url = request.url.toString()
                 // 宿主内建桥：kxxy://perm/request?name=…（设置页权限卡片）
+                //             kxxy://open?url=…（兼容层的 window.open 桥，见 handleOpenBridge）
                 if (request.url.scheme == "kxxy") {
+                    if (request.url.host == "open") return handleOpenBridge(request.url)
                     return handlePermissionBridge(request.url)
                 }
                 // 子框架一律放行。右侧栏「工作区文件」的 HTML 预览是宿主拼出
@@ -202,6 +218,8 @@ class MainActivity : Activity() {
                 super.onPageFinished(view, url)
                 Log.i(TAG, "page finished: $url")
                 currentPath = pathOf(url)
+                // 页面就绪后立刻把挂起的 attention 意图送进去（冷启动路径）。
+                flushPendingAttention()
             }
 
             /**
@@ -298,6 +316,36 @@ class MainActivity : Activity() {
     }
 
     /**
+     * `kxxy://open?url=…` 桥（缺陷 DF，登录白屏）。
+     *
+     * 背景见 `plugins/kxxy-host/web/compat.js` 的 `installWindowOpenBridge`：
+     * 本宿主没有多窗口 WebView，官方账号登录的 `window.open('about:blank')`
+     * 会把主框架导航成空白页。兼容层把这类调用改写成这条桥，由原生层交给
+     * 系统浏览器打开 —— 与 Desktop 版 `platform-login` 的
+     * `action: "open", external: true` 同义。
+     *
+     * 只接受 http/https：`file:` / `intent:` / `content:` 会被系统当成任意
+     * 组件调用，等于把「打开一个网页」放大成「拉起任意应用」。
+     */
+    private fun handleOpenBridge(uri: android.net.Uri): Boolean {
+        val raw = uri.getQueryParameter("url") ?: return true
+        val target = runCatching { android.net.Uri.parse(raw) }.getOrNull() ?: return true
+        val scheme = target.scheme?.lowercase()
+        if (scheme != "http" && scheme != "https") {
+            Log.w(TAG, "open bridge rejected scheme: $scheme")
+            return true
+        }
+        Log.i(TAG, "open bridge: ${raw.take(120)}")
+        runCatching {
+            startActivity(
+                android.content.Intent(android.content.Intent.ACTION_VIEW, target)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        }.onFailure { Log.w(TAG, "open bridge failed: ${it.message}") }
+        return true
+    }
+
+    /**
      * `kxxy://perm/request?name=…` 桥（设置页「系统权限」卡片触发）。
      *
      * 权限请求必须由 Activity 发起，而设置页跑在 WebView 里 —— 复用
@@ -312,7 +360,16 @@ class MainActivity : Activity() {
             "notifications" -> {
                 if (android.os.Build.VERSION.SDK_INT >= 33) {
                     requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_PERM_NOTIFICATIONS)
+                } else {
+                    openNotificationSettings()
                 }
+            }
+            "notification-channels" -> {
+                // 「应用通知已允许，但『需要你确认』这条渠道被单独静音」是
+                // 最容易被误判成「引擎坏了」的一种状态 —— 应用级开关是开的，
+                // 权限也都授予了，可最重要的通知就是不响。这种情况必须把用户
+                // 直接送到**渠道列表**，而不是笼统的应用通知页。
+                openNotificationSettings()
             }
             "all-files" -> {
                 // Android 11+ 的「所有文件访问」必须去系统设置页，应用内弹不出来
@@ -395,6 +452,106 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * 热态点击通知：Activity 已在栈里（`launchMode=singleTask`）时走这里。
+     *
+     * 改造前 MainActivity **完全没有** onNewIntent —— 通知点击永远只会
+     * `onResume`，把已经在前台的界面重新拉一次，用户看不出「点的是哪一条」。
+     */
+    override fun onNewIntent(intent: android.content.Intent?) {
+        super.onNewIntent(intent)
+        if (intent == null) return
+        // 必须 setIntent：否则后续 getIntent() 仍返回冷启动那一条，重复点击
+        // 同一条通知会看起来「第一次有用、之后都没反应」。
+        setIntent(intent)
+        handleLaunchIntent(intent)
+    }
+
+    /** 从启动意图里提取 attention 目标，存入 pending 等待页面就绪。 */
+    private fun handleLaunchIntent(intent: android.content.Intent?) {
+        val attentionId = intent?.getStringExtra(EXTRA_ATTENTION_ID) ?: return
+        pendingAttentionId = attentionId
+        pendingSessionId = intent.getStringExtra(EXTRA_SESSION_ID)
+        Log.i(TAG, "launch intent: attention=$attentionId")
+        flushPendingAttention()
+    }
+
+    /** 页面已就绪时把挂起的意图送进前端。 */
+    private fun flushPendingAttention() {
+        val id = pendingAttentionId ?: return
+        if (!urlLoaded || !::webView.isInitialized) return
+        pendingAttentionId = null
+        val sessionId = pendingSessionId
+        pendingSessionId = null
+        navigateToAttention(id, sessionId)
+    }
+
+    /**
+     * 把「打开某条 attention」的意图交给前端。
+     *
+     * **刻意不硬编码前端路由**：这里只做两件事 —— 把意图写进 URL hash（可回退、
+     * 可分享）并发一个自定义事件（重复点同一条时 hash 不变、不会触发
+     * hashchange，但事件仍会送达）。落到哪个视图由 kxxy-host 的 web 层决定，
+     * 原生壳不需要知道前端有几个页面。
+     *
+     * 用 evaluateJavascript 而不是 loadUrl：loadUrl 会**重新加载整个文档**，
+     * 用户正在看的会话会被刷没。
+     */
+    private fun navigateToAttention(attentionId: String, sessionId: String?) {
+        val js = buildString {
+            append("(function(){try{var d={id:").append(jsString(attentionId))
+            if (sessionId != null) append(",sessionId:").append(jsString(sessionId))
+            append("};")
+            append("var h='#kxxy-attention='+encodeURIComponent(d.id);")
+            append("if(d.sessionId){h+='&session='+encodeURIComponent(d.sessionId);}")
+            append("if(location.hash!==h){location.hash=h;}")
+            append("window.dispatchEvent(new CustomEvent('kxxy-attention',{detail:d}));")
+            append("}catch(e){}})()")
+        }
+        runCatching { webView.evaluateJavascript(js, null) }
+            .onFailure { Log.w(TAG, "attention route failed: ${it.message}") }
+    }
+
+    /** 转义成 JS 双引号字符串字面量。 */
+    private fun jsString(value: String): String {
+        val sb = StringBuilder(value.length + 2)
+        sb.append('"')
+        for (ch in value) {
+            when (ch) {
+                '"' -> sb.append("\\\"")
+                '\\' -> sb.append("\\\\")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                '\t' -> sb.append("\\t")
+                '<' -> sb.append("\\u003c")
+                '>' -> sb.append("\\u003e")
+                '&' -> sb.append("\\u0026")
+                else -> if (ch < ' ') sb.append("\\u%04x".format(ch.code)) else sb.append(ch)
+            }
+        }
+        sb.append('"')
+        return sb.toString()
+    }
+
+    /**
+     * 打开本应用的通知设置（含四条渠道的单独开关）。
+     *
+     * `EXTRA_APP_PACKAGE` 是 Android 8 起的分包写法；某些 ROM（HyperOS / EMUI）
+     * 只认旧的两个 extra，所以两套都填，兜底再退化到全应用列表。
+     */
+    private fun openNotificationSettings() {
+        val intents = listOf(
+            android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, packageName)
+                .putExtra("android.provider.extra.APP_PACKAGE", packageName),
+            android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:$packageName")),
+        )
+        for (intent in intents) {
+            if (runCatching { startActivity(intent) }.isSuccess) return
+        }
+        Log.w(TAG, "notification settings intent unavailable")
+    }
+
     private fun pathOf(url: String): String? =
         runCatching { android.net.Uri.parse(url).path }.getOrNull()
 
@@ -460,5 +617,11 @@ class MainActivity : Activity() {
         private const val REQUEST_FILE_CHOOSER = 4201
         private const val REQ_PERM_NOTIFICATIONS = 4202
         private const val REQ_PERM_STORAGE = 4203
+
+        /** 通知点击时带过来的请求标识（由 [app.kxxy.service.Notifier] 写入）。 */
+        const val EXTRA_ATTENTION_ID = "kxxy.extra.attention_id"
+
+        /** 该请求所属的会话（可能为空：引擎没给就不跳会话）。 */
+        const val EXTRA_SESSION_ID = "kxxy.extra.session_id"
     }
 }

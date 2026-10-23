@@ -52,6 +52,19 @@ const runInDom = (styles, documentElement = {}) => {
     observe() {}
     disconnect() {}
   }
+  // 布局微调那一层会往 `<head>` 里追加一张 `<style data-kxxy-mobile-layout>`。
+  // 真实 WebView 的 `document` 有 `head` / `createElement` / `querySelector` /
+  // `appendChild`，这里必须补齐 —— 缺 `querySelector` 时旧实现在第 443 行抛
+  // `TypeError`，而在真实浏览器里那段代码永远走不到，等于这套断言从来没验过
+  // 注入路径（缺陷 DS）。
+  const headChildren = [];
+  const head = {
+    appendChild(node) {
+      headChildren.push(node);
+      return node;
+    },
+  };
+  const hasMobileLayout = () => headChildren.some((n) => n.attributes["data-kxxy-mobile-layout"] !== undefined);
   const sandbox = {
     URL: globalThis.URL,
     AbortSignal: globalThis.AbortSignal,
@@ -68,12 +81,20 @@ const runInDom = (styles, documentElement = {}) => {
         }
         return [];
       },
+      querySelector: (selector) => {
+        if (selector === "style[data-kxxy-mobile-layout]") return hasMobileLayout() ? headChildren[0] : null;
+        return null;
+      },
+      createElement: () => ({ attributes: {}, textContent: "" , setAttribute(name, value) { this.attributes[name] = value; } }),
+      head,
+      addEventListener() {},
       documentElement,
     },
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox, { filename: "compat.js" });
+  nodes.injected = headChildren;
   return nodes;
 };
 
@@ -204,6 +225,43 @@ check(
   "展开后不再含 @scope（幂等的前提）",
   patch("@scope ([x]) { .a{color:red} }").includes("@scope"),
   false,
+);
+
+console.log("\n[2b] @container → @media（Chrome 105+，2026-10-23 右上角压字的根因）");
+check(
+  "无容器名的 width 范围查询被搬成 @media",
+  patch("@container (width<=540px){.a{display:none}}"),
+  "@media (width<=540px) {.a{display:none}}",
+);
+check(
+  "min-width 形式同样能搬",
+  patch("@container (min-width: 400px){.a{color:red}}"),
+  "@media (min-width: 400px) {.a{color:red}}",
+);
+check(
+  "inline-size 改写成 width（@media 不认盒维度名）",
+  patch("@container (inline-size < 400px){.a{color:red}}"),
+  "@media (width < 400px) {.a{color:red}}",
+);
+// 四条「宁可放过」。它们必须**逐字保留原文**而不是重建字符串：
+// 重建会让 patchCssText 认为「文本变了」，于是 MutationObserver 反复自激。
+const namedContainer = "@container card (width>400px){.a{color:red}}";
+check("带容器名的不翻（逐字保留）", patch(namedContainer), namedContainer);
+const styleContainer = "@container style(--theme:dark){.a{color:red}}";
+check("style() 查询不翻（逐字保留）", patch(styleContainer), styleContainer);
+const notContainer = "@container not (width>400px){.a{color:red}}";
+check("not (...) 不翻（逐字保留）", patch(notContainer), notContainer);
+const opaqueContainer = "@container (aspect-ratio > 1/1){.a{color:red}}";
+check("读不懂的维度不翻（逐字保留）", patch(opaqueContainer), opaqueContainer);
+// 幂等：搬完的文本里不再有 @container，第二遍不再变化。
+const containerOnce = patch("@container (width<=540px){.a{display:none}}");
+check("搬完后文本里不再出现 @container", containerOnce.includes("@container"), false);
+check("第二次跑不再变化", patch(containerOnce), containerOnce);
+// dsh-web-mobile 的规则全都写在 @media 里，所以嵌套形态是主场景。
+check(
+  "嵌套在 @media 里的 @container 也搬",
+  patch("@media (max-width:767px){@container (width<=540px){.a{display:none}}}"),
+  "@media (max-width:767px){@media (width<=540px) {.a{display:none}}}",
 );
 
 console.log("\n[3] 幂等：已展开的文本再跑一次不变");
@@ -370,6 +428,33 @@ check(
   ),
   '[class*="Dc7zOa_titleRow"] > [class*="_headerCorner"]{display:none}',
 );
+
+// [8] 布局微调层的注入路径（缺陷 DQ 的守卫）
+// 这一段验的是「compat.js 真的把那几条规则追加进 <head> 了吗」——之前的
+// 夹具没有 `querySelector`，注入路径一次都没走到过；等真机上「顶栏多两个
+// 图标」的规则不生效时，这套测试本来该报错却是绿的（缺陷 DS）。
+{
+  const injected = runInDom([{ textContent: "" }]).injected;
+  check("布局微调层注入一张 style", injected.length, 1);
+  const css = injected[0]?.textContent ?? "";
+  check("注入的 style 带 data-kxxy-mobile-layout", injected[0]?.attributes["data-kxxy-mobile-layout"], "");
+  check("隐藏宿主重复的侧栏入口", css.includes("[data-conversation-header-corner]"), true);
+  check(
+    "最窄一档整块隐藏「标准模式」chip（阈值与上游 @container 的 540px 一致）",
+    css.includes("@media (max-width: 540px)")
+      && css.includes('header [class*="_headerActions"] > [class*="_label"]:not(#kxxy) { display: none !important }'),
+    true,
+  );
+  check(
+    "headerActions 直接子级加溢出保护（压字的直接机制）",
+    css.includes('header [class*="_headerActions"] > *:not(#kxxy) { min-width: 0; overflow: hidden }'),
+    true,
+  );
+  check("状态行字号收到 11px", css.includes("[data-composer-stat]:not(#kxxy) { font-size: 11px"), true);
+  check("分隔符用兄弟选择器", css.includes("~ [class*=\"_sep\"]"), true);
+  check("只在窄屏生效", css.includes("@media (max-width: 767px)"), true);
+  check("不依赖 :has()", css.includes(":has("), false);
+}
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);

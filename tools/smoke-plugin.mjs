@@ -26,6 +26,19 @@ import { openZip } from './lib/zipread.mjs'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = join(HERE, '..', 'plugins', 'kxxy-host', 'lib', 'index.js')
 
+// ── 锚点 8 的标记一致性 ────────────────────────────────────────────────
+// `RuntimeInstaller.isComplete()` 的锚点 8 靠 `kxxy-host@N` 判断设备上的
+// 插件是不是当前版本。这个标记写在 lib/index.js 首行，而**真正被判定版本
+// 的是整个 plugins/kxxy-host/ 目录**（web/*.js、web/*.css、lib/*.mjs 全在
+// 里面）—— 改了 web 层却忘了递增编号，老设备升级 APK 后锚点 8 照样通过、
+// `isComplete()` 判真、跳过重装，新 UI 永远不落地，且没有任何报错。
+// 所以这里把它钉死：插件首行标记与 RuntimeInstaller.kt 的常量必须一致，
+// 且必须真的落在文件前 256 字节内（`COMPAT_MARKER_PROBE_BYTES`）。
+const RUNTIME_INSTALLER = join(
+  HERE, '..', 'android', 'app', 'src', 'main', 'java', 'app', 'kxxy', 'engine', 'RuntimeInstaller.kt',
+)
+const MARKER_PROBE_BYTES = 256
+
 // 插件的所有动作通道都挂在 KXXY_ENGINE_ROOT 下（restart.request /
 // stdin.request / export/ / extensions/）。冒测试给它一个临时目录，
 // 动作之后逐个验证文件真的落盘 —— 「动作真做」是这个断言的核心。
@@ -219,6 +232,42 @@ if (indexTaps.length === 1) {
   // 所以每次输入都是干净的 HTML，无需幂等；这里只确认单次调用只注入一份。
   if (out.split('data-kxxy-compat').length - 1 !== 1) fail('单次 tap 注入了多份兼容层')
   else ok('单次 tap 只注入一份')
+
+  // ── @container → @media 垫片（Chrome 105+）────────────────────────────
+  // 这一段守的是 2026-10-23 那次「右上角压字」的修复：`@container` 是本机
+  // WebView 104 唯一还没垫的现代 CSS 特性，上游（agent-preset）与内置移动端
+  // 插件（dsh-web-mobile）整族窄屏折叠都建在它上面。三条断言分别对应
+  // 「函数在」「接进了改写链」「保守策略没被顺手放开」。
+  if (!out.includes('containerRewriteCss')) fail('兼容层缺少 @container 垫片（containerRewriteCss）')
+  else ok('@container 垫片存在')
+  if (!out.includes("indexOf('@container')")) fail('@container 垫片未接进 patchCssText 改写链')
+  else ok('@container 垫片已接进改写链')
+  if (!out.includes('CONTAINER_OPAQUE')) fail('@container 垫片缺少 style()/scroll-state() 保守跳过')
+  else ok('@container 垫片保留 style()/scroll-state() 跳过')
+
+  // ── 移动端布局微调（compat.js 的 installMobileLayoutTweaks）────────────
+  // 这一段守的是三条**只靠选择器字面量成立**的约定，任何一条被顺手改掉
+  // 都不会报错、只会在手机上静默失效，所以必须断言到字符串级。
+  // 背景见 compat.js 里该函数上方的长注释。
+  if (!/installMobileLayoutTweaks\s*\(\)/.test(out)) fail('兼容层未调用 installMobileLayoutTweaks')
+  else ok('兼容层调用了 installMobileLayoutTweaks')
+  // ① 顶栏重复入口：宿主 headerCorner 用 DOM 属性锚定（不碰 hash）。
+  if (!out.includes('data-conversation-header-corner')) fail('布局微调缺少 headerCorner 锚点 data-conversation-header-corner')
+  else ok('布局微调按 data-conversation-header-corner 隐藏重复的侧栏入口')
+  // ② 底部状态行：宿主 StatsPills 的 data-composer-stat。
+  if (!out.includes('data-composer-stat')) fail('布局微调缺少状态指标锚点 data-composer-stat')
+  else ok('布局微调按 data-composer-stat 收紧状态指标行')
+  // ③ 注入的 style 要有自己的标记，否则重复注入无从判断、也无从在真机上排查。
+  if (!out.includes('data-kxxy-mobile-layout')) fail('布局微调缺少 style 标记 data-kxxy-mobile-layout')
+  else ok('布局微调样式自带 data-kxxy-mobile-layout 标记')
+  // ④ 必须是「只在窄屏生效」：桌面上宿主自带的右侧栏入口是唯一入口，
+  //    无条件隐藏会让桌面档打不开右侧栏。
+  if (!out.includes('@media (max-width: 767px)')) fail('布局微调缺少窄屏媒体查询（会误伤桌面档）')
+  else ok('布局微调只在窄屏生效（@media max-width:767px）')
+  // ⑤ 特异性抬升是承重的：插件有一条反向规则带 !important 把 corner 放出来，
+  //    去掉 :not(#kxxy) 就会被它盖回去。
+  if ((out.match(/:not\(#kxxy\)/g) ?? []).length < 4) fail('布局微调缺少 :not(#kxxy) 特异性抬升（会被插件的 !important 规则盖回去）')
+  else ok('布局微调带 :not(#kxxy) 特异性抬升')
 
   // ── 现代内建补齐层（锚点 6 的第二份资产）──────────────────────────
   // 与 compat.js 分开成独立资产的原因见 RuntimeInstaller.MODERN_LAYER_MARKER：
@@ -449,6 +498,12 @@ console.log('[1] GET /kxxy（宿主管理页）')
   for (const id of ['about-entry', 'about-dialog', 'btn-about-close', 'btn-about-dismiss']) {
     if (!r.text.includes(`id="${id}"`)) fail(`index.html 缺少 #${id}（关于卡/弹窗不完整）`)
   }
+  // 通用确认弹窗的 DOM：根 / 标题 / 说明 / 统计行 / 两个按钮。
+  // 少任何一个，confirmDialog() 都会取到 null，表现为「点确定没反应」。
+  for (const id of ['confirm-dialog', 'confirm-panel', 'confirm-title', 'confirm-desc',
+    'confirm-stats', 'btn-confirm-ok', 'btn-confirm-cancel']) {
+    if (!r.text.includes(`id="${id}"`)) fail(`index.html 缺少 #${id}（确认弹窗不完整）`)
+  }
   // 弹窗里必须还有 Node 版本节点：它由 fetchState 实时写入，
   // 移进弹窗后若 id 丢了，「宿主环境参数」就变成永远不会更新的静态文案。
   if (!r.text.includes('id="info-node-ver"')) {
@@ -502,6 +557,16 @@ console.log('\n[2] GET /kxxy/assets/host.css')
       fail('.tabbar-inner 未使用 grid-auto-flow，列数不随页签个数自适应')
     } else ok('底栏列数由页签个数决定（未写死）')
 
+    // ── 确认弹窗样式 + hidden 覆盖坑 ──────────────────────────────────
+    // `.confirm-stats` 显式写了 display:flex，会盖掉 hidden 属性默认的
+    // display:none（UA 样式优先级更低）。没有统计项的弹窗（卸载单个扩展）
+    // 底部会多留一条空白 —— 不影响功能，但一眼看得出没打磨过。
+    if (!/\.confirm-dialog\s*\{/.test(css)) {
+      fail('host.css 缺少 .confirm-dialog 规则（弹窗无样式）')
+    } else if (!/\.confirm-stats\[hidden\][\s\S]{0,80}display:\s*none/.test(css)) {
+      fail('.confirm-stats[hidden] 未强制 display:none，无统计项的弹窗会留空白')
+    } else ok('确认弹窗样式齐备（含 hidden 覆盖修正）')
+
     // ── 扩展分组展开态必须跨轮询存活 ─────────────────────────────────
     // fetchExtensions() 每 5 秒被 startPolling 调用一次，而 renderExtensions
     // 每次都把 innerHTML 清空重建。展开态若只存在 DOM 的 class 上，用户点开
@@ -542,6 +607,119 @@ console.log('\n[3] GET /kxxy/assets/host.js')
     if (/function initMirrorActions|function fetchMirror|function renderMirrorResults|function applyMirror/.test(r.text)) {
       fail('host.js 仍残留镜像源逻辑（DOM 已删除，引用会是 null）')
     } else ok('镜像源 JS 逻辑已随 UI 一并移除')
+
+    // ── 应用内确认弹窗（替代原生 confirm）──────────────────────────────
+    // Android WebView 的原生 confirm 会在顶部加一行「网址为 http://127.0.0.1
+    // 的网页显示：」，出现在自家控制台里既像故障提示、又完全没法定制；
+    // 而且只能吃一段纯文本，摊不开「26 个 / 1.2 GB」这类摘要。
+    // 三层都要在：DOM 根、CSS 规则、JS 函数；缺一层就是「点了没反应」。
+    if (!/function confirmDialog\(opts\)/.test(r.text)) {
+      fail('host.js 缺少 confirmDialog()')
+    } else if (!/dom\.confirmDialog\.setAttribute\('data-open', 'true'\)/.test(r.text)) {
+      fail('confirmDialog 没写 data-open，弹窗不会显示')
+    } else if (!/dom\.btnConfirmOk\.addEventListener\('click', onOk\)/.test(r.text)
+      || !/dom\.btnConfirmCancel\.addEventListener\('click', onCancel\)/.test(r.text)) {
+      fail('confirmDialog 的确定/取消没绑 click，弹窗会卡死')
+    } else {
+      // 兜底：DOM 未就绪时退回原生 confirm，绝不能静默 resolve(false) 让操作失效
+      if (!/window\.confirm\(/.test(r.text)) {
+        fail('confirmDialog 缺 window.confirm 兜底，DOM 缺失时操作会静默失效')
+      } else {
+        // 所有业务 confirm 都必须走新弹窗；残留的裸 confirm( 说明有漏改
+        const bare = r.text
+          .split('\n')
+          .map((line, i) => ({ line: line.trim(), no: i + 1 }))
+          .filter(({ line }) => /(^|[^.\w])confirm\(/.test(line) && !line.startsWith('*') && !line.startsWith('//'))
+        if (bare.length > 0) {
+          fail(`host.js 仍有裸 confirm() 调用：第 ${bare.map((b) => b.no).join(', ')} 行`)
+        } else ok('确认弹窗已接管全部业务确认（无裸 confirm 残留）')
+      }
+    }
+
+    // ── 锚点 8：插件树指纹契约（缺陷 DP 的彻底修法）──────────────
+    //
+    // 这里原本断言的是「lib/index.js 首行的 kxxy-host@N 与 RuntimeInstaller.kt
+    // 的 HOST_PLUGIN_MARKER 一致」。那条断言本身没错，但它守的是一个不该存在
+    // 的约定：一个手写数字管辖整个插件目录，改了 web 层忘递增，装完什么都不变。
+    //
+    // 现在判据换成构建期算的内容指纹（整棵插件树 → sha256 → lib/.fingerprint
+    // → 与 BuildConfig.HOST_PLUGIN_FINGERPRINT 比对）。守护点因此变了：
+    //   · 入口首行必须还留着 `kxxy-host@` 标记（给人眼读，也要能被探针找到）；
+    //   · RuntimeInstaller 必须**不再**出现硬编码的 HOST_PLUGIN_MARKER
+    //     （出现即说明有人回退到人工编号）；
+    //   · 两侧的关键标识符必须在场，任何一侧被删都会让锚点 8 静默失效。
+    const pluginHead = readFileSync(PLUGIN, 'utf8').slice(0, MARKER_PROBE_BYTES)
+    const headMark = pluginHead.match(/kxxy-host@([0-9a-zA-Z._-]+)/)
+    const ktSrc = readFileSync(RUNTIME_INSTALLER, 'utf8')
+    const legacyConst = ktSrc.match(/HOST_PLUGIN_MARKER\s*=\s*"kxxy-host@(\d+)"/)
+    if (!headMark) {
+      fail(`lib/index.js 前 ${MARKER_PROBE_BYTES} 字节内找不到 kxxy-host@ 标记（锚点 8 探针会读不到）`)
+    } else if (legacyConst) {
+      fail(
+        `RuntimeInstaller.kt 仍残留硬编码 HOST_PLUGIN_MARKER="kxxy-host@${legacyConst[1]}"`
+        + ' —— 锚点 8 已改为内容指纹，人工编号必须删掉，否则「改 web 层忘递增」的坑会回来',
+      )
+    } else if (!ktSrc.includes('HOST_PLUGIN_FP_FILE')) {
+      fail('RuntimeInstaller.kt 找不到 HOST_PLUGIN_FP_FILE —— 锚点 8 的指纹探针被删了')
+    } else if (!ktSrc.includes('hostPluginIsCurrent(')) {
+      fail('RuntimeInstaller.kt 找不到 hostPluginIsCurrent() —— 锚点 8 判定被摘掉了')
+    } else if (!ktSrc.includes('BuildConfig.HOST_PLUGIN_FINGERPRINT')) {
+      fail('RuntimeInstaller.kt 没读 BuildConfig.HOST_PLUGIN_FINGERPRINT —— 期望值来源丢了')
+    } else {
+      ok(`锚点 8 用内容指纹（入口标记 kxxy-host@${headMark[1]}，期望值取 BuildConfig）`)
+    }
+
+    // 指纹的**生产端**也得在：build-runtime.mjs 一旦不写 .fingerprint，
+    // 设备侧探针就会永远判「老 runtime 没有指纹」，每次启动重装 713 MiB。
+    const builderSrc = readFileSync(join(HERE, 'build-runtime.mjs'), 'utf8')
+    if (!builderSrc.includes('stampHostPluginFingerprint')) {
+      fail('build-runtime.mjs 找不到 stampHostPluginFingerprint —— 指纹不会被写进 zip')
+    } else if (!builderSrc.includes('HOST_PLUGIN_FP_REL')) {
+      fail('build-runtime.mjs 找不到 HOST_PLUGIN_FP_REL —— 指纹文件路径常量丢了')
+    } else if (!builderSrc.includes('"android", "app", "src", "main", "assets", "meta"')) {
+      fail('build-runtime.mjs 不再写 assets/meta/build.json —— gradle 的期望值会退化成 unknown')
+    } else {
+      ok('build-runtime.mjs 会写 .fingerprint 与 assets/meta/build.json')
+    }
+
+    // ── 通知体系（方案 B）的防回退断言 ─────────────────────────────
+    //
+    // 这条路有四段，任何一段被悄悄改掉，「点按钮回调引擎」就断了，而且断得
+    // 无声：通知照发、按钮照点、引擎永远等不到回执。所以四段全查：
+    //   ① Notifier 里有四条渠道，attention 必须是 HIGH；
+    //   ② 按钮必须走 getBroadcast → AttentionReceiver（getService 在
+    //      Android 12+ 会抛 ForegroundServiceStartNotAllowedException）；
+    //   ③ AttentionReceiver 必须在 Manifest 里注册且 exported="false"；
+    //   ④ kxxy-host 必须有 attention 的写入与取回执两个路由。
+    const JAVA_BASE = join(HERE, '..', 'android', 'app', 'src', 'main', 'java', 'app', 'kxxy')
+    const notifierSrc = readFileSync(join(JAVA_BASE, 'service', 'Notifier.kt'), 'utf8')
+    const receiverSrc = readFileSync(join(JAVA_BASE, 'service', 'AttentionReceiver.kt'), 'utf8')
+    const serviceSrc = readFileSync(join(JAVA_BASE, 'service', 'EngineService.kt'), 'utf8')
+    const manifestSrc = readFileSync(join(HERE, '..', 'android', 'app', 'src', 'main', 'AndroidManifest.xml'), 'utf8')
+
+    const pluginSrc = readFileSync(PLUGIN, 'utf8')
+    if (!pluginSrc.includes('/kxxy/api/attention')) {
+      fail('kxxy-host 找不到 /kxxy/api/attention 路由 —— 引擎无法投递请求')
+    } else if (!pluginSrc.includes('/kxxy/api/attention/response') || !pluginSrc.includes('/kxxy/api/attention/answer')) {
+      fail('kxxy-host 缺 attention 回执路由 —— 引擎拿不到用户的选择')
+    } else if (!notifierSrc.includes('CHANNEL_ATTENTION')) {
+      fail('Notifier.kt 找不到 CHANNEL_ATTENTION —— 四条渠道退化了')
+    } else if (!notifierSrc.includes('IMPORTANCE_HIGH')) {
+      fail('Notifier.kt 里没有 IMPORTANCE_HIGH —— 「需要你确认」将不会横幅提醒')
+    } else if (!notifierSrc.includes('getBroadcast') || !notifierSrc.includes('AttentionReceiver::class')) {
+      // 判据落在 Notifier 而不是 Receiver：PendingIntent 是在 Notifier 里造的。
+      // （这条曾写成「Receiver 源码里不能出现 getService」，结果被它自己的
+      // 注释绊倒 —— 注释里恰恰写着「不能用 getService」。）
+      fail('Notifier.kt 没把 attention 的按钮指向 AttentionReceiver（getBroadcast + AttentionReceiver::class）')
+    } else if (!receiverSrc.includes('ACTION_RESPONSE')) {
+      fail('AttentionReceiver 缺 ACTION_RESPONSE —— 广播发出去也没人接')
+    } else if (!/AttentionReceiver[\s\S]{0,200}exported="false"/.test(manifestSrc)) {
+      fail('AndroidManifest.xml 里 AttentionReceiver 未注册或未声明 exported="false"')
+    } else if (!serviceSrc.includes('Notifier.ensureChannels')) {
+      fail('EngineService 不再调用 Notifier.ensureChannels —— 渠道不会在启动时建好')
+    } else {
+      ok('通知体系四段齐全（渠道 / getBroadcast / Manifest / attention 三路由）')
+    }
   }
 }
 
@@ -684,7 +862,11 @@ console.log('\n[10] 未知端点 /kxxy/api/nope')
 }
 
 console.log('\n[11] 不可信来源（Host 非回环）应被拒')
-{
+if (!useAuth) {
+  // --no-auth 用来在无引擎凭据的机器上跑通其余用例，它同时也把来源校验
+  // 关掉了。这时再断言 403 只会永远红着 —— 跳过而不是假装通过。
+  ok('跳过（--no-auth 已关闭来源校验）')
+} else {
   const r = await raw('/kxxy/api/state', { headers: { host: 'evil.example.com:3080' } })
   if (r.status !== 403) fail(`状态码应为 403，实为 ${r.status}`)
   else ok('403 forbidden')
@@ -694,7 +876,9 @@ console.log('\n[11] 不可信来源（Host 非回环）应被拒')
 }
 
 console.log('\n[12] 跨站来源（sec-fetch-site: cross-site）应被拒')
-{
+if (!useAuth) {
+  ok('跳过（--no-auth 已关闭来源校验）')
+} else {
   const r = await raw('/kxxy/api/state', {
     headers: { host: '127.0.0.1:3080', 'sec-fetch-site': 'cross-site' },
   })
@@ -921,9 +1105,18 @@ console.log('\n[14b] /kxxy/api/health（启动配置体检）')
     writeFileSync(join(nm, 'kxxy-host', 'package.json'), '{"name":"kxxy-host"}\n')
     writeFileSync(join(engineRoot, 'android-overlay.yml'), '- id: sandbox-policy\n  config: {}\n')
 
-    const zipPath = join(HERE, '..', 'android', 'app', 'src', 'main', 'assets', 'runtime.zip')
-    if (!existsSync(zipPath)) {
-      fail(`夹具缺失：${zipPath} 不存在，无法解出 js-yaml`)
+    // 缺陷 DN：zip 路径不能写死成 assets/ 一个位置。
+    // `build-apk.ps1` 打完包会把 assets/runtime.zip 整个搬到
+    // `.cache/apk-assets-hold/`（大资源不能留在 assets，见缺陷 BL 的
+    // compressDebugAssets OOM），所以「刚打完包 → 立刻跑冒烟」这个最自然的
+    // 时刻，assets 下恰恰是空的。与 verify-runtime / simulate-install 用
+    // 同一条探测链。
+    const zipPath = [
+      join(HERE, '..', 'android', 'app', 'src', 'main', 'assets', 'runtime.zip'),
+      join(HERE, '..', '.cache', 'apk-assets-hold', 'runtime.zip'),
+    ].find((p) => existsSync(p))
+    if (zipPath === undefined) {
+      fail('夹具缺失：assets/runtime.zip 与 .cache/apk-assets-hold/runtime.zip 都不存在，无法解出 js-yaml')
     } else {
       const zip = openZip(zipPath)
       const prefix = 'lib/node_modules/js-yaml/'

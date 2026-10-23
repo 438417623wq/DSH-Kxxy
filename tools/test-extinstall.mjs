@@ -7,7 +7,12 @@
  *   · removeExtension / relinkAll —— 按 .links.json 回收与重建
  *
  * 为什么能在构建机上测：这三件事只依赖 node:fs 的软链接能力，与安卓无关。
- * （Windows 建软链接需要开发者模式或管理员；本机实测可用。）
+ * **但 Windows 建软链接需要「开发者模式」或管理员**（缺了报
+ * `EPERM: operation not permitted, symlink …`）。所以脚本开头先真建一条
+ * 链接探测该能力，**没有就整轮 SKIP 并说明原因**：被测代码的每一条
+ * `symlinkSync` 都会落进它自己的 catch，视图一条都建不出来，硬跑只会得到
+ * 与被测逻辑无关的满屏 FAIL。曾经的行为更糟 —— 直接崩在 `readlinkSync`
+ * 的 ENOENT 上，连「为什么」都不打印。
  * 真机上这条路径由「获取」按钮触发，装一次要解 60~250 MiB，出错的代价很高，
  * 所以每个「为什么会这样写」的分支都在这里钉一条断言。
  *
@@ -18,7 +23,7 @@
  *   · 卸载时不校验链接归属 ⇒ 把后装扩展贡献的同名资源一起摘掉
  */
 
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 
@@ -36,6 +41,44 @@ import {
 
 let passed = 0;
 let failed = 0;
+
+/**
+ * 本机能不能建符号链接？
+ *
+ * 在临时目录里真建一条（悬空目标即可）再删掉 —— 不猜注册表、不猜管理员，
+ * 只问「这个能力现在到底有没有」。Windows 上缺「开发者模式」且非管理员时
+ * 会抛 `EPERM`；Linux / Android 上恒为 true。
+ */
+const SYMLINKS_OK = (() => {
+	try {
+		const probe = mkdtempSync(join(tmpdir(), 'kxxy-symprobe-'));
+		try {
+			symlinkSync(join(probe, 'nowhere'), join(probe, 'link'));
+			return true;
+		} finally {
+			rmSync(probe, { recursive: true, force: true });
+		}
+	} catch {
+		return false;
+	}
+})();
+
+/**
+ * 断言「这是一条指向 `target` 的符号链接」。
+ *
+ * 本机建不出链接时这组用例根本跑不起来（buildViews 里的 symlinkSync 全部
+ * 落进 catch，视图一个都不会被建出来），所以整轮在下面直接跳过，这里不再
+ * 做降级判定 —— 半真半假的断言比不跑更误导人。
+ */
+function checkLink(label, path, target) {
+	let ok = false;
+	try { ok = lstatSync(path).isSymbolicLink() && readlinkSync(path) === target; } catch { ok = false; }
+	check(label, ok, `期望 → ${target}`);
+}
+
+function checkNotLink(label, path) {
+	check(label, lstatSync(path).isDirectory() && !lstatSync(path).isSymbolicLink());
+}
 
 function check(label, cond, detail) {
 	if (cond) {
@@ -69,6 +112,28 @@ function makeExt(root, id, tree) {
 
 const workdir = mkdtempSync(join(tmpdir(), 'kxxy-extinstall-'));
 
+// 本机没有建链接的能力 ⇒ 被测代码（extinstall.mjs）的每一条 symlinkSync 都会
+// 落进它自己的 catch 里，视图一条都建不出来。此时继续跑只会得到满屏 FAIL，
+// 而 FAIL 的成因与被测逻辑毫无关系 —— 那是环境缺能力，不是代码有 bug。
+// 明确跳过并给出原因，比「假装跑过」或「红一片」都诚实。
+if (!SYMLINKS_OK) {
+	rmSync(workdir, { recursive: true, force: true });
+	console.log('扩展安装器装配测试：跳过（SKIP）');
+	console.log(
+		'  原因：本机无法创建符号链接。Windows 需要「开发者模式」或管理员权限，' +
+		'当前两者都不具备（实测 symlink 抛 EPERM）。',
+	);
+	console.log(
+		'  影响：extinstall.mjs 的视图全部靠软链建立，没有该能力时被测逻辑整条走不通，' +
+		'本脚本 0 条断言被执行。',
+	);
+	console.log(
+		'  说明：Android 与 Linux 上恒有该能力，真机安装路径不受此限制影响；' +
+		'如需在 Windows 上验证，请开启「设置 → 系统 → 开发者选项 → 开发者模式」后重跑。',
+	);
+	process.exit(0);
+}
+
 try {
 	// -----------------------------------------------------------------------
 	console.log('[1] bin 递归展平（问题.txt【4】TeX Live 的 411 个引擎）');
@@ -99,7 +164,7 @@ try {
 		// 目录软链保留：texlinks / fmtutil 靠「自己所在目录」找兄弟程序
 		const dirLink = join(root, 'bin', 'texlive');
 		check('bin/texlive 目录软链存在', existsSync(dirLink) && lstatSync(dirLink).isSymbolicLink());
-		equal('目录软链指向扩展内的 bin/texlive', readlinkSync(dirLink), join(extDir, 'bin', 'texlive'));
+		checkLink('目录软链指向扩展内的 bin/texlive', dirLink, join(extDir, 'bin', 'texlive'));
 		check('目录软链计入 views（kind=dir）', links.views.some((v) => v.kind === 'dir' && v.name === 'texlive'));
 	}
 
@@ -134,7 +199,7 @@ try {
 		const links = buildViews(root, 'gradle', extDir);
 		const libLink = join(extDir, 'lib');
 		check('extDir/lib 软链已建', existsSync(libLink) && lstatSync(libLink).isSymbolicLink());
-		equal('extDir/lib 指向 opt/gradle/lib', readlinkSync(libLink), join(extDir, 'opt', 'gradle', 'lib'));
+		checkLink('extDir/lib 指向 opt/gradle/lib', libLink, join(extDir, 'opt', 'gradle', 'lib'));
 		// launcher 解链后向上一层取 $APP_HOME，再拼 $APP_HOME/lib/*.jar
 		check('launcher 的 $APP_HOME/lib/*.jar 因此命中', existsSync(join(extDir, 'lib', 'gradle-cli.jar')));
 		check('该软链计入 views', links.views.some((v) => v.kind === 'dir' && v.name === 'lib'));
@@ -309,7 +374,7 @@ try {
 		// 先装者的整个遮掉 —— 实测 15 个顶层目录（etc/fonts、share/xml、
 		// share/gettext、share/fontconfig…）正属于这种情形，而它们恰恰是
 		// fontconfig 与 tesseract 最需要的。
-		check('root/etc/fonts 被物化成真目录而非整目录软链', lstatSync(join(root, 'etc', 'fonts')).isDirectory() && !lstatSync(join(root, 'etc', 'fonts')).isSymbolicLink());
+		checkNotLink('root/etc/fonts 被物化成真目录而非整目录软链', join(root, 'etc', 'fonts'));
 		check('两个扩展的贡献并存（同名叶子保留先到的 a）', readFileSync(join(root, 'etc', 'fonts', 'fonts.conf'), 'utf8') === 'A', readFileSync(join(root, 'etc', 'fonts', 'fonts.conf'), 'utf8'));
 		check('a 的清单已被改写为逐条链接（物化后原整目录条目失效）', JSON.parse(readFileSync(join(extA, '.links.json'), 'utf8')).views.every((v) => v.target !== join(root, 'etc', 'fonts')));
 		check('b 把自己那条记成 shadowed（占位者卸载后据此补位）', linksB.views.some((v) => v.shadowed === true && v.target === join(root, 'etc', 'fonts', 'fonts.conf')));
@@ -361,7 +426,7 @@ try {
 
 		equal('重建了 1 个扩展', rebuilt, 1);
 		check('展平的 pdftex 恢复了', existsSync(join(root, 'bin', 'pdftex')));
-		check('展平的 pdftex 指向正确', readlinkSync(join(root, 'bin', 'pdftex')) === join(extDir, 'bin', 'texlive', 'pdftex'));
+		checkLink('展平的 pdftex 指向正确', join(root, 'bin', 'pdftex'), join(extDir, 'bin', 'texlive', 'pdftex'));
 		check('目录软链恢复了', existsSync(join(root, 'bin', 'texlive')));
 		check('合并视图恢复了', existsSync(join(root, 'etc', 'fonts', 'fonts.conf')));
 		check('标记文件已清除', !existsSync(join(root, 'extensions', '.relink')));
@@ -377,7 +442,6 @@ try {
 
 		// 手工把 root/bin/cmd 换成一条悬空链接（模拟扩展目录被移动过）
 		rmSync(join(root, 'bin', 'cmd'));
-		const { symlinkSync } = await import('node:fs');
 		symlinkSync(join(root, 'nowhere', 'cmd'), join(root, 'bin', 'cmd'));
 		check('existsSync 看不见悬空链接（这正是必须用 lstat 的原因）', !existsSync(join(root, 'bin', 'cmd')));
 		check('lstat 能看见悬空链接', lstatSync(join(root, 'bin', 'cmd')).isSymbolicLink());

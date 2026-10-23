@@ -2,6 +2,7 @@ package app.kxxy
 
 import android.app.Application
 import android.util.Log
+import app.kxxy.engine.BuildMeta
 import app.kxxy.engine.EngineSupervisor
 import app.kxxy.engine.ShizukuBridge
 import app.kxxy.engine.ShizukuShellServer
@@ -41,7 +42,16 @@ class KxxyApp : Application() {
         // 必须在这里启动：Toast / 剪贴板 / 通知都要求应用进程的上下文。
         TermuxApiServer.start(this, appScope)
         supervisor = EngineSupervisor(this)
-        Log.i(TAG, "KxxyApp created, version=${BuildConfig.VERSION_NAME}")
+        /*
+         * 启动日志必须自证版本（缺陷 DP）。
+         *
+         * 原来只有一行 `version=0.1.0` —— 那是 gradle 里写死的常量，与仓库
+         * 的 v0.9.x 毫无关系，用户贴 logcat 过来也判断不出装的是哪一版。
+         * 现在一次打全三样：APK 版本（git 推导）、runtime.zip 的 sha256 前 16 位、
+         * 宿主插件的内容指纹前 16 位。有了这一行，「插件到底是新的还是旧的」
+         * 这类问题不用再猜。
+         */
+        Log.i(TAG, "KxxyApp created · ${BuildMeta.startupLine(this)}")
     }
 
     companion object {

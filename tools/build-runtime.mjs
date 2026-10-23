@@ -34,6 +34,8 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
@@ -606,6 +608,11 @@ const OFFICE_CACHE = join(PROJECT, ".cache", "office");
  */
 const WASM_PKG = {
   url: "https://registry.npmmirror.com/@deepseek-ai/libreoffice-kit-wasm/-/libreoffice-kit-wasm-0.1.5.tgz",
+  // 缺陷 DH：构建机到 registry.npmmirror.com 的 TLS 直接断连，npmjs 可达且字节相同
+  // （sha256 断言保证）。保留主地址，只是加一条备用。
+  fallbacks: [
+    "https://registry.npmjs.org/@deepseek-ai/libreoffice-kit-wasm/-/libreoffice-kit-wasm-0.1.5.tgz",
+  ],
   file: "libreoffice-kit-wasm-0.1.5.tgz",
   sha256: "4d5dda19a257d75fd09776d37a4f37708d7c2e163defede64b3377cb411ed406",
   version: "0.1.5",
@@ -614,6 +621,10 @@ const WASM_PKG = {
 
 const FONT_PKG = {
   url: "https://registry.npmmirror.com/@expo-google-fonts/noto-sans-sc/-/noto-sans-sc-0.4.4.tgz",
+  // 缺陷 DH：同上。
+  fallbacks: [
+    "https://registry.npmjs.org/@expo-google-fonts/noto-sans-sc/-/noto-sans-sc-0.4.4.tgz",
+  ],
   file: "noto-sans-sc-0.4.4.tgz",
   sha256: "e18cd1a1fbb95d7c25fc133406dfd1b2b25d718835b51ec23d556dc4b11578a8",
   zipBase: "lib/node_modules/kxxy-host/fonts/",
@@ -653,7 +664,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 「补丁集变了 ⇒ 设备必然重装一次」。代价是一次几百 MB 的重装，
  * 而漏判的代价是设备上静默复现已经修过的缺陷。
  */
-const PATCHSET_MARKER = "kxxy-patchset@5";
+const PATCHSET_MARKER = "kxxy-patchset@6";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**
@@ -670,6 +681,8 @@ const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
  */
 const MOBILE_PLUGIN_PKG = {
   url: "https://registry.npmmirror.com/dsh-web-mobile/-/dsh-web-mobile-3.1.0.tgz",
+  // 缺陷 DH：同上。
+  fallbacks: ["https://registry.npmjs.org/dsh-web-mobile/-/dsh-web-mobile-3.1.0.tgz"],
   file: "dsh-web-mobile-3.1.0.tgz",
   sha256: "6881c6d0d806606765c4700b8c1797211f1522be17372ea07182799363a640fb",
   zipBase: "lib/node_modules/dsh-web-mobile/",
@@ -989,10 +1002,42 @@ function attachAndroidJar(merged, asarPart, jarInfo) {
   console.log(`      + ${markerPath}（${ANDROID_JAR_MARKER}）`);
 }
 
-/** 下载（带缓存与 sha256 校验）并解开一个 npm tarball。 */
+/**
+ * 下载（带缓存与 sha256 校验）并解开一个 npm tarball。
+ *
+ * `fallbacks` 是同内容的备用地址（缺陷 DH）。
+ *
+ * 为什么需要：这些包写在 `registry.npmmirror.com` 上，而构建机到该域名
+ * 的 TLS 会**直接断连**（`基础连接已经关闭: 发送时发生错误`，不是 404、
+ * 不是超时）。`registry.npmjs.org` 反而稳定可达，且 tarball 字节完全相同
+ * （下面的 sha256 断言就是证据 —— 换地址换了内容会立刻失败）。
+ *
+ * 顺序：先主地址，失败再逐个备用。只要 sha256 对得上，来源无关紧要；
+ * 缓存命中（`downloadTo` 的第一行）时一个地址都不会被访问。
+ */
 async function fetchTgz(pkg) {
   const dest = join(OFFICE_CACHE, pkg.file);
-  const state = await downloadTo(pkg.url, dest);
+  const urls = [pkg.url, ...(pkg.fallbacks ?? [])];
+  let state = null;
+  let lastError = null;
+  for (const url of urls) {
+    try {
+      state = await downloadTo(url, dest);
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      console.warn(`      ! 下载失败（换备用地址）：${url}`);
+      console.warn(`        ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (state === null) {
+    throw new Error(
+      `${pkg.file} 全部地址均失败：\n` +
+        urls.map((u) => `  - ${u}`).join("\n") +
+        `\n最后一条错误：${lastError instanceof Error ? lastError.message : String(lastError)}`,
+    );
+  }
   const buf = readFileSync(dest);
   const got = sha256Hex(buf);
   if (got !== pkg.sha256) {
@@ -1364,6 +1409,137 @@ async function bundleTexliveMacros(asarPart) {
   console.log(`      + ${markerPath}（${TEXLIVE_MARKER}）`);
 }
 
+// ──────────────────────────────────────── 宿主插件内容指纹（替代手工递增编号）
+//
+// 缺陷 DP 与「插件更新不会到达老设备」是同一个病：锚点 8 判的是
+// `kxxy-host/lib/index.js` 首行那个人手写死的 `kxxy-host@N`，而它**实际管辖
+// 整个 `plugins/kxxy-host/` 目录** —— `web/*.js`、`web/*.css`、`lib/*.mjs` 改一遍，
+// 只要忘了递增 N，设备上就会带着旧 web 层继续跑，且前十六个锚点全通过、
+// `isComplete()` 判真、跳过重装，**整条链路一声不响**。
+//
+// 「忘了递增」不是自制力问题：全仓只有 index.js:1 与 RuntimeInstaller.kt 两处
+// 写着这个数字，任何一次改动都要人工同步，只要没有测试守护就迟早漏。
+//
+// 现在改成构建期算内容指纹：对整棵插件树（路径 + 内容）求 sha256，写进
+// 插件自己的 `lib/.fingerprint`，同时把入口首行的标记改写成 `kxxy-host@<指纹前12位>`
+// 供人 eyes-read。设备侧锚点 8 改为「读 APK assets 里的期望指纹，与设备上的
+// `.fingerprint` 比对」——APK 换了而插件没换，指纹必然不等，强制重装。
+//
+// **自指问题的处理**：指纹不能包含它自己产出的两样东西 ——
+//   ① `lib/.fingerprint` 文件本身（写之前算，算完写）；
+//   ② `lib/index.js` 首行那行标记注释（算之前先剥掉，写的时候再放回去）。
+// 否则「算出的指纹改变标记、标记又改变指纹」，每次构建的指纹都不一样，
+// 设备上永远重装（700 MiB 全量解压，比 bug 本身更糟）。
+const HOST_PLUGIN_NAME = "kxxy-host";
+const HOST_PLUGIN_BASE = `lib/node_modules/${HOST_PLUGIN_NAME}/`;
+const HOST_PLUGIN_ENTRY_REL = "lib/index.js";
+const HOST_PLUGIN_FP_REL = "lib/.fingerprint";
+
+/**
+ * 入口首行的分界标记行。
+ *
+ * 允许标记里出现中文与任意非星号字符，以「星号 + 斜杠」结束（这里刻意不把
+ * 那两个字符连写出来 —— 在块注释里连写会提前结束本注释，本文件已经踩过一次）。
+ */
+const HOST_MARK_LINE_RE = /^\/\* kxxy-host@[^\n]*?\*\/\r?\n/;
+
+const sha256Of = (buf) => createHash("sha256").update(buf).digest("hex");
+
+/**
+ * 计算并写入宿主插件指纹，返回完整 sha256（64 hex）。
+ *
+ * 条目按**路径排序**后逐条 `路径\0内容sha256` 拼接再整体求一次 sha256：
+ * 排序保证与 readdir 顺序无关（Windows/NTFS 与 ext4 的目录顺序不同）；
+ * 两层哈希保证大文件不占内存、且单文件改动只影响它自己那一行。
+ */
+function stampHostPluginFingerprint(asarPart) {
+  const rows = [];
+  let bytes = 0;
+  for (const [path, value] of asarPart) {
+    if (!path.startsWith(HOST_PLUGIN_BASE)) continue;
+    if (path === `${HOST_PLUGIN_BASE}${HOST_PLUGIN_FP_REL}`) continue;
+    const data = value.data ?? Buffer.alloc(0);
+    const rel = path.slice(HOST_PLUGIN_BASE.length);
+    const normalised =
+      rel === HOST_PLUGIN_ENTRY_REL
+        ? Buffer.from(data.toString("utf8").replace(HOST_MARK_LINE_RE, ""), "utf8")
+        : data;
+    rows.push(`${rel}\u0000${sha256Of(normalised)}`);
+    bytes += normalised.length;
+  }
+  if (rows.length === 0) throw new Error(`插件树为空，无法计算指纹：${HOST_PLUGIN_BASE}`);
+  rows.sort();
+  const fingerprint = sha256Of(Buffer.from(rows.join("\n"), "utf8"));
+  const short = fingerprint.slice(0, 12);
+
+  // 入口首行标记：先是给人看的（`head -1 lib/index.js` 就知道设备上是哪一版），
+  // 其次是给 smoke-plugin.mjs 的格式断言盯的。真正生效的判据是 .fingerprint。
+  const entryPath = `${HOST_PLUGIN_BASE}${HOST_PLUGIN_ENTRY_REL}`;
+  const entry = asarPart.get(entryPath);
+  if (!entry) throw new Error(`插件入口不存在：${entryPath}`);
+  const body = entry.data.toString("utf8").replace(HOST_MARK_LINE_RE, "");
+  asarPart.set(entryPath, {
+    ...entry,
+    data: Buffer.from(`/* kxxy-host@${short} */\n${body}`, "utf8"),
+  });
+
+  // 指纹文件：三行 key:value，纯 ASCII，Native 侧按行前缀解析（不引 JSON 库，
+  // 也不为它开一个 700 MiB 的 zip 读；设备上直接 readText 即可）。
+  asarPart.set(`${HOST_PLUGIN_BASE}${HOST_PLUGIN_FP_REL}`, {
+    data: Buffer.from(
+      `algorithm:sha256\nfingerprint:${fingerprint}\nfiles:${rows.length}\nmarker:kxxy-host@${short}\n`,
+      "utf8",
+    ),
+    mode: 0o644,
+  });
+
+  console.log(
+    `      指纹 ${HOST_PLUGIN_NAME}: ${fingerprint.slice(0, 16)}…（${rows.length} 文件 / ${human(bytes)}）`,
+  );
+  console.log(`      入口标记 → kxxy-host@${short}`);
+  return fingerprint;
+}
+
+/**
+ * 从 git remote 取仓库地址，规范化成**能点开**的 https 形式。
+ *
+ * 这个值唯一的用途是填关于弹窗里那条「GitHub」链接，所以不追求完整语义：
+ *   · `git@github.com:owner/repo.git` → `https://github.com/owner/repo`
+ *   · 结尾的 `.git` 去掉（浏览器里点进去更干净）
+ *   · 非 http(s)（本地路径、file:// 克隆）一律丢弃
+ *
+ * 拿不到就返回空串，前端会把整条链接隐藏 —— 一个点不通的死链比没有更糟。
+ * 之所以在**构建期**取而不是运行期：设备上没有 git，也没有仓库元数据。
+ */
+function readRepoUrl() {
+  const candidates = [
+    "git",
+    "C:\\Program Files\\Git\\cmd\\git.exe",
+    "C:\\Program Files (x86)\\Git\\cmd\\git.exe",
+    "/usr/bin/git",
+  ];
+  for (const bin of candidates) {
+    let raw = "";
+    try {
+      raw = execFileSync(bin, ["remote", "get-url", "origin"], {
+        cwd: PROJECT,
+        encoding: "utf8",
+        timeout: 10_000,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      continue;
+    }
+    if (!raw) continue;
+    const ssh = /^git@([^:]+):(.+)$/.exec(raw);
+    let url = ssh ? `https://${ssh[1]}/${ssh[2]}` : raw;
+    url = url.replace(/\.git$/, "").replace(/\/+$/, "");
+    if (/^https?:\/\//i.test(url)) return url;
+    return "";
+  }
+  return "";
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
@@ -1686,6 +1862,19 @@ async function main() {
   console.log(`      + ${patchsetPath}（${PATCHSET_MARKER}）`);
 
   /*
+   * 宿主插件指纹。
+   *
+   * **位置很关键**：必须放在插件树所有 `asarPart.set()` 都做完之后 —— 它在
+   * L1593 那一轮 readPluginFiles 里铺进去，之后又被 packaging 包装器（含
+   * 32.5 MiB 的 bundletool jar）、office 资产、tessdata、TeX 宏包树、patchset
+   * 标记各补了几条。早一步算，指纹就漏掉那些条目，「换了打包工具/宏包树却不
+   * 重装」的坑原样回来；而它又必须早于下面的 `collectDirs` 与写出循环，否则
+   * `lib/.fingerprint` 这个新条目不会进 zip。
+   */
+  const hostPluginFingerprint = stampHostPluginFingerprint(asarPart);
+
+
+  /*
    * 悬空 LINK 清扫。
    *
    * 剔除了 Termux 应用脚本与死解释器脚本之后，指向它们的符号链接会变成
@@ -1807,7 +1996,19 @@ async function main() {
   // 用同步 fd 而非 createWriteStream：ZipWriter 的 sink 是同步回调，
   // 且 259 MiB 的产物若先攒在用户态再 end()，statSync 会抢在 flush 之前跑。
   const fd = openSync(opts.out, "w");
-  const zip = new ZipWriter((buf) => writeSync(fd, buf));
+  /*
+   * 边写边算 sha256（缺陷 DP 的配套：APK 侧要知道「这一份 runtime 是什么」）。
+   *
+   * 为什么不在写完之后整份读一遍：runtime.zip 有 713 MiB，重读一次要多吃
+   * 一次磁盘 IO 与一个 713 MiB 的读句柄，在这台提交内存常年只剩 1 GB 上下的
+   * 构建机上是实打实的风险。ZipWriter 的 sink 本来就是同步回调，顺手 update
+   * 一次，额外代价只有一次哈希（约 1 秒，不占额外内存）。
+   */
+  const zipDigest = createHash("sha256");
+  const zip = new ZipWriter((buf) => {
+    zipDigest.update(buf);
+    writeSync(fd, buf);
+  });
 
   /*
    * 写出循环里的周期性 GC（缺陷 CT 连带修复）。
@@ -1905,7 +2106,7 @@ async function main() {
   // 判断「产物是否被截断」的依据。`written` 此刻还没算上 manifest 自己，
   // 所以 +1。
   const manifest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runtimeVersion: "v0.1.0-arm64",
     rootPlaceholder: ROOT_PLACEHOLDER,
     termuxPrefix: TERMUX_PREFIX,
@@ -1917,6 +2118,18 @@ async function main() {
     placeholderPaths: norm.placeholderPaths,
     removedPaths: norm.droppedPaths,
     builtAt: new Date().toISOString(),
+    /*
+     * 插件指纹（schemaVersion 2 新增）。
+     *
+     * 引擎侧（kxxy-host 的 `/kxxy/api/state`）与 diag.json 都要报这个值，
+     * 用来回答「设备上这份插件到底是什么」。选它而不是让引擎去读自己的
+     * `.fingerprint` 文件，是为了让「运行期读到的值」只有一个来源。
+     */
+    plugins: {
+      hostFingerprint: hostPluginFingerprint,
+      hostMarker: `kxxy-host@${hostPluginFingerprint.slice(0, 12)}`,
+      mobileMarker: MOBILE_PLUGIN_MARKER,
+    },
   };
   await zip.add("kxxy-runtime.json", Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8"), { mode: 0o644 });
   written += 1;
@@ -1946,8 +2159,43 @@ async function main() {
   rmSync(spillPath, { force: true });
 
   const stats = statSync(opts.out);
+  const runtimeSha256 = zipDigest.digest("hex");
   console.log(`[8/8] 写出 ${opts.out}`);
   console.log(`      条目 ${written}，zip ${human(stats.size)}（未压缩 ${human(totalBytes)}）`);
+  console.log(`      sha256 ${runtimeSha256}`);
+
+  /*
+   * 构建清单（缺陷 DP 的收口）。
+   *
+   * 落两处，缺一不可：
+   *   · `android/app/src/main/assets/meta/build.json` —— **原生探针的期望值来源**。
+   *     探针要回答「APK 换了、设备上插件没换」，而设备上那份旧的 build.json
+   *     就在旧 runtime 里、跟着旧插件一起躺着，读它等于让嫌疑人自证清白。
+   *     期望值只能来自 APK 本体，所以必须进 assets（几 KB，aapt2 正常打包）。
+   *   · `.cache/build-meta.json` —— 构建机与人看的副本，被 build-apk.ps1 打日志用。
+   *
+   * 键名保持**扁平**：gradle 侧用一条 `"key": "value"` 正则取值，不引 JSON 解析
+   * （build.gradle.kts 里没有 JSON 库，且配置阶段不该为了 6 个字段去加依赖）。
+   */
+  const buildMeta = {
+    schema: 1,
+    generatedAt: new Date().toISOString(),
+    runtimeSha256,
+    runtimeSize: stats.size,
+    runtimeEntries: written,
+    runtimeUncompressedBytes: totalBytes,
+    kxxyHostFingerprint: hostPluginFingerprint,
+    kxxyHostMarker: `kxxy-host@${hostPluginFingerprint.slice(0, 12)}`,
+    dshWebMobileMarker: MOBILE_PLUGIN_MARKER,
+    nodeVersion: manifest.node,
+    repoUrl: readRepoUrl(),
+  };
+  const buildMetaJson = `${JSON.stringify(buildMeta, null, 2)}\n`;
+  writeFileSync(join(PROJECT, ".cache", "build-meta.json"), buildMetaJson, "utf8");
+  const assetsMetaDir = join(PROJECT, "android", "app", "src", "main", "assets", "meta");
+  mkdirSync(assetsMetaDir, { recursive: true });
+  writeFileSync(join(assetsMetaDir, "build.json"), buildMetaJson, "utf8");
+  console.log(`      构建清单 → assets/meta/build.json + .cache/build-meta.json`);
 
   if (opts.manifest) {
     writeFileSync(opts.manifest, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
