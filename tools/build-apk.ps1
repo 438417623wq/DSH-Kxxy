@@ -188,12 +188,30 @@ try {
 
     # ── 4) 注入大资源（STORE + 重写中央目录）─────────────────────────────
     Write-Host "[4/6] 注入大资源 …" -ForegroundColor Cyan
+    # 先算清楚「应该有」的增量，而不是只判一个死阈值 `> 1GB`。
+    # 2026-10-23 出过一次：清暂存目录时把 runtime.zip 一起删了，assets 里只剩
+    # ext-pool 与 meta。小包本身就有 1.19 GB，`> 1GB` 的断言照样通过，于是
+    # 「成功」打出一个没有运行时的 APK（1.19 GB，真机装上必然起不来）。
+    $holdItems = @(Get-ChildItem $hold -ErrorAction SilentlyContinue)
+    if ($holdItems.Count -eq 0) {
+        throw "暂存目录 $hold 是空的：大资源没从 assets 移过来，注入只会打出一个瘦包"
+    }
+    if (-not (Test-Path (Join-Path $hold 'runtime.zip'))) {
+        throw "暂存目录里没有 runtime.zip —— 先跑 node tools/build-runtime.mjs 生成运行时再打包"
+    }
+    $holdBytes = ($holdItems | ForEach-Object {
+        if ($_.PSIsContainer) {
+            (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                Measure-Object -Property Length -Sum).Sum
+        } else { $_.Length }
+    } | Measure-Object -Sum).Sum
     & $node "$Project\tools\inject-apk-assets.mjs" --apk $apk --assets $hold
     if ($LASTEXITCODE -ne 0) { throw "注入失败（exit $LASTEXITCODE）" }
     $injected = (Get-Item $apk).Length
     Write-Host ("      注入后 {0:N0} B（{1:N2} MiB）" -f $injected, ($injected / 1MB))
-    if ($injected -lt 1GB) {
-        throw "注入后 APK 只有 $([math]::Round($injected/1MB,2)) MiB，大资源没进去"
+    $expectInjected = $small + [int64]($holdBytes * 0.98)
+    if ($injected -lt $expectInjected) {
+        throw ("注入后 APK {0:N2} MiB，低于预期 {1:N2} MiB —— 大资源没全进去" -f ($injected / 1MB), ($expectInjected / 1MB))
     }
 
     # ── 5) zipalign ───────────────────────────────────────────────────────
