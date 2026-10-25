@@ -329,9 +329,22 @@ if (-not (Test-Path $hostGoExe)) {
     }
     Write-Ok "解压 $([math]::Round((Get-Item $GoZip).Length/1MB,1)) MiB …"
     if (Test-Path $HostRoot) { Remove-Item -Recurse -Force $HostRoot }
-    # Windows 10+ 自带 bsdtar，认 zip，比 Expand-Archive 快得多
-    & tar -xf $GoZip -C $Gotool
-    if ($LASTEXITCODE -ne 0) {
+    # Windows 10+ 自带 bsdtar，认 zip，比 Expand-Archive 快得多。
+    #
+    # ⚠️ 必须先探测 tar 是否存在再调用。原来直接写 `& tar -xf`：在**没有** tar 的
+    # 机器上（Windows 10 1803 以前的 System32 里没有 tar.exe，本机就是）这不是
+    # 「命令返回非零」，而是**终止性**的 CommandNotFoundException ——
+    # $ErrorActionPreference = "Stop" 让脚本当场死在第 333 行，
+    # 下面那句 Expand-Archive 兜底**永远执行不到**。表现为：
+    # 「解压 75.4 MiB …」之后立刻 `The term 'tar' is not recognized`，
+    # 而 go 交叉编译静默降级（fetch-extensions 只打一行 ⚠️ 就继续建池）。
+    $tarExe = Get-Command tar -ErrorAction SilentlyContinue
+    $extracted = $false
+    if ($tarExe) {
+        & $tarExe.Source -xf $GoZip -C $Gotool
+        $extracted = ($LASTEXITCODE -eq 0)
+    }
+    if (-not $extracted) {
         Expand-Archive -Path $GoZip -DestinationPath $Gotool -Force
     }
     if (-not (Test-Path $hostGoExe)) { throw "宿主 go 解压后仍找不到：$hostGoExe" }
