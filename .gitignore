@@ -26,6 +26,12 @@ __pycache__/
 # 需要它的人请按 README「三、构建」自行生成。
 android/app/src/main/assets/runtime.zip
 
+# 别名清单（tools/build-runtime.mjs 的产物，与 runtime.zip 同源同次生成）：
+# 1,709 条 `路径 → 本体` 的对照表，119 KiB。它和 runtime.zip 必须**成对**使用
+# （RuntimeInstaller 解完 zip 后按它建软链），单独提交任何一半都没有意义，
+# 所以同样不入库。缺了它 zip 里的 LINK 条目会被跳过，别名的可执行文件全部缺失。
+android/app/src/main/assets/alias-links.txt
+
 # 构建清单（tools/build-runtime.mjs 每次构建重写，进 assets 是给 gradle 当输入读，
 # 不是源码）：内含 runtimeSha256 / 插件指纹 / 构建时刻 / 仓库地址。
 # 不入库的理由有两条：① 每次构建都变，提交它等于每包一次无意义 diff；

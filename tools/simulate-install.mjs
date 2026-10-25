@@ -171,7 +171,7 @@ const OFFICE_FONT_FILES = [
  * `grep -c kxxyArchiveApply` 仍是 0 —— 前面的锚点全通过，isComplete()
  * 判真，补丁根本没解出来。标记由 build-runtime.mjs 写在 kxxy-host 目录下。
  */
-const PATCHSET_MARKER = "kxxy-patchset@6";
+const PATCHSET_MARKER = "kxxy-patchset@7";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**
@@ -734,6 +734,13 @@ const anchors = [
   // libreoffice-kit、dsh-office-to-pdf …），它们没有版本标记可探 —— 补丁落地
   // 与否只能靠这个构建期写入的小文件判定。
   ["锚点 11 补丁集标记", join(target, PATCHSET_MARKER_FILE)],
+  // 锚点 11b：图片编解码后端 `bin/magick`（缺陷 DX）。`sharp` 的 Android 替身
+  // 把全部像素操作委托给它，而它曾经只存在于扩展池（用户点「获取」才有）。
+  // 全新安装的设备上缺它时，发图片会 spawn ENOENT → 上层包成 INVALID_IMAGE
+  // → 前端显示「仅支持 PNG、JPG、WebP、GIF 格式的图片」，用户发的却是合法 PNG。
+  ["锚点 11b 图片编解码后端 magick", join(target, "bin/magick")],
+  ["锚点 11b magick 核心库", join(target, "lib/libMagickCore-7.Q16HDRI.so")],
+  ["锚点 11b magick 配置 colors.xml", join(target, "etc/ImageMagick-7/colors.xml")],
   // 锚点 12：Tesseract 简体中文语言包。与锚点 9 同型（新增资产 + 版本戳不变
   // ⇒ 不加锚点老设备永不重装）。Termux 生态里根本没有中文包，只能随 runtime 发。
   ["锚点 12 中文语言包标记", join(target, TESSDATA_MARKER_FILE)],

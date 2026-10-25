@@ -50,6 +50,36 @@ export const SEED_PACKAGES = [
   "jq", "yq", "fd", "fzf", "bat", "eza",
   "tree", "sd", "sqlite", "bc", "lua54",
 
+  // ── G1.5 图片编解码后端：`sharp` 的 Android 替身必须能 spawn 到 magick ──
+  //
+  // 为什么必须在**预装**闭包里，而不是留在扩展池（缺陷 DX）：
+  //
+  // 上游 `sharp` 没有 android 预编译产物，`dsh-attachment-local` 的
+  // `detectImage()` / `normalizeImage()` / `probeImage()` 一碰图片就必抛
+  // `Could not load the "sharp" module using the android-arm64 runtime`。
+  // 本项目的修法是换掉整个 `sharp` 包，用 `tools/prebuilt/sharp-android/`
+  // 里的纯 JS 替身，**编解码全部 spawn `<root>/bin/magick`**（见缺陷 BF）。
+  //
+  // 但那个修法只写对了「替身」，没保证「magick 在设备上」：imagemagick 当时
+  // 只存在于扩展池 `imagemagick` 条目里，而扩展池是**用户点「获取」才解包**
+  // 的可选项。于是全新安装的设备上 `<root>/bin/magick` 根本不存在，替身
+  // 每次 spawn 都是 `ENOENT`，`detectImage()` 把它包成
+  // `AttachmentError("Unsupported or malformed image data.", "INVALID_IMAGE")`，
+  // 前端 `attachmentErrorText()` 再把 `INVALID_IMAGE` 映射成
+  // `image.unsupportedType` —— 用户看到的就是截图里那句
+  // **「仅支持 PNG、JPG、WebP、GIF 格式的图片」**，而他发的恰恰是 PNG。
+  // 也就是说：后端缺失被伪装成了「格式不支持」，完全误导排查方向。
+  //
+  // 体积代价：边际 47 包 / 46.95 MiB（含 ghostscript 19.47 MiB）。
+  // 相对 1.85 GiB 的 APK 是 +2.5%，换来「开箱即可发图片」。
+  // 顺带把 ghostscript 也变成预装 —— Office 预览与 PDF 那条链本来就要它。
+  //
+  // ⚠️ 副作用（已核实）：`imagemagick` 与 `ghostscript` 两个扩展池条目会因此
+  // 变成「边际集合为空」，`fetch-extensions.mjs` 会跳过它们，扩展中心的
+  // 卡片数从 26 降到 24。这两个工具**仍然可用**（已预装进 runtime.zip），
+  // 只是不再需要用户手动获取。`verify-runtime.mjs` 的下限断言同步下调。
+  "imagemagick",
+
   // ── G2 归档压缩：任何格式都能解 ────────────────────────────────────
   // xz-utils/tar/gzip/bzip2 已在基线（Termux deb 内层就是 data.tar.xz）。
   "zstd", "lz4", "zip", "unzip", "7zip", "unrar", "cpio", "libarchive",

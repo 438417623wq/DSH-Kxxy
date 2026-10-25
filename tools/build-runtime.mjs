@@ -663,8 +663,15 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 这个编号必须一起递增**。它不追求精确到「哪个补丁变了」，只保证
  * 「补丁集变了 ⇒ 设备必然重装一次」。代价是一次几百 MB 的重装，
  * 而漏判的代价是设备上静默复现已经修过的缺陷。
+ *
+ * 6 → 7：缺陷 DX（图片发送必失败）。`sharp` 替身本身没改 API 面，但它依赖的
+ * 后端从「扩展池可选」变成「runtime 预装」，而**老设备上 runtime 里根本没有
+ * `bin/magick`**。不递增编号的话前十五锚点全过、`isComplete()` 判真、
+ * 跳过重装 ⇒ 设备继续缺 magick ⇒ 用户继续看到「仅支持 PNG、JPG、WebP、GIF」。
+ * 注意：这条标记只能保证「重装一次」，真正把 magick 装上的是 runtime.zip 里
+ * 新增的 `bin/magick` 本体，所以锚点 11 还额外探了那个实体（见 RuntimeInstaller）。
  */
-const PATCHSET_MARKER = "kxxy-patchset@6";
+const PATCHSET_MARKER = "kxxy-patchset@7";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

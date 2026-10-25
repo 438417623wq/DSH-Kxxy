@@ -28,9 +28,18 @@
  * `<policy domain="resource" name="width" value="8KP"/>`，超过 8192px 的图
  * 连 identify 都会 `ImproperImageHeader` 失败 —— 而准入检查恰恰要先看到尺寸
  * 才能按 maxDimension 拒收。因此尺寸/格式/帧数/位深全部自己从字节里读。
+ *
+ * ⚠️ 后端依赖（缺陷 DX）：本文件把**所有像素操作**都委托给
+ * `<root>/bin/magick`，所以「运行时预装闭包里必须有 imagemagick」是这条链的
+ * 硬前提。曾经它只存在于扩展池（用户点「获取」才有），全新安装的设备上
+ * `bin/magick` 不存在 ⇒ spawn ENOENT ⇒ 被上层包成 `INVALID_IMAGE` ⇒ 前端显示
+ * 「仅支持 PNG、JPG、WebP、GIF 格式的图片」。修法有两层：
+ *   ① `tools/lib/seeds.mjs` 把 `imagemagick` 放进预装闭包（根治）；
+ *   ② 本文件在探测不到后端时抛 [MagickUnavailableError]（带 `code`），
+ *      让「后端缺失」与「图片损坏」在日志里可区分（兜底诊断）。
  */
 const { spawn } = require("node:child_process");
-const { readFileSync } = require("node:fs");
+const { existsSync, accessSync, constants: fsConstants } = require("node:fs");
 const { dirname, join } = require("node:path");
 
 /** 引擎根：本文件位于 <root>/lib/node_modules/sharp/dist/，上溯四级。 */
@@ -40,7 +49,77 @@ const ENGINE_ROOT = (() => {
   return dirname(dirname(dirname(dirname(__dirname))));
 })();
 
-const MAGICK = join(ENGINE_ROOT, "bin", "magick");
+/**
+ * 定位 magick 可执行文件（缺陷 DX）。
+ *
+ * 旧写法是 `join(ENGINE_ROOT, "bin", "magick")` 一条路写死。问题不在路径本身
+ * （引擎根推导是对的），而在于**没有任何探测**：`imagemagick` 曾只存在于
+ * 扩展池，用户没点「获取」时 `<root>/bin/magick` 根本不存在，于是每次
+ * `spawn` 都 `ENOENT`，`detectImage()` 把它包成 `INVALID_IMAGE`，前端再映射成
+ * 「仅支持 PNG、JPG、WebP、GIF 格式的图片」—— 一句与真实原因毫无关系的话。
+ *
+ * 现在按优先级探测，并在**全部失败时给出可执行的诊断**：
+ *   1. `KXXY_MAGICK`（构建/测试可显式覆盖）
+ *   2. `<engineRoot>/bin/magick`（正常安装路径；`bin/` 已在 PATH 首位）
+ *   3. `magick`（交给 PATH —— 设备上 `bin/` 就是 PATH 第一项）
+ *   4. `<engineRoot>/extensions/imagemagick/bin/magick`（用户装过扩展池时，
+ *      解包落在 extensions/ 下，`buildViews` 会把 bin/ 展平进 `<root>/bin`，
+ *      但 relink 未跑完的窗口期里这条能救急）
+ *
+ * 找到的路径缓存起来（第一次 spawn 之前就要确定，否则没法把「找不到后端」
+ * 和「图真的坏了」区分开）。
+ */
+function locateMagick() {
+  const candidates = [
+    process.env.KXXY_MAGICK,
+    join(ENGINE_ROOT, "bin", "magick"),
+    "magick",
+    join(ENGINE_ROOT, "extensions", "imagemagick", "bin", "magick"),
+  ].filter((c) => typeof c === "string" && c.length > 0);
+
+  for (const cand of candidates) {
+    // 裸名（"magick"）无法用 existsSync 判，直接放行交给 spawn + PATH。
+    if (!cand.includes("/") && !cand.includes("\\")) return cand;
+    try {
+      accessSync(cand, fsConstants.X_OK);
+      return cand;
+    } catch {
+      // 不存在或不可执行，试下一个
+    }
+  }
+  return null;
+}
+
+const MAGICK = locateMagick();
+
+/**
+ * 后端缺失时抛的错误。
+ *
+ * 关键：**不能**让它落进 `INVALID_IMAGE`。`detectImage()` 的 catch 分支把任何
+ * 非 AttachmentError 异常都包成 `INVALID_IMAGE`（"Unsupported or malformed
+ * image data."），而前端把这个 reason 映射成「仅支持 PNG、JPG、WebP、GIF」。
+ * 一个「引擎缺 magick」的部署问题就这样变成了「你的图片格式不对」，用户会
+ * 反复换图、换格式、重装 APK，永远修不好。
+ *
+ * 这里用一个带稳定 `code` 的普通 Error，并在 message 里写清缺什么、怎么办。
+ * 它仍然会被 `detectImage()` 包成 AttachmentError —— 但 `cause` 会被保留，
+ * 且 `AttachmentError` 的 message 是固定的，所以真正的线索在 `cause.message`。
+ * 为了让线索一定能露出来，同时把 `code` 挂到 message 上（下游
+ * `String(error)` / `error.message` 都能看到）。
+ */
+class MagickUnavailableError extends Error {
+  constructor() {
+    const where = MAGICK ?? "(未找到)";
+    super(
+      `KXXY_MAGICK_UNAVAILABLE: 图片编解码后端缺失 —— 找不到可执行的 magick（探测结果：${where}）。` +
+        "运行时的预装闭包应当包含 imagemagick 包（<root>/bin/magick）；" +
+        "若这是从旧 APK 升级上来的设备，请在扩展中心安装「ImageMagick 图像处理」，或重装 APK。",
+    );
+    this.name = "MagickUnavailableError";
+    this.code = "KXXY_MAGICK_UNAVAILABLE";
+    this.magickPath = MAGICK;
+  }
+}
 
 /**
  * 按魔数判定容器格式。只认 dsh-attachment-local 声明的四种 mediaType。
@@ -412,15 +491,29 @@ function carriesMetadata(buf, info) {
   return spec;
 }
 
-/** 执行 magick，收集 stdout/stderr。stdin 用给定 Buffer。 */
+/**
+ * 执行 magick，收集 stdout/stderr。stdin 用给定 Buffer。
+ *
+ * `ENOENT` 必须被翻译成 [MagickUnavailableError]，不能原样冒出去：调用方
+ * （`dsh-attachment-local` 的 detectImage / probeImage / normalizeImage）
+ * 的 catch 分支会把任何非 AttachmentError 异常统一包成 `INVALID_IMAGE`
+ * （"Unsupported or malformed image data."），前端再把它显示成
+ * 「仅支持 PNG、JPG、WebP、GIF 格式的图片」。后端缺失与图片损坏就这样
+ * 变成了同一句话（缺陷 DX）。
+ */
 function runMagick(args, input) {
+  if (MAGICK === null) return Promise.reject(new MagickUnavailableError());
   return new Promise((resolve, reject) => {
     const child = spawn(MAGICK, args, { stdio: ["pipe", "pipe", "pipe"] });
     const out = [];
     const err = [];
     child.stdout.on("data", (c) => out.push(c));
     child.stderr.on("data", (c) => err.push(c));
-    child.on("error", reject);
+    child.on("error", (e) => {
+      // 裸名走 PATH 时也可能 ENOENT（PATH 里没有 magick）。
+      if (e && e.code === "ENOENT") reject(new MagickUnavailableError());
+      else reject(e);
+    });
     child.on("close", (code) => {
       resolve({
         code,

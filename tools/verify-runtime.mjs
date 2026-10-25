@@ -1026,6 +1026,64 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
   }
 }
 
+// ---------------------------------------------------------------- 图片编解码后端
+//
+// 为什么需要（缺陷 DX）：`sharp` 的 Android 替身（缺陷 BF）把**所有像素操作**
+// 委托给 `<root>/bin/magick`。但 `imagemagick` 当时只存在于扩展池
+// `imagemagick` 条目里 —— 而扩展池是「用户点获取才解包」的可选项。于是全新
+// 安装的设备上 `bin/magick` 根本不存在，替身每次 spawn 都是 ENOENT，
+// `detectImage()` 把它包成 `AttachmentError(..., "INVALID_IMAGE")`，
+// 前端 `attachmentErrorText()` 再把 `INVALID_IMAGE` 映射成
+// `image.unsupportedType` ⇒ 用户看到「仅支持 PNG、JPG、WebP、GIF 格式的图片」，
+// 而他发的恰恰是合法 PNG。**后端缺失被伪装成格式不支持**，这是最难排查的一类。
+//
+// 修法是把 `imagemagick` 放进预装闭包（`tools/lib/seeds.mjs`），所以这里断言
+// runtime.zip 里真的有这个二进制，以及它 DT_NEEDED 的库都在。
+// 只判 `bin/magick` 存在不够 —— 缺库时它照样存在，但一执行就
+// `CANNOT LINK EXECUTABLE`（缺陷 BH 同型），所以顺带断言几个关键依赖。
+{
+  const problems = [];
+  const magick = byName.get("bin/magick");
+  if (!magick) {
+    problems.push(
+      "runtime.zip 里没有 bin/magick —— 图片发送会报「仅支持 PNG、JPG、WebP、GIF」" +
+        "（sharp 替身 spawn 不到后端，错误被伪装成格式不支持）",
+    );
+  } else {
+    const buf = readLocal(magick);
+    // ELF64 aarch64：7f 45 4c 46 / e_machine 0xb7。magick 在 Termux 包里是
+    // 8,472 B 的小 ELF（真正的实现在 libMagickWand），别按体积判。
+    if (buf.length < 4 || buf.readUInt32BE(0) !== 0x7f454c46) {
+      problems.push(`bin/magick 不是 ELF（${buf.length} B）`);
+    }
+  }
+  // magick 自己 NEEDED libMagickCore / libMagickWand；Core 再 NEEDED 一长串
+  // 图像库。挑几个「缺了必然起不来」且必须由 imagemagick 闭包提供的：
+  for (const dep of [
+    "lib/libMagickCore-7.Q16HDRI.so",
+    "lib/libMagickWand-7.Q16HDRI.so",
+    "lib/libjpeg.so.8",
+    "lib/libpng16.so",
+    "lib/libwebp.so",
+    "lib/libtiff.so",
+    "lib/libfreetype.so",
+  ]) {
+    if (!byName.get(dep)) problems.push(`图片编解码后端缺依赖：${dep}`);
+  }
+  // 配置文件：缺陷 AX 已修好 MAGICK_CONFIGURE_PATH，缺 colors.xml 会每次
+  // 调用刷 `UnableToOpenConfigureFile`（出图仍成功，所以容易被当无害告警）。
+  if (!byName.get("etc/ImageMagick-7/colors.xml")) {
+    problems.push("缺 etc/ImageMagick-7/colors.xml（MAGICK_CONFIGURE_PATH 指向的配置目录）");
+  }
+  if (problems.length > 0) {
+    console.log("图片编解码后端：✗");
+    for (const p of problems) console.log(`  ${p}`);
+    missing += 1;
+  } else {
+    console.log("图片编解码后端：✓ bin/magick + 7 个关键依赖 + colors.xml 齐备（sharp 替身可用）");
+  }
+}
+
 // ---------------------------------------------------------------- 字符集映射
 //
 // 为什么需要：`PRUNE_EXT` 里曾有一条 `.map`（本意是裁 JS sourcemap），但扩展池里
@@ -1256,7 +1314,12 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
   } else {
     const catalog = JSON.parse(readLocal(catalogEntry).toString("utf8"));
     const ids = (catalog.items ?? []).map((i) => i.id);
-    if (ids.length < 25) problems.push(`扩展目录只有 ${ids.length} 项（应 ≥25）`);
+    // 下限从 25 降到 24：`imagemagick` 与 `ghostscript` 进预装闭包后
+    // （缺陷 DX，图片发送必需的后端），它们的池条目边际集合为空，
+    // fetch-extensions 会跳过、不再出现在目录里（26 → 24；`yt-dlp`
+    // 早就是同样的原因被跳过，从来不在目录里）。这两个工具本身仍然可用
+    // —— 它们已经打进 runtime.zip 的 bin/ 与 lib/ 了。
+    if (ids.length < 24) problems.push(`扩展目录只有 ${ids.length} 项（应 ≥24）`);
     for (const need of ["maven", "php", "ruby", "erlang", "yarn"]) {
       if (!ids.includes(need)) problems.push(`扩展目录缺 ${need}`);
     }

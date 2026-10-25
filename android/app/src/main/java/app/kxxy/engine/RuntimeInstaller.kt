@@ -426,6 +426,24 @@ class RuntimeInstaller(private val ctx: Context) {
             return false
         }
 
+        // 锚点 11b：图片编解码后端 `bin/magick` 必须真实落盘（缺陷 DX）。
+        //
+        // 与锚点 14/15 同一条教训：**标记只证明 zip 里带的是新版，证明不了
+        // install 真把实体解出来了**。这里探的是 `sharp` 替身的硬依赖 ——
+        // 替身把全部像素操作委托给 `<root>/bin/magick`，而它曾经只存在于
+        // 扩展池（用户点「获取」才有）。全新安装的设备上该文件不存在时，
+        // 发图片会 spawn ENOENT → 上层包成 INVALID_IMAGE → 前端显示
+        // 「仅支持 PNG、JPG、WebP、GIF 格式的图片」，用户发的却是合法 PNG。
+        //
+        // 判据取「文件存在且非空」，不判可执行位：可执行位由
+        // [restoreExecBits] 统一补，且这里判死会触发 700+ MiB 重装，
+        // 而补一个 bit 就能恢复（与锚点 15 同一条取舍）。
+        val magick = File(root, "bin/magick")
+        if (!magick.isFile || magick.length() == 0L) {
+            Log.w(TAG, "runtime probe: bin/magick missing (image codec backend), forcing reinstall")
+            return false
+        }
+
         // 锚点 12：Tesseract 简体中文语言包。
         // 与锚点 9 同型（新增资产 + 版本戳不变 ⇒ 不加锚点老设备永不重装）。
         // 只判标记文件不够：标记 26 B、写入必然成功，而 2.4 MiB 的
@@ -2326,7 +2344,7 @@ class RuntimeInstaller(private val ctx: Context) {
          *
          * 改动 patches.mjs 里任何补丁、或增删补丁时，必须同步递增此编号。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@6"
+        private const val PATCHSET_MARKER = "kxxy-patchset@7"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**
