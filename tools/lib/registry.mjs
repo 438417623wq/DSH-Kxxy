@@ -399,7 +399,18 @@ export function openAsar(path) {
   const buf = readFileSync(path);
   const headerSize = buf.readUInt32LE(12);
   const header = JSON.parse(buf.subarray(16, 16 + headerSize).toString("utf8"));
-  const base = 16 + headerSize;
+  // payload 起点是 `16 + align4(headerSize)`，**不是** `16 + headerSize`。
+  //
+  // Electron 写 asar 时把 header JSON 补齐到 4 字节边界再拼 payload（见
+  // `tools/pack-asar.mjs` 的 `padded = align4(jsonLen)`，以及本文件头注释里
+  // 「base = 16 + align4(jsonLen) = 8 + f4」那条反推）。真实桌面版 asar 的
+  // jsonLen 是 4,748,087（% 4 = 3），少算这 1 字节会让**每个**条目整体错位：
+  // `package.json` 读出来首字符是 `\0`，JSON.parse 直接抛错，闭包只剩 3 个根包、
+  // 接缝包全部「漏出闭包」—— 报错信息完全指向别处。
+  //
+  // 只有 jsonLen % 4 == 0 时两种写法才等价，所以这个缺陷在头部长度碰巧对齐的
+  // 机器上不可见。
+  const base = 16 + ((headerSize + 3) & ~3);
   // electron-builder 会把带原生二进制 / 需保留权限位的文件从 asar 里「解包」到
   // <asar>.unpacked 下的同构目录树，header 里只留 {size, unpacked:true, integrity}
   // 而没有 offset —— 直接按 offset 读会得到 0 字节。必须回退到磁盘。
