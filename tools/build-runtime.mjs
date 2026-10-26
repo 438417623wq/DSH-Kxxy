@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 装配 `assets/runtime.zip`：Termux stage（bionic 系统层）+ asar（dsh JS 依赖树）
  * → 一份可直接解压到 `filesDir/engine/` 的运行时。
  *
@@ -671,7 +671,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 注意：这条标记只能保证「重装一次」，真正把 magick 装上的是 runtime.zip 里
  * 新增的 `bin/magick` 本体，所以锚点 11 还额外探了那个实体（见 RuntimeInstaller）。
  */
-const PATCHSET_MARKER = "kxxy-patchset@7";
+const PATCHSET_MARKER = "kxxy-patchset@8";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

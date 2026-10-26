@@ -1139,6 +1139,117 @@ function androidOpener() {
   return "dsh-native-command → Android 放行桌面能力（打开/显示位置走 termux-api shim）";
 }
 
+/**
+ * 硅基流动（以及同类「OpenAI 兼容但只认四个 role」的网关）收到 `developer` 角色会 400。
+ *
+ * ── 症状（用户真机报，附截图）────────────────────────────────────────────
+ *
+ * 在手机上用「硅基流动」做 provider，**每一轮都失败**，界面原文：
+ *
+ *     本轮运行失败 400  INVALID_REQUEST
+ *     {"code":20015,"message":"Input tag 'developer' found using 'role' does not
+ *      match any of the expected tags: 'system', 'user', 'assistant', 'tool'"}
+ *
+ * 同一份 provider 配置在**桌面端完全正常** —— 这一点很误导，容易让人怀疑
+ * 手机端打包漏了什么。实测桌面与手机的 `pi-ai` 逐字节相同（64579 B），
+ * 所以差异不在代码，而在**模型元数据**。
+ *
+ * ── 根因链（三层，缺一不可）─────────────────────────────────────────────
+ *
+ *   1. `@earendil-works/pi-ai` 的 `openai-completions.js` 里只有一行决定角色：
+ *
+ *          const instructionRole = model.reasoning && compat.supportsDeveloperRole
+ *              ? "developer" : "system";
+ *
+ *      所以只要 `reasoning` 与 `supportsDeveloperRole` 同时为真，系统提示词就
+ *      以 `developer` 身份发出。
+ *
+ *   2. `supportsDeveloperRole` 来自 `detectCompat()` 里一份**硬编码的
+ *      「非标准 provider」名单**：
+ *
+ *          const isNonStandard = isNvidia || isCerebras || provider === "xai" ||
+ *            isTogether || baseUrl.includes("chutes.ai") || isDeepSeek || isZai ||
+ *            isMoonshot || provider === "opencode" || isCloudflareWorkersAI ||
+ *            isCloudflareAiGateway || isAntLing;
+ *          supportsDeveloperRole: isOpenRouterDeveloperRoleModel || (!isNonStandard && !isOpenRouter)
+ *
+ *      `api.siliconflow.cn` **不在名单里** ⇒ 被判成「标准 OpenAI」⇒
+ *      `supportsDeveloperRole = true`。而硅基流动的后端是 Rust 网关，它的
+ *      tagged enum 只认 `system/user/assistant/tool`，于是整体 400。
+ *
+ *   3. `model.reasoning` 来自配置里的 `models[].reasoningEfforts`：写了非空
+ *      dict 就是 `true`（见 dsh-llm-pi-ai 的 `resolveModelReasoning`）。
+ *      桌面端的 `guijiji` 路由**没有**这个字段 ⇒ `reasoning = false` ⇒
+ *      走 `system` ⇒ 一直正常。手机端用户在设置页打开过「推理等级」开关
+ *      ⇒ 写入 `reasoningEfforts` ⇒ `reasoning = true` ⇒ 触发 1 里的分支。
+ *
+ * **注意「推理等级 → Off」救不了**：那个下拉框改的是每次请求的
+ * `reasoningEffort`（`profileOptions` 里 `reasoning === "off" ? undefined : reasoning`），
+ * 只决定要不要发推理参数，**完全不碰 `model.reasoning`**。用户按「关掉推理」
+ * 操作后错误照旧，正是这个原因（真机复验过）。
+ *
+ * ── 修法：把判定改成「问得出答案就问，问不出来就不发」───────────────────
+ *
+ * 不在名单里加 `siliconflow`（那是把上游的硬编码名单再抄一遍，换个中转域名
+ * 又会复发，且要跟 pi-ai 的版本走）。而是给 `detectCompat` 补一条**通用**
+ * 规则：`baseUrl` 里出现自建/第三方网关的常见特征时，`developer` 一律不发。
+ *
+ * 但「猜域名」仍然脆弱。真正稳的是**让用户可覆盖**：pi-ai 已经支持
+ * `model.compat.supportsDeveloperRole`（`COMPLETIONS_COMPAT_GATE` 里是
+ * `"offer"`，即路由级与模型级都能配），所以本补丁只做一件事 ——
+ * **把硅基流动这类已知不认 `developer` 的域名补进 `isNonStandard`**，
+ * 同时保留配置覆盖的能力。用户仍可在 `cordis.patch.yml` 里写
+ * `compat.supportsDeveloperRole: true` 强行打开（例如换成真的 OpenAI）。
+ *
+ * 为什么不改 `dsh-llm-pi-ai` 而是改 pi-ai 本体：`instructionRole` 那行在
+ * pi-ai 里，dsh-llm-pi-ai 只是把 `compat` 传下去。改上层拿不到这个判定点。
+ */
+function patchDeveloperRoleCompat(ctx) {
+  const rel = "@earendil-works/pi-ai/dist/api/openai-completions.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无 @earendil-works/pi-ai）";
+
+  const src = ctx.read(rel);
+  const ANCHOR = 'const isNonStandard = isNvidia ||';
+
+  // 幂等：补丁集标记之外，再按「本补丁的独有片段」判一次，避免重复拼接。
+  if (src.includes("KXXY_DEVELOPER_ROLE_GUARD")) {
+    return "已打过（硅基流动等网关的 developer 角色兼容），跳过";
+  }
+  must(src.includes(ANCHOR), `pi-ai 的 detectCompat 结构变了：找不到锚点 "${ANCHOR}"`);
+
+  /*
+   * 追加一组域名判定。刻意与上游 `isNonStandard` 的写法保持同一形状
+   * （一串 `||`），这样上游升级时 diff 一眼能看出来。
+   *
+   * 名单依据（每一条都是「OpenAI 兼容但 tagged enum 只认四个 role」的网关）：
+   *   · siliconflow.cn / siliconflow.com —— 硅基流动，本次真机事故
+   *   · dashscope.aliyuncs.com          —— 阿里百炼（兼容模式同样不认 developer）
+   *   · open.bigmodel.cn                —— 智谱（上游已按 zai 处理，这里兜底）
+   *   · api.moonshot.                   —— 月之暗面（同上）
+   * 新域名只需加一条 `baseUrl.includes(...)`，不必再动结构。
+   */
+  const GUARD = `
+    /* KXXY_DEVELOPER_ROLE_GUARD: 这些网关的 role 是 tagged enum，只认
+       system/user/assistant/tool；发 developer 会整体 400。见 patches.mjs
+       的 patchDeveloperRoleCompat 注释（缺陷 EA）。 */
+    const isDeveloperRoleHostile = baseUrl.includes("siliconflow.cn") ||
+        baseUrl.includes("siliconflow.com") ||
+        baseUrl.includes("dashscope.aliyuncs.com") ||
+        baseUrl.includes("open.bigmodel.cn") ||
+        baseUrl.includes("api.moonshot.");`;
+
+  let out = src.replace(ANCHOR, `${GUARD}\n    const isNonStandard = isDeveloperRoleHostile || isNvidia ||`);
+  must(out !== src, "pi-ai 的 isNonStandard 改写未生效");
+
+  // `supportsDeveloperRole` 那一行不动：`isNonStandard` 变真之后它自然为 false，
+  // 而且这样保留了「用户显式配置 compat 覆盖」的路径（getCompat 里 compat 优先）。
+  const BEFORE = "const isNonStandard = isDeveloperRoleHostile || isNvidia ||";
+  must(out.includes(BEFORE), "pi-ai 的 isNonStandard 改写锚点丢失");
+
+  ctx.write(rel, out);
+  return "pi-ai → 硅基流动/百炼/智谱/月暗 等网关不再发 developer 角色（缺陷 EA）";
+}
+
 export function applyAllPatches(root, termuxRead) {
   const ctx = createPatchContext(root);
   const results = [
@@ -1162,6 +1273,7 @@ export function applyAllPatches(root, termuxRead) {
     patchDocumentPreviewOfficeExtensions(ctx),
     patchDocumentPreviewArchiveProviders(ctx),
     patchDocumentPreviewMediaProviders(ctx),
+    patchDeveloperRoleCompat(ctx),
     patchDshManifest(ctx),
   ];
   return results;
