@@ -8,3 +8,11 @@
 *.zip binary
 *.jar binary
 *.so binary
+
+# 签名密钥是二进制（PKCS12 里混着 DER 与随机盐）。这条不是洁癖：`* text=auto`
+# 会让 git 对「看起来像文本」的二进制做 CRLF 归一化，一旦它把某几个 0x0D 0x0A
+# 当成行尾改掉，keystore 就打不开了 —— 而这把钥匙丢了等于所有已装设备必须卸载。
+# 实测当前这份 2,660 B 的 .jks 已被 git 自己判成 binary，但判定靠的是启发式
+# （前 8,000 字节里有没有 NUL），换一把钥匙就可能变卦，所以显式钉死。
+*.jks binary
+*.keystore binary

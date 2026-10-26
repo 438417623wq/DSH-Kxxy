@@ -15,6 +15,19 @@ captures/
 hs_err_pid*.log
 replay_pid*.log
 
+# ⚠️ 下面几条**不要**照着常见 Android 模板往这里加 —— 加了会直接毁掉升级链路：
+#
+#     *.jks
+#     *.keystore
+#     android/keystore/
+#     keystore.properties
+#
+# `android/keystore/` 是**故意入库**的：它是 DSH Kxxy 的固定签名密钥。
+# 一旦不入库，换机器 / 重新 clone 就只剩两条路 —— 用本机自动生成的
+# debug.keystore（就是缺陷 DX），或者找不到密钥直接构建失败。前者会让所有
+# 已装设备报 INSTALL_FAILED_UPDATE_INCOMPATIBLE，只能卸载（连引擎与 713 MiB
+# 运行时一起清掉）。取舍与风险见 android/keystore/README.md。
+
 # ---- Python 字节码（tools/lib/poolextract.py 等被 fetch-extensions.mjs 调用时生成）----
 __pycache__/
 *.pyc

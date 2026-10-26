@@ -1,4 +1,4 @@
-# DSH Kxxy —— DeepSeek Harness 安卓移植（方案 T：Web-First）
+﻿# DSH Kxxy —— DeepSeek Harness 安卓移植（方案 T：Web-First）
 
 把桌面版 DSH 的**完整能力**（官方 React 前端 + 86 个插槽 + 插件生态 + Turn 推理链 + Tool Call 卡片）
 搬到 Android 手机端，而**不重写 UI**。
@@ -53,6 +53,9 @@
 ```
 dsh-kxxy/
 ├── android/                      Android 工程（AGP 8.5.2 / Kotlin 1.9.24 / JDK 17）
+│   ├── keystore/                 **固定签名密钥（入库）**，见其 README
+│   │   ├── kxxy-signing.jks      PKCS12 / RSA 2048 / 100 年 / 别名 kxxy
+│   │   └── kxxy-signing.properties 密码、别名、certSha256（构建期硬断言用）
 │   └── app/src/main/
 │       ├── assets/runtime.zip    707 MiB 运行时（构建产物，**不入库**，见 tools/）
 │       ├── assets/ext-pool/      1.16 GiB 扩展包池（26 项，构建产物，**不入库**）
@@ -77,7 +80,9 @@ dsh-kxxy/
 │   ├── fetch-extensions.mjs      构建扩展包池
 │   ├── verify-runtime.mjs        产物结构校验
 │   ├── simulate-install.mjs      复刻设备端解包流程
-│   ├── build-apk.ps1             Gradle 打包 + 注入大资源 + zipalign + apksigner
+│   ├── build-apk.ps1             Gradle 打包 + 注入大资源 + zipalign + 调 sign-apk 签名
+│   ├── sign-apk.mjs              固定签名（--in/--out 签、--print 打印、--check 断言指纹）
+│   ├── test-signing.mjs          固定签名契约测试（指纹 / 接线 / 无 debug 密钥残留）
 │   ├── inject-apk-assets.mjs     把 runtime.zip / 26 个池流式追加进 APK（绕开 AGP 整份读）
 │   ├── smoke-plugin.mjs          插件路由冒烟测试
 │   ├── check-bundle.mjs          用真实 dsh-app-boot 验证 bundle 解析
@@ -89,6 +94,7 @@ dsh-kxxy/
 │   ├── test-media-providers.mjs 媒体 provider 单测（video/audio 槽位与状态机）
 │   ├── check-mobile-layout.mjs   布局微调层叠校验（铺真实宿主 CSS + 插件 !important，无头 Chrome 读 computed style）
 │   ├── prebuilt/                 自研原生产物（Android arm64）与注入片段
+│   │   ├── apksigner/                apksigner.jar（1.18 MB，签名不依赖本机 SDK）
 │   │   ├── documentpreview-archive/  zip / epub provider 注入片段
 │   │   └── documentpreview-media/    video / audio provider 注入片段
 │   └── lib/                      装配/补丁/打包库
@@ -101,6 +107,10 @@ dsh-kxxy/
 
 前置：JDK 17、Android SDK（platforms 36 / build-tools 36 / ndk 28.2 / cmake 3.22.1）。
 本机没有 gradle wrapper，用已安装的 Gradle 8.10.2。
+
+> **签名不需要额外准备**：密钥在 `android/keystore/`（入库），`apksigner` 由
+> `tools/sign-apk.mjs` 自带 jar 兜底 —— 换一台只装了 JDK 的机器也能出**同一把钥匙**的包。
+> 详见 `android/keystore/README.md` 与缺陷 DX。
 
 > **仓库不含 `assets/runtime.zip`**（707 MiB，`.gitignore` 已排除）—— 它是构建产物，
 > 由下面第 1、2 步从**本机已安装的 DSH 桌面版** `app.asar` + Termux aarch64 `.deb` 现场装配。
@@ -178,14 +188,25 @@ $env:KXXY_PYTHON = $py
 & $node tools/test-extinstall.mjs
 
 & $node tools/test-compat-open.mjs& $node tools/test-native-command.mjs
+& $node tools/test-signing.mjs           # 固定签名契约（指纹 / 接线 / 无 debug 密钥残留）
 & $node tools/check-mobile-layout.mjs   # 只在需要看布局层叠时跑：它会写出夹具并让你用 chrome --headless --dump-dom 读回
 # 4) 打包 APK
 #    大资源（runtime.zip + ext-pool/*.pool）必须移出 assets，构建完用流式追加器注入，
-#    再 zipalign、重签。已固化为一条命令：
+#    再 zipalign、再调 tools/sign-apk.mjs 用仓库固定密钥签名。已固化为一条命令：
 powershell -File tools\build-apk.ps1
+
+# 4.5) 只重签（换了机器、只想把现有包重新签一次时；不需要 gradle / SDK）
+& $node tools/sign-apk.mjs --in  android\app\build\outputs\apk\debug\app-aligned.apk `
+                           --out android\app\build\outputs\apk\debug\app-signed.apk
+& $node tools/sign-apk.mjs --check android\app\build\outputs\apk\debug\app-signed.apk
 ```
 
 产物：`android/app/build/outputs/apk/debug/app-signed.apk`（④ 全能精选档 ≈ 1.9 GiB，另有包池按需本地展开）。
+
+> **签名是固定的，换机器不用再卸载**。密钥在 `android/keystore/`（入库），
+> 证书 `SHA-256 d0:8a:e4:99:…:03:73`、`CN=DSH Kxxy`。只有从**旧的 debug 签名包**
+> 迁过来时需要卸载一次（那把 `CN=Android Debug` 的私钥已随旧机器丢失，无法导出）。
+> 详见 `android/keystore/README.md` 与缺陷 DX。
 
 > **为什么不能直接 `gradle assembleDebug`**：AGP 的 `:app:compressDebugAssets` 走
 > `com.android.zipflinger.BytesSource`，把**每个 asset 整份读进内存**。runtime.zip 700+ MiB
@@ -228,6 +249,36 @@ powershell -File tools\build-apk.ps1
 > 装完新 APK 不 `pm clear` 直接启动，日志出 `rewriteRootPlaceholder: 1159/1159`、
 > `materialiseLinks: 1618 created`、`restoreExecBits: 1241 file(s) made executable`、
 > `runtime install complete`；再重启一次出 `runtime already installed and complete`（不循环）。
+
+---
+
+## 三点五、签名（固定密钥）
+
+| 项 | 值 |
+| --- | --- |
+| 密钥 | `android/keystore/kxxy-signing.jks`（**入库**） |
+| 类型 | PKCS12 / RSA 2048 / SHA256withRSA / 有效期 36500 天 |
+| 别名 | `kxxy`（密码见 `kxxy-signing.properties`） |
+| 证书 | `CN=DSH Kxxy, OU=Android, O=DSH Kxxy, C=CN` |
+| SHA-256 | `d0:8a:e4:99:73:63:7a:25:ff:b3:7c:c0:aa:c3:ac:71:fa:58:12:58:6b:11:8e:2e:94:39:d6:fa:49:b9:03:73` |
+| 签名方案 | v1 + v2（`targetSdk=28`，v2 是硬要求） |
+
+三处消费方读**同一份** `kxxy-signing.properties`：
+
+1. `android/app/build.gradle.kts` → `signingConfigs.create("kxxy")`，debug / release 都用它；
+2. `tools/build-apk.ps1` 第 6 步 → 调 `tools/sign-apk.mjs`（zipalign 之后必须重签）；
+3. `tools/sign-apk.mjs` → 只重签 / 打印 / 校验指纹。
+
+```
+node tools/sign-apk.mjs --print <apk>    # 这个包用的是哪把钥匙
+node tools/sign-apk.mjs --check <apk>    # 与仓库固定密钥一致才退出 0
+node tools/test-signing.mjs              # 契约断言（含「无 debug 密钥残留」）
+```
+
+**为什么密钥敢入库**：本应用 sideload 分发、密钥不保护任何服务端凭据，而丢钥匙的
+代价是确定的（所有已装设备必须卸载，连 713 MiB 运行时一起清）。风险与取舍写在
+`android/keystore/README.md`，`.gitignore` 里也留了一条反向警告（别照抄
+`*.jks` / `*.keystore` 模板）。
 
 ---
 
@@ -404,8 +455,36 @@ powershell -File tools\build-apk.ps1
 | DU | 控制台**左上角版本号永远是 `v0.3.2-android`**，与关于页里的真版本（`0.9.2+caf7a90.dirty`）对不上；关于页里也**没有仓库入口**（用户报） | 两个问题同一个病根：**前端里存在与原生版本无关的写死值**。<br>① `plugins/kxxy-host/web/index.html:31` 那行 `<span class="header-version">v0.3.2-android</span>` 是**插件自己的**版本号，插件随 runtime 打包、一个 APK 生命周期内不变，所以用户升级 APK 后页头纹丝不动。缺陷 DP 已经把「真版本」接进了关于弹窗（`engine.build.*`），但页头这条老路径没跟着改 —— 同一个界面里出现两个互相矛盾的版本号，比只有一个错的更误导。<br>② 关于页里没有仓库入口，用户想反馈只能自己去搜。 | ① 页头版本改为**与关于弹窗同源**：`index.html` 只留 `<span id="header-version">&nbsp;</span>` 作占位（`&nbsp;` 是为了避免拿到数据前把行高撑一下又缩回去），`host.js` 的 `renderHeaderVersion(build)` 从 `engine.build` 取，只显示 `v<主版本> · #<versionCode>`（页头宽度只够这么多），带 `+commit` 的完整串与 dirty 标记挂在 `title` 上。<br>② 关于页作者行加 `.about-repo-link`（GitHub 图标 + 文字），`href` 由 `renderRepoLink(build)` 按 `engine.build.repoUrl` 填。URL 走构建期链路（见第九节第 4 条），拿不到就 `hidden`。两个新函数都在 `renderAboutBuild` 末尾统一调用 —— **三处版本号必须同一个数据源**，否则这缺陷必然复发。<br>③ CSS 两处坑：`.about-author` 原先是 `justify-content: space-between`，三个子项会被均分到「两端 + 中间」，改成 `flex-start` + 链接 `margin-left:auto`；`.about-repo-link` 自己声明了 `display:inline-flex`，会盖掉 UA 对 `[hidden]` 的 `display:none`，必须显式补 `.about-repo-link[hidden]{display:none}`（同 `.attention-host[hidden]` 的教训）。 |
 | DV | 隐藏「标准模式」之后，**两个状态芯片（后台任务、子智能体）仍然把标题挤成一两个词**；按用户提的「只有一个就完整显示、两个同时出现就上下排」做成竖排（用户报，附截图） | 缺陷 DT 修完 `@container` 之后暴露出的**下一层问题**：芯片不再互相压字了，但 `headerActions` 是 `flex:none` 的横排盒，两个 12px 芯片 + corner 合计约 150px，393dp 里只给标题留 120px 左右。<br>① 不能靠「数一数有几个芯片」来切换布局：`:has()` 在 WebView 104 不存在（靠兼容层改写，一改就惰性化）、用 JS 量数量要监听窗口变化且首帧会跳。<br>② 上游把 headerActions 在手机档做成 `overflow-x: auto` 的滚动盒 —— 主轴一换成 column，这个 auto 会让**纵向**也变成滚动容器，两行被裁且多出一条不可见的滚动缝。<br>③ 上游还有一条 4 个属性选择器 + `!important` 的 `flex-direction: row` 兜底规则（给旧宿主用的），特异性不够会被压掉。 | ① **不写数量判断**：`flex-direction: column` 本身就是数量自适应 —— 单芯片排一列就是一行，两个芯片自然上下两行，像素级不需要特判（`compat.js` 的 `MOBILE_LAYOUT_CSS` 540px 块）。<br>② 这一条要把三件事一起给掉：`overflow: visible !important`（压掉上游的 `overflow-x: auto`）、`:not(#kxxy)`（把特异性抬到 id 级，压过上游那条 4 属性选择器规则，同时不依赖宿主是否带 `data-mobile-nav`）、`align-items: flex-end`（右对齐，与横排时芯片靠右的视觉一致）。顺序不写死：后台任务 chip 被上游 `order: 9` 推到末位，column 下 order 仍生效 ⇒ 子智能体在上、后台任务在下。<br>③ 尺寸走紧凑档（11px / 行高 15px / 热区 17px）：两行合计约 34px，header 只从 76 涨到 87，比保持 12px 时的 97 稳；嫌热区小把 `min-height` 提到 22px 即可。<br>④ **顺手抓住一处 `@10` 引入的回归**：`header [class*="_label"]:not(#kxxy){display:none!important}` 按 `_label` **后缀**锚，上游各插件共用这个后缀（`.f8BMvq_label` = 标准模式、`._3K3mEa_label` = 子智能体），于是子智能体芯片只剩一个圆环。修法是紧跟一条 `header [class*="_headerActions"] [class*="_label"]:not(#kxxy){display: revert !important}` —— 先全藏再把 headerActions 内的恢复；能这么切是因为标准模式的 label 挂在 titleRow 那层、两个状态芯片是 headerActions 的直接子级，这个结构差别是稳的。用 `revert` 而不是 `inline`（label 可能是块级容器）。恢复规则同样必须带 `:not(#kxxy)`，否则特异性低于隐藏规则，同 `!important` 下压不过。<br>**验证**：`test-compat-css.mjs` 的 `[8]` 段新增 7 条断言 → 74 通过 / 0 失败；另写 `.cache/preview/gen-css.mjs` 从 `compat.js` 抽出真实 CSS 做三面板对照渲染（落地后单芯片 / 落地后双芯片 / 落地前横排），无头 Chrome 393dp 出图确认标题完整、两行右对齐。 |
 | DW | 竖排落地后右上角**仍然是四行散排**：「○ 1 个后台任务运行中 ⌄」/ 文件夹图标 /「标准模式」/「○ 6 个子智能体 ⌄」各占一行，右缘参差（用户报，附两张真机截图） | 两层原因叠加：<br>① **@11 的恢复规则把「标准模式」带了回来**。当时写的修法基于一个错误判断——「标准模式的 label 挂在 titleRow 那一层（不在 headerActions 内）」，于是恢复规则 `header [class*="_headerActions"] [class*="_label"]:not(#kxxy){display:revert!important}` 无差别恢复了 headerActions 内**所有** label。真机截图证明「标准模式」芯片（`span.f8BMvq_label`，图标 + 文字一体、**没有外层容器**）就参与竖排列——源码取证（`dsh-client-ui-agent-preset/lib/client.js` 的 AgentPresetLabel）：它渲染成单个 span，且注释明写「**Read-only by construction** —— Offering a control here would promise a switch the host refuses」：纯只读标签、不是模式切换入口（模式选择在新会话屏的 AgentPresetSeat）。<br>② **titleRow 塞不下就换行**。多出的「标准模式」盒子和 36px 的 corner 图标把 titleRow 挤成多行，与竖排的两行芯片交错，形成四行散排。 | ① **恢复规则收窄**：`header [class*="_headerActions"] [class*="_label"]:not([class*="f8BMvq"]):not(#kxxy){display:revert!important}` —— 恢复状态芯片文字但排除标准模式。锚点用 `f8BMvq_label` 完整片段而不是 `_label` 后缀：CSS module 哈希只随上游重新构建而变，而上游依赖树钉死在本仓库的 runtime.zip 里，产物内恒定；哈希真变了症状只是「标准模式重新出现」，不引入新的失败模式。<br>② **整块隐藏兜底**：`header [class*="f8BMvq_label"]:not(#kxxy){display:none!important}` —— 全藏规则将来若被收窄锚点，这条保证标准模式（含图标）仍然消失。上游标注 read-only，藏掉零功能损失；上游窄屏本就在藏它的文字（`@container (width<=540px){.f8BMvq_label{display:none}}`），这里只是藏得更彻底。<br>③ **corner 钉到第一行**：`align-self: flex-start !important` —— titleRow 默认垂直居中会让 36px 的 corner 落在两行 17px 芯片的中间（「插进芯片列」的观感），顶到第一行后与「后台任务」行平齐，右缘一条整齐竖线。<br>④ 版本标记 `@11` → **`@12`**（compat.js 首行 + RuntimeInstaller + simulate-install 三处同步）。<br>**验证**：`test-compat-css.mjs` [8] 段更新 2 条 + 新增 2 条断言 → **76 通过 / 0 失败**；预览夹具**补上此前缺失的「标准模式」芯片**（上一版夹具没放它，预览全绿而真机散排的直接原因），三面板无头 Chrome 393dp 渲染：单芯片场景一行、双芯片场景两行 + corner 一行、对照组复现 @11 的挤压。 |
-
+| DX | **每次出新包都得先卸载才能装**，否则 `adb install` 报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package app.kxxy signatures do not match previously installed version`；用户原话：「能不能固定签名啊，换了几次了，每次要卸载」 | **没有任何一处代码决定过「用哪把钥匙」**，于是两个构建入口各自落到了 AGP 的默认值上：<br>① `android/app/build.gradle.kts` 里**没有** `signingConfigs`，AGP 对 debug 变体自动套用 `$HOME/.android/debug.keystore`；<br>② `tools/build-apk.ps1` 第 6 步显式写死 `$ks = "$env:USERPROFILE\.android\debug.keystore"`，密码 `android`、别名 `androiddebugkey`。<br>`debug.keystore` 是**每台机器、每个 Windows 用户各自生成**的一次性密钥（AGP 缺失时自动创建）。所以「换构建机 / 换用户 / 清了 `%USERPROFILE%` / 重装系统」中任意一件事发生，签出来的包就是另一把钥匙 —— 而这条错误**没有绕过手段**（版本号降级还能 `adb install -d` 硬压，签名不符不行），只能卸载；卸载又会连 `/data/data/app.kxxy/` 下的引擎、713 MiB 运行时、会话、已装扩展一起删掉，装回去等于从零解压一遍。<br>本次事故的直接证据：旧产物证书 `CN=Android Debug` / `SHA-256 c2:61:8a:ca:…:56`，且 `%USERPROFILE%\.android\` 下**连 `debug.keystore` 都不存在了**（`keytool` 无从导出，私钥永久丢失）。<br>**另有两个被同一个缺陷盖住的坑**（换机器时才暴露）：③ `build-apk.ps1` 把 JDK 与 SDK 都写成硬前置，而本机 `build-tools/` 一度为空、PATH 里没有 java —— 连 `-SkipGradle`（只注入+对齐+重签）这条快速迭代路径都会被无关前置挡住；④ 即便有 `build-tools`，Node 18+ 直接 `spawn` `.bat` 会抛 `EINVAL`（CVE-2024-27980 之后的硬限制），改走 `cmd /c` 又因 `spawnSync` 把引号转义成 `\"` 而报「文件名、目录名或卷标语法不正确」，且 `apksigner.bat` 自己还要 `JAVA_HOME`。 | **把「钥匙是谁」收成一份入库文件，并让三处都读它**：<br>① 新增 `android/keystore/kxxy-signing.jks`（PKCS12 / RSA 2048 / 36500 天 / 别名 `kxxy`，DN `CN=DSH Kxxy`）+ `kxxy-signing.properties`（密码、别名、`certSha256`）。**故意入库**，`.gitignore` 里同时写了一条反向警告（不要照抄 `*.jks` / `*.keystore` 模板）。取舍：本应用 sideload 分发、密钥不保护任何服务端凭据，而丢钥匙的代价是确定的（所有设备必须卸载）—— 两害相权入库，风险写进 `android/keystore/README.md`。<br>② `build.gradle.kts` 新增 `signingConfigs.create("kxxy")` 并接到 **debug 与 release 两个变体**（本项目发布物就是 debug 变体，见文件头 targetSdk=28 的说明）；缺 properties / 缺 jks 时**抛 GradleException**，而不是静默回落到 AGP 默认密钥 —— 后者正是缺陷本身。<br>③ 签名动作整体收进 `tools/sign-apk.mjs`：`--in/--out` 签名、`--print` 打印指纹、`--check` 断言指纹。它自带 `tools/prebuilt/apksigner/apksigner.jar`（1.18 MB，从 Termux `apksigner_37.0.0_all.deb` 取出），**不要求本机装过 Android SDK**；解析顺序刻意是「有 java 时优先 `java -jar`（SDK 的 jar → 自带的 jar），没有 java 才退 `.bat`」—— 这条把上面③④两个坑一起消掉（参数是干净数组、不需要 shell、不需要 `JAVA_HOME`）。<br>④ 三重硬校验，任一不满足直接抛错而不是产出「能装不能升」的包：(a) 签名后文件必须比输入大（曾出现 apksigner 声称 exit 0 但文件没变）；(b) 实际证书 SHA-256 必须等于 properties 的 `certSha256`；(c) 目标路径上已有旧产物时再比一次**新旧指纹**，不一致就打印「这次装上去需要先卸载」。<br>⑤ `build-apk.ps1`：JDK / SDK 从硬前置降级为「只在真跑 gradle 时才要求」，并补上 `local.properties` 的 `sdk.dir` 与 IDE 自带 JBR / `~/.jdks` 探测；第 6 步改成调用 `sign-apk.mjs`，删掉自己拼 `apksigner` 的那段。<br>⑥ 新增 `tools/test-signing.mjs`（**25 条断言**，跳过 1 项）：properties 五字段齐全、指纹 64 位 hex、用 `keytool -exportcert -rfc` 导出证书后**自己算 DER 的 sha256** 与 properties 比对（独立于 apksigner 的第二条链路）、证书 DN 不得是 `CN=Android Debug`、四个受影响文件里不得再有 `debug.keystore` / `androiddebugkey` / `pass:android` 的**活引用**（注释里讨论缺陷是允许的）、gradle 的 signingConfigs 真的接到两个变体、`build-apk.ps1` 真的调 `sign-apk.mjs` 且不再自己拼 apksigner、自带 jar 是完整 zip。<br>**反向验证**（缺一不可）：① 用一把临时错误密钥签出包 → `--check` 退出码 1 并打印两边指纹；② 把 properties 的 `certSha256` 改成 64 个 0 → 签名**在写盘前**就抛错，且**不残留** `.signing` 临时文件；③ 强制 `KXXY_APKSIGNER` 指向仓库自带 jar（模拟没装 SDK 的新机器）→ 签出的指纹与走 SDK jar 时**逐字相同**。<br>**真机侧一次性成本**：旧调试密钥的私钥已随旧机器丢失，所以从旧包迁到本密钥**需要卸载一次**，此后永久不用再卸。 |
+| DY | 跑 `powershell -File tools\build-apk.ps1 -SkipGradle`（「只重做注入+对齐+签名」的快速路径）时，**先把唯一一份成品删了、再跳过生成它的步骤**，最后停在 `找不到 …\app-debug.apk`、退出码 1，磁盘上什么都不剩 —— 连上一次能装的包都没了 | `-SkipGradle` 的语义是「复用上次 gradle 出的小包」，但第 2 步「清干净产物」是无条件的：<br>`Remove-Item -Force -ErrorAction SilentlyContinue $apk, $aligned, $signed`<br>于是 `$apk`（`app-debug.apk`）在这一行就被删掉，第 3 步又因为 `-SkipGradle` 直接跳过 gradle，第 3 步末尾的 `if (-not (Test-Path $apk)) { throw }` 必然命中。**两个各自合理的决定叠在一起，结果是「删掉输入再跳过生成」**，而顺序上没有任何一处能拦住它。<br>为什么这次后果特别重：本机当时没有 `platforms/android-36`、`ndk`、`cmake`（只有 `platforms/android-34` 与一个空的 `build-tools`），**无法当场重编**；回收站里也没有（`Remove-Item` 不进回收站），卷影副本未启用。1.72 GiB 的成品与那份 `app-signed.apk` 一起丢失。<br>**根因不是 `-SkipGradle`，而是「破坏性操作没有前置校验」**：同一段代码在正常路径下也先删后建，只是因为紧接着 gradle 会重新生成，缺陷被掩盖了。 | ① **删之前先判能不能继续**：`-SkipGradle` 分支现在**第一件事**就是检查 `$apk` 是否存在，不存在立刻抛错并说明「去掉 -SkipGradle 让 gradle 先出小包」，**一个文件都不动**。<br>② `-SkipGradle` 分支**保留** `app-debug.apk`（它就是这次要注入的输入），只清 `app-aligned.apk` / `app-signed.apk`。<br>③ 正常（跑 gradle）分支把现有 `app-debug.apk` 与 `app-signed.apk` **先挪进 `.cache/apk-backup/`** 再清 —— gradle 失败或中途抛错时至少还有一份能装的包。备份目录刻意**不放进** `.cache/apk-assets-hold/`，否则注入器会把备份当成大资源再塞一遍。<br>④ 顺带修掉一个同源的隐形地雷：gradle 命令原来写死 `--offline`，而本机缓存里只有 AGP **8.5.1**、`build.gradle.kts` 要 **8.5.2**，offline 下报 `No cached version of com.android.tools.build:gradle:8.5.2`（看起来像「插件没装」，实际是「不许下载」）。改成 `-Offline` 显式开关，默认联网（缓存命中时不会真下载）。<br>**验证**：删掉 `app-debug.apk` 后跑 `-SkipGradle` → 立刻报错且 `app-signed.apk` 仍在（反向验证「一个文件都不动」）；补齐 SDK 组件后跑完整 `build-apk.ps1` → 备份、gradle、注入、对齐、签名全通。 |
 **关于缺陷 Q 的额外结论（终端功能本身是好的）**：`dsh.terminal.shell` 这个键**已被官方废弃** —— 在四个运行时 bundle（`sidebar-terminal` / `client.terminal` / `terminal-bash` / `terminal`）里对 `/terminal\.shell/` 与 `/localStorage/` 的命中数**都是 0**；官方新建终端走 `webTerminals.selectShell(path)` → 开 tab 时把 `shellPath` 作为参数传下去（`terminal-bash` 的默认值是 `DEFAULT_BASH_SHELL = "/bin/bash"`，可被 `config.shellPath` 覆盖，而该配置由引擎侧注入）。所以那张卡显示的 `bin/cmd` 只是**历史遗留值**，不影响终端；真机上终端本身工作正常（`uname -a` 正常、提示符显示当前目录），即缺陷 K 的修复仍然有效（提示符一栏见缺陷 S）。对照实验也证明**官方终端天然跟随主题**：浅色下 `.xterm-viewport` 背景透明、文字 `rgb(15,17,21)`，官方 `sidebar-terminal` 插件全部用 `var(--dsw-alias-*)` 官方 token。
+
+**缺陷 DX 的定位手法**（可复用）：症状是「装新包必须卸载」，而报错文案本身就把答案写清楚了一半 ——
+
+```
+INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package app.kxxy signatures
+do not match previously installed version
+```
+
+这句里 **`signatures do not match`** 是关键判据，它与另一条极易混淆的错误性质完全不同：
+
+| 错误 | 含义 | 有没有绕过手段 |
+| --- | --- | --- |
+| `INSTALL_FAILED_VERSION_DOWNGRADE` | 新包 `versionCode` 比已装的小 | 有：`adb install -d` |
+| `INSTALL_FAILED_UPDATE_INCOMPATIBLE` | 两包**签名证书不同** | **没有**，只能卸载 |
+
+所以看到前者先查版本号推导（见第九节），看到后者直接查「这次用的 keystore 与上次是不是同一把」。本项目当时是后者，而根因不在代码逻辑里 —— 是**没人指定过密钥**：`build.gradle.kts` 没有 `signingConfigs`，`build-apk.ps1` 第 6 步读 `$HOME/.android/debug.keystore`，而那是 AGP 在缺失时**自动生成**的一次性密钥（每台机器、每个 Windows 用户各一份，密码固定 `android`、别名 `androiddebugkey`）。
+
+**一条可复用的取证动作**：不必等到装机，直接问产物「你用的是哪把钥匙」——
+
+```powershell
+node tools/sign-apk.mjs --check android\app\build\outputs\apk\debug\app-signed.apk
+```
+
+它把 APK 里的证书 SHA-256 与仓库内 `android/keystore/kxxy-signing.properties` 的
+`certSha256` 比对，不一致就以退出码 1 报错并打印两边指纹。本次实测：旧产物是
+`C2:61:8A:CA:…:56`（`CN=Android Debug`），新产物是 `D0:8A:E4:99:…:73`
+（`CN=DSH Kxxy`）—— 一眼就能确认「这次装上去要不要卸载」。
 
 **缺陷 P 的定位手法**（可复用）：症状是「跟随系统没反应」，第一直觉会去查官方前端的
 主题逻辑，但它那行 `resolvedId = preference === "system" ? (media?.matches === true ? "dark" : "light") : preference`

@@ -25,7 +25,72 @@ plugins {
 import java.io.File
 import java.time.OffsetDateTime
 import java.time.temporal.ChronoUnit
+import java.util.Properties
 import java.util.concurrent.TimeUnit
+
+// ══════════════════════════════════════════════════════════════════════════
+// 固定签名：读 android/keystore/kxxy-signing.properties
+// ══════════════════════════════════════════════════════════════════════════
+//
+// 背景（真实事故，用户原话「能不能固定签名啊，换了几次了，每次要卸载」）：
+// 这里原来**没有** signingConfigs，于是 AGP 对 debug 变体套用它自己的默认值 ——
+// `$HOME/.android/debug.keystore`，一个**每台机器、每个 Windows 用户各自生成**
+// 的一次性密钥（密码固定 `android`、别名 `androiddebugkey`）。换构建机、换
+// 用户、甚至清了 `%USERPROFILE%` 都会得到一把新钥匙，设备上已装的包于是报
+//
+//     INSTALL_FAILED_UPDATE_INCOMPATIBLE:
+//     Package app.kxxy signatures do not match previously installed version
+//
+// 这条错误**没有绕过手段**（不同于版本号降级的 `INSTALL_FAILED_VERSION_DOWNGRADE`
+// 还能 `adb install -d` 硬压），只能卸载 —— 而 `adb uninstall app.kxxy` 会连
+// `/data/data/app.kxxy/` 下的引擎、713 MiB 运行时、会话、扩展一起删掉。
+//
+// 现在改成「仓库内固定密钥」，三处消费方读同一份 properties：
+// gradle（本文件）、tools/build-apk.ps1（第 6 步调它）、tools/sign-apk.mjs。
+// 详细取舍与「为什么密码敢入库」见 android/keystore/README.md。
+val signingPropsFile = rootProject.file("keystore/kxxy-signing.properties")
+
+if (!signingPropsFile.isFile) {
+    // 刻意不回落 debug.keystore：那条路正是缺陷本身。缺文件时给一句能照做的
+    // 补救说明，而不是让 gradle 悄悄换一把新钥匙（症状要到装设备时才出现）。
+    throw GradleException(
+        "缺少固定签名配置 ${signingPropsFile}。\n" +
+            "  本项目的签名密钥随仓库分发（android/keystore/），请确认检出完整：\n" +
+            "    git checkout -- android/keystore/\n" +
+            "  绝不要临时用 keytool 生成一个新的 —— 那会让所有已装设备无法覆盖升级。",
+    )
+}
+
+val signingProps = Properties().apply {
+    signingPropsFile.inputStream().use { load(it) }
+}
+
+fun signingProp(key: String): String =
+    signingProps.getProperty(key)?.trim()?.takeIf { it.isNotEmpty() }
+        ?: throw GradleException("${signingPropsFile.name} 缺少字段 $key")
+
+val kxxyStoreFile = rootProject.file("keystore/${signingProp("storeFile")}")
+val kxxyCertSha256 = signingProp("certSha256").lowercase()
+
+// 指纹必须是 64 位小写十六进制。它是 `tools/sign-apk.mjs` 签完之后要比对的那串值：
+// 少一位或混进大写/冒号时，gradle 这一侧毫无感觉（签名照样成功），要等到
+// apksigner 重签完才发现「指纹不符」—— 那时排查方向会先怀疑到 keystore 上。
+// 这里在**配置阶段**就拦住，代价是一行正则。
+if (!Regex("^[0-9a-f]{64}$").matches(kxxyCertSha256)) {
+    throw GradleException(
+        "${signingPropsFile.name} 的 certSha256 不是 64 位小写十六进制：" +
+            "「$kxxyCertSha256」（${kxxyCertSha256.length} 位）。\n" +
+            "  取值方式：keytool -list -v -keystore kxxy-signing.jks -storepass kxxy-signing",
+    )
+}
+
+if (!kxxyStoreFile.isFile) {
+    throw GradleException(
+        "固定签名密钥不存在：$kxxyStoreFile\n" +
+            "  它是入库文件，检出缺失请 git checkout -- android/keystore/；" +
+            "不要重新生成（见 android/keystore/README.md）。",
+    )
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // 版本号与构建元数据：git 是唯一事实源
@@ -257,10 +322,37 @@ android {
         }
     }
 
+    // 固定签名（见文件头）。`create("kxxy")` 的名字被 buildTypes 两侧引用，
+    // 改名时记得一起改。
+    signingConfigs {
+        create("kxxy") {
+            storeFile = kxxyStoreFile
+            storeType = "PKCS12"
+            storePassword = signingProp("storePassword")
+            keyAlias = signingProp("keyAlias")
+            keyPassword = signingProp("keyPassword")
+            // v1 + v2 都要：targetSdk=28 / minSdk=26 的设备上 v2 足够，但 v1
+            // 是 `adb install` 与某些第三方安装器的兜底，关掉会在个别 ROM 上
+            // 报 `INSTALL_PARSE_FAILED_NO_CERTIFICATES`（历史上踩过，见
+            // build-apk.ps1 第 6 步的注释）。apksigner 默认两代都签，这里显式写。
+            enableV1Signing = true
+            enableV2Signing = true
+        }
+    }
+
     buildTypes {
+        // ⚠️ 两个变体都用**同一把**固定密钥。debug 也用正式密钥的理由不是「图省事」，
+        // 而是本项目的发布物**就是** debug 变体（targetSdk=28 + sideload，见文件头），
+        // 从来没有走过 release。若这里保留 AGP 的 debug 默认值，就会出现
+        // 「gradle 出的中间产物一把钥匙、build-apk.ps1 重签另一把」的分裂，
+        // 而两者又都要装到同一台设备上 —— 那正是缺陷本身。
+        debug {
+            signingConfig = signingConfigs.getByName("kxxy")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("kxxy")
         }
     }
 

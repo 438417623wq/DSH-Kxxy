@@ -9,14 +9,17 @@
 必须先满足：
   · `node tools/build-runtime.mjs --manifest .cache/manifest.json` 已跑完（runtime.zip 就位）
   · `node tools/fetch-extensions.mjs` 已跑完（.cache/ext-pool 就位）
-  · `JAVA_HOME` 指向 JDK 17，`gradle` 与 `apksigner.bat` 可用
+  · 跑 gradle 时需要 JDK 17 与 Android SDK；**只做注入+对齐+签名时两者都不需要**
+    （签名用仓库自带 apksigner.jar，见 android/keystore/README.md 与缺陷 DX）
 
 用法：
   powershell -File tools/build-apk.ps1
 
 参数：
-  -SkipGradle    跳过 gradle（只做注入 + 对齐 + 签名，用于仅改了注入器时快速迭代）
+  -SkipGradle    跳过 gradle（只做注入 + 对齐 + 签名，用于仅改了注入器时快速迭代）。
+                 前提是已有 app-debug.apk —— 没有时会在删任何东西**之前**报错。
   -KeepAligned   保留中间产物 app-aligned.apk
+  -Offline       给 gradle 加 --offline（依赖全在 ~/.gradle 缓存里时才用；默认联网）
 
 ⚠️ 内存前提：本机物理 8 GB、提交上限 15.82 GB、常态余量 < 2 GB。
    `compressDebugAssets` 会把每个 asset 整份读进堆，runtime.zip 700+ MiB 必 OOM，
@@ -26,6 +29,7 @@
 param(
     [switch]$SkipGradle,
     [switch]$KeepAligned,
+    [switch]$Offline,
     [string]$Gradle = ""
 )
 
@@ -70,6 +74,9 @@ try {
     $aligned  = "$Project\android\app\build\outputs\apk\debug\app-aligned.apk"
     $signed   = "$Project\android\app\build\outputs\apk\debug\app-signed.apk"
 
+    # SDK：只有 gradle 需要（`-SkipGradle` 的注入+对齐+签名三件事都不碰它 ——
+    # apksigner 从缺陷 DX 起由 tools/sign-apk.mjs 自带 jar 兜底）。
+    # 所以这里探测不到只记一笔，等到真要跑 gradle 时才报错。
     $sdkCandidates = @(
         $env:ANDROID_HOME,
         $env:ANDROID_SDK_ROOT,
@@ -77,39 +84,70 @@ try {
         "$env:LOCALAPPDATA\Android\Sdk",
         "C:\Users\XiaoXin\AppData\Local\Android\Sdk"
     ) | Where-Object { $_ }
+    # local.properties 里的 sdk.dir 也要认：那是 gradle 自己的事实源，
+    # 机器上装了多个 SDK 时以它为准（本仓库的 local.properties 就是这种形态）。
+    $localProps = "$Project\android\local.properties"
+    if (Test-Path $localProps) {
+        $line = Select-String -Path $localProps -Pattern '^\s*sdk\.dir\s*=\s*(.+)$' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($line) {
+            $sdkDir = $line.Matches[0].Groups[1].Value.Trim()
+            # properties 里的 Windows 路径是 `C\:\\KF\\fbtools\\sdk` 这种转义形态。
+            $sdkDir = $sdkDir -replace '\\\\', '\' -replace '\\([: ])', '$1'
+            $sdkCandidates = @($sdkDir) + $sdkCandidates
+        }
+    }
     $sdk = $null
     foreach ($cand in $sdkCandidates) {
         if (Test-Path (Join-Path $cand "build-tools")) { $sdk = $cand; break }
     }
-    if (-not $sdk) {
-        throw "找不到 Android SDK（试过：$($sdkCandidates -join '; ')）。用 ANDROID_HOME 指定。"
-    }
 
-    # JDK：apksigner.bat 与 gradle 都需要。优先 JAVA_HOME，其次本机工具链目录。
-    $jdkCandidates = @($env:JAVA_HOME, "C:\KF\fbtools\jdk") | Where-Object { $_ }
+    # JDK：gradle 需要 JAVA_HOME，apksigner.bat 也需要。优先 JAVA_HOME，
+    # 其次本机工具链目录，最后是 IDE 自带的 JBR / ~/.jdks。
+    #
+    # 缺陷 DX 之后这里**不再是硬前置**：签名走 `tools/sign-apk.mjs`，它自己按
+    # KXXY_JAVA → JAVA_HOME → Android Studio JBR → ~/.jdks → PATH 找 java，
+    # 找不到时给出「怎么装/怎么指」的明确提示。这里探测到就导出 JAVA_HOME，
+    # 探测不到则只在**真要跑 gradle** 时才报错 —— 否则 `-SkipGradle`
+    # （只注入 + 对齐 + 重签）这条快速迭代路径会被一个与它无关的前置挡住。
+    $jdkCandidates = @($env:JAVA_HOME, $env:KXXY_JAVA_HOME, "C:\KF\fbtools\jdk") | Where-Object { $_ }
     $jdk = $null
     foreach ($cand in $jdkCandidates) {
         if (Test-Path (Join-Path $cand "bin\java.exe")) { $jdk = $cand; break }
     }
-    if (-not $jdk) {
-        $adoptium = Get-ChildItem "C:\Program Files\Eclipse Adoptium" -Directory -ErrorAction SilentlyContinue |
-            Where-Object { Test-Path (Join-Path $_.FullName "bin\java.exe") } | Select-Object -First 1
-        if ($adoptium) { $jdk = $adoptium.FullName }
+    if (-not $jdk -and $env:KXXY_JAVA -and (Test-Path $env:KXXY_JAVA)) {
+        # KXXY_JAVA 直接给 java.exe 时，取 <jdk>/bin/java.exe 的上两级。
+        $jdk = Split-Path -Parent (Split-Path -Parent $env:KXXY_JAVA)
     }
     if (-not $jdk) {
-        throw "找不到 JDK 17（试过：$($jdkCandidates -join '; ')、C:\Program Files\Eclipse Adoptium）。用 JAVA_HOME 指定。"
+        $jdkRoots = @(
+            "C:\Program Files\Eclipse Adoptium",
+            "C:\Program Files\Java",
+            "$env:LOCALAPPDATA\Programs\Android Studio\jbr",
+            "C:\Program Files\Android\Android Studio\jbr",
+            "$env:USERPROFILE\.jdks"
+        ) | Where-Object { $_ -and (Test-Path $_) }
+        foreach ($root in $jdkRoots) {
+            if (Test-Path (Join-Path $root "bin\java.exe")) { $jdk = $root; break }
+            $hit = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path (Join-Path $_.FullName "bin\java.exe") } |
+                Select-Object -First 1
+            if ($hit) { $jdk = $hit.FullName; break }
+        }
     }
 
     # JAVA_HOME 必须在 gradle **之前**就导出。原来只在第 6 步签名时设置，
     # 于是 `gradle.bat` 一启动就报
     # `ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH.`
     # 并已 exit 9009 结束（本机 PATH 里没有 java）。
-    $env:JAVA_HOME = $jdk
-    $env:PATH = "$jdk\bin;$env:PATH"
+    if ($jdk) {
+        $env:JAVA_HOME = $jdk
+        $env:PATH = "$jdk\bin;$env:PATH"
+    }
 
     Write-Host "      node = $node"
-    Write-Host "      sdk  = $sdk"
-    Write-Host "      jdk  = $jdk"
+    Write-Host ("      sdk  = " + $(if ($sdk) { $sdk } else { "（未探测到；仅 gradle 需要，-SkipGradle 时用不到）" }))
+    Write-Host ("      jdk  = " + $(if ($jdk) { $jdk } else { "（未探测到；交给 tools/sign-apk.mjs 再找）" }))
 
     # gradle：优先本机工具链里的 8.10.2（AGP 8.5.2 的已验证组合），
     # 其次 PATH，最后才是 ~/.gradle/wrapper/dists。本项目没有 gradlew。
@@ -135,10 +173,19 @@ try {
             if ($hit) { $gradle = $hit.FullName }
         }
     }
-    if (-not $gradle -or -not (Test-Path $gradle)) {
-        throw "找不到 gradle（C:\KF\fbtools\gradle、PATH 与 ~/.gradle/wrapper/dists 都没有）。请用 -SkipGradle 或自行安装。"
+    # 只在真要跑 gradle 时才是硬前置（见上面 JDK 段落的说明）。
+    if (-not $SkipGradle) {
+        if (-not $sdk) {
+            throw "跑 gradle 需要 Android SDK（试过：$($sdkCandidates -join '; ')）。用 ANDROID_HOME 指定，或改用 -SkipGradle。"
+        }
+        if (-not $gradle -or -not (Test-Path $gradle)) {
+            throw "找不到 gradle（C:\KF\fbtools\gradle、PATH 与 ~/.gradle/wrapper/dists 都没有）。请用 -SkipGradle 或自行安装。"
+        }
+        if (-not $jdk) {
+            throw "跑 gradle 需要 JDK 17：JAVA_HOME / KXXY_JAVA_HOME / C:\KF\fbtools\jdk 都没有 bin\java.exe。用 JAVA_HOME 指定，或改用 -SkipGradle 只做注入+签名。"
+        }
+        Write-Host "      gradle = $gradle"
     }
-    Write-Host "      gradle = $gradle"
 
     # ── 1) 大资源移出 assets（compressDebugAssets 才不会 OOM）────────────
     Write-Host "[1/6] 将大资源移出 assets …" -ForegroundColor Cyan
@@ -161,8 +208,47 @@ try {
 
     # ── 2) 清干净产物（AGP 增量打包 append-only，会残留孤儿数据）──────────
     Write-Host "[2/6] 清理旧产物 …" -ForegroundColor Cyan
-    Remove-Item -Force -ErrorAction SilentlyContinue $apk, $aligned, $signed
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$Project\android\app\build\intermediates\apk\debug"
+    #
+    # 缺陷 DY（2026-10-26 真事故）：这里原来是无条件
+    #
+    #     Remove-Item -Force -ErrorAction SilentlyContinue $apk, $aligned, $signed
+    #
+    # 而 `-SkipGradle` 的本意是「复用上次 gradle 出的小包，只重做注入+对齐+签名」。
+    # 两者放在一起就是：**先把唯一那份 app-debug.apk 删掉，再跳过生成它的步骤**，
+    # 于是第 3 步之后立刻 `找不到 app-debug.apk`，退出码 1，磁盘上什么都不剩
+    # —— 连上一次能装的包都没了。本次就是这样丢掉了 1.72 GiB 的成品（而本机
+    # 没有 platform-36 / NDK / cmake，无法当场重编）。
+    #
+    # 现在分三种情况处理，原则是「删之前先确保能还原」：
+    #   ① `-SkipGradle` 且没有 app-debug.apk → **在删任何东西之前**就报错；
+    #   ② `-SkipGradle` 且有 app-debug.apk  → 保留它（它就是这次要注入的输入），
+    #      只清 aligned / signed；
+    #   ③ 正常跑 gradle → 把现有 app-debug.apk 先挪进备份目录再清，
+    #      这样 gradle 失败时还能用上一次的包（备份目录单独放，不混进 $hold，
+    #      否则注入器会把它当成大资源再塞一遍）。
+    if ($SkipGradle) {
+        if (-not (Test-Path $apk)) {
+            throw @"
+-SkipGradle 需要一份已存在的 $apk，但它不存在。
+  本机没有可用的 gradle 产物时，请去掉 -SkipGradle 让 gradle 先出小包。
+  （旧版本会先删掉它再跳过生成，结果是「什么都不剩」—— 见缺陷 DY。）
+"@
+        }
+        Write-Host "      保留输入小包 app-debug.apk（-SkipGradle 的输入）"
+        Remove-Item -Force -ErrorAction SilentlyContinue $aligned, $signed
+    } else {
+        # 备份上一次的成品：gradle 失败 / 中途抛错时至少还有一份能装的包。
+        $backup = "$Project\.cache\apk-backup"
+        foreach ($item in @($apk, $signed)) {
+            if (Test-Path $item) {
+                New-Item -ItemType Directory -Force -Path $backup | Out-Null
+                Move-Item -Force $item (Join-Path $backup (Split-Path -Leaf $item))
+                Write-Host ("      备份 " + (Split-Path -Leaf $item) + " → .cache/apk-backup/")
+            }
+        }
+        Remove-Item -Force -ErrorAction SilentlyContinue $aligned
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$Project\android\app\build\intermediates\apk\debug"
+    }
 
     # ── 3) gradle 出小 APK ────────────────────────────────────────────────
     if (-not $SkipGradle) {
@@ -175,7 +261,15 @@ try {
             $jvmArgs = "-Xmx2048m -XX:MaxMetaspaceSize=384m " +
                        "-XX:ReservedCodeCacheSize=96m -XX:+UseSerialGC " +
                        "-XX:TieredStopAtLevel=1"
-            & $gradle assembleDebug --offline --console=plain --max-workers=1 `
+            # `--offline` 曾经是默认值，因为旧构建机上依赖全在 ~/.gradle 缓存里、
+            # 联网反而慢。但它有一个只在**换机器/换版本**时才爆的坑：
+            # 缓存里只有 AGP 8.5.1，而 build.gradle.kts 要 8.5.2 —— offline 下
+            # 直接 `No cached version of com.android.tools.build:gradle:8.5.2`，
+            # 报错看起来像「插件没装」，实际是「不许下载」。现在改成显式开关：
+            # 默认联网（缓存命中时不会真的下载），`-Offline` 才强制离线。
+            $offlineArg = @()
+            if ($Offline) { $offlineArg = @("--offline") }
+            & $gradle assembleDebug @offlineArg --console=plain --max-workers=1 `
                 "-Dorg.gradle.jvmargs=$jvmArgs"
             if ($LASTEXITCODE -ne 0) { throw "gradle 失败（exit $LASTEXITCODE）" }
         } finally { Pop-Location }
@@ -220,48 +314,36 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "zipalign 失败（exit $LASTEXITCODE）" }
 
     # ── 6) 重签 ───────────────────────────────────────────────────────────
-    Write-Host "[6/6] apksigner 重签 …" -ForegroundColor Cyan
-    # 缺陷 DI：这里原来写死 `C:\Program Files\Eclipse Adoptium\jdk-17.0.18.8-hotspot`，
-    # 本机没有该目录。改用上面探测到的 $jdk（apksigner.bat 需要 JAVA_HOME 才能跑）。
-    $env:JAVA_HOME = $jdk
-    $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
-    # build-tools 版本按目录探测（本机有 25.0.3 / 34.0.0 / 36.0.0），取最高的一个 ——
-    # 写死 36.0.0 在只有 34 的机器上会直接失败。
-    $signer = $null
-    $btRoot = Join-Path $sdk "build-tools"
-    $btDirs = Get-ChildItem $btRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object { Test-Path (Join-Path $_.FullName "apksigner.bat") } |
-        Sort-Object { [version]($_.Name -replace '[^0-9.].*$','') } -Descending
-    foreach ($d in $btDirs) {
-        $cand = Join-Path $d.FullName "apksigner.bat"
-        if (Test-Path $cand) { $signer = $cand; break }
-    }
-    $ks = "$env:USERPROFILE\.android\debug.keystore"
-    if (-not $signer) { throw "找不到 apksigner（$btRoot 下没有任何 build-tools 带 apksigner.bat）" }
-    if (-not (Test-Path $ks)) { throw "找不到 debug.keystore: $ks" }
-    Write-Host "      apksigner = $signer"
+    Write-Host "[6/6] 固定签名（tools/sign-apk.mjs）…" -ForegroundColor Cyan
+    # ── 缺陷 DX：签名从「本机 debug.keystore」改成「仓库内固定密钥」────────
+    #
+    # 原来这里读的是 `$env:USERPROFILE\.android\debug.keystore` —— AGP 在缺失时
+    # **自动生成**的一次性密钥（密码固定 android / 别名 androiddebugkey），
+    # 每台机器、每个 Windows 用户各一份。于是换构建机、换用户、清了
+    # `%USERPROFILE%`，签出来的包在设备上都报
+    #
+    #     INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package app.kxxy signatures
+    #     do not match previously installed version
+    #
+    # 这条错误没有任何绕过手段（版本号降级还能 `adb install -d` 硬压），
+    # 只能卸载 —— 而卸载会连引擎、713 MiB 运行时、会话、扩展一起删掉。
+    # 用户原话：「能不能固定签名啊，换了几次了，每次要卸载」。
+    #
+    # 现在三件事一起改掉：
+    #   ① 密钥固定在 android/keystore/kxxy-signing.jks（入库，见该目录 README）；
+    #   ② 签名动作收进 tools/sign-apk.mjs —— 它自带 apksigner.jar 兜底，
+    #      **不要求本机装过 Android SDK**（这正是「换机器就出事」的另一半）；
+    #   ③ 签完硬校验证书 SHA-256 与 properties 里的 certSha256 相等，
+    #      不等直接抛错，而不是产出一个能装、不能升的包。
+    #
+    # 注意顺序仍然是「先 zipalign，再签名」：v2/v3 签名块覆盖整个文件字节，
+    # 重排 offset 必然让它失效（见 packaging/zipalign.mjs 文件头）。
+    & $node "$Project\tools\sign-apk.mjs" --in $aligned --out $signed
+    if ($LASTEXITCODE -ne 0) { throw "固定签名失败（exit $LASTEXITCODE）" }
+    if (-not (Test-Path $signed)) { throw "签名脚本声称成功，但 $signed 不存在" }
 
-    Copy-Item -Force $aligned $signed
-    & $signer sign --ks $ks --ks-pass pass:android --key-pass pass:android `
-        --ks-key-alias androiddebugkey $signed
-    if ($LASTEXITCODE -ne 0) { throw "apksigner 失败（exit $LASTEXITCODE）" }
-
-    # 硬校验：签名必须真的落盘。踩过一次 —— apksigner 声称 exit 0，
-    # 但 signed 与 aligned 字节完全相同、且没有 APK Signing Block，
-    # 装设备时才报 INSTALL_PARSE_FAILED_NO_CERTIFICATES。
     $nAligned = (Get-Item $aligned).Length
     $nSigned = (Get-Item $signed).Length
-    if ($nSigned -le $nAligned) {
-        throw "签名无效：signed=$nSigned B 未大于 aligned=$nAligned B（apksigner 没改动文件）"
-    }
-    # 注意：**不要**在这里用 `| Select-Object -First 4`。管道提前关闭会把
-    # apksigner 进程直接掐掉（Windows 上表现为 exit -1），于是下面那句
-    # `if ($LASTEXITCODE -ne 0)` 必然抛「apksigner verify 失败」，明明签名是好的。
-    # 先把输出全收进变量再取前几行。
-    $verifyOut = & $signer verify --print-certs $signed 2>&1
-    $verifyRc = $LASTEXITCODE
-    $verifyOut | Select-Object -First 4 | ForEach-Object { Write-Host "      $_" }
-    if ($verifyRc -ne 0) { throw "apksigner verify 失败（exit $verifyRc）" }
     Write-Host ("      aligned {0:N0} B → signed {1:N0} B（+{2:N0} B 签名块）" -f `
         $nAligned, $nSigned, ($nSigned - $nAligned))
 
@@ -273,9 +355,15 @@ try {
     Write-Host ("      {0:N0} B（{1:N2} MiB）" -f $final, ($final / 1MB)) -ForegroundColor Green
     Write-Host ""
     Write-Host "安装到真机（patchset 版本未变时必须 pm clear，否则 isComplete() 判真不重装）：" -ForegroundColor Yellow
-    Write-Host "  adb install -r -d `"$signed`""
+    Write-Host "  adb install -r `"$signed`""
     Write-Host "  adb shell pm clear app.kxxy"
     Write-Host "  adb shell monkey -p app.kxxy -c android.intent.category.LAUNCHER 1"
+    Write-Host ""
+    Write-Host "签名是仓库内固定密钥（android/keystore/），此后换机器/换用户都不用再卸载。" -ForegroundColor DarkGray
+    Write-Host "只有从**旧的 debug 签名包**迁到本密钥时，需要卸载一次：" -ForegroundColor DarkGray
+    Write-Host "  adb uninstall app.kxxy" -ForegroundColor DarkGray
+    Write-Host "想确认手里这个包用的是哪把钥匙：" -ForegroundColor DarkGray
+    Write-Host "  node tools/sign-apk.mjs --check `"$signed`"" -ForegroundColor DarkGray
 } finally {
     Pop-Location
 }
