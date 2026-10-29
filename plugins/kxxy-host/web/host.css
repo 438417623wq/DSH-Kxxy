@@ -1724,6 +1724,84 @@ html, body {
   font-weight: 700;
 }
 
+/*
+ * 系统权限卡片：折叠态只留一行标题。
+ *
+ * 卡片自身 padding 归零，由 summary 的 16px 撑出留白 —— 和补丁卡
+ * （`.patch-card`）同一套做法。若保留卡片 padding，summary 会缩进一层，
+ * 折叠条看起来比相邻卡片窄一截。
+ */
+.perm-card {
+  padding: 0;
+}
+
+/* 展开后的内容区：上边框把「标题栏」和「清单」分开，视觉上才是两段 */
+.perm-body {
+  padding: 0 16px 16px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* 折叠条里的汇总徽章：数字用等宽字体（.badge 已内置），宽度变化不抖动 */
+#perm-summary-badge {
+  font-variant-numeric: tabular-nums;
+}
+
+.badge-warn {
+  background-color: rgba(245, 158, 11, 0.15);
+  color: var(--accent-orange);
+  border: 1px solid rgba(245, 158, 11, 0.32);
+}
+
+/*
+ * 系统权限卡片的底部操作区（一键授予）。
+ *
+ * flex column 让子元素自动拉满宽度 —— 卡片里的次要按钮不需要
+ * `button-block`（那个类把高度固定在 44px，对辅助文案旁的按钮太高了）。
+ */
+.perm-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/*
+ * 权限分组：卡片内按「媒体与输入 / 通知与后台 / 文件… / 短信 / 厂商开关」
+ * 分块，与系统「应用权限」页的观感对齐，用户在两处之间来回对照时不用
+ * 重新找位置。
+ */
+.perm-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-top: 14px;
+}
+
+.perm-group-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+  margin-bottom: 6px;
+}
+
+.perm-group .setting-list {
+  margin-top: 0;
+  gap: 10px;
+}
+
+.perm-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  padding: 0 2px;
+}
+
+.perm-hint b {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
 .segment-btn:disabled {
   opacity: 0.38;
   cursor: not-allowed;

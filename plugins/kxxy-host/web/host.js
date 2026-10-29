@@ -111,6 +111,9 @@
     btnPrivApply: document.getElementById('btn-priv-apply'),
     appearanceList: document.getElementById('appearance-list'),
     permList: document.getElementById('perm-list'),
+    permDetails: document.getElementById('perm-details'),
+    permSummaryBadge: document.getElementById('perm-summary-badge'),
+    btnPermGrantAll: document.getElementById('btn-perm-grant-all'),
     toggleForeground: document.getElementById('toggle-foreground'),
     toggleWatchdog: document.getElementById('toggle-watchdog'),
     toggleLan: document.getElementById('toggle-lan'),
@@ -577,59 +580,133 @@
   }
 
   /**
-   * 设置页「系统权限」卡片：Android 能力开关的真实状态 + 一键申请。
-   * 申请走 kxxy://perm/request?name=… 桥（MainActivity 拦截后发起系统对话框），
-   * 状态来自原生心跳写进 kxxy-state.json 的 permissions 字段，轮询自动刷新。
+   * 系统权限条目的文案表。
+   *
+   * 键与原生 PermCatalog 的 id **逐字对应**（那是状态快照里的字段名）。
+   * 新增一项权限时两边一起加：原生负责声明 + 状态 + 申请路径，
+   * 这里只负责「叫什么、干什么用的、按钮写什么」。
+   *
+   * 字段约定：
+   *   grant —— 未授予时按钮文案（弹系统对话框的那类）
+   *   nav   —— 应用内根本授不了的（厂商安全中心 / 应用详情页），按钮文案
+   */
+  const PERM_META = {
+    camera: { label: '相机', desc: '拍照、扫码、网页视频采集（getUserMedia）', grant: '去授权' },
+    microphone: { label: '麦克风', desc: '语音输入与录音（getUserMedia、录音类命令）', grant: '去授权' },
+    media: { label: '照片、视频与音乐', desc: '读取相册与音乐文件（系统权限页会拆成「照片和视频」「音乐和音频」两行）', grant: '去授权' },
+    audio_volume: { label: '媒体音量控制', desc: '调整媒体音量（安装即授予，应用内不可撤销）' },
+    all_files: { label: '文件和文档', desc: '所有文件访问 —— 导出日志写入 Download/kxxy/（Android 11+，系统页开启）', grant: '去开启' },
+    shortcut: { label: '桌面快捷方式', desc: '创建桌面快捷方式（安装即授予）' },
+    sms: { label: '短信', desc: '读取、发送短信与彩信（验证码、通知类任务用）', grant: '去授权' },
+    overlay: { label: '显示悬浮窗', desc: '在其他应用上层显示（后台弹窗提示用）', grant: '去开启' },
+    // 特殊权限没有系统对话框，按钮文案统一是「去开启 / 去设置」（跳系统页），
+    // 写「去授权」会让用户以为还能弹出个框来
+    battery: { label: '电池优化白名单', desc: '防止后台引擎被系统休眠策略中止', grant: '去设置' },
+    install_unknown: { label: '安装未知应用', desc: '在应用内直接打开自己构建的 APK', grant: '去设置' },
+    app_list: { label: '获取应用列表', desc: '读取已安装应用清单（Android 11+ 的包可见性，安装即授予）' },
+    sensors: { label: '获取设备动作与方向', desc: '高采样率传感器（安装即授予；低采样率无需权限）' },
+    miui_perms: { label: '锁屏显示 / 后台弹出 / 链式启动', desc: '厂商安全中心的开关，系统没有对应权限，只能到手机管家的应用权限页改', nav: '去管理' },
+    app_settings: { label: '应用详情页', desc: '所有权限的最终兜底入口 —— 弹窗不再出现时从那里手动开', nav: '去设置' }
+  };
+
+  /**
+   * 分组与顺序。刻意与系统「应用权限」页的观感对齐：
+   * 用户在两处之间来回对照时不至于找一个开关找两遍。
+   */
+  const PERM_GROUPS = [
+    { title: '媒体与输入', ids: ['camera', 'microphone', 'media', 'audio_volume'] },
+    { title: '通知与后台', ids: ['notifications', 'battery', 'overlay'] },
+    { title: '文件、应用与桌面', ids: ['all_files', 'install_unknown', 'app_list', 'shortcut'] },
+    { title: '短信', ids: ['sms'] },
+    { title: '设备与厂商开关', ids: ['sensors', 'miui_perms', 'app_settings'] }
+  ];
+
+  /**
+   * 设置页「系统权限」卡片：Android 能力开关的真实状态 + 逐项申请。
+   * 申请走 kxxy://perm/request?name=<id> 桥（MainActivity 拦截后分派到
+   * 对话框 / 系统页 / 厂商安全中心），状态来自原生心跳写进 kxxy-state.json
+   * 的 permissions 字段，轮询自动刷新。
    */
   function renderPermissions(engine) {
     if (!dom.permList) return;
     const perms = engine.permissions || {};
+    // 逐项状态：原生未升级时没有 entries，此时退回 `null`（= 只展示、不可点）
+    const statuses = perms.entries && typeof perms.entries === 'object' ? perms.entries : null;
 
-    /*
-     * 通知这一行有三种状态，混成「已授权 / 未授权」两种会掩盖最麻烦的那种：
-     *
-     *   ① 未授权 —— 请求系统对话框；
-     *   ② 已授权，但「需要你确认」这条渠道被单独静音 —— 应用级开关和权限都是
-     *      对的，可最重要的通知就是不响。用户自己几乎不可能想到是渠道级设置，
-     *      所以这里要主动点出来，并把按钮直送渠道列表；
-     *   ③ 都正常。
-     */
-    const notifEnabled = perms.notifications === true;
-    const attentionBlocked = engine.notifications && engine.notifications.attentionBlocked === true;
-    const notifRow = (notifEnabled && !attentionBlocked)
-      ? {
+    /** 通知行是三态的特殊项，单独构造（渠道静音时 value 为 true 但仍需按钮）。 */
+    function notificationsRow() {
+      const enabled = perms.notifications === true;
+      const blocked = engine.notifications && engine.notifications.attentionBlocked === true;
+      if (enabled && !blocked) {
+        return { label: '通知', desc: '引擎状态常驻通知与待确认请求（正常）', value: true, action: null };
+      }
+      if (enabled) {
+        return {
           label: '通知',
-          desc: '引擎状态常驻通知与待确认请求（正常）',
+          desc: '「需要你确认」渠道被静音 —— 有请求时不会响。点右侧去系统设置恢复。',
           value: true,
-          action: null,
-        }
-      : notifEnabled
-        ? {
-            label: '通知',
-            desc: '「需要你确认」渠道被静音 —— 有请求时不会响。点右侧去系统设置恢复。',
-            value: true,
-            action: 'notification-channels',
-            actionLabel: '去设置',
-          }
-        : {
-            label: '通知',
-            desc: '引擎状态常驻通知（Android 13+ 需授权）',
-            value: false,
-            action: 'notifications',
-            actionLabel: '去授权',
-          };
-
-    const rows = [
-      notifRow,
-      { label: '所有文件访问', desc: '导出日志写入 Download/kxxy/（Android 11+，系统设置页开启）', value: perms.allFiles, action: 'all-files', actionLabel: '去开启' },
-      { label: '电池优化白名单', desc: '防止后台引擎被系统休眠策略中止', value: perms.battery, action: 'battery', actionLabel: '去设置' },
-    ];
-    if (perms.legacyStorage !== null && perms.legacyStorage !== undefined) {
-      rows.push({ label: '存储（旧版）', desc: 'Android 10 及以下的文件读写授权', value: perms.legacyStorage, action: 'storage', actionLabel: '去授权' });
+          action: 'notification-channels',
+          actionLabel: '去设置'
+        };
+      }
+      return {
+        label: '通知',
+        desc: '引擎状态常驻通知（Android 13+ 需授权）',
+        value: false,
+        action: 'notifications',
+        actionLabel: '去授权'
+      };
     }
 
-    dom.permList.innerHTML = '';
-    rows.forEach((row) => {
+    /**
+     * 构造一条权限行。
+     *
+     * 三态语义（与原生 PermCatalog.status 对齐）：
+     *   true      → 已授予，不再给按钮；
+     *   false     → 未授予，给「去授权」（会弹对话框的那类）；
+     *   null/缺省 → 应用内判定不了（厂商开关 / 老版本原生没有该字段），
+     *               只给跳转按钮，且**不画 ✓**，免得谎报已授权。
+     */
+    function entryRow(id) {
+      const meta = PERM_META[id];
+      if (!meta) return null;
+
+      // 硬件缺失时这一行永远不可能授予成功，文案要说清原因
+      let desc = meta.desc;
+      let hardwareOk = true;
+      if (id === 'camera' && perms.cameraHardware === false) {
+        hardwareOk = false;
+        desc = '这台设备没有摄像头';
+      }
+      if (id === 'microphone' && perms.microphoneHardware === false) {
+        hardwareOk = false;
+        desc = '这台设备没有麦克风';
+      }
+
+      const raw = statuses ? statuses[id] : undefined;
+      const unknown = raw === undefined || raw === null;
+      const granted = raw === true;
+
+      let action = null;
+      let actionLabel = null;
+      if (hardwareOk) {
+        if (unknown) {
+          // 厂商跳转类条目：不管状态如何都得给按钮，它本来就不是「授予」动作
+          if (meta.nav) {
+            action = id;
+            actionLabel = meta.nav;
+          }
+        } else if (!granted) {
+          action = id;
+          actionLabel = meta.grant || '去授权';
+        }
+      }
+
+      return { label: meta.label, desc, value: granted, action, actionLabel };
+    }
+
+    /** 渲染一条 setting-row（与旧的权限行同构，样式直接复用）。 */
+    function appendRow(host, row) {
       const div = document.createElement('div');
       div.className = 'setting-row';
       const granted = row.value === true;
@@ -639,18 +716,106 @@
           <span class="setting-desc">${escapeHtml(row.desc)}</span>
         </div>
       `;
-      // 注意条件里没有 granted：渠道被静音时 value 仍是 true，
-      // 但用户恰恰需要一个按钮去修它。
       if (row.action) {
-        const btn = el(`<button class="button button-subtle button-sm">${escapeHtml(row.actionLabel)}</button>`);
+        const btn = el(`<button class="button button-subtle button-sm">${escapeHtml(row.actionLabel || '去设置')}</button>`);
         btn.addEventListener('click', () => {
-          // kxxy:// 由原生层拦截（应设置页在 WebView 内，权限请求必须由 Activity 发起）
+          // kxxy:// 由原生层拦截（权限请求必须由 Activity 发起，设置页只是个 WebView）
           window.location.href = `kxxy://perm/request?name=${encodeURIComponent(row.action)}`;
+          // 系统对话框是异步的：先等一拍再刷状态，用户回到本页时徽章通常已更新
+          setTimeout(fetchState, 1500);
+          setTimeout(fetchState, 4000);
         });
         div.appendChild(btn);
       }
-      dom.permList.appendChild(div);
+      host.appendChild(div);
+    }
+
+    dom.permList.innerHTML = '';
+    PERM_GROUPS.forEach((group) => {
+      // 先把该组的行全部构造出来，整组为空就不画标题（例如老版本原生没有这些字段）
+      const rows = group.ids
+        .map((id) => (id === 'notifications' ? notificationsRow() : entryRow(id)))
+        .filter(Boolean);
+      if (!rows.length) return;
+
+      const wrap = document.createElement('div');
+      wrap.className = 'perm-group';
+      const title = document.createElement('div');
+      title.className = 'perm-group-title';
+      title.textContent = group.title;
+      wrap.appendChild(title);
+      const list = document.createElement('div');
+      list.className = 'setting-list';
+      rows.forEach((row) => appendRow(list, row));
+      wrap.appendChild(list);
+      dom.permList.appendChild(wrap);
     });
+
+    /*
+     * 批量按钮：只统计「会弹对话框」的那几项。
+     *
+     * 特殊权限（文件和文档 / 悬浮窗 / 电池 / 安装未知应用）不参与判定 ——
+     * 它们本来就无法一次性授予，算进来会让按钮永远灰不掉。
+     * 无硬件的那一项按「已完成」处理，同理。
+     */
+    const runtimeIds = ['camera', 'microphone', 'media', 'sms'];
+    const pending = runtimeIds.filter((id) => {
+      if (id === 'camera' && perms.cameraHardware === false) return false;
+      if (id === 'microphone' && perms.microphoneHardware === false) return false;
+      if (!statuses) return false;
+      return statuses[id] !== true;
+    });
+    const notifMissing = perms.notifications !== true;
+    const total = pending.length + (notifMissing ? 1 : 0);
+
+    if (dom.btnPermGrantAll) {
+      dom.btnPermGrantAll.disabled = total === 0;
+      dom.btnPermGrantAll.textContent = total === 0
+        ? '运行时权限已全部授予'
+        : `一键授予全部权限（还差 ${total} 项）`;
+    }
+
+    /*
+     * 折叠条上的汇总徽章。
+     *
+     * 卡片收起后，用户只看得到这一行 —— 所以它必须回答「我到底还差什么」，
+     * 而且统计口径要和展开后的清单一致：**所有**未授予项都算，
+     * 不只是能弹框的那几项（特殊权限也要去设置页开，同样没完成）。
+     *
+     * 状态为 null 的（厂商跳转类、老版本原生没有的字段）不计入 ——
+     * 应用内判定不出来，报成「还差」会变成永远清不掉的假数字。
+     */
+    if (dom.permSummaryBadge) {
+      const badge = dom.permSummaryBadge;
+      if (!statuses) {
+        badge.textContent = '状态未知';
+        badge.className = 'badge badge-subtle';
+      } else {
+        const grantedIds = Object.keys(statuses).filter((id) => statuses[id] === true);
+        /*
+         * 未授予项。
+         *
+         * 无硬件的那两项要排除：原生算的是 `camera = 有硬件 && 已授予`，
+         * 没有摄像头的设备上它恒为 false —— 若照实计入，徽章会永远是
+         * 「还差 1 项」，而展开后那一行根本没有按钮可点。
+         */
+        const missingIds = Object.keys(statuses).filter((id) => {
+          if (statuses[id] !== false) return false;
+          if (id === 'camera' && perms.cameraHardware === false) return false;
+          if (id === 'microphone' && perms.microphoneHardware === false) return false;
+          return true;
+        });
+        // 通知不在 entries 里（它走 perms.notifications 快照），单独补进去
+        if (notifMissing) missingIds.push('notifications');
+        else grantedIds.push('notifications');
+        const missingCount = missingIds.length;
+        const totalCount = grantedIds.length + missingCount;
+        badge.textContent = missingCount === 0
+          ? '全部已授予'
+          : `还差 ${missingCount} 项 · ${grantedIds.length}/${totalCount}`;
+        badge.className = missingCount === 0 ? 'badge badge-success' : 'badge badge-warn';
+      }
+    }
   }
 
   // ==========================================
@@ -1657,6 +1822,50 @@
     // 权限等级：模式卡选中后「应用并重启引擎」
     if (dom.btnPrivApply) {
       dom.btnPrivApply.addEventListener('click', () => applyPrivMode());
+    }
+
+    /*
+     * 一键授予全部运行时权限。
+     *
+     * 为什么不在前端逐条调：Android 的系统对话框一次只处理一组权限，
+     * 逐条发 kxxy:// 会连弹好几个框，而且后一个 Activity 回调可能覆盖前一个
+     * 挂起的请求。交给原生层一次 requestPermissions（已授予的自动跳过）最稳。
+     */
+    if (dom.btnPermGrantAll) {
+      dom.btnPermGrantAll.addEventListener('click', () => {
+        window.location.href = 'kxxy://perm/request?name=all';
+        // 对话框是异步的：两拍刷新，用户答完回到页面时徽章基本已更新
+        setTimeout(fetchState, 1500);
+        setTimeout(fetchState, 4500);
+      });
+    }
+
+    // 兜底出口已并入权限卡最后一行（app_settings），不再单独绑按钮
+
+    /*
+     * 系统权限卡片的折叠状态。
+     *
+     * HTML 里没写 `open`，所以首次进来是收起的 —— 16 个项目铺开要占一整屏多，
+     * 而设置页的主角其实是下面的权限等级与守护开关。用户手动展开过一次就记住
+     * 选择（localStorage），下次进来保持展开，不用反复点。
+     *
+     * 存的是 `'1'/'0'` 而不是布尔字符串 `'true'`：键名带版本语义，
+     * 以后要换默认行为时可以直接改成新键，老值自然失效。
+     */
+    if (dom.permDetails) {
+      const PERM_OPEN_KEY = 'kxxy.settings.perm.open.v1';
+      let saved = null;
+      try {
+        saved = window.localStorage.getItem(PERM_OPEN_KEY);
+      } catch (_) {
+        // 无痕/受限 WebView 下 localStorage 会抛，折叠功能本身不能因此失效
+      }
+      if (saved === '1') dom.permDetails.open = true;
+      dom.permDetails.addEventListener('toggle', () => {
+        try {
+          window.localStorage.setItem(PERM_OPEN_KEY, dom.permDetails.open ? '1' : '0');
+        } catch (_) {}
+      });
     }
 
     // 开关绑定 (常驻前台 / 看门狗 / 局域网反代)

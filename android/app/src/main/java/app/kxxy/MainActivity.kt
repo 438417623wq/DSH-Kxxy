@@ -13,6 +13,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import app.kxxy.engine.EngineConfig
 import app.kxxy.engine.EngineSupervisor
+import app.kxxy.engine.PermCatalog
 import app.kxxy.engine.ShizukuBridge
 import app.kxxy.service.EngineService
 import kotlinx.coroutines.Job
@@ -65,6 +66,19 @@ class MainActivity : Activity() {
      * WebView 认为还有一个悬空 chooser，之后所有点击都不再弹窗（经典坑）。
      */
     private var filePathCallback: android.webkit.ValueCallback<Array<android.net.Uri>>? = null
+
+    /**
+     * 挂起的网页媒体权限请求（相机 / 麦克风）。
+     *
+     * `onPermissionRequest` 是**必须立刻作答**的回调：系统对话框要跨
+     * `requestPermissions` 存活，所以先把 request 存在这里，等
+     * [onRequestPermissionsResult] 拿到结果再 grant/deny。
+     * 反复创建必须先把旧的 deny 掉，否则 WebView 里那条 request 永远悬空
+     * （网页的 Promise 不 resolve，语音输入按钮一直转圈）。
+     */
+    private var pendingWebPermission: android.webkit.PermissionRequest? = null
+
+
 
     /**
      * 待投递的 attention 目标。
@@ -168,6 +182,23 @@ class MainActivity : Activity() {
                     callback.onReceiveValue(null)
                     false
                 }
+            }
+
+            /**
+             * 网页侧媒体权限（`getUserMedia` / `MediaRecorder` / `<input capture>`）。
+             *
+             * 为什么必须有这个回调：WebView 的默认实现是**一律拒绝**且不弹任何
+             * 提示 —— 网页侧看到的是 `NotAllowedError: Permission denied`，
+             * 而系统层根本没被问过。也就是说，光在清单里声明 CAMERA /
+             * RECORD_AUDIO、光在设置里授权，网页仍然用不了摄像头：
+             * 必须由 Activity 在 onPermissionRequest 里显式 grant。
+             *
+             * 授权范围刻意收窄到「本机回环页面 + 相机/麦克风两类资源」：
+             * 官方前端与宿主管理页同源运行在 127.0.0.1，除此之外的来源
+             * （含远程页面、file:）一律 deny，避免这套桥被做成通用提权口。
+             */
+            override fun onPermissionRequest(request: android.webkit.PermissionRequest) {
+                handleWebPermissionRequest(request)
             }
         }
 
@@ -371,31 +402,6 @@ class MainActivity : Activity() {
                 // 直接送到**渠道列表**，而不是笼统的应用通知页。
                 openNotificationSettings()
             }
-            "all-files" -> {
-                // Android 11+ 的「所有文件访问」必须去系统设置页，应用内弹不出来
-                val intent = try {
-                    android.content.Intent(
-                        android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                        android.net.Uri.parse("package:$packageName"),
-                    )
-                } catch (_: Exception) {
-                    android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                }
-                runCatching { startActivity(intent) }
-            }
-            "battery" -> {
-                val intent = android.content.Intent(
-                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    android.net.Uri.parse("package:$packageName"),
-                )
-                runCatching { startActivity(intent) }
-                    .onFailure { Log.w(TAG, "battery intent failed: ${it.message}") }
-            }
-            "storage" -> {
-                if (android.os.Build.VERSION.SDK_INT <= 29) {
-                    requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), REQ_PERM_STORAGE)
-                }
-            }
             "shizuku" -> {
                 // Shizuku 的授权不是系统权限对话框，而是 Shizuku 自己的界面：
                 // 由 Shizuku server 弹出，结果经 addRequestPermissionResultListener
@@ -405,8 +411,239 @@ class MainActivity : Activity() {
                     Log.w(TAG, "shizuku permission request rejected (binder not ready)")
                 }
             }
+            // 一键授予：所有「清单里声明过、还没授予」的运行时权限，一次问完。
+            // 系统会按权限组依次弹框（相机 → 麦克风 → 短信 → 媒体…），
+            // 逐个框而不是合并成一个，所以文案里不能承诺「只弹一次」。
+            "all" -> requestRuntimeGroup(PermCatalog.missingRuntime(this).toTypedArray(), REQ_PERM_ALL)
+            else -> {
+                // 其余全部走权限目录：id 就是 PermCatalog 的条目名
+                // （camera / microphone / media / sms / overlay / battery / …）。
+                // 新增权限项时只需要改 PermCatalog + 清单，这里不用动。
+                val entry = PermCatalog.find(name)
+                if (entry == null) {
+                    Log.w(TAG, "permission bridge: unknown entry $name")
+                } else {
+                    dispatchCatalogEntry(entry)
+                }
+            }
         }
         return true
+    }
+
+    /**
+     * 按权限条目的类别分派到正确的申请路径。
+     *
+     * 这是整条链上最容易做错的一步：把特殊权限当成运行时权限去申请，
+     * 系统不会有任何反应（没有对话框、也没有回调），用户只会觉得
+     * 「这个按钮是假的」。所以四类必须分开：
+     *
+     *   RUNTIME  → 系统对话框
+     *   SPECIAL  → 对应的 Settings 页
+     *   NAVIGATE → 厂商安全中心（MIUI/HyperOS 的锁屏显示、后台弹出等）
+     *   NORMAL   → 安装即授予，应用内无从修改，送到应用详情页让用户自己看
+     */
+    private fun dispatchCatalogEntry(entry: PermCatalog.Entry) {
+        when (entry.kind) {
+            PermCatalog.Kind.RUNTIME -> requestRuntimeGroup(
+                entry.perms.filter { PermCatalog.isDeclared(this, it) && !hasPermission(it) }.toTypedArray(),
+                REQ_PERM_MEDIA,
+            )
+            PermCatalog.Kind.SPECIAL -> openSpecialPermission(entry.id)
+            PermCatalog.Kind.NAVIGATE -> if (entry.id == "miui_perms") openVendorPermissionEditor() else openAppSettings()
+            PermCatalog.Kind.NORMAL -> openAppSettings()
+        }
+    }
+
+    /** 特殊权限：每一条都得用各自的 Settings action，且都有版本门槛。 */
+    private fun openSpecialPermission(id: String) {
+        when (id) {
+            "all_files" -> {
+                // Android 11+ 起「所有文件访问」只能去系统页开
+                val intent = try {
+                    android.content.Intent(
+                        android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        android.net.Uri.parse("package:$packageName"),
+                    )
+                } catch (_: Exception) {
+                    android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                }
+                runCatching { startActivity(intent) }
+                    .onFailure { openAppSettings() }
+            }
+            "overlay" -> {
+                // 悬浮窗：部分 ROM（含 MIUI）会把这个 action 吃掉，兜底走应用详情页
+                runCatching {
+                    startActivity(
+                        android.content.Intent(
+                            android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            android.net.Uri.parse("package:$packageName"),
+                        ),
+                    )
+                }.onFailure { openAppSettings() }
+            }
+            "battery" -> {
+                runCatching {
+                    startActivity(
+                        android.content.Intent(
+                            android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            android.net.Uri.parse("package:$packageName"),
+                        ),
+                    )
+                }.onFailure {
+                    Log.w(TAG, "battery intent failed: ${it.message}")
+                    openAppSettings()
+                }
+            }
+            "install_unknown" -> {
+                // Android 8.0+ 的「安装未知应用」是按应用授权的
+                runCatching {
+                    startActivity(
+                        android.content.Intent(
+                            android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            android.net.Uri.parse("package:$packageName"),
+                        ),
+                    )
+                }.onFailure { openAppSettings() }
+            }
+            else -> openAppSettings()
+        }
+    }
+
+    /**
+     * MIUI / HyperOS 安全中心的「应用权限管理」页。
+     *
+     * 为什么需要它：截图里那些「锁屏显示」「后台弹出界面」「链式启动管理」
+     * 「动态壁纸服务」**没有对应的 Android 权限**，是厂商安全中心自己加的
+     * 开关，manifest 里声明不出来、requestPermissions 也唤不起。唯一可行的
+     * 路径是厂商私有 action（小米系沿用多年），失败就退到应用详情页 ——
+     * 那条路任何 ROM 都有，只是用户要多点两下。
+     */
+    private fun openVendorPermissionEditor() {
+        val candidates = listOf(
+            android.content.Intent("miui.intent.action.APP_PERM_EDITOR").apply {
+                setClassName(
+                    "com.miui.securitycenter",
+                    "com.miui.permcenter.permissions.PermissionsEditorActivity",
+                )
+                putExtra("extra_pkgname", packageName)
+            },
+            android.content.Intent("miui.intent.action.APP_PERM_EDITOR").apply {
+                putExtra("extra_pkgname", packageName)
+            },
+        )
+        for (intent in candidates) {
+            if (runCatching { startActivity(intent) }.isSuccess) return
+        }
+        Log.i(TAG, "vendor permission editor unavailable, falling back to app settings")
+        openAppSettings()
+    }
+
+    /** 应用详情页 —— 所有权限路径的最终兜底。 */
+    private fun openAppSettings() {
+        // 权限被拒两次后系统进入「不再询问」：之后 requestPermissions
+        // 连对话框都不弹，回调里直接就是 DENIED —— 用户只会看到
+        // 「点了没反应」。唯一出口是应用详情页，那里能手动开。
+        runCatching {
+            startActivity(
+                android.content.Intent(
+                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.parse("package:$packageName"),
+                ),
+            )
+        }.onFailure { Log.w(TAG, "app settings intent failed: ${it.message}") }
+    }
+
+    /**
+     * 请求一组运行时权限，**已授予的直接跳过**。
+     *
+     * 为什么要过滤：`requestPermissions` 里带上一个已授予的权限，系统仍然会
+     * 把它塞进结果数组，但对话框上不会出现对应条目 —— 用户点「一键授予」
+     * 后看到只有一个框，会以为剩下的没生效。滤掉已授予的之后，空数组这条
+     * 路径直接返回（什么都不弹），由状态轮询把界面刷成已授权。
+     */
+    private fun requestRuntimeGroup(permissions: Array<String>, requestCode: Int) {
+        val missing = permissions.filterNot { hasPermission(it) }
+        if (missing.isEmpty()) {
+            Log.i(TAG, "runtime group already granted: ${permissions.joinToString()}")
+            return
+        }
+        runCatching { requestPermissions(missing.toTypedArray(), requestCode) }
+            .onFailure { Log.w(TAG, "requestPermissions failed: ${it.message}") }
+    }
+
+    /** 单条权限的当前授予状态（不做缓存：用户随时可能在系统设置里收回）。 */
+    private fun hasPermission(permission: String): Boolean = PermCatalog.isGranted(this, permission)
+
+    /**
+     * 处理网页侧的媒体权限请求（[WebChromeClient.onPermissionRequest] 的实体）。
+     *
+     * 三种情况：
+     *   ① 来源不是本机回环页 → deny（这套桥只服务自家页面）；
+     *   ② 请求里没有相机/麦克风 → deny（受保护媒体等资源本宿主不支持）；
+     *   ③ 清单权限已授予 → 立刻 grant；
+     *      未授予 → 先弹系统对话框，把 request 挂起，回执到了再作答。
+     *
+     * 注意 grant 的参数只放**已授予**的那部分：用户只批了麦克风时，
+     * 把 CAMERA 一起塞进 grant 会让 WebView 认为相机也被允许，之后
+     * `getUserMedia({video:true})` 抛的是底层 CameraService 的
+     * SecurityException（闪退级），而不是可捕获的 NotAllowedError。
+     */
+    private fun handleWebPermissionRequest(request: android.webkit.PermissionRequest) {
+        val origin = request.origin?.toString().orEmpty()
+        if (!origin.startsWith("http://127.0.0.1:") && !origin.startsWith("http://localhost:")) {
+            Log.w(TAG, "web permission denied for origin: $origin")
+            runCatching { request.deny() }
+            return
+        }
+
+        val wanted = request.resources.filter {
+            it == android.webkit.PermissionRequest.RESOURCE_VIDEO_CAPTURE ||
+                it == android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE
+        }
+        if (wanted.isEmpty()) {
+            Log.i(TAG, "web permission: no supported resource in ${request.resources.joinToString()}")
+            runCatching { request.deny() }
+            return
+        }
+
+        val needed = LinkedHashSet<String>()
+        if (wanted.contains(android.webkit.PermissionRequest.RESOURCE_VIDEO_CAPTURE) &&
+            !hasPermission(android.Manifest.permission.CAMERA)
+        ) {
+            needed.add(android.Manifest.permission.CAMERA)
+        }
+        if (wanted.contains(android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE) &&
+            !hasPermission(android.Manifest.permission.RECORD_AUDIO)
+        ) {
+            needed.add(android.Manifest.permission.RECORD_AUDIO)
+        }
+
+        if (needed.isNotEmpty()) {
+            // 上一次还没作答的请求必须收尾，否则它的 Promise 永远悬空
+            pendingWebPermission?.let { runCatching { it.deny() } }
+            pendingWebPermission = request
+            runCatching { requestPermissions(needed.toTypedArray(), REQ_PERM_WEB_MEDIA) }
+                .onFailure {
+                    Log.w(TAG, "web permission request failed: ${it.message}")
+                    pendingWebPermission = null
+                    runCatching { request.deny() }
+                }
+            return
+        }
+
+        val granted = wanted.filter { resource ->
+            when (resource) {
+                android.webkit.PermissionRequest.RESOURCE_VIDEO_CAPTURE -> hasPermission(android.Manifest.permission.CAMERA)
+                android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE -> hasPermission(android.Manifest.permission.RECORD_AUDIO)
+                else -> false
+            }
+        }
+        if (granted.isEmpty()) {
+            runCatching { request.deny() }
+        } else {
+            runCatching { request.grant(granted.toTypedArray()) }
+                .onFailure { runCatching { request.deny() } }
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -418,6 +655,28 @@ class MainActivity : Activity() {
         // 结果不需要主动回传：权限状态由 publishState 写进 kxxy-state.json，
         // 管理页轮询 /kxxy/api/state 数秒内自动刷新。
         Log.i(TAG, "permission result: req=$requestCode grants=${grantResults.joinToString()}")
+
+        // 网页媒体请求在等这个回执：此时才轮到对 WebView 作答。
+        if (requestCode != REQ_PERM_WEB_MEDIA) return
+        val request = pendingWebPermission ?: return
+        pendingWebPermission = null
+        // 逐条复核，而不是信任 grantResults 的下标对齐 —— 某些 ROM 会合并
+        // 相邻请求，下标与 permissions 的顺序对不上。hasPermission 是权威事实源。
+        val granted = request.resources.filter { resource ->
+            when (resource) {
+                android.webkit.PermissionRequest.RESOURCE_VIDEO_CAPTURE -> hasPermission(android.Manifest.permission.CAMERA)
+                android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE -> hasPermission(android.Manifest.permission.RECORD_AUDIO)
+                else -> false
+            }
+        }
+        if (granted.isEmpty()) {
+            Log.i(TAG, "web permission denied by user")
+            runCatching { request.deny() }
+        } else {
+            Log.i(TAG, "web permission granted: ${granted.joinToString()}")
+            runCatching { request.grant(granted.toTypedArray()) }
+                .onFailure { runCatching { request.deny() } }
+        }
     }
 
     /**
@@ -599,6 +858,9 @@ class MainActivity : Activity() {
         // 悬空的文件选择回调会让 WebView 之后所有 input 点击静默失效
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
+        // 同理：悬空的权限请求会让网页侧的 getUserMedia Promise 永不 resolve
+        pendingWebPermission?.let { runCatching { it.deny() } }
+        pendingWebPermission = null
         if (::webView.isInitialized) {
             runCatching {
                 (webView.parent as? ViewGroup)?.removeView(webView)
@@ -616,7 +878,15 @@ class MainActivity : Activity() {
 
         private const val REQUEST_FILE_CHOOSER = 4201
         private const val REQ_PERM_NOTIFICATIONS = 4202
-        private const val REQ_PERM_STORAGE = 4203
+
+        /** 设置页里「相机」「麦克风」「媒体」「短信」等单项授权共用的回执码。 */
+        private const val REQ_PERM_MEDIA = 4204
+
+        /** 设置页「一键授予全部权限」。 */
+        private const val REQ_PERM_ALL = 4205
+
+        /** 网页 getUserMedia 触发的权限请求，回执用来给 WebView 作答。 */
+        private const val REQ_PERM_WEB_MEDIA = 4206
 
         /** 通知点击时带过来的请求标识（由 [app.kxxy.service.Notifier] 写入）。 */
         const val EXTRA_ATTENTION_ID = "kxxy.extra.attention_id"

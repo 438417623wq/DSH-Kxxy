@@ -469,19 +469,42 @@
           </div>
         </div>
 
-        <!-- 系统权限卡片（状态来自原生心跳，申请走 kxxy:// 桥） -->
-        <div class="card block-card">
-          <div class="card-title-group">
-            <h3 class="card-title">系统权限</h3>
-            <span class="card-subtitle">Android 能力开关 —— 影响通知、日志导出与后台保活</span>
-          </div>
-          <div class="setting-list" id="perm-list">
-            <div class="setting-row">
-              <div class="setting-info">
-                <span class="setting-title">加载中…</span>
+        <!--
+          系统权限卡片：默认折叠。
+
+          16 个项目铺开要占一整屏多（截图实测），而用户进设置页十次有九次
+          不是为了逐条授权 —— 折叠后只留一行「系统权限 + 还差 N 项」，
+          想细看再点开。折叠状态记在 localStorage，展开过一次以后就记住。
+        -->
+        <div class="card block-card perm-card">
+          <details class="patch-accordion perm-accordion" id="perm-details">
+            <summary class="patch-summary">
+              <div class="patch-summary-left">
+                <span class="accordion-title">系统权限</span>
+                <span class="badge badge-subtle" id="perm-summary-badge">加载中…</span>
+              </div>
+              <div class="patch-summary-right">
+                <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </div>
+            </summary>
+            <div class="perm-body">
+              <div class="perm-groups" id="perm-list">
+                <div class="setting-row">
+                  <div class="setting-info">
+                    <span class="setting-title">加载中…</span>
+                  </div>
+                </div>
+              </div>
+              <div class="perm-actions">
+                <button class="button button-primary button-block" id="btn-perm-grant-all">一键授予全部权限</button>
+                <div class="perm-hint" id="perm-hint">
+                  相机、麦克风、照片与音乐、短信、通知会依次弹系统对话框；「文件和文档」「显示悬浮窗」「电池优化」「安装未知应用」系统不提供对话框，只能跳到设置页手动开启。厂商开关（锁屏显示、后台弹出、链式启动）在手机管家的应用权限页里。
+                </div>
               </div>
             </div>
-          </div>
+          </details>
         </div>
 
         <!-- 宿主运行权限等级：模式卡片组 -->

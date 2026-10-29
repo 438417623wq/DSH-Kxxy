@@ -27,12 +27,62 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- 外置工作区读写（sessions/workspaces 外置到公开目录，卸载不丢） -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- ===== 媒体与文件（对照系统权限页的「照片和视频」「音乐和音频」）=====
+         targetSdk 固定 28，因此 Android 13+ 也走 legacy 的 READ_EXTERNAL_STORAGE：
+         系统会在权限页上把它拆成「照片和视频」「音乐和音频」两行，行为与用户
+         预期一致。刻意不声明 READ_MEDIA_IMAGES / READ_MEDIA_AUDIO —— 那是
+         targetSdk 33+ 的通道，在 28 上申请会立刻 DENIED，并计入「拒绝两次
+         不再询问」，反而把权限做死。 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <!-- ===== 短信（对照系统权限页的「短信 / 发送彩信」）=====
+         三条成组：只发不收会让验证码类流程断在半路，只读不发又做不了回复。
+         这是 dangerous 权限，由设置页「系统权限」卡片或首次使用时请求。 -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+    <!-- ===== 其他权限（对照系统权限页的「其他权限」列表）=====
+         · 显示悬浮窗 → SYSTEM_ALERT_WINDOW（特殊权限，只能跳设置页开）
+         · 后台弹出界面 → 由悬浮窗/后台启动策略间接影响，无原生权限，见 miui_perms
+         · 获取应用列表 → QUERY_ALL_PACKAGES（normal，安装即授予）
+         · 媒体音量控制 → MODIFY_AUDIO_SETTINGS（见上文）
+         · 桌面快捷方式 → launcher 的 INSTALL_SHORTCUT（normal）
+         · 获取设备动作与方向 → HIGH_SAMPLING_RATE_SENSORS（normal；
+           低采样率本身不需要权限，MIUI 的单列开关在安全中心）
+         · 锁屏显示 / 链式启动 / 动态壁纸服务 → 没有对应原生权限，
+           只能由厂商安全中心管（设置页卡片提供跳转） -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <uses-permission android:name="com.android.launcher.permission.INSTALL_SHORTCUT" />
+
     <!-- 导出日志写 Download/kxxy/（五项改进方案 §7-3 方案 B）。
          targetSdk 28 走 legacy storage：Android 9 及以下安装即授，
          Android 10 需运行时授权（未授时导出自动退回应用私有目录，不报错）。 -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />
+    <!-- ===== 媒体能力：相机 / 麦克风 =====
+         用户原话：「录音、相机，它是个应用，应该要获取全部权限」。此前清单里
+         **一条媒体权限都没有**，于是两件事同时坏掉：
+           ① 设置页「系统权限」卡片无行可显示 —— 因为原生快照压根没有这两项；
+           ② WebView 里的 getUserMedia / <input capture> 直接失败，因为
+              Chromium 在 onPermissionRequest 之前就要看清单里有没有声明。
+         这三条都是运行时（dangerous）权限，由设置页卡片或首次使用时请求，
+         具体入口见 MainActivity.handlePermissionBridge 的 camera/microphone/media/all。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- normal 权限，安装即授予。WebView 的音频采集路径（AAudio/OpenSL）在
+         grant 之后仍会检查它，缺了表现为「网页拿到了音轨但一直是静音」——
+         现象很像麦克风坏了，实际是这一行。 -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- required=false：没有摄像头/麦克风的设备（部分平板、模拟器）照样能装，
+         权限卡会把对应行标成「无硬件」而不是永远显示未授权。
+         不写 uses-feature 时系统会按「需要摄像头」处理，Google Play 会被过滤；
+         本应用走 sideload 不受影响，但保持声明正确没有坏处。 -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
     <!-- 设置页「系统权限」卡片请求电池优化白名单（kxxy://perm/request?name=battery） -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- 缺陷 DG：在应用内「点开」自己构建的 APK（交付文件卡片 / 终端里 apk 路径）

@@ -71,3 +71,5 @@ plugins/kxxy-host/web/theme.css
 # build-go-android.ps1 / inject-apk-assets.mjs 这几个固定入口）。
 # 保留在本地便于回溯，但不入库：265 个文件里绝大多数只在某一次复现里有意义。
 tools/_*
+# versionCode 落盘下限（本机状态，随构建机变化，不入库）
+android/.kxxy-version-code-floor

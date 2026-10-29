@@ -242,18 +242,45 @@ if (versionSource == "none") {
  * versionCode 必须**严格单调递增**，否则 `adb install -r` 直接
  * `INSTALL_FAILED_VERSION_DOWNGRADE`。
  *
- * 取两个候选值的较大者：
- *   · 语义码：0.9.2 (+ahead) → 902（major*10000 + minor*100 + patch + ahead）
- *   · 提交累计：commitCount + 1000。加偏移是因为**已发布到用户设备上的包**
- *     写的是 versionCode=1，而历史提交数远大于它；偏移保证从第一个 git 版本
- *     开始就比任何已装包都大，不需要用户卸载重装。
+ * ── 真事故：0.9.4 装不上 0.9.3 ─────────────────────────────────────────
+ * 旧公式是 `major*10000 + minor*100 + patch + ahead`，再与 `commitCount+1000`
+ * 取 max。问题是这两个数**不同量级**：语义码在 0.x 阶段只有 900 上下，永远
+ * 被 1000 起步的提交数压住。于是在这台机器上打了新包、版本名升了、versionCode
+ * 却还在 1039 附近打转 —— 只要设备上装过任何一个用提交数算出的更大值
+ * （比如别的目录/别的机器上打的 0.9.4），之后所有 0.9.x 都装不上去，
+ * 而版本名看上去完全正常（`0.9.3` < `0.9.4` 谁也解释不了为什么被拒）。
  *
- * 用 max 而不是二选一：打了 tag 时语义码人可读且跳变大；同 tag 下连续打包
- * 时提交数递增（保证覆盖安装成功）。
+ * 现在把语义版本放到**高位**，位数固定，各段互不越界：
+ *
+ *     major*10_000_000 + minor*100_000 + patch*1_000 + ahead(0..999)
+ *     0.9.4 + 0  → 904_000        0.9.4 + 12 → 904_012
+ *     1.0.0 + 0  → 1_000_000      0.10.0     → 1_000_000（minor 两位够用）
+ *
+ * 这样「版本名涨 → versionCode 一定涨」，不再依赖提交数兜底。提交数只作为
+ * 下限保留（防止 0.0.0 那种历史包比新包大），另外还有一层落盘的下限，
+ * 见 [versionCodeFloorFile]。
  */
-val tagVersionCode = baseMajor * 10_000 + baseMinor * 100 + basePatch + ahead
+val semanticVersionCode = baseMajor * 10_000_000 +
+    baseMinor * 100_000 +
+    basePatch * 1_000 +
+    ahead.coerceIn(0, 999)
 val countVersionCode = gitCommitCount + 1_000
-val computedVersionCode = maxOf(tagVersionCode, countVersionCode)
+
+/**
+ * versionCode 落盘下限（`android/.kxxy-version-code-floor`，已 gitignore）。
+ *
+ * 语义码再规整也挡不住「版本名被改回去」——比如这次把 0.9.3 的提交重新打包，
+ * 或仓库被重新克隆、rebase 后 ahead 归零。记下曾经发出去过的最大值，
+ * 每次构建取 max，保证同一台构建机**永不倒车**。
+ *
+ * 缺点说清楚：这个文件是本机的，换机器/换克隆不会带过去。跨机连续性靠
+ * `KXXY_VERSION_CODE` 环境变量显式指定（CI 走这条）。
+ */
+val versionCodeFloorFile = rootProject.file(".kxxy-version-code-floor")
+val recordedFloor = runCatching {
+    if (versionCodeFloorFile.isFile) versionCodeFloorFile.readText().trim().toIntOrNull() ?: 0 else 0
+}.getOrDefault(0)
+val computedVersionCode = maxOf(semanticVersionCode, countVersionCode, recordedFloor)
 
 /**
  * versionName 形如 `0.9.2+3.caf7a90`，dirty 时追加 `.dirty`。
@@ -279,6 +306,21 @@ val computedVersionName = buildString {
 val finalVersionCode = System.getenv("KXXY_VERSION_CODE")?.toIntOrNull() ?: computedVersionCode
 val finalVersionName = System.getenv("KXXY_VERSION_NAME")?.takeIf { it.isNotBlank() }
     ?: computedVersionName
+
+/*
+ * 把本次真正用到的 versionCode 记进落盘下限（只写更大的值）。
+ *
+ * 写在配置阶段是有意的：`assembleDebug` 之前必然经过配置，所以任何一条
+ * 打包路径都会留下脚印；失败也绝不阻断构建 —— 这个文件是保险丝，不是依赖。
+ */
+runCatching {
+    if (finalVersionCode > recordedFloor) {
+        versionCodeFloorFile.writeText("$finalVersionCode\n")
+    }
+}.onFailure { logger.warn("[kxxy] 写入 versionCode 下限失败：${it.message}") }
+
+// 让 build-apk.ps1 能读到本次产物该叫什么（它按 versionCode 做注入断言）
+runCatching { logger.lifecycle("[kxxy] versionCode=$finalVersionCode versionName=$finalVersionName") }
 
 // ── 构建清单：由 tools/build-runtime.mjs 在打包 runtime 时写出 ──────────────
 //

@@ -844,13 +844,6 @@ class EngineSupervisor(private val ctx: Context) {
             val nm = ctx.getSystemService(android.app.NotificationManager::class.java)
             nm?.areNotificationsEnabled() ?: false
         }.getOrDefault(false)
-        val allFiles = runCatching {
-            android.os.Build.VERSION.SDK_INT >= 30 && android.os.Environment.isExternalStorageManager()
-        }.getOrDefault(false)
-        val battery = runCatching {
-            val pm = ctx.getSystemService(android.os.PowerManager::class.java)
-            pm?.isIgnoringBatteryOptimizations(ctx.packageName) ?: false
-        }.getOrDefault(false)
         // Android 10 及以下走 legacy storage 的运行时权限；11+ 由「所有文件访问」
         // 接管，此字段报告 null 让前端隐藏该行。
         val legacyStorage: Boolean? = if (android.os.Build.VERSION.SDK_INT > 29) {
@@ -863,12 +856,38 @@ class EngineSupervisor(private val ctx: Context) {
                     android.os.Process.myUid(),
                 )
         }
+        val cameraHardware = PermCatalog.hasCamera(ctx)
+        val microphoneHardware = PermCatalog.hasMicrophone(ctx)
+        val camera = cameraHardware && PermCatalog.isGranted(ctx, android.Manifest.permission.CAMERA)
+        val microphone = microphoneHardware && PermCatalog.isGranted(ctx, android.Manifest.permission.RECORD_AUDIO)
         return buildString {
             append("{\n")
             append("    \"notifications\": $notifications,\n")
-            append("    \"allFiles\": $allFiles,\n")
-            append("    \"battery\": $battery,\n")
-            append("    \"legacyStorage\": ${legacyStorage ?: "null"}\n")
+            append("    \"allFiles\": ${PermCatalog.status(ctx, PermCatalog.find("all_files")!!) ?: false},\n")
+            append("    \"battery\": ${PermCatalog.status(ctx, PermCatalog.find("battery")!!) ?: false},\n")
+            append("    \"camera\": $camera,\n")
+            append("    \"microphone\": $microphone,\n")
+            append("    \"cameraHardware\": $cameraHardware,\n")
+            append("    \"microphoneHardware\": $microphoneHardware,\n")
+            append("    \"legacyStorage\": ${legacyStorage ?: "null"},\n")
+            /*
+             * 通用条目状态（权限目录驱动）。
+             *
+             * 与上面那几个扁平字段的关系：扁平字段是旧版前端的契约，不能删
+             * （老网页配新 APK 时会读不到）；`entries` 是新卡片的唯一数据源 ——
+             * 键就是 PermCatalog 的 id，值三态：true / false / null（无法判定，
+             * 例如厂商安全中心里才有的开关）。
+             *
+             * 写成 Map 而不是数组：前端要按 id 查，数组还得自己建索引；
+             * 而且多一个未知 id 也不会让老前端整体解析失败。
+             */
+            append("    \"entries\": {")
+            PermCatalog.entries.forEachIndexed { index, entry ->
+                if (index > 0) append(", ")
+                append("\"").append(entry.id).append("\": ")
+                append(PermCatalog.status(ctx, entry)?.toString() ?: "null")
+            }
+            append("}\n")
             append("  }")
         }
     }
