@@ -738,6 +738,9 @@ class EngineSupervisor(private val ctx: Context) {
         // 列进「已安装」并给出启停开关（overlay 里 insert 的 Loader entry
         // 能跑但不显示，见 EngineConfig.ensureProfileManifest 的说明）。
         EngineConfig.ensureProfileManifest(ctx)
+        // 异常兜底脚本：必须在 buildEnv 之前落盘，否则 NODE_OPTIONS 不会注入
+        // （buildEnv 检查文件存在才拼 --require，见 EngineConfig 里的四条纪律）。
+        EngineConfig.ensureGuard(ctx)
     }
 
     /**

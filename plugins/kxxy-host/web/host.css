@@ -2484,6 +2484,19 @@ input, textarea, select {
   border: 1px solid var(--border-subtle);
 }
 
+/*
+ * 第四态：提示（WARN）。
+ *
+ * 与 BAD 刻意分开 —— 它表示「有事发生，但已经自动兜住了」（典型：插件抛的
+ * 异常被引擎兜底接住，进程没死）。染成红色会让用户去点「修复启动」，而修复
+ * 动的是 profile 补丁，跟插件的运行时错误毫无关系；染成绿色又等于把问题藏了。
+ */
+.check-status-icon.warn {
+  background-color: rgba(245, 158, 11, 0.15);
+  color: var(--accent-orange);
+  border: 1px solid rgba(245, 158, 11, 0.32);
+}
+
 /* 检查项里「修复建议」那一行：单独一种颜色，别和 detail 混在一起。 */
 .check-fixhint {
   font-size: 11px;

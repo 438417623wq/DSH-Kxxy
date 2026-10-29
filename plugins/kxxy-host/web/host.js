@@ -1949,15 +1949,18 @@
     if (!data) return;
     const checks = Array.isArray(data.checks) ? data.checks : [];
     const bad = checks.filter(c => c.verdict === 'BAD');
+    const warn = checks.filter(c => c.verdict === 'WARN');
     const unknown = checks.filter(c => c.verdict === 'UNKNOWN');
 
     // ── 总评 ──────────────────────────────────────────────
+    // 三色：红=要修，黄=有事但兜住了，绿=干净。WARN 也会让圆环变黄，
+    // 但它**不**影响下面的「修复」卡（那个只认 BAD）。
     let ringState = 'ok';
     let ringIcon = '✓';
     if (bad.length) {
       ringState = 'bad';
       ringIcon = '✕';
-    } else if (unknown.length) {
+    } else if (warn.length || unknown.length) {
       ringState = 'warn';
       ringIcon = '!';
     }
@@ -1965,9 +1968,10 @@
     if (dom.healthRingIcon) dom.healthRingIcon.textContent = ringIcon;
     if (dom.healthHeadline) dom.healthHeadline.textContent = data.headline || '体检完成';
     if (dom.healthSubline) {
-      const okCount = checks.length - bad.length - unknown.length;
+      const okCount = checks.length - bad.length - warn.length - unknown.length;
       dom.healthSubline.textContent = `${okCount}/${checks.length} 项正常`
         + (bad.length ? ` · ${bad.length} 项有问题` : '')
+        + (warn.length ? ` · ${warn.length} 项提示` : '')
         + (unknown.length ? ` · ${unknown.length} 项无法验证` : '')
         + ' · ' + formatClock(data.checkedAt);
     }
@@ -1981,6 +1985,7 @@
 
         // 三态映射。UNKNOWN 刻意用中性灰：它是「我没法验证」，
         // 染成绿色会让人误以为没问题，染成红色又是在报假警。
+        // WARN 用橙色：有事发生但已经兜住了，既不该装绿也不该报警。
         let iconClass = 'check-status-icon success';
         let iconSymbol = '✓';
         let badgeText = '正常';
@@ -1988,13 +1993,19 @@
           iconClass = 'check-status-icon fail';
           iconSymbol = '✕';
           badgeText = '有问题';
+        } else if (item.verdict === 'WARN') {
+          iconClass = 'check-status-icon warn';
+          iconSymbol = '!';
+          badgeText = '已兜底';
         } else if (item.verdict === 'UNKNOWN') {
           iconClass = 'check-status-icon unknown';
           iconSymbol = '–';
           badgeText = '未知';
         }
 
-        const fixHint = item.verdict === 'BAD' && item.fixHint
+        // 提示语对 WARN 同样要给：用户看到「已兜底 3 次」的第一反应就是
+        // 「那我该做什么」，答案必须是「去停用某个插件」，而不是「修复启动」。
+        const fixHint = (item.verdict === 'BAD' || item.verdict === 'WARN') && item.fixHint
           ? `<div class="check-fixhint">${escapeHtml(item.fixHint)}</div>`
           : '';
 
@@ -2016,7 +2027,9 @@
     if (dom.healthCountBadge) {
       dom.healthCountBadge.textContent = bad.length
         ? `${bad.length} 项待修`
-        : (unknown.length ? `${unknown.length} 项未知` : '全部通过');
+        : warn.length
+          ? `${warn.length} 项提示`
+          : (unknown.length ? `${unknown.length} 项未知` : '全部通过');
     }
 
     // ── 修复区 ────────────────────────────────────────────

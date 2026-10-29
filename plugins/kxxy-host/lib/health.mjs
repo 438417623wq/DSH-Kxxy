@@ -87,6 +87,8 @@ function parser() {
 /** 体检结论三态。与原生侧 RecoveryProbe.Verdict 同名同义。 */
 export const Verdict = {
   OK: 'OK',
+  /** 能跑，但有值得说一声的事（例如兜底拦过插件异常）——**不触发修复**。 */
+  WARN: 'WARN',
   BAD: 'BAD',
   UNKNOWN: 'UNKNOWN',
 }
@@ -121,6 +123,8 @@ export function healthPaths(root) {
     profileManifest: home ? join(home, 'profiles', 'web', 'package.json') : '',
     profileModules: home ? join(home, 'profiles', 'web', 'node_modules') : '',
     homePatch: home ? join(home, 'cordis.patch.yml') : '',
+    // 异常兜底的产物目录（EngineConfig.guardDir）。state/log 都在这一层。
+    guardDir: home ? join(home, 'guard') : '',
     overlay: root ? join(root, 'android-overlay.yml') : '',
     // 备份根在 files/ 下（原生 EngineConfig.recoveryRoot），引擎根是
     // files/engine —— 所以是 engine 的兄弟目录，不是子目录。
@@ -416,10 +420,77 @@ function checkRuntime(root) {
   return check(code, title, Verdict.OK, '关键文件齐全')
 }
 
+/**
+ * 进程级异常兜底（kxxy-guard）体检。
+ *
+ * 这一项回答的问题很具体：**装了插件之后引擎有没有被拖崩**。
+ *
+ * 判定分三段：
+ *   · 状态文件不存在 → UNKNOWN。可能是这次启动没注入兜底（老 APK、或脚本没落盘），
+ *     也可能是引擎还没跑满一轮。无论哪种，都**不是启动配置问题**，不该触发修复；
+ *   · 有文件、total=0 → OK。兜底装上了，本轮一次都没拦到；
+ *   · 有文件、total>0 → WARN。插件抛出的异步异常被接住了，**引擎活着**。
+ *     这是「已经兜住」而不是「坏了」，所以既不是 BAD（不弹修复），
+ *     也不能是 OK（用户有权知道某个插件在报错）。
+ *
+ * 归因：guard 会从栈里认 `node_modules/<pkg>` 并区分 asar 内核。认出插件时
+ * 直接把包名给出来 —— 用户下一步就是去插件页停用它，而不是去点「修复启动」
+ * （修复动的是 profile 补丁，跟插件的异步报错毫无关系，点错了反而会连累主题
+ * 与模型配置，见缺陷 BW/CA）。
+ */
+function checkGuard(dir) {
+  const code = 'GUARD'
+  const title = '异常兜底'
+  if (!dir) {
+    return check(code, title, Verdict.UNKNOWN, '无法定位 DSH_HOME，读不到兜底状态')
+  }
+  const file = join(dir, 'guard-state.json')
+  let state
+  try {
+    state = JSON.parse(readFileSync(file, 'utf8'))
+  } catch (e) {
+    if (e && e.code === 'ENOENT') {
+      return check(
+        code,
+        title,
+        Verdict.UNKNOWN,
+        '本轮启动没有注入兜底 —— 引擎仍是原生行为，插件抛出的未捕获异常会带崩整个进程',
+        '重装 APK 后首次启动会写入 $HOME/guard/kxxy-guard.cjs；若重装后仍如此，把这条发给开发者',
+      )
+    }
+    return check(code, title, Verdict.UNKNOWN, `兜底状态文件读不出来：${e.message}`)
+  }
+
+  const total = Number(state.total) || 0
+  if (total === 0) {
+    return check(code, title, Verdict.OK, '兜底已生效，本轮没有拦截到异常')
+  }
+
+  // 把「一次都没拦到」和「拦了但都是同一个插件」区分开 —— 后者才是要处理的
+  const recent = Array.isArray(state.recent) ? state.recent : []
+  const plugins = [...new Set(recent.map((r) => r && r.plugin).filter(Boolean))]
+  const blamed = state.lastPlugin || plugins[0] || ''
+  const where = state.lastCore ? '（栈里指向 dsh 内核，不是插件）' : ''
+  const msg = String(state.lastMessage || '').replace(/\s+/g, ' ').slice(0, 160)
+  const detail =
+    `已兜底 ${total} 次异常，引擎没有退出。最近一次：${state.lastKind || '未知类型'}` +
+    (blamed ? ` · ${blamed}${where}` : ' · 栈里认不出归属') +
+    (msg ? ` —— ${msg}` : '')
+
+  return check(
+    code,
+    title,
+    Verdict.WARN,
+    detail,
+    blamed && !state.lastCore
+      ? `疑似来自插件 ${blamed}：到对话页侧栏 →「插件」停用它即可。这类错误不影响启动，不需要「修复」`
+      : '这类错误不影响启动，不需要「修复」；若频繁出现可在插件页逐个停用排查',
+  )
+}
+
 // ---------------------------------------------------------------------------
 // 备份记录（只读）
 // ---------------------------------------------------------------------------
-
 /**
  * 读最近一次修复的备份记录。
  *
@@ -503,9 +574,11 @@ export function runHealthCheck(root) {
     checkOverlay(p.overlay),
     checkExtensions(p.engineRoot ? join(p.engineRoot, 'extensions') : ''),
     checkRuntime(p.engineRoot),
+    checkGuard(p.guardDir),
   ]
 
   const bad = checks.filter((c) => c.verdict === Verdict.BAD)
+  const warn = checks.filter((c) => c.verdict === Verdict.WARN)
   const unknown = checks.filter((c) => c.verdict === Verdict.UNKNOWN)
 
   // 建议力度：红项里只要有「补丁/清单」类，L1 就能解（移文件 + 收缩 bundle）；
@@ -515,7 +588,8 @@ export function runHealthCheck(root) {
   else if (bad.length) level = 'L1'
 
   let headline
-  if (!bad.length && !unknown.length) headline = '启动配置健康，下次重启可以正常起来'
+  if (!bad.length && !warn.length && !unknown.length) headline = '启动配置健康，下次重启可以正常起来'
+  else if (!bad.length && !unknown.length) headline = `启动配置健康，有 ${warn.length} 项提示（已自动兜底，不影响启动）`
   else if (!bad.length) headline = `有 ${unknown.length} 项无法验证（不影响启动）`
   else headline = `发现 ${bad.length} 项问题，建议修复后再重启`
 
@@ -530,6 +604,8 @@ export function runHealthCheck(root) {
       engineRoot: p.engineRoot,
     },
     checks,
+    // 首页/底栏要按「红黄绿」三色给个总状态，前端不该自己再数一遍
+    warnCount: warn.length,
     lastRecovery: latestRecovery(p.recoveryRoot),
     recoveryCount: recoveryCount(p.recoveryRoot),
   }

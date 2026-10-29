@@ -1212,8 +1212,67 @@ object EngineConfig {
         val opensslConf = File(tlsDir(ctx), "openssl.cnf")
         if (opensslConf.isFile) env += "OPENSSL_CONF=${opensslConf.absolutePath}"
 
+        // ── 引擎进程的异常兜底（kxxy-guard）────────────────────────────────
+        //
+        // 装第三方插件后「整个应用崩掉」的真正机制：插件在定时器、socket 事件、
+        // native addon 回调里抛出的异常没人接，而 Node 默认会让**整个进程**退出
+        // —— 用户看到的是引擎没了、会话没了，其实只是那一个插件烂了。
+        // cordis 的 Loader 只兜住了「import 失败」与「apply 里同步抛错」两种，
+        // 异步那一路是敞着的。兜底脚本见 assets/guard/kxxy-guard.cjs 的文件头。
+        //
+        // 四条纪律（每条都对应一种会让事情更糟的写法）：
+        //   1. **文件不存在就不注入**：`--require` 找不到文件是启动期致命错误，
+        //      引擎会连起都起不来，比没有兜底严重得多；
+        //   2. **路径加双引号**：NODE_OPTIONS 按空格切分，路径带空格会被截断；
+        //   3. **反斜杠换正斜杠**：引号内的 `\` 是转义字符，`\d` 会变成 `d`；
+        //   4. **KXXY_GUARD_MAIN 只在主进程生效**：guard 读完立刻 delete，子进程
+        //      （插件跑的 npm install / tsc）拿不到开关，保持 Node 默认的「该崩就崩」，
+        //      否则会表现为构建卡死。
+        //
+        // 不注入 `--unhandled-rejections=warn`：它同样被子进程继承，会改变子进程语义。
+        val guard = guardScript(ctx)
+        if (guard.isFile && guard.length() > 0) {
+            val guardPath = guard.absolutePath.replace('\\', '/')
+            env += "KXXY_GUARD_DIR=${guardDir(ctx).absolutePath}"
+            env += "KXXY_GUARD_MAIN=1"
+            env += "NODE_OPTIONS=--require \"$guardPath\""
+        }
+
         return env.toTypedArray()
     }
+
+    /** 异常兜底脚本目录（在 $HOME 下，随会话数据保留，不随 runtime 升级丢失）。 */
+    fun guardDir(ctx: Context): File = File(dshHome(ctx), "guard")
+
+    /** 兜底脚本本体；不存在时 [buildEnv] 不注入 NODE_OPTIONS。 */
+    fun guardScript(ctx: Context): File = File(guardDir(ctx), "kxxy-guard.cjs")
+
+    /**
+     * 把 `assets/guard/kxxy-guard.cjs` 同步到 `$HOME/guard/`。
+     *
+     * 为什么放 assets 而不是写死在 Kotlin 的原始字符串里：它是 200 行 JS，
+     * 需要能本地跑测试（tools/test-guard.mjs 用同一份文件），塞进 Kotlin 就
+     * 既不能 lint 也不能测。为什么落到 $HOME 而不是 engine 根：engine 根随
+     * runtime 升级整体替换，而 $HOME 是持久区 —— 兜底是启动期就要生效的东西，
+     * 不能依赖「这一次安装成功」。
+     *
+     * 内容相同就不重写（避免每次启动都动磁盘），失败静默：兜底装不上只是少一层
+     * 保护，绝不能因此让引擎起不来 —— 体检页会显示「未安装」。
+     */
+    fun ensureGuard(ctx: Context) {
+        val text = runCatching {
+            ctx.assets.open(GUARD_ASSET).bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }.getOrNull() ?: return
+        val f = guardScript(ctx)
+        if (f.isFile && runCatching { f.readText() == text }.getOrDefault(false)) return
+        runCatching {
+            f.parentFile?.mkdirs()
+            f.writeText(text)
+        }
+    }
+
+    /** 兜底脚本的 assets 路径。 */
+    private const val GUARD_ASSET = "guard/kxxy-guard.cjs"
 
     /**
      * Android 适配覆盖层内容（启动时由 --patch 注入）。
