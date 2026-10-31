@@ -1752,6 +1752,70 @@ html, body {
   border: 1px solid rgba(245, 158, 11, 0.32);
 }
 
+/* 插件加载失败：比 badge-warn 更重，因为它直接导致对话页进不去 */
+.badge-danger {
+  background-color: rgba(235, 87, 87, 0.15);
+  color: var(--accent-red);
+  border: 1px solid rgba(235, 87, 87, 0.32);
+}
+
+/*
+ * 插件页顶部告警条。
+ *
+ * 只在检测到真实加载失败时出现，所以用红系而不是中性色 —— 它回答的是
+ * 「对话页为什么进不去」，不是一般提示。按钮右对齐、不撑满，避免抢走
+ * 上面那段说明的注意力。
+ */
+.plugin-alert {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid rgba(235, 87, 87, 0.35);
+  background-color: rgba(235, 87, 87, 0.08);
+}
+
+.plugin-alert-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.plugin-alert-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent-red);
+}
+
+.plugin-alert-desc {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+/* 已停用的插件整行降权，避免和「正在生效」的混在一起 */
+.plugin-row-off .setting-title,
+.plugin-row-off .setting-desc {
+  opacity: 0.62;
+}
+
+/* 加载失败的具体原因（来自引擎日志），等宽字体便于对齐错误栈首行 */
+.plugin-reason {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent-red);
+  opacity: 0.9;
+}
+
+/* 体检项里的直达按钮（例如「网页端入口」→ 插件页） */
+.check-jump {
+  align-self: flex-start;
+  margin-top: 8px;
+}
+
 /*
  * 系统权限卡片的底部操作区（一键授予）。
  *

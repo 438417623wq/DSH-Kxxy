@@ -24,6 +24,7 @@
 import { existsSync, readFileSync, statSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
+import { collectBootReport } from './bootreport.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -489,6 +490,90 @@ function checkGuard(dir) {
 }
 
 // ---------------------------------------------------------------------------
+// 网页端入口体检
+// ---------------------------------------------------------------------------
+
+/**
+ * 网页端入口体检。
+ *
+ * 这是对「体检 7/7 全绿，但用户进不去页面」那次事故的正面回应。
+ *
+ * 之前所有体检项都只看**磁盘上的配置**：补丁能不能解析、清单里 bundle 在不在、
+ * 运行时文件齐不齐。这些确实决定「引擎起不起得来」，但不决定「页面能不能用」。
+ * 官方前端在 boot 阶段要解析 client-modules，某些从桌面端搬来的插件声明了
+ * 移动端没有的 client 入口（`@deepseek-ai/dsh-client-runtime/client`），
+ * 解析失败后前端会整页替换成 `Failed to load plugins` —— 引擎活着、会话数据库
+ * 完好、所有配置都合法，于是体检全绿，而用户看到的是白底错误页。
+ *
+ * 所以这一项必须看**运行期证据**，而不是配置文件：
+ *   · `engine.log` 里 app-boot 打的 `did not activate` / `skipping profile bundle`；
+ *   · 原生 `WebBootLog` 从 WebView console 抓到的浏览器侧失败（整页替换那种）。
+ * 两者由 bootreport.mjs 统一解析，插件页也用同一份数据标注「加载失败」。
+ *
+ * 判定：
+ *   · `startup failed`（必需插件没起来）→ BAD
+ *   · 浏览器侧整页失败          → BAD（用户真的进不去）
+ *   · 只有 optional 未激活 / bundle 被跳过 → WARN（页面能用，但插件没生效）
+ *
+ * 关键：**不参与「修复」力度**。修复（RecoveryManager）动的是 profile 补丁与
+ * bundle 列表，而这里的成因是「插件与移动端客户端不兼容」——点修复既解决不了，
+ * 还会连带搬走主题与模型配置。正确动作只有一个：到「插件」页停用它。
+ */
+function checkWebBoot(report) {
+  const code = 'WEB_BOOT'
+  const title = '网页端入口'
+
+  const nameList = (names) => {
+    const uniq = [...new Set(names.filter(Boolean))]
+    return uniq.slice(0, 3).join('、') + (uniq.length > 3 ? ` 等 ${uniq.length} 个` : '')
+  }
+
+  if (report.required) {
+    return check(
+      code,
+      title,
+      Verdict.BAD,
+      `引擎启动失败：必需插件没有激活${report.inactive.length ? `（${nameList(report.inactive.map((i) => i.id))}）` : ''}`,
+      '这类问题会让引擎完全起不来，先按「修复」处理；若反复出现，把这条详情发给开发者',
+    )
+  }
+
+  if (report.browser.length) {
+    const names = report.browser.flatMap((b) => b.names)
+    const msg = report.browser[report.browser.length - 1].message.replace(/\s+/g, ' ').slice(0, 160)
+    return check(
+      code,
+      title,
+      Verdict.BAD,
+      `页面加载时插件初始化失败${names.length ? `：${nameList(names)}` : ''}。前端会整页停在「Failed to load plugins」，对话页进不去。${msg ? `（${msg}）` : ''}`,
+      '到「插件」页停用上面列出的插件，再点「应用并重启引擎」—— 插件与移动端客户端不兼容时，停用是唯一不丢数据就能恢复页面的做法',
+    )
+  }
+
+  if (report.inactive.length) {
+    return check(
+      code,
+      title,
+      Verdict.WARN,
+      `${report.inactive.length} 个入口未激活：${nameList(report.inactive.map((i) => i.id))}`,
+      '页面仍可用，但这几个插件的功能不会出现；到「插件」页停用后重启即可清掉这条提示',
+    )
+  }
+
+  if (report.skipped.length) {
+    return check(
+      code,
+      title,
+      Verdict.WARN,
+      `${report.skipped.length} 个插件被跳过：${nameList(report.skipped.map((s) => s.name))}`,
+      '被跳过的插件通常没装全（依赖不完整）；到「插件」页停用它，或在对话页侧栏重装',
+    )
+  }
+
+  return check(code, title, Verdict.OK, '本轮日志里没有插件加载失败')
+}
+
+// ---------------------------------------------------------------------------
 // 备份记录（只读）
 // ---------------------------------------------------------------------------
 /**
@@ -567,6 +652,16 @@ export const CORE_BUNDLES = [
  */
 export function runHealthCheck(root) {
   const p = healthPaths(root)
+
+  // 启动失败报告：任何异常都不能让体检整体失败（日志正被写入时可能读到半行、
+  // 权限问题也可能抛）。拿不到就按「没抓到」处理，不能反过来把体检搞崩。
+  let boot
+  try {
+    boot = collectBootReport(p.engineRoot, p.dshHome)
+  } catch {
+    boot = { started: 0, skipped: [], inactive: [], required: false, browser: [], failedNames: [] }
+  }
+
   const checks = [
     checkPatchFile(p.profilePatch, 'PROFILE_PATCH', 'profile 补丁'),
     checkPatchFile(p.homePatch, 'HOME_PATCH', 'home 补丁'),
@@ -575,6 +670,7 @@ export function runHealthCheck(root) {
     checkExtensions(p.engineRoot ? join(p.engineRoot, 'extensions') : ''),
     checkRuntime(p.engineRoot),
     checkGuard(p.guardDir),
+    checkWebBoot(boot),
   ]
 
   const bad = checks.filter((c) => c.verdict === Verdict.BAD)
@@ -583,12 +679,19 @@ export function runHealthCheck(root) {
 
   // 建议力度：红项里只要有「补丁/清单」类，L1 就能解（移文件 + 收缩 bundle）；
   // 只有运行时坏了才需要 L3。
+  //
+  // WEB_BOOT 刻意排除：它的成因是插件与移动端客户端不兼容，而修复动的是补丁与
+  // bundle 列表 —— 既治不了病，还会连带搬走主题与模型配置（缺陷 BW/CA 的教训）。
+  // 它只报红，正确动作是去「插件」页停用那一个插件。
   let level = 'NONE'
-  if (bad.some((c) => c.code === 'RUNTIME')) level = 'L3'
-  else if (bad.length) level = 'L1'
+  const repairable = bad.filter((c) => c.code !== 'WEB_BOOT')
+  if (repairable.some((c) => c.code === 'RUNTIME')) level = 'L3'
+  else if (repairable.length) level = 'L1'
 
+  const webBootBad = bad.some((c) => c.code === 'WEB_BOOT')
   let headline
-  if (!bad.length && !warn.length && !unknown.length) headline = '启动配置健康，下次重启可以正常起来'
+  if (webBootBad) headline = '有插件没加载起来，对话页可能进不去'
+  else if (!bad.length && !warn.length && !unknown.length) headline = '启动配置健康，下次重启可以正常起来'
   else if (!bad.length && !unknown.length) headline = `启动配置健康，有 ${warn.length} 项提示（已自动兜底，不影响启动）`
   else if (!bad.length) headline = `有 ${unknown.length} 项无法验证（不影响启动）`
   else headline = `发现 ${bad.length} 项问题，建议修复后再重启`
@@ -604,6 +707,8 @@ export function runHealthCheck(root) {
       engineRoot: p.engineRoot,
     },
     checks,
+    // 插件页/概览页可直接拿这份名单标红，不必再解析一次日志
+    bootFailures: boot.failedNames,
     // 首页/底栏要按「红黄绿」三色给个总状态，前端不该自己再数一遍
     warnCount: warn.length,
     lastRecovery: latestRecovery(p.recoveryRoot),

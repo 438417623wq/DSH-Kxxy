@@ -741,6 +741,10 @@ class EngineSupervisor(private val ctx: Context) {
         // 异常兜底脚本：必须在 buildEnv 之前落盘，否则 NODE_OPTIONS 不会注入
         // （buildEnv 检查文件存在才拼 --require，见 EngineConfig 里的四条纪律）。
         EngineConfig.ensureGuard(ctx)
+        // 网页端启动失败记录按「一次引擎启动」为一轮：上一轮抓到的失败属于
+        // 上一次的插件配置，留着会让体检在用户已经停用插件、重启过之后仍然报红。
+        // 新页面一旦再次失败会立刻重新写入（MainActivity 的 console 回调）。
+        WebBootLog.reset(ctx)
     }
 
     /**

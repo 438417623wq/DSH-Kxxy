@@ -15,6 +15,7 @@ import app.kxxy.engine.EngineConfig
 import app.kxxy.engine.EngineSupervisor
 import app.kxxy.engine.PermCatalog
 import app.kxxy.engine.ShizukuBridge
+import app.kxxy.engine.WebBootLog
 import app.kxxy.service.EngineService
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
@@ -153,6 +154,10 @@ class MainActivity : Activity() {
         webView.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
                 Log.d(TAG, "console/${msg.messageLevel()} ${msg.sourceId()}:${msg.lineNumber()} ${msg.message()}")
+                // 体检只看得见磁盘，看不见浏览器 —— 而「装了插件后进不去页面」
+                // 只发生在浏览器侧（前端 boot 阶段整页替换成 Failed to load
+                // plugins，引擎本身活着）。这里把那条错误落盘，体检才可能报出来。
+                WebBootLog.record(this@MainActivity, msg.message(), msg.sourceId(), msg.lineNumber())
                 return true
             }
 

@@ -38,6 +38,7 @@ import { fileURLToPath } from 'node:url'
 import * as extinstall from './extinstall.mjs'
 import * as health from './health.mjs'
 import * as mirror from './mirror.mjs'
+import * as plugins from './plugins.mjs'
 import { tarGzSync } from './tar.mjs'
 
 /** 插件名。 */
@@ -1047,6 +1048,51 @@ export function apply(ctx) {
               return
             }
             sendJson(res, 200, result)
+            return
+          }
+
+          // ── 插件启停（对话页白屏时的救命入口）───────────────────────
+          //
+          // 官方插件管理页在对话页侧栏里，而「装了插件导致对话页进不去」时
+          // 那个入口正好打不开。这里给控制台一条独立通道：列清单 + 改
+          // profile 清单里的 bundles，改完由用户点重启生效。
+          //
+          // 只动 bundles，不删 node_modules —— 停用要能一键恢复，且不该
+          // 为了「让我先进得去」去等一次几百 MB 的下载。
+          if (path === '/kxxy/api/plugins' && req.method === 'GET') {
+            try {
+              sendJson(res, 200, plugins.listPlugins(extinstall.engineRoot()))
+            } catch (e) {
+              // 清单坏了也要把原因说清楚：这时用户正需要知道「为什么列不出来」
+              sendJson(res, 500, { ok: false, error: String(e?.message ?? e) })
+            }
+            return
+          }
+
+          if (path === '/kxxy/api/plugins/toggle' && req.method === 'POST') {
+            const raw = await readBody(req)
+            let payload
+            try {
+              payload = JSON.parse(raw || '{}')
+            } catch {
+              sendJson(res, 400, { error: 'invalid json' })
+              return
+            }
+            try {
+              const result = plugins.setPluginEnabled(
+                String(payload.name ?? ''),
+                Boolean(payload.enabled),
+                extinstall.engineRoot(),
+              )
+              ctx.logger?.info?.(
+                `[kxxy-host] plugin ${payload.name} -> ${payload.enabled ? 'enabled' : 'disabled'}`,
+              )
+              sendJson(res, 200, result)
+            } catch (e) {
+              // 受保护组件、清单里没有、写盘失败都走这里 —— 明确报错，
+              // 绝不返回「成功」让用户以为已经停用了
+              sendJson(res, 400, { error: String(e?.message ?? e) })
+            }
             return
           }
 

@@ -135,6 +135,16 @@
     btnRestartEngine: document.getElementById('btn-restart-engine'),
     btnExportLogs: document.getElementById('btn-export-logs'),
 
+    // 插件视图（对话页白屏时的停用入口）
+    pluginList: document.getElementById('plugin-list'),
+    pluginAlert: document.getElementById('plugin-alert'),
+    pluginAlertTitle: document.getElementById('plugin-alert-title'),
+    pluginAlertDesc: document.getElementById('plugin-alert-desc'),
+    btnPluginDisableBroken: document.getElementById('btn-plugin-disable-broken'),
+    btnPluginRestart: document.getElementById('btn-plugin-restart'),
+    pluginHint: document.getElementById('plugin-hint'),
+    btnOpenPlugins: document.getElementById('btn-open-plugins'),
+
     // 体检视图元素（方案 K 常驻形态）
     healthRing: document.getElementById('health-ring'),
     healthRingIcon: document.getElementById('health-ring-icon'),
@@ -394,8 +404,21 @@
             pane.classList.remove('active');
           }
         });
+
+        // 插件页每次进入都重新拉一次：清单可能刚被对话页的插件管理改过，
+        // 而这一页存在的意义就是「别处打不开时的可靠副本」，不能缓存旧状态。
+        if (targetView === 'plugins') fetchPlugins();
       });
     });
+  }
+
+  /**
+   * 程序化切页：直接点对应 Tab，让「切换 Tab 时要做的副作用」
+   * （插件页重拉、体检页起轮询）只在一处维护。
+   */
+  function goToView(target) {
+    const btn = Array.from(dom.tabItems).find((b) => b.getAttribute('data-target') === target);
+    if (btn) btn.click();
   }
 
   // ==========================================
@@ -1996,7 +2019,9 @@
         } else if (item.verdict === 'WARN') {
           iconClass = 'check-status-icon warn';
           iconSymbol = '!';
-          badgeText = '已兜底';
+          // GUARD 的文案是「已兜底」（引擎活着，插件报过错）；网页端入口那条
+          // 只是「插件没激活」，说成兜底会让人以为已经处理过了。
+          badgeText = item.code === 'GUARD' ? '已兜底' : '提示';
         } else if (item.verdict === 'UNKNOWN') {
           iconClass = 'check-status-icon unknown';
           iconSymbol = '–';
@@ -2009,6 +2034,12 @@
           ? `<div class="check-fixhint">${escapeHtml(item.fixHint)}</div>`
           : '';
 
+        // 网页端入口这一类，正确动作只有「去插件页停用」，给一个直达按钮 ——
+        // 让用户自己在五个页签里找，正是在他最不方便的时候再加一道门槛。
+        const jump = item.code === 'WEB_BOOT' && item.verdict !== 'OK'
+          ? '<button class="button button-subtle button-sm check-jump" data-goto="plugins">去停用插件</button>'
+          : '';
+
         div.innerHTML = `
           <div class="${iconClass}" aria-hidden="true">${iconSymbol}</div>
           <div class="check-content">
@@ -2018,26 +2049,36 @@
             </div>
             <div class="check-detail">${escapeHtml(item.detail || '')}</div>
             ${fixHint}
+            ${jump}
           </div>
         `;
+        const jumper = div.querySelector('[data-goto]');
+        if (jumper) {
+          jumper.addEventListener('click', () => goToView(jumper.getAttribute('data-goto')));
+        }
         dom.healthChecks.appendChild(div);
       });
     }
 
     if (dom.healthCountBadge) {
       dom.healthCountBadge.textContent = bad.length
-        ? `${bad.length} 项待修`
+        ? `${bad.length} 项待处理`
         : warn.length
           ? `${warn.length} 项提示`
           : (unknown.length ? `${unknown.length} 项未知` : '全部通过');
     }
 
     // ── 修复区 ────────────────────────────────────────────
-    // 只在真有 BAD 项时出现。全绿却给个「修复」按钮，用户会以为有隐患。
+    // 只在「有能靠修复解决的红项」时出现。
+    //
+    // WEB_BOOT 必须排除：它的成因是插件与移动端客户端不兼容，修复动的是补丁与
+    // bundle 列表，点下去既治不了病，还会把主题/模型配置一起搬走。把「修复」
+    // 按钮摆在一个修不好的红项下面，等于骗用户去点错的地方。
+    const repairableBad = bad.filter((c) => c.code !== 'WEB_BOOT');
     if (dom.healthRepairCard) {
-      dom.healthRepairCard.hidden = bad.length === 0;
+      dom.healthRepairCard.hidden = repairableBad.length === 0;
     }
-    if (bad.length && dom.healthLevels) {
+    if (repairableBad.length && dom.healthLevels) {
       renderRepairLevels(data.level || 'L1');
     }
 
@@ -2303,6 +2344,234 @@
   }
 
   // ==========================================
+  // 7.5 插件启停（对话页白屏时的救命入口）
+  // ==========================================
+  /*
+   * 为什么这个页面值得单独存在：
+   *
+   * 官方插件管理在对话页侧栏里。而「装了插件 → 对话页停在 Failed to load
+   * plugins」这个场景下，侧栏根本打不开 —— 用户最需要停用插件的时刻，
+   * 唯一入口正好失效，只剩清数据或重装。
+   *
+   * 控制台（/kxxy）与对话页同源、同一台引擎，但走独立路由，所以它必须在
+   * 那种状态下依然可用。这里的改动只动 profile 清单的 bundles 数组：
+   * 停用 = 摘掉（包体保留），启用 = 加回，生效需要重启引擎。
+   */
+  let pluginsCache = null;
+  let pluginsDirty = 0;
+
+  /** 拉清单。失败也要渲染出原因 —— 用户正在找了毛病，不能只给个「加载中」。 */
+  async function fetchPlugins() {
+    try {
+      const data = await apiGet('/kxxy/api/plugins');
+      if (!data || data.ok === false) {
+        renderPluginsError((data && data.error) || '接口没有返回数据');
+        return;
+      }
+      pluginsCache = data;
+      renderPlugins(data);
+    } catch (err) {
+      renderPluginsError(err.message || String(err));
+    }
+  }
+
+  function renderPluginsError(message) {
+    if (!dom.pluginList) return;
+    dom.pluginList.innerHTML = '';
+    const row = el(`
+      <div class="setting-row">
+        <div class="setting-info">
+          <span class="setting-title">读不到插件清单</span>
+          <span class="setting-desc">${escapeHtml(message)}</span>
+        </div>
+      </div>
+    `);
+    dom.pluginList.appendChild(row);
+    // 清单读不出来时，「一键停用」无从下手，必须禁用（否则点了只会报错）
+    if (dom.btnPluginDisableBroken) dom.btnPluginDisableBroken.disabled = true;
+    if (dom.pluginAlert) dom.pluginAlert.style.display = 'none';
+  }
+
+  /**
+   * 渲染插件列表。
+   *
+   * 排序由服务端完成（失败的排最前），这里只负责把「能不能点」表达清楚：
+   *   · 核心 bundle / 宿主插件 → 不给开关，标「受保护」；
+   *   · 已停用 → 灰行 + 「已停用」徽章，开关仍可点以恢复；
+   *   · 清单里有、盘上没有 → 「未装全」，停用它是最省事的处理。
+   */
+  function renderPlugins(data) {
+    if (!dom.pluginList) return;
+    const list = Array.isArray(data.plugins) ? data.plugins : [];
+
+    /* 顶部告警：只有真的抓到加载失败才出现。
+       名单来自引擎日志与浏览器 console，是「页面为什么进不去」的唯一证据。 */
+    const failed = list.filter((p) => p.failed);
+    if (dom.pluginAlert) {
+      if (failed.length) {
+        dom.pluginAlert.style.display = '';
+        if (dom.pluginAlertTitle) {
+          dom.pluginAlertTitle.textContent = `${failed.length} 个插件没有加载起来`;
+        }
+        if (dom.pluginAlertDesc) {
+          dom.pluginAlertDesc.textContent =
+            `${failed.map((p) => p.name).join('、')} —— 它们会让对话页停在「Failed to load plugins」。停用后重启即可恢复，会话不会丢。`;
+        }
+        if (dom.btnPluginDisableBroken) {
+          // 已经全被停用（或全是受保护项）就没必要再给按钮
+          const actionable = failed.filter((p) => p.enabled && !p.protected);
+          dom.btnPluginDisableBroken.disabled = actionable.length === 0;
+          dom.btnPluginDisableBroken.textContent = actionable.length
+            ? `一键停用（${actionable.length}）`
+            : '已全部停用';
+        }
+      } else {
+        dom.pluginAlert.style.display = 'none';
+      }
+    }
+
+    dom.pluginList.innerHTML = '';
+    if (!list.length) {
+      dom.pluginList.innerHTML = `
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="setting-title">清单里还没有第三方插件</span>
+            <span class="setting-desc">装插件请到对话页侧栏 →「插件」→「+ 添加插件」</span>
+          </div>
+        </div>`;
+      return;
+    }
+
+    list.forEach((p) => {
+      const row = document.createElement('div');
+      row.className = 'setting-row plugin-row';
+      if (!p.enabled) row.classList.add('plugin-row-off');
+
+      const badges = [];
+      if (p.failed) badges.push('<span class="badge badge-danger">加载失败</span>');
+      if (!p.enabled) badges.push('<span class="badge badge-subtle">已停用</span>');
+      if (p.missing) badges.push('<span class="badge badge-warn">未装全</span>');
+      if (p.protected) badges.push('<span class="badge badge-accent">受保护</span>');
+
+      const meta = [p.version ? `v${p.version}` : '', p.description || ''].filter(Boolean).join(' · ');
+      row.innerHTML = `
+        <div class="setting-info">
+          <span class="setting-title">${escapeHtml(p.name)} ${badges.join(' ')}</span>
+          <span class="setting-desc">${escapeHtml(meta || '（无描述）')}</span>
+          ${p.failed && p.reason ? `<span class="setting-desc plugin-reason">${escapeHtml(p.reason)}</span>` : ''}
+        </div>
+      `;
+
+      if (!p.protected) {
+        const label = document.createElement('label');
+        label.className = 'toggle-switch';
+        label.innerHTML = `
+          <input type="checkbox" ${p.enabled ? 'checked' : ''}>
+          <span class="toggle-slider"></span>
+        `;
+        const input = label.querySelector('input');
+        input.addEventListener('change', () => togglePlugin(p.name, input.checked, input));
+        row.appendChild(label);
+      }
+      dom.pluginList.appendChild(row);
+    });
+
+    updatePluginFoot();
+  }
+
+  /** 只切一个插件。失败就回滚开关状态 —— 不能让 UI 显示成「已停用」而文件没改。 */
+  async function togglePlugin(name, enabled, input) {
+    if (input) input.disabled = true;
+    try {
+      const res = await apiPost('/kxxy/api/plugins/toggle', { name, enabled });
+      if (res && res.changed === false) {
+        showToast(`${name} 已经是${enabled ? '启用' : '停用'}状态`, 'info');
+      } else {
+        pluginsDirty += 1;
+        showToast(`${name} 已${enabled ? '启用' : '停用'}，重启引擎后生效`, 'success');
+      }
+      await fetchPlugins();
+    } catch (err) {
+      if (input) input.checked = !enabled;
+      showToast(err.message || '操作失败', 'error');
+    } finally {
+      if (input) input.disabled = false;
+    }
+  }
+
+  /** 底部按钮：有没有待生效的改动。 */
+  function updatePluginFoot() {
+    if (!dom.btnPluginRestart) return;
+    if (pluginsDirty > 0) {
+      dom.btnPluginRestart.disabled = false;
+      dom.btnPluginRestart.textContent = `应用并重启引擎（${pluginsDirty} 项待生效）`;
+      if (dom.pluginHint) {
+        dom.pluginHint.textContent = '重启期间对话页会短暂断开，会话与设置都不会丢。';
+      }
+    } else {
+      dom.btnPluginRestart.disabled = true;
+      dom.btnPluginRestart.textContent = '应用并重启引擎';
+      if (dom.pluginHint) {
+        dom.pluginHint.textContent = '改动要重启引擎才生效。重启期间对话页会短暂断开，会话不会丢。';
+      }
+    }
+  }
+
+  /** 一键停用所有「开着且加载失败」的插件，然后提示重启。 */
+  async function disableBrokenPlugins() {
+    const list = (pluginsCache && pluginsCache.plugins) || [];
+    const targets = list.filter((p) => p.failed && p.enabled && !p.protected).map((p) => p.name);
+    if (!targets.length) return;
+    if (dom.btnPluginDisableBroken) dom.btnPluginDisableBroken.disabled = true;
+    let ok = 0;
+    for (const name of targets) {
+      try {
+        const res = await apiPost('/kxxy/api/plugins/toggle', { name, enabled: false });
+        if (res && res.changed) ok += 1;
+      } catch (err) {
+        showToast(`${name} 停用失败：${err.message || err}`, 'error');
+      }
+    }
+    pluginsDirty += ok;
+    showToast(ok ? `已停用 ${ok} 个插件，点下方「应用并重启引擎」生效` : '没有可停用的插件', ok ? 'success' : 'info');
+    await fetchPlugins();
+  }
+
+  async function restartForPlugins() {
+    if (!dom.btnPluginRestart) return;
+    const ok = await confirmDialog({
+      title: '应用插件改动',
+      desc: '引擎会重启一次，对话页需要重新加载。\n会话、工作区与设置都不会丢失。',
+      okText: '重启',
+    });
+    if (!ok) return;
+    dom.btnPluginRestart.disabled = true;
+    try {
+      await apiPost('/kxxy/api/action', { action: 'restart-engine' });
+      pluginsDirty = 0;
+      showToast('重启请求已提交，引擎将在 1~2 秒内重启', 'success');
+      setTimeout(fetchPlugins, 4000);
+      setTimeout(fetchPlugins, 9000);
+    } catch {
+      dom.btnPluginRestart.disabled = false;
+    }
+  }
+
+  function initPlugins() {
+    if (dom.btnPluginRestart) {
+      dom.btnPluginRestart.addEventListener('click', restartForPlugins);
+    }
+    if (dom.btnPluginDisableBroken) {
+      dom.btnPluginDisableBroken.addEventListener('click', disableBrokenPlugins);
+    }
+    // 概览页「服务管理」里的直达按钮
+    if (dom.btnOpenPlugins) {
+      dom.btnOpenPlugins.addEventListener('click', () => goToView('plugins'));
+    }
+    updatePluginFoot();
+  }
+
+  // ==========================================
   // 8. 轮询生命周期管理 (支持 visibilitychange)
   // ==========================================
   function startPolling() {
@@ -2347,11 +2616,15 @@
     initAboutDialog();
     initBatchActions();
     initHealth();
+    initPlugins();
     initLifecycle();
 
     // 启动初始拉取
     startPolling();
     fetchExtensions();
+    // 插件清单也预拉一次：概览页/体检页的红色提示要能立刻点进插件页，
+    // 而不是等用户切过去才开始加载。
+    fetchPlugins();
   }
 
   if (document.readyState === 'loading') {

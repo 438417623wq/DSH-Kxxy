@@ -1275,6 +1275,21 @@ object EngineConfig {
     private const val GUARD_ASSET = "guard/kxxy-guard.cjs"
 
     /**
+     * 网页端启动失败记录的目录（`$HOME/web-boot/`）。
+     *
+     * 为什么和 guard 平级放在 $HOME：体检（kxxy-host/health.mjs）就是按
+     * `DSH_HOME` 找这些文件的，同层摆放不需要再给插件加一条原生通道；
+     * 而 engine 根会随 runtime 升级整体替换，写在那里会被下一次升级抹掉。
+     */
+    fun webBootDir(ctx: Context): File = File(dshHome(ctx), "web-boot")
+
+    /**
+     * 网页端启动失败记录（由 [WebBootLog] 从 WebView console 抓到后写入，
+     * 体检读它来判断「页面是不是根本进不去」）。
+     */
+    fun webBootFile(ctx: Context): File = File(webBootDir(ctx), "web-boot.json")
+
+    /**
      * Android 适配覆盖层内容（启动时由 --patch 注入）。
      *
      * 三条硬约束（每条都是上游行为决定，不是可选项）：

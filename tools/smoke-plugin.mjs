@@ -1298,6 +1298,91 @@ console.log('\n[14b] /kxxy/api/health（启动配置体检）')
         else ok('安装未完成（无 .links.json）→ OK（跳过，不误报）')
       }
     }
+
+    // ⑩c 网页端入口：真机事故「体检 7/7 全绿，对话页却停在
+    //     Failed to load plugins」。前面的格子把 manifest 与覆盖层都弄坏了，
+    //     先恢复成健康基线，再喂一条浏览器侧失败，专测这一项。
+    {
+      writeFileSync(join(FAKE_ENGINE_ROOT, 'android-overlay.yml'), '- id: sandbox-policy\n  config: {}\n')
+      writeFileSync(join(profileDir, 'cordis.patch.yml'), '- id: ui-theme\n')
+      writeFileSync(join(profileDir, 'package.json'), JSON.stringify({
+        name: 'dsh-profile-web',
+        dependencies: { 'dsh-web-mobile': '3.1.0', '@neystan/dsh-pet': '0.4.1' },
+        dsh: {
+          profile: {
+            bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-web-mobile', '@neystan/dsh-pet'],
+          },
+        },
+      }, null, 2))
+      writeFileSync(
+        join(FAKE_ENGINE_ROOT, 'engine.log'),
+        `---- engine start ${Date.now() - 5000} ----\nweb boot: ready\n`,
+      )
+      mkdirSync(join(HOME_DIR, 'web-boot'), { recursive: true })
+      writeFileSync(
+        join(HOME_DIR, 'web-boot', 'web-boot.json'),
+        JSON.stringify({
+          version: 1,
+          entries: [{
+            at: Date.now(),
+            source: 'http://127.0.0.1:3080/',
+            message: 'Uncaught Error: web boot: 2 entries did not activate @neystan/dsh-pet dsh-at-file',
+          }],
+        }),
+      )
+
+      const j = JSON.parse((await get('/kxxy/api/health')).text)
+      const c = j.checks.find((x) => x.code === 'WEB_BOOT')
+      if (c?.verdict !== 'BAD') fail(`浏览器侧加载失败应判 BAD，实为 ${c?.verdict}（${c?.detail}）`)
+      else ok('浏览器侧插件加载失败 → WEB_BOOT BAD')
+      if (j.ok !== false) fail('总评应为红色')
+      else ok('总评转红（不再假绿）')
+      if (j.level !== 'NONE') fail(`网页端失败不该给修复按钮，level 实为 ${j.level}`)
+      else ok('level=NONE：只报红，不推「修复」')
+      if (!/@neystan\/dsh-pet/.test(c?.detail ?? '')) fail(`详情没点出插件名：${c?.detail}`)
+      else ok('详情点出具体插件名')
+
+      // 插件清单：与体检读同一份失败报告
+      const list = JSON.parse((await get('/kxxy/api/plugins')).text)
+      const pet = list.plugins?.find((p) => p.name === '@neystan/dsh-pet')
+      if (!pet) fail(`清单里没有第三方插件：${JSON.stringify(list.plugins?.map((p) => p.name))}`)
+      else ok('清单列出第三方插件')
+      if (pet?.failed !== true) fail('失败插件没被标记')
+      else ok('失败插件被标记（与体检同源）')
+      const protectedBase = list.plugins?.find((p) => p.name === '@deepseek-ai/dsh-base')
+      if (protectedBase?.protected !== true) fail('核心 bundle 未标为受保护')
+      else ok('核心 bundle 标为受保护')
+
+      // 停用：改 bundles、保留 dependencies
+      const offRes = await fetch(base + '/kxxy/api/plugins/toggle', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', connection: 'close' },
+        body: JSON.stringify({ name: '@neystan/dsh-pet', enabled: false }),
+      })
+      if (offRes.status !== 200) fail(`停用应 200，实为 ${offRes.status}`)
+      else ok('停用 → 200')
+      const afterOff = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8'))
+      if (afterOff.dsh.profile.bundles.includes('@neystan/dsh-pet')) fail('bundles 未移除')
+      else ok('停用后 bundles 已移除')
+      if (afterOff.dependencies?.['@neystan/dsh-pet'] !== '0.4.1') fail('dependencies 被误删')
+      else ok('dependencies 保留（可一键恢复）')
+
+      // 受保护组件必须 400，且不能悄悄改文件
+      const guardRes = await fetch(base + '/kxxy/api/plugins/toggle', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', connection: 'close' },
+        body: JSON.stringify({ name: '@deepseek-ai/dsh-base', enabled: false }),
+      })
+      if (guardRes.status !== 400) fail(`停用核心应 400，实为 ${guardRes.status}`)
+      else ok('停用核心 bundle → 400')
+
+      // 清掉失败记录 → 应回到 OK（停用后重启的预期状态）
+      rmSync(join(HOME_DIR, 'web-boot', 'web-boot.json'), { force: true })
+      const j2 = JSON.parse((await get('/kxxy/api/health')).text)
+      const c2 = j2.checks.find((x) => x.code === 'WEB_BOOT')
+      if (c2?.verdict !== 'OK') fail(`无失败记录应判 OK，实为 ${c2?.verdict}`)
+      else ok('无失败记录 → WEB_BOOT OK（不残留假红）')
+    }
   } finally {
     if (prevHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = prevHome
