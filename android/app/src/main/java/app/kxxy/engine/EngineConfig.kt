@@ -1231,11 +1231,40 @@ object EngineConfig {
         //
         // 不注入 `--unhandled-rejections=warn`：它同样被子进程继承，会改变子进程语义。
         val guard = guardScript(ctx)
+
+        // ── 跨源访问兜底（kxxy-cors）────────────────────────────────────
+        //
+        // 插件起的本地 HTTP 服务（典型：billion-context 的压缩代理监听
+        // 18787），其前端是从宿主页 `http://127.0.0.1:3080` 直接 `fetch`
+        // 过去的绝对地址。桌面端跑在 Electron 里，渲染进程不受同源策略约束；
+        // Android WebView 强制同源，且**没有任何开关能关掉**，于是同一段代码
+        // 在手机上必然抛 `TypeError: Failed to fetch` —— 报错文本完全看不出
+        // 是跨源，用户只看到「连接代理失败」，而代理本身活得好好的。
+        //
+        // 补丁在 Node 侧给响应加 ACAO（见 assets/guard/kxxy-cors.cjs 的文件头），
+        // 与 guard 的三点不同全部是有意为之：
+        //   1. **不加 `KXXY_*_MAIN` 这类主进程开关**：代理 lane 是 spawn 出来的
+        //      独立进程，只在主进程装没有任何意义；
+        //   2. **跟着 NODE_OPTIONS 一起注入**：子进程继承 NODE_OPTIONS。已核对
+        //      上游的 spawn(`stripInheritedProxy` 只剔代理变量，另一个只剔
+        //      5 个 `BILI_*` 通道)，NODE_OPTIONS 原样传下去；
+        //   3. 脚本自身全程 try/catch：它会被装进每一个 node 子进程（包括插件
+        //      跑的 npm install），抛异常会让整个引擎起不来。
+        val cors = corsScript(ctx)
+
+        val requires = buildList {
+            if (guard.isFile && guard.length() > 0) add(guard.absolutePath)
+            if (cors.isFile && cors.length() > 0) add(cors.absolutePath)
+        }
         if (guard.isFile && guard.length() > 0) {
-            val guardPath = guard.absolutePath.replace('\\', '/')
             env += "KXXY_GUARD_DIR=${guardDir(ctx).absolutePath}"
             env += "KXXY_GUARD_MAIN=1"
-            env += "NODE_OPTIONS=--require \"$guardPath\""
+        }
+        if (requires.isNotEmpty()) {
+            // 每个路径都要单独加引号：NODE_OPTIONS 按空格切分，$HOME 带空格时
+            // 会被截成两截（缺陷 BH 的同一个坑）。
+            env += "NODE_OPTIONS=" +
+                requires.joinToString(" ") { "--require \"${it.replace('\\', '/')}\"" }
         }
 
         return env.toTypedArray()
@@ -1246,6 +1275,14 @@ object EngineConfig {
 
     /** 兜底脚本本体；不存在时 [buildEnv] 不注入 NODE_OPTIONS。 */
     fun guardScript(ctx: Context): File = File(guardDir(ctx), "kxxy-guard.cjs")
+
+    /**
+     * 跨源补丁脚本本体；不存在时 [buildEnv] 不注入 NODE_OPTIONS。
+     *
+     * 与 guard 同目录：两者都是「启动期就要落盘、必须活过 runtime 升级」的
+     * 东西，分开放只会多一个要记住的位置。
+     */
+    fun corsScript(ctx: Context): File = File(guardDir(ctx), "kxxy-cors.cjs")
 
     /**
      * 把 `assets/guard/kxxy-guard.cjs` 同步到 `$HOME/guard/`。
@@ -1259,20 +1296,34 @@ object EngineConfig {
      * 内容相同就不重写（避免每次启动都动磁盘），失败静默：兜底装不上只是少一层
      * 保护，绝不能因此让引擎起不来 —— 体检页会显示「未安装」。
      */
-    fun ensureGuard(ctx: Context) {
+    fun ensureGuard(ctx: Context) = syncGuardAsset(ctx, GUARD_ASSET, guardScript(ctx))
+
+    /**
+     * 把 `assets/guard/kxxy-cors.cjs` 同步到 `$HOME/guard/`。
+     *
+     * 与 [ensureGuard] 同一套约定（内容相同不重写、失败静默）。它比兜底更
+     * 不能失败：装不上时插件面板会一直显示「连接代理失败」，而引擎看起来
+     * 一切正常 —— 但也不能为了它把启动流程搞挂，舍与取和兜底保持一致。
+     */
+    fun ensureCors(ctx: Context) = syncGuardAsset(ctx, CORS_ASSET, corsScript(ctx))
+
+    /** guard 目录下两份脚本的落盘逻辑完全一致，只有来源/目标不同。 */
+    private fun syncGuardAsset(ctx: Context, asset: String, target: File) {
         val text = runCatching {
-            ctx.assets.open(GUARD_ASSET).bufferedReader(Charsets.UTF_8).use { it.readText() }
+            ctx.assets.open(asset).bufferedReader(Charsets.UTF_8).use { it.readText() }
         }.getOrNull() ?: return
-        val f = guardScript(ctx)
-        if (f.isFile && runCatching { f.readText() == text }.getOrDefault(false)) return
+        if (target.isFile && runCatching { target.readText() == text }.getOrDefault(false)) return
         runCatching {
-            f.parentFile?.mkdirs()
-            f.writeText(text)
+            target.parentFile?.mkdirs()
+            target.writeText(text)
         }
     }
 
     /** 兜底脚本的 assets 路径。 */
     private const val GUARD_ASSET = "guard/kxxy-guard.cjs"
+
+    /** 跨源补丁的 assets 路径。 */
+    private const val CORS_ASSET = "guard/kxxy-cors.cjs"
 
     /**
      * 网页端启动失败记录的目录（`$HOME/web-boot/`）。
