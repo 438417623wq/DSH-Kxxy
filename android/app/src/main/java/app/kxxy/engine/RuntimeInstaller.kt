@@ -2344,7 +2344,7 @@ class RuntimeInstaller(private val ctx: Context) {
          *
          * 改动 patches.mjs 里任何补丁、或增删补丁时，必须同步递增此编号。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@8"
+        private const val PATCHSET_MARKER = "kxxy-patchset@10"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**

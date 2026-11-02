@@ -21,12 +21,13 @@
  *   node tools/test-native-command.mjs [上游 index.js 路径]
  * 默认从 DSH Desktop 的 asar 解出的 node_modules 里找（见 UPSTREAM_CANDIDATES）。
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 import { createPatchContext, patchNativeCommandAndroid } from "./lib/patches.mjs";
+import { openAsar } from "./lib/registry.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -36,11 +37,34 @@ const UPSTREAM_CANDIDATES = [
   "C:/KF/deepseek harness/DSH Desktop/resources/app/node_modules/@deepseek-ai/dsh-native-command/lib/index.js",
 ].filter(Boolean);
 
+/**
+ * 兜底：直接从 `.cache/app.asar` 里抽。
+ *
+ * 上面那条固定路径是另一台构建机的解包安装位置，本机装的是 asar 形态 ——
+ * 换机器或上游发版后重装，「找不到上游 index.js」会让这个测试整个跑不起来，
+ * 看起来像补丁坏了，其实只是找不到参照物。而 `.cache/app.asar` 正是
+ * build-runtime 的输入，用它当参照物在任何机器上都成立，且不会与产物错代。
+ */
+function extractFromAsar() {
+  const asarPath = join(HERE, "..", ".cache", "app.asar");
+  if (!existsSync(asarPath)) return null;
+  try {
+    const asar = openAsar(asarPath);
+    const buf = asar.readFile("/dsh/node_modules/@deepseek-ai/dsh-native-command/lib/index.js");
+    const out = join(HERE, "..", ".cache", "upstream", "dsh-native-command-index.js");
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(out, buf);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 function locate() {
   for (const candidate of UPSTREAM_CANDIDATES) {
     if (existsSync(candidate)) return candidate;
   }
-  return null;
+  return extractFromAsar();
 }
 
 let pass = 0;

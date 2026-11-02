@@ -159,6 +159,34 @@ try {
   ok('只有 optional 失败 → WARN', webBoot.verdict === 'WARN', webBoot.verdict)
   ok('WARN 也不触发修复', health.level === 'NONE', health.level)
 
+  // 补丁降级之后的形态（patches.mjs 的 patchFrontendLenientBoot）：第三方插件
+  // 加载失败但被**跳过**，页面照常挂载。这一档必须是 WARN —— 报成 BAD 就等于
+  // 又回到「明明进得去，体检说进不去」的老毛病。
+  const lenient = fixture('lenient', {
+    log: '---- engine start 1000 ----\nweb boot: ready\n',
+    bundles: [...CORE],
+    webBoot: {
+      version: 1,
+      updatedAt: 2000,
+      entries: [
+        {
+          at: 1500,
+          source: 'http://127.0.0.1:3080/',
+          message:
+            'web boot: 1 entr from third-party plugins failed and were skipped (their UI stays absent; details below)\n' +
+            '@neystan/dsh-pet: import failed: client-modules: require("@deepseek-ai/dsh-client-runtime/client") missed the module table',
+        },
+      ],
+    },
+  })
+  process.env.DSH_HOME = lenient.home
+  health = runHealthCheck(lenient.engine)
+  webBoot = health.checks.find((c) => c.code === 'WEB_BOOT')
+  ok('已跳过的插件 → WARN（不是 BAD）', webBoot.verdict === 'WARN', webBoot.verdict)
+  ok('WARN 里点出包名', webBoot.detail.includes('@neystan/dsh-pet'), webBoot.detail)
+  ok('WARN 文案说明页面照常可用', /页面照常可用/.test(webBoot.detail), webBoot.detail)
+  ok('降级也不触发修复', health.level === 'NONE', health.level)
+
   const healthy = fixture('healthy', {
     log: '---- engine start 1000 ----\nweb boot: ready\n',
     bundles: [...CORE],
@@ -197,6 +225,67 @@ try {
   ok('失败插件排在最前', listed.plugins[0].name === '@neystan/dsh-pet', listed.plugins[0].name)
   ok('核心标为受保护', listed.plugins.find((p) => p.name === '@deepseek-ai/dsh-base').protected === true)
   ok('宿主插件标为受保护', listed.plugins.find((p) => p.name === 'kxxy-host').protected === true)
+
+  // 失败原因必须来自**浏览器侧那条消息**：引擎日志只知道「没激活」，真正的
+  // 根因（`missed the module table`）只有前端 console 里有。插件页只给红点
+  // 不给原因，用户点「停用」时就是在盲猜。
+  const reasonFixture = fixture('reason', {
+    log: '---- engine start 1000 ----\nweb boot: ready\n',
+    bundles: [...CORE, '@neystan/dsh-pet'],
+    webBoot: {
+      version: 1,
+      updatedAt: 2000,
+      entries: [
+        {
+          at: 1500,
+          message:
+            'web boot: 1 entr from third-party plugins failed and were skipped\n' +
+            '@neystan/dsh-pet: import failed: client-modules: require("@deepseek-ai/dsh-client-runtime/client") missed the module table',
+        },
+      ],
+    },
+  })
+  process.env.DSH_HOME = reasonFixture.home
+  const reasonListed = listPlugins(reasonFixture.engine)
+  const petReason = reasonListed.plugins.find((p) => p.name === '@neystan/dsh-pet')
+  ok('浏览器侧失败也会标红插件的', petReason && petReason.failed === true)
+  ok('失败原因取自浏览器消息', /missed the module table/.test(petReason.reason || ''), petReason.reason)
+
+  // 聚合包：`@neystan/dsh-web-ui-all` 自己不上前，只是把子插件的 patch 串起来。
+  // 子插件挂了、聚合包不红，用户会看到「插件页一切正常，对话页却少了三个面板」，
+  // 而真正该停用的恰恰是这个聚合包。
+  const aggFixture = fixture('aggregate', {
+    log: '---- engine start 1000 ----\nweb boot: ready\n',
+    bundles: [...CORE, '@neystan/dsh-web-ui-all'],
+    webBoot: {
+      version: 1,
+      updatedAt: 2000,
+      entries: [
+        {
+          at: 1500,
+          message:
+            'web boot: 1 entr from third-party plugins failed and were skipped\n' +
+            '@neystan/dsh-pet: import failed: client-modules: missed the module table',
+        },
+      ],
+    },
+  })
+  const aggDir = join(aggFixture.profile, 'node_modules', '@neystan', 'dsh-web-ui-all')
+  mkdirSync(aggDir, { recursive: true })
+  writeFileSync(
+    join(aggDir, 'package.json'),
+    JSON.stringify({
+      name: '@neystan/dsh-web-ui-all',
+      version: '0.1.16',
+      dependencies: { '@neystan/dsh-pet': '0.1.16' },
+    }),
+  )
+  process.env.DSH_HOME = aggFixture.home
+  const aggRow = listPlugins(aggFixture.engine).plugins.find((p) => p.name === '@neystan/dsh-web-ui-all')
+  ok('聚合包因子插件失败而标红', aggRow && aggRow.failed === true, JSON.stringify(aggRow))
+  ok('聚合包借到子插件的原因', /missed the module table/.test(aggRow.reason || ''), aggRow.reason)
+
+  process.env.DSH_HOME = pluginFixture.home
 
   const disabled = setPluginEnabled('@neystan/dsh-pet', false, pluginFixture.engine)
   ok('停用返回 requiresRestart', disabled.requiresRestart === true)

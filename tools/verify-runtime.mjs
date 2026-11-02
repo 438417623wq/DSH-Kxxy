@@ -805,6 +805,7 @@ for (const [suffix, label] of NEED_ANY) {
   const BUNDLE_CHECKS = [
     {
       entry: "lib/node_modules/@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.js",
+      label: "归档与音视频 provider",
       // 归档预览（zip / epub）与音视频预览各自的入口 + 收尾调用。
       needles: [
         ["function kxxyArchiveApply(", "归档 provider 片段"],
@@ -814,8 +815,19 @@ for (const [suffix, label] of NEED_ANY) {
         ["/kxxy/media?path=", "音视频指向宿主媒体路由"],
       ],
     },
+    {
+      // 客户端插件兼容：老世代运行时总包别名。缺了它，装了 neystan 全家桶 /
+      // dsh-at-file 这类老插件时，对话页会整页停在 `Failed to load plugins`。
+      entry: "lib/node_modules/@deepseek-ai/dsh-client-modules/lib/client.js",
+      label: "客户端运行时总包别名",
+      needles: [
+        ["KXXY_CLIENT_RUNTIME_ALIAS", "别名补丁记号"],
+        ["[\"@deepseek-ai/dsh-client-runtime/client\",\"@deepseek-ai/dsh-client-store\"]", "别名指向 store 种子"],
+        ["this.seed.set(kxxyAlias", "别名写进种子表"],
+      ],
+    },
   ];
-  for (const { entry, needles } of BUNDLE_CHECKS) {
+  for (const { entry, label, needles } of BUNDLE_CHECKS) {
     const file = byName.get(entry);
     if (!file) {
       console.log(`\n上游补丁痕迹：✗ ${entry} 缺失，跳过`);
@@ -824,12 +836,41 @@ for (const [suffix, label] of NEED_ANY) {
     const text = readLocal(file).toString("utf8");
     const absent = needles.filter(([needle]) => !text.includes(needle));
     if (absent.length > 0) {
-      for (const [, label] of absent) {
-        console.log(`上游补丁痕迹：✗ ${label} 不在 ${entry.split("/").pop()} 里（补丁未生效）`);
+      for (const [, what] of absent) {
+        console.log(`上游补丁痕迹：✗ ${what} 不在 ${entry.split("/").pop()} 里（补丁未生效）`);
       }
       missing += absent.length;
     } else {
-      console.log(`\n上游补丁痕迹：✓ 归档与音视频 provider 均已写进 ${entry.split("/").pop()}（${needles.length} 项特征齐备）`);
+      console.log(`\n上游补丁痕迹：✓ ${label} 均已写进 ${entry.split("/").pop()}（${needles.length} 项特征齐备）`);
+    }
+  }
+
+  // 前端主 chunk 的文件名带内容哈希，只能按目录扫。这里查的是「第三方插件
+  // 加载失败降级」的措辞 —— 它同时是体检判 WARN 的依据，改了字就会失配。
+  {
+    const feEntries = [...byName.keys()].filter(
+      (k) =>
+        k.startsWith("lib/node_modules/@deepseek-ai/dsh-web-frontend/dist/assets/") &&
+        /\/index-[^/]+\.js$/.test(k),
+    );
+    if (feEntries.length !== 1) {
+      console.log(`\n上游补丁痕迹：✗ 前端主 chunk 命中 ${feEntries.length} 个（期望 1 个）`);
+      missing += 1;
+    } else {
+      const text = readLocal(byName.get(feEntries[0])).toString("utf8");
+      const feNeedles = [
+        ["failed and were skipped", "第三方插件降级告警"],
+        ["kxxyFatal", "官方包仍然硬失败的判据"],
+      ];
+      const absent = feNeedles.filter(([n]) => !text.includes(n));
+      if (absent.length > 0) {
+        for (const [, what] of absent) {
+          console.log(`上游补丁痕迹：✗ ${what} 不在前端主 chunk 里（补丁未生效）`);
+        }
+        missing += absent.length;
+      } else {
+        console.log(`\n上游补丁痕迹：✓ 前端 boot 降级已写进 ${feEntries[0].split("/").pop()}（2 项特征齐备）`);
+      }
     }
   }
 }

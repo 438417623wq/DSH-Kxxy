@@ -104,6 +104,9 @@ function packageMeta(name, engineRoot) {
       return {
         version: String(pkg.version ?? ''),
         description: String(pkg.description ?? ''),
+        // 依赖名留一份：判断「这个聚合包是不是因为子插件挂了才红」要用它
+        // （见 listPlugins 里的 failed 判定）。不为它多读一次磁盘。
+        deps: Object.keys(pkg.dependencies ?? {}),
         found: true,
       }
     } catch {
@@ -111,6 +114,21 @@ function packageMeta(name, engineRoot) {
     }
   }
   return { version: '', description: '', found: false }
+}
+
+/**
+ * 聚合包的红点原因：从它依赖里借一条子插件的解释。
+ *
+ * `@neystan/dsh-web-ui-all` 这类包自己不上前 —— 它只是把若干子插件的 patch
+ * 串起来。子插件加载失败时，红点落在聚合包上（那才是该停用的东西），但它
+ * 自己没有任何报错，reasonOf 里也查不到它。这里顺着依赖表往下找一层。
+ */
+function failedReasonFromDeps(meta, reasonOf) {
+  for (const dep of meta.deps ?? []) {
+    const reason = reasonOf.get(dep)
+    if (reason) return `${dep}: ${reason}`
+  }
+  return null
 }
 
 /**
@@ -133,10 +151,30 @@ export function listPlugins(engineRoot) {
   const reasonOf = new Map()
   for (const item of boot.inactive) reasonOf.set(item.id, item.detail)
   for (const item of boot.skipped) reasonOf.set(item.name, item.reason)
+  // 浏览器侧的失败原因也要能显示出来：那条消息里才有真正的根因
+  // （`missed the module table - not a platform seed word…`）。用户点「停用」
+  // 之前最想知道的就是这个，只给一个红点等于让他猜。
+  for (const entry of boot.browser ?? []) {
+    const text = String(entry.message ?? '')
+    for (const n of entry.names ?? []) {
+      if (reasonOf.has(n)) continue
+      const line = text.split('\n').find((l) => l.includes(n)) ?? ''
+      reasonOf.set(n, (line || text).replace(/\s+/g, ' ').trim().slice(0, 240))
+    }
+  }
 
   // 装过的 = 依赖表里的 + bundles 里的（有些 bundle 由 native 直接写进 bundles，
   // 但没写进 dependencies，例如 kxxy-host）
   const installed = new Set([...Object.keys(dependencies), ...bundles])
+
+  // 「已跳过」档：前端降级补丁（patches.mjs 的 patchFrontendLenientBoot）把
+  // 第三方插件的加载失败变成「跳过这个插件、页面照常」。这类失败与「对话页
+  // 进不去」不是一回事，前端要把两种文案分开，所以在这里标出来。
+  const softNames = new Set()
+  for (const entry of boot.browser ?? []) {
+    if (!/failed and were skipped/.test(String(entry.message ?? ''))) continue
+    for (const n of entry.names ?? []) softNames.add(n)
+  }
 
   const plugins = [...installed].map((name) => {
     const meta = packageMeta(name, engineRoot)
@@ -144,13 +182,16 @@ export function listPlugins(engineRoot) {
     const protectedPlugin = PROTECTED.has(name)
     // 名字匹配要够松（entry id 常常只是包名的一段），但也不能太松：
     // 4 个字符以下的片段（`dsh`、`kxxy`）会把无关插件一起标红。
-    const failed = [...failedSet].some(
-      (f) =>
-        f === name ||
-        name.endsWith(`/${f}`) ||
-        f.endsWith(`/${name}`) ||
-        (f.length >= 6 && name.includes(f)),
+    //
+    // 也认「自己的依赖有没有挂」：聚合包（`@neystan/dsh-web-ui-all` 这种）自己
+    // 不上前，patch 层里 insert 的是它的依赖。子插件挂了、聚合包不红，用户就会
+    // 看到「插件页一切正常，对话页却少了三个面板」—— 而真正该停用的恰恰是这个
+    // 聚合包（停用它会连带摘掉整张 patch 层）。
+    const matched = [...failedSet].filter(
+      (f) => nameMatches(name, f) || (meta.deps ?? []).some((d) => nameMatches(d, f)),
     )
+    const failed = matched.length > 0
+    const soft = failed && matched.every((m) => softNames.has(m))
     return {
       name,
       version: meta.version,
@@ -161,7 +202,11 @@ export function listPlugins(engineRoot) {
       /** 清单里有、盘上没有：装了但没装全，停用它是最省事的处理。 */
       missing: !meta.found,
       failed,
-      reason: failed ? (reasonOf.get(name) ?? '') : '',
+      /** true = 失败但已被前端跳过（页面可用，只是功能不出现）。 */
+      soft,
+      // 聚合包自己没报错，原因来自它的子插件 —— 直接把子插件的那条原因借过来，
+      // 否则聚合包只有一个红点、没有任何解释。
+      reason: failed ? (reasonOf.get(name) ?? failedReasonFromDeps(meta, reasonOf) ?? '') : '',
     }
   })
 
@@ -231,6 +276,23 @@ export function setPluginEnabled(name, enabled, engineRoot) {
   renameSync(tmp, file)
 
   return { ok: true, name: target, enabled: Boolean(enabled), changed: true, requiresRestart: true }
+}
+
+/**
+ * 失败名与插件名是否指同一个东西。
+ *
+ * 两侧都可能只是「一段」：entry id 常常是包名的一部分（`pet` ↔
+ * `@neystan/dsh-pet`），所以允许双向 endsWith。但 6 个字符以下不放开
+ * `includes`，否则 `dsh`、`kxxy` 这种片段会把无关插件一起标红。
+ */
+function nameMatches(row, candidate) {
+  if (!row || !candidate) return false
+  return (
+    row === candidate ||
+    row.endsWith(`/${candidate}`) ||
+    candidate.endsWith(`/${row}`) ||
+    (candidate.length >= 6 && row.includes(candidate))
+  )
 }
 
 /** 只保留最近 N 份 `package.json.bak-*`（时间戳后缀字典序即时间序）。 */

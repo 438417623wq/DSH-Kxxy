@@ -312,6 +312,32 @@ async function writeThemePreference(settings, preference) {
 }
 
 /**
+ * 上游 DSH 核心版本，供「关于」弹窗显示。
+ *
+ * 为什么值得单独读一次：同步桌面版发版（换 app.asar 重打 runtime）之后，
+ * 设备上**没有任何别的办法**确认到底换没换成功 —— 应用版本号描述的是 APK，
+ * 与上游无关。这里直接读引擎根里那份 `package.json`，与正在跑的代码是同
+ * 一份文件，不可能错代。
+ *
+ * 一个进程生命周期内不会变（换版本必然重启引擎），读到就缓存。
+ * 读不到返回 null，前端会显示占位符 `—`，不编造。
+ */
+let dshVersionCache = null
+function readDshVersion(engineRoot) {
+  if (dshVersionCache) return dshVersionCache
+  if (!engineRoot) return null
+  try {
+    const pkgPath = join(engineRoot, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+    dshVersionCache = typeof pkg.version === 'string' ? pkg.version : null
+  } catch {
+    // 老 runtime 或目录被裁剪时读不到，保持 null
+    dshVersionCache = null
+  }
+  return dshVersionCache
+}
+
+/**
  * 采集引擎状态。
  *
  * 数据来源分两类：
@@ -338,6 +364,9 @@ function collectEngineState(ctx) {
 
   // 用户保存但尚未生效的权限等级（前端显示「已保存 · 重启引擎后生效」徽章）
   const engineRoot = extinstall.engineRoot()
+  // 上游核心版本：与「应用版本」并列展示，用来确认 APK 里装的是哪一版 DSH
+  const dshVersion = readDshVersion(engineRoot)
+  if (dshVersion) state.dshVersion = dshVersion
   if (engineRoot) {
     try {
       const prefs = readPrefs(engineRoot)

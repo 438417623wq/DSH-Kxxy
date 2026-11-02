@@ -1250,6 +1250,132 @@ function patchDeveloperRoleCompat(ctx) {
   return "pi-ai → 硅基流动/百炼/智谱/月暗 等网关不再发 developer 角色（缺陷 EA）";
 }
 
+/**
+ * 旧世代客户端运行时的别名：`@deepseek-ai/dsh-client-runtime/client` → 平台 store 种子。
+ *
+ * 症状（用户报，2026-11-02 真机）：装上 `@neystan/dsh-web-ui-all`（task-board /
+ * pet / describe-image 三件）与 `dsh-at-file` 之后，对话页**整页**停在
+ * `Failed to load plugins`，每一条错误都长这样：
+ *
+ *     client-modules: require("@deepseek-ai/dsh-client-runtime/client") missed
+ *     the module table — not a platform seed word, not a materialized module,
+ *     and no registered package factory
+ *
+ * 根因不在插件，在上游**换代**：`@deepseek-ai/dsh-client-runtime` 这个「客户端
+ * 运行时总包」在 0.1.x 时代是插件公共依赖，它的 `./client` 子路径只做一件事
+ * —— 转出 store 契约（`createSnapshotStore` / `defineStore` / `shallowEqual`）。
+ * 当前 0.2.1 把它拆成了 `dsh-client-store` + 一票 `dsh-client-ui-*`，总包本身
+ * **根本不在安装树里**（`app.asar` 里一条都搜不到），于是老插件按老名字
+ * require 时直接命中「module table 里没有这个名字」的硬错误。
+ *
+ * 为什么别名到 store 是**等价**而不是将就：对比过两边的类型声明
+ * （`dsh-client-runtime@0.1.1-rc.2` 的 `lib/types/client/contract/store.d.ts`）
+ * 与前端产物里的 store 实现，函数名 / 参数 / 返回值一致；被这批插件实际用到的
+ * 成员只有 `createSnapshotStore`（task-board、describe-image、dsh-at-file）和
+ * `defineStore`（dsh-pet）。老名字指到同一个对象上，语义完全对齐。
+ *
+ * 为什么打在加载器而不是前端产物：种子表（`staticModules`）在
+ * `dist/assets/index-<hash>.js` 里，文件名带内容哈希、每次发版都重新压缩；
+ * 而种子表是**由前端传进来**的参数，加载器 `dsh-client-modules/lib/client.js`
+ * 是普通打包产物 —— 路径稳定、代码可读。在加载器里补别名，前端换版不用跟着改。
+ *
+ * 幂等：靠 `KXXY_CLIENT_RUNTIME_ALIAS` 记号判断。
+ */
+export function patchClientRuntimeAlias(ctx) {
+  const rel = "@deepseek-ai/dsh-client-modules/lib/client.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无 dsh-client-modules）";
+  const src = ctx.read(rel);
+  if (src.includes("KXXY_CLIENT_RUNTIME_ALIAS")) return "已打过（客户端运行时总包别名），跳过";
+
+  const ANCHOR = "this.seed = new Map(Object.entries(options.staticModules));";
+  must(src.includes(ANCHOR), `dsh-client-modules 的种子表构造点变了：找不到锚点 "${ANCHOR}"`);
+
+  const indent = /^([\t ]*)this\.seed = new Map\(Object\.entries\(options\.staticModules\)\);/m.exec(src)[1];
+  // 只有 `/client` 这一个子路径做别名。裸包名不做：插件对它的期待是整个运行
+  // 时 API，用 store 顶上会在别处变成「undefined is not a function」，比现在
+  // 这条明确的 import 失败更难查。而这批插件的 client bundle 只 require 子路径。
+  const ALIASES = [["@deepseek-ai/dsh-client-runtime/client", "@deepseek-ai/dsh-client-store"]];
+  const body = [
+    "",
+    `${indent}/* KXXY_CLIENT_RUNTIME_ALIAS: 0.1.x 的「客户端运行时总包」在 0.2.x 被拆掉，`,
+    `${indent}   它的 ./client 子路径当年只是 store 契约的转发。老插件仍按老名字 require，`,
+    `${indent}   于是整页停在 Failed to load plugins。别名到 store 种子（同一份实现的同一个`,
+    `${indent}   对象），语义等价。见 tools/lib/patches.mjs 的 patchClientRuntimeAlias。 */`,
+    `${indent}for (const [kxxyAlias, kxxyTarget] of ${JSON.stringify(ALIASES)}) {`,
+    `${indent}\tif (!this.seed.has(kxxyAlias) && this.seed.has(kxxyTarget)) this.seed.set(kxxyAlias, this.seed.get(kxxyTarget));`,
+    `${indent}}`,
+  ].join("\n");
+
+  const at = src.indexOf(ANCHOR);
+  must(src.indexOf(ANCHOR, at + 1) < 0, "dsh-client-modules 的种子表构造行出现多次，插入不安全");
+  ctx.write(rel, src.slice(0, at + ANCHOR.length) + body + src.slice(at + ANCHOR.length));
+  return "客户端运行时总包别名 → @deepseek-ai/dsh-client-runtime/client 指向 store 种子（老插件可加载）";
+}
+
+/**
+ * 前端 boot：**一个第三方插件挂掉不再让整页停摆**，改成「跳过它，其余照常」。
+ *
+ * 症状（用户报，2026-11-02）：装了不兼容的插件后，对话页整页只剩
+ * `HARNESS / Failed to load plugins` —— 引擎活着、会话完好、控制台也进得去，
+ * 唯独对话页进不去。用户的原话是「哪怕不兼容也不应该崩溃」。
+ *
+ * 机制：前端 boot 结束后会跑一次汇总（产物里的 `IZ`），把每个 entry 的
+ * 最终状态一次性列出，只要有一条不是 `active` 就 `throw`，上层 `catch` 里
+ * 直接 `page.fail(...)` 把整页换成错误卡。也就是说：**report 阶段的诊断**
+ * 具备了「杀页面」的权力，哪怕真正的挂载（`uiRenderer`）完全没问题。
+ *
+ * 判定改成按来源分档：
+ *   · 官方包（`@deepseek-ai/*`）失败 —— 仍然硬失败。它们与运行时是同一套
+ *     安装，集体失败意味着运行时本身坏了，这时候留一张能读的错误卡比半残
+ *     界面有用；
+ *   · 其它（第三方 / 自带插件）—— 只 `console.warn` 并继续挂载。页面照常
+ *     可用，坏掉的那个插件就是「它的功能不出现」。
+ *
+ * 为什么可以这样降级：`IZ` 只是**汇总**，它跑之前 loader 已经把每个 entry
+ * 的失败隔离在自己的 fiber 里了（`entries.start` 里逐条处理），后面的
+ * `EZ(ctx)` 要注入 `uiRenderer` 才挂载 —— 真挂了收集器的核心问题会在那一步
+ * 抛出来，仍然会走 `page.fail`。所以这里不吞掉任何致命信息。
+ *
+ * 告警文案刻意保留 `web boot:` 前缀与「failed and were skipped」措辞：
+ *   · 原生 `WebBootLog` 按特征串落盘（见 MARKERS）；
+ *   · 体检 WEB_BOOT 按同一特征串把它判成 WARN 而不是 BAD
+ *     （页面能用 ≠ 页面进不去，两者不能共用一档）。
+ *
+ * 锚点用正则而不是字面串：这段是压缩产物的单行代码，局部变量名（当前是 `r`）
+ * 每次发版都可能变，命中失败必须让构建失败 —— 宁可打包失败，也不要产出一个
+ * 「补丁没打上、用户装完还是白屏」的包。
+ */
+export function patchFrontendLenientBoot(ctx) {
+  const PREFIX = "lib/node_modules/@deepseek-ai/dsh-web-frontend/dist/assets/";
+  const mains = [...ctx.files.keys()].filter((k) => k.startsWith(PREFIX) && /\/index-[^/]+\.js$/.test(k));
+  must(mains.length === 1, `前端主 chunk 定位失败：命中 ${mains.length} 个（期望 1 个 index-<hash>.js）`);
+  const key = mains[0];
+  const text = ctx.files.get(key).data.toString("utf8");
+  if (text.includes("failed and were skipped")) return "已打过（第三方插件加载失败降级），跳过";
+
+  // 目标语句（压缩后）：if(r.length>0)throw new Error(`web boot: ${String(r.length)} entr${...} did not activate\n${r.join(`\n`)}`)}
+  //
+  // 注意 `\n` 是**真的换行**：上游那份压缩产物的模板字符串里直接断了一行，
+  // 不是 `\n` 这两个字符。写成 `\\n` 会静默失配（第一版就是这样，靠本测试抓出来）。
+  const RE =
+    /if\((\w+)\.length>0\)throw new Error\(`web boot: \$\{String\(\1\.length\)\} entr\$\{\1\.length===1\?"y":"ies"\} did not activate\n\$\{\1\.join\(`\n`\)\}`\)\}/;
+  const m = RE.exec(text);
+  must(m !== null, "前端 boot 的未激活汇总结构变了：找不到 IZ 的 throw 语句（压缩变量名或措辞已改）");
+  must(RE.exec(text.slice(m.index + m[0].length)) === null, "前端 boot 的未激活汇总语句出现多次，替换不安全");
+
+  const id = m[1];
+  const BODY = [
+    `const kxxyFatal=${id}.filter(function(kxxyLine){return /^@deepseek-ai\\//.test(kxxyLine)});`,
+    `if(kxxyFatal.length>0)throw new Error("web boot: "+String(kxxyFatal.length)+" entr"+(kxxyFatal.length===1?"y":"ies")+" did not activate\\n"+kxxyFatal.join("\\n"));`,
+    `if(${id}.length>0)console.warn("web boot: "+String(${id}.length)+" entr"+(${id}.length===1?"y":"ies")+" from third-party plugins failed and were skipped (their UI stays absent; details below)\\n"+${id}.join("\\n"));`,
+    "}",
+  ].join("");
+
+  const out = text.slice(0, m.index) + BODY + text.slice(m.index + m[0].length);
+  ctx.files.set(key, { data: Buffer.from(out, "utf8"), mode: ctx.files.get(key).mode ?? 0o644 });
+  return `前端 boot 降级 → 第三方插件加载失败只跳过（官方包仍硬失败）：${key.split("/").pop()}`;
+}
+
 export function applyAllPatches(root, termuxRead) {
   const ctx = createPatchContext(root);
   const results = [
@@ -1274,6 +1400,8 @@ export function applyAllPatches(root, termuxRead) {
     patchDocumentPreviewArchiveProviders(ctx),
     patchDocumentPreviewMediaProviders(ctx),
     patchDeveloperRoleCompat(ctx),
+    patchClientRuntimeAlias(ctx),
+    patchFrontendLenientBoot(ctx),
     patchDshManifest(ctx),
   ];
   return results;

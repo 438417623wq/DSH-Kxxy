@@ -538,15 +538,38 @@ function checkWebBoot(report) {
     )
   }
 
-  if (report.browser.length) {
-    const names = report.browser.flatMap((b) => b.names)
-    const msg = report.browser[report.browser.length - 1].message.replace(/\s+/g, ' ').slice(0, 160)
+  // 浏览器侧记录分两档，因为它们对用户的意义完全不同：
+  //
+  //   · 硬失败：前端整页停在 `Failed to load plugins`，对话页**真的进不去** → BAD
+  //   · 已跳过：启动降级补丁（patches.mjs 的 patchFrontendLenientBoot）把
+  //     第三方插件的加载失败改成「跳过它、其余照常挂载」，页面进得去，只是
+  //     那个插件的功能不出现 → WARN
+  //
+  // 混在一档会导致两种错误：把「能用但少个面板」报成进不去（用户被吓到，
+  // 且指引变成「去停用」这种不必要的操作）；或者反过来把白屏报成小事。
+  const browserHard = report.browser.filter((b) => !/failed and were skipped/.test(b.message))
+  const browserSkipped = report.browser.filter((b) => /failed and were skipped/.test(b.message))
+
+  if (browserHard.length) {
+    const names = browserHard.flatMap((b) => b.names)
+    const msg = browserHard[browserHard.length - 1].message.replace(/\s+/g, ' ').slice(0, 160)
     return check(
       code,
       title,
       Verdict.BAD,
       `页面加载时插件初始化失败${names.length ? `：${nameList(names)}` : ''}。前端会整页停在「Failed to load plugins」，对话页进不去。${msg ? `（${msg}）` : ''}`,
       '到「插件」页停用上面列出的插件，再点「应用并重启引擎」—— 插件与移动端客户端不兼容时，停用是唯一不丢数据就能恢复页面的做法',
+    )
+  }
+
+  if (browserSkipped.length) {
+    const names = browserSkipped.flatMap((b) => b.names)
+    return check(
+      code,
+      title,
+      Verdict.WARN,
+      `${nameList([...new Set(names)]) || '部分第三方插件'} 加载失败，已跳过；页面照常可用，但这些插件的功能不会出现`,
+      '这类插件与当前客户端不兼容（常见原因是它们依赖已被上游拆分的旧包）。到「插件」页停用它并重启，就能让这条提示消失；功能需要的话请找插件作者要适配新版',
     )
   }
 

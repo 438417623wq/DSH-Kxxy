@@ -11,7 +11,7 @@
  *   → normaliseStageFiles           把 Termux 绝对前缀换成占位符（必须在去重之后：
  *                                   去重按 sha256，归一化会改内容）
  *   → resolveClosure → readClosureInto
- *   → applyAllPatches               10 个补丁作用在 lib/node_modules 上
+ *   → applyAllPatches               全部补丁作用在 lib/node_modules 上
  *   → corepackWrappers              生成 bin/{pnpm,npm,npx}
  *   → mergeEntries + collectDirs
  *   → ZipWriter                     写出
@@ -670,8 +670,21 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 跳过重装 ⇒ 设备继续缺 magick ⇒ 用户继续看到「仅支持 PNG、JPG、WebP、GIF」。
  * 注意：这条标记只能保证「重装一次」，真正把 magick 装上的是 runtime.zip 里
  * 新增的 `bin/magick` 本体，所以锚点 11 还额外探了那个实体（见 RuntimeInstaller）。
+ *
+ * 8 → 9：上游桌面版 0.2.1-rc.3 → rc.5 同步（2026-11-02）。
+ * 补丁集一行没改，但 **dsh 的 JS 树整棵换了**。标记只认「补丁集编号」，
+ * 不认上游版本，所以不动编号的话设备会判定 runtime 完整、跳过重解压，
+ * 用户看到的现象就是「APK 升级了，界面和功能却一点没变」—— 与缺陷 EA 里
+ * 「手工改 zip 忘了对齐标记」是同一个坑，只不过这次触发它的是上游同步。
+ * 判据：**凡是换了 app.asar（上游发版）或改了 patches.mjs，都要 +1**。
+ *
+ * 9 → 10：客户端插件兼容（2026-11-02）。新增两条补丁 —— 老世代运行时总包的
+ * 别名（`@deepseek-ai/dsh-client-runtime/client` → store 种子）、以及前端 boot
+ * 对第三方插件失败的降级。**这两条改的是运行时里已有的文件内容**，而设备上
+ * 的 `isComplete()` 只看锚点与标记文件：不递增编号的话，装完新 APK 仍然跑
+ * `@9` 的那份 client-modules 与前端 chunk，用户会看到「更新了但插件还是白屏」。
  */
-const PATCHSET_MARKER = "kxxy-patchset@8";
+const PATCHSET_MARKER = "kxxy-patchset@10";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

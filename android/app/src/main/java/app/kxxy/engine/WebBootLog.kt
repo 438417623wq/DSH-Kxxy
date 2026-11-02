@@ -43,6 +43,9 @@ object WebBootLog {
      * - `Failed to load plugins`：前端错误页标题，最直接的「进不去」
      * - `missed the module table`：client-modules 缺模块表，插件前端入口挂掉的根因
      * - `Failed to fetch dynamically imported module`：动态 import 404，同族故障
+     * - `failed and were skipped`：第三方插件失败但**已跳过**（补丁降级后的形态）。
+     *   这条是「页面能用、那个插件不出现」，不是「进不去」。收进来是为了让体检
+     *   能把它报成 WARN 并点出包名 —— 不收的话用户在体检里看不到任何交代。
      *
      * 刻意**不**收 `console.error` 的通用错误：官方前端在插件自己报错时也会
      * 打 error，但那种页面照常可用，收进来会让体检误报成「进不去」。
@@ -52,6 +55,7 @@ object WebBootLog {
         "Failed to load plugins",
         "missed the module table",
         "Failed to fetch dynamically imported module",
+        "failed and were skipped",
     )
 
     private val lock = Any()

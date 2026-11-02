@@ -118,6 +118,7 @@
     toggleWatchdog: document.getElementById('toggle-watchdog'),
     toggleLan: document.getElementById('toggle-lan'),
     infoNodeVer: document.getElementById('info-node-ver'),
+    infoDshVer: document.getElementById('info-dsh-ver'),
     infoPnpmVer: document.getElementById('info-pnpm-ver'),
     aboutEntry: document.getElementById('about-entry'),
     aboutDialog: document.getElementById('about-dialog'),
@@ -145,7 +146,7 @@
     pluginHint: document.getElementById('plugin-hint'),
     btnOpenPlugins: document.getElementById('btn-open-plugins'),
 
-    // 体检视图元素（方案 K 常驻形态）
+    // 体检元素（已并入概览页，DOM id 保持不变）
     healthRing: document.getElementById('health-ring'),
     healthRingIcon: document.getElementById('health-ring-icon'),
     healthHeadline: document.getElementById('health-headline'),
@@ -408,13 +409,25 @@
         // 插件页每次进入都重新拉一次：清单可能刚被对话页的插件管理改过，
         // 而这一页存在的意义就是「别处打不开时的可靠副本」，不能缓存旧状态。
         if (targetView === 'plugins') fetchPlugins();
+
+        // 体检并入概览后没有独立页签了，轮询跟着「概览是否在前台」走：
+        // 切到概览立刻刷一次并持续刷新，切走就停（省电，也别在用户没看时
+        // 反复解析 YAML）。
+        if (targetView === 'overview') startHealthPolling();
+        else stopHealthPolling();
       });
     });
   }
 
+  /** 当前处于前台的视图名（底栏高亮项）。 */
+  function activeView() {
+    const active = document.querySelector('.tab-item.active');
+    return active ? active.getAttribute('data-target') : '';
+  }
+
   /**
    * 程序化切页：直接点对应 Tab，让「切换 Tab 时要做的副作用」
-   * （插件页重拉、体检页起轮询）只在一处维护。
+   * （插件页重拉、体检轮询开关）只在一处维护。
    */
   function goToView(target) {
     const btn = Array.from(dom.tabItems).find((b) => b.getAttribute('data-target') === target);
@@ -489,6 +502,10 @@
       // 5) 设置页面静态信息同步
       if (dom.infoNodeVer && engine.node) {
         dom.infoNodeVer.textContent = engine.node;
+      }
+      // 上游 DSH 核心版本由插件从引擎根里的 package.json 读出（见 collectEngineState）
+      if (dom.infoDshVer && engine.dshVersion) {
+        dom.infoDshVer.textContent = engine.dshVersion;
       }
 
       // 5b) 构建元数据（缺陷 DP）：值变了才重渲染 —— 轮询是最秒级的，
@@ -1920,16 +1937,20 @@
   // 7. 启动配置体检（方案 K 的常驻形态）
   // ==========================================
   //
+  // 原先是底栏的独立「体检」页签，现已整块并进概览 —— 底栏五个页签在手机上
+  // 每个只剩 96px，而「配置能不能被引擎解析」和「引擎在不在跑」本就是同一个
+  // 问题（现在到底有没有事），拆两页只会让人多点一次。
+  //
   // 为什么体检在前端做轮询而不是推送：体检本身很便宜（六个文件解析），
   // 但引擎侧没有推送通道，且这个页面的刷新语义就是「我现在看一眼」。
-  // 用户切到体检页时拉一次，之后每 POLL_INTERVAL 拉一次。
+  // 概览在前台时拉一次，之后每 POLL_INTERVAL 拉一次。
   //
   // 为什么不自动定时刷新：解析三层 YAML 虽然快，但没必要在用户没看的时候
-  // 每 5 秒跑一遍。只在体检页可见时才轮询（见 initHealth 的可见性判断）。
+  // 每 5 秒跑一遍。只在概览可见时才轮询（见 initHealth / initTabSwitch）。
 
   /** 体检结果缓存：修复时要拿它的 level 决定推荐力度。 */
   let lastHealth = null;
-  /** 体检轮询定时器（仅体检页可见时存在）。 */
+  /** 体检轮询定时器（仅概览在前台时存在）。 */
   let healthTimer = null;
   /** 修复请求是否已发出、正在等引擎重启。 */
   let recoveryPending = false;
@@ -1955,12 +1976,24 @@
   async function fetchHealth(manual) {
     if (!dom.healthChecks) return;
     try {
-      const data = await apiGet('/kxxy/api/health');
+      /*
+       * 这里**不用** apiGet：它失败时会弹 toast。体检并进概览后变成「只要有
+       * 概览就每 5 秒跑一次」，而引擎重启/修复那几秒里所有请求都会失败 ——
+       * 用 apiGet 就会和状态轮询一起连着弹十几条「获取数据失败」，把真正
+       * 有用的信息淹掉。所以自己 fetch，失败只在用户手动点刷新时说一句。
+       */
+      const res = await fetch('/kxxy/api/health', {
+        headers: { Accept: 'application/json' },
+        cache: 'no-store'
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
       lastHealth = data;
       renderHealth(data);
       if (manual) showToast('体检完成', 'success');
-    } catch {
-      // apiGet 已提示；这里把页面切到「读不到」而不是留旧数据骗人
+    } catch (err) {
+      if (manual) showToast(`体检失败: ${err.message || err}`, 'error');
+      // 这里把页面切到「读不到」而不是留旧数据骗人
       if (dom.healthHeadline) dom.healthHeadline.textContent = '体检失败';
       if (dom.healthSubline) dom.healthSubline.textContent = '无法连接引擎，稍后重试';
       if (dom.healthRing) dom.healthRing.setAttribute('data-state', 'warn');
@@ -2207,7 +2240,7 @@
       if (Date.now() > deadline) {
         recoveryPending = false;
         setHealthBusy(false);
-        showToast('引擎重启耗时较长，请稍后手动刷新体检页', 'warning');
+        showToast('引擎重启耗时较长，请点概览页的刷新按钮重试', 'warning');
         return;
       }
       try {
@@ -2289,7 +2322,7 @@
     }
   }
 
-  /** 时间戳 → HH:mm:ss（体检页的时间显示，跨天不显示日期，够用）。 */
+  /** 时间戳 → HH:mm:ss（体检的时间显示，跨天不显示日期，够用）。 */
   function formatClock(ms) {
     if (!ms) return '—';
     const d = new Date(Number(ms));
@@ -2299,14 +2332,15 @@
   }
 
   /**
-   * 体检页初始化。
+   * 体检初始化。
    *
-   * 轮询只在「体检页可见」时跑：
-   *   · 切到体检 tab → 立刻拉一次 + 开轮询
-   *   · 切走 → 停轮询（省电，也别在用户没看时反复解析 YAML）
-   *   · 整个页面隐藏（切后台）→ initLifecycle 会统一停掉所有轮询
+   * 体检原先是独立页签，轮询由「点体检页签」触发；现在整块并进概览，
+   * 于是改成「概览在前台就跑」：
+   *   · 进页面（概览是默认页）→ 立刻拉一次 + 开轮询
+   *   · 切到别的页签 → 停轮询
+   *   · 整个页面隐藏（切后台）→ initLifecycle 统一停掉，回来再起
    *
-   * 注意：不能只在 init() 里拉一次 —— 用户可能开着体检页等引擎自己
+   * 注意：不能只在 init() 里拉一次 —— 用户可能停在概览页等引擎自己
    * 恢复，这时候需要持续刷新才能看到状态变化。
    */
   function initHealth() {
@@ -2316,15 +2350,8 @@
     if (dom.btnHealthUndo) {
       dom.btnHealthUndo.addEventListener('click', undoLastRecovery);
     }
-
-    // Tab 切换时控制体检轮询（复用 initTabSwitch 的点击，这里额外挂一个）
-    dom.tabItems.forEach(btn => {
-      btn.addEventListener('click', () => {
-        const target = btn.getAttribute('data-target');
-        if (target === 'health') startHealthPolling();
-        else stopHealthPolling();
-      });
-    });
+    // 交给 startHealthPolling 自己判断当前视图：默认是概览，直接开跑。
+    if (activeView() === 'overview') startHealthPolling();
   }
 
   function startHealthPolling() {
@@ -2405,17 +2432,25 @@
     const list = Array.isArray(data.plugins) ? data.plugins : [];
 
     /* 顶部告警：只有真的抓到加载失败才出现。
-       名单来自引擎日志与浏览器 console，是「页面为什么进不去」的唯一证据。 */
+       名单来自引擎日志与浏览器 console，是「页面为什么进不去」的唯一证据。
+
+       文案分两档（服务端给的 `soft`）：第三方插件加载失败时前端会**跳过它**
+       继续挂载，页面照常可用 —— 这时候说「对话页进不去」会把人吓一跳，
+       而且指引（停用）看起来像必须做的操作。 */
     const failed = list.filter((p) => p.failed);
     if (dom.pluginAlert) {
       if (failed.length) {
+        const allSoft = failed.every((p) => p.soft);
         dom.pluginAlert.style.display = '';
         if (dom.pluginAlertTitle) {
-          dom.pluginAlertTitle.textContent = `${failed.length} 个插件没有加载起来`;
+          dom.pluginAlertTitle.textContent = allSoft
+            ? `${failed.length} 个插件没能加载，已跳过`
+            : `${failed.length} 个插件没有加载起来`;
         }
         if (dom.pluginAlertDesc) {
-          dom.pluginAlertDesc.textContent =
-            `${failed.map((p) => p.name).join('、')} —— 它们会让对话页停在「Failed to load plugins」。停用后重启即可恢复，会话不会丢。`;
+          dom.pluginAlertDesc.textContent = allSoft
+            ? `${failed.map((p) => p.name).join('、')} —— 已自动跳过，页面照常可用，只是这些插件的功能不会出现。停用并重启可以清掉这条提示。`
+            : `${failed.map((p) => p.name).join('、')} —— 它们会让对话页停在「Failed to load plugins」。停用后重启即可恢复，会话不会丢。`;
         }
         if (dom.btnPluginDisableBroken) {
           // 已经全被停用（或全是受保护项）就没必要再给按钮
@@ -2595,8 +2630,12 @@
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
         stopPolling();
+        // 体检轮询和状态轮询一样只在页面可见时跑：后台解析 YAML 纯属浪费电，
+        // 而且 WebView 在后台本来就会被节流，定时器只会攒起来一起炸。
+        stopHealthPolling();
       } else {
         startPolling();
+        if (activeView() === 'overview') startHealthPolling();
       }
     });
   }
@@ -2622,7 +2661,7 @@
     // 启动初始拉取
     startPolling();
     fetchExtensions();
-    // 插件清单也预拉一次：概览页/体检页的红色提示要能立刻点进插件页，
+    // 插件清单也预拉一次：概览页的红项要能立刻点进插件页，
     // 而不是等用户切过去才开始加载。
     fetchPlugins();
   }
