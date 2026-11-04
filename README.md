@@ -20,6 +20,7 @@
 │  EngineProcess      PTY 启动引擎（--expose-internals 是硬前提）    │
 │  RuntimeInstaller   解包 runtime.zip（含 LINK 物化 / 十五锚点自愈）│
 │  EngineService      前台服务保活（specialUse）                     │
+│  KeepAwake          息屏持 PARTIAL_WAKE_LOCK（CPU 不挂起，闲置让位）│
 │  Privilege          Normal / Shizuku / Root 三级权限               │
 │  dsh_pty.c          forkpty 原生 PTY（Android 无 posix_openpt）    │
 │  dsh_pty_node.c     node-pty 的 N-API 实现（终端侧栏用）           │

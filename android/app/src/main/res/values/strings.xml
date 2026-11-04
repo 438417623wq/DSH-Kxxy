@@ -35,6 +35,8 @@
     <string name="status_installing">正在安装运行时 %1$d%%</string>
     <string name="status_starting">正在启动引擎…</string>
     <string name="status_healthy">引擎已就绪</string>
+    <!-- 息屏持锁时的常驻通知文案：锁屏后用户唯一能确认「它还在跑」的地方 -->
+    <string name="status_healthy_awake">引擎已就绪 · 息屏运行中</string>
     <string name="status_backoff">启动失败，%1$d 秒后重试（第 %2$d 次）</string>
     <string name="status_exiting">正在退出…</string>
 

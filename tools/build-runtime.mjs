@@ -683,8 +683,13 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 对第三方插件失败的降级。**这两条改的是运行时里已有的文件内容**，而设备上
  * 的 `isComplete()` 只看锚点与标记文件：不递增编号的话，装完新 APK 仍然跑
  * `@9` 的那份 client-modules 与前端 chunk，用户会看到「更新了但插件还是白屏」。
+ *
+ * 10 → 11：息屏保活（2026-11-04）。**改的不是补丁，是自有插件的前端资源** ——
+ * `kxxy-host/web` 新增了设置页的「息屏继续运行」开关与状态行。同一个坑：
+ * 用户装完新 APK，设置页却找不到那一行，因为设备上还跑着 `@10` 解出来的旧
+ * host 资源。判据放宽成一句话：**zip 里任何会影响运行时行为的文件变了，都要 +1**。
  */
-const PATCHSET_MARKER = "kxxy-patchset@10";
+const PATCHSET_MARKER = "kxxy-patchset@11";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

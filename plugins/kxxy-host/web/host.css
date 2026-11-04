@@ -2156,6 +2156,13 @@ html, body {
   padding-bottom: 0;
 }
 
+/* 与 .attention-host[hidden] 同一条教训：`.setting-row` 上的 display:flex 是
+   作者样式，必然盖掉 UA 的 [hidden]{display:none} —— 不显式写这一条，JS 里
+   `row.hidden = true` 会「看起来没生效」，白名单提示永远挂在设置页上。 */
+.setting-row[hidden] {
+  display: none;
+}
+
 .setting-info {
   display: flex;
   flex-direction: column;

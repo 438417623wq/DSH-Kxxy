@@ -25,6 +25,7 @@ import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 
 import { openZip } from './lib/zipread.mjs'
+import { openAsar } from './lib/registry.mjs'
 import { createPatchContext, patchClientRuntimeAlias, patchFrontendLenientBoot } from './lib/patches.mjs'
 
 let pass = 0
@@ -47,34 +48,52 @@ const CANDIDATES = [
   join(here, '..', 'android', 'app', 'src', 'main', 'assets', 'runtime.zip'),
 ].filter(Boolean)
 
-const zipPath = CANDIDATES.find((p) => existsSync(p))
-if (!zipPath) {
-  console.error('找不到 runtime.zip：先跑一次 tools/build-runtime.mjs')
-  process.exit(2)
-}
-console.log(`运行时：${zipPath}`)
+const CLIENT_MODULES = 'lib/node_modules/@deepseek-ai/dsh-client-modules/lib/client.js'
+const FE_PREFIX = 'lib/node_modules/@deepseek-ai/dsh-web-frontend/dist/assets/'
 
-const zip = openZip(zipPath)
-const allNames = zip.names()
+/**
+ * 参照物优先取 `.cache/app.asar`（未打补丁的原始产物）。
+ *
+ * `runtime.zip` 是 build-runtime 的**产物**，里面已经跑过 applyAllPatches ——
+ * 拿它当「打补丁前」的样本，「上游本体里没有别名记号」这条断言就永远为假，
+ * 而失败信息会把人引向「补丁坏了」这个错误结论。app.asar 才是补丁的真正输入。
+ */
+const asarPath = join(here, '..', '.cache', 'app.asar')
+const useAsar = !process.argv[2] && existsSync(asarPath)
 
-/** 只把补丁要用到的条目喂进内存表（整棵树上万文件，没必要全读）。 */
-function pick(predicate) {
-  const files = new Map()
+let files
+if (useAsar) {
+  console.log(`参照物：${asarPath}（未打补丁）`)
+  const asar = openAsar(asarPath)
+  files = new Map()
+  files.set(CLIENT_MODULES, {
+    data: asar.readFile('/dsh/node_modules/@deepseek-ai/dsh-client-modules/lib/client.js'),
+    mode: 0o644,
+  })
+  asar.walkFiles('/dsh/node_modules/@deepseek-ai/dsh-web-frontend/dist/assets', (p) => {
+    if (!/\/index-[^/]+\.js$/.test(p)) return
+    files.set(`${FE_PREFIX}${p.split('/').pop()}`, { data: asar.readFile(p), mode: 0o644 })
+  })
+} else {
+  const zipPath = CANDIDATES.find((p) => existsSync(p))
+  if (!zipPath) {
+    console.error('找不到 runtime.zip 或 .cache/app.asar：先跑一次 tools/build-runtime.mjs')
+    process.exit(2)
+  }
+  console.log(`运行时：${zipPath}`)
+  const zip = openZip(zipPath)
+  const allNames = zip.names()
+
+  /** 只把补丁要用到的条目喂进内存表（整棵树上万文件，没必要全读）。 */
+  files = new Map()
   for (const name of allNames) {
-    if (!predicate(name)) continue
+    if (!(name === CLIENT_MODULES || (name.startsWith(FE_PREFIX) && /\/index-[^/]+\.js$/.test(name)))) continue
     const data = zip.read(name)
     if (!data) continue
     files.set(name, { data, mode: 0o644 })
   }
-  return files
 }
 
-const CLIENT_MODULES = 'lib/node_modules/@deepseek-ai/dsh-client-modules/lib/client.js'
-const FE_PREFIX = 'lib/node_modules/@deepseek-ai/dsh-web-frontend/dist/assets/'
-
-const files = pick(
-  (n) => n === CLIENT_MODULES || (n.startsWith(FE_PREFIX) && /\/index-[^/]+\.js$/.test(n)),
-)
 ok('取到加载器本体', files.has(CLIENT_MODULES))
 const feKey = [...files.keys()].find((k) => /\/index-[^/]+\.js$/.test(k))
 ok('取到前端主 chunk', Boolean(feKey), feKey ?? '(缺)')

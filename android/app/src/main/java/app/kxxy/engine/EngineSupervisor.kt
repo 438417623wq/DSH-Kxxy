@@ -802,6 +802,15 @@ class EngineSupervisor(private val ctx: Context) {
                  * 前端拿到的是 `notifications.enabled` 之类。
                  */
                 append("  \"notifications\": ${notificationSnapshot()},\n")
+                /*
+                 * 息屏保活快照。
+                 *
+                 * 设置页的「息屏继续运行」开关与它下面的状态行（正在保持唤醒 /
+                 * 亮屏待命 / 已闲置让位 / 未加入电池优化白名单）全靠这一段 ——
+                 * 页面上看到的每一个字都必须来自原生侧的**真实**状态，不能是
+                 * 前端自己猜的。同上，kxxy-host 用 Object.assign 摊平。
+                 */
+                append("  \"keepAwake\": ${app.kxxy.service.KeepAwake.snapshotJson()},\n")
                 append("  \"updatedAt\": ${System.currentTimeMillis()}\n")
                 append("}\n")
             }

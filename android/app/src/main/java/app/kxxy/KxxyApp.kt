@@ -7,6 +7,7 @@ import app.kxxy.engine.EngineSupervisor
 import app.kxxy.engine.ShizukuBridge
 import app.kxxy.engine.ShizukuShellServer
 import app.kxxy.engine.TermuxApiServer
+import app.kxxy.service.KeepAwake
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -42,6 +43,9 @@ class KxxyApp : Application() {
         // 必须在这里启动：Toast / 剪贴板 / 通知都要求应用进程的上下文。
         TermuxApiServer.start(this, appScope)
         supervisor = EngineSupervisor(this)
+        // 息屏保活：必须在任何状态发布之前初始化 —— publishState 会把它的快照
+        // 拼进 kxxy-state.json，晚初始化会让管理页先看到一份缺字段的状态。
+        KeepAwake.init(this, appScope)
         /*
          * 启动日志必须自证版本（缺陷 DP）。
          *

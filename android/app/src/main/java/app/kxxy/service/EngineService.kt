@@ -47,6 +47,15 @@ class EngineService : Service() {
 
     private var stateJob: Job? = null
 
+    /**
+     * 息屏保活状态的订阅。
+     *
+     * 单独一条协程而不是并进 [stateJob]：引擎状态和「有没有持 CPU 锁」是两个
+     * 独立的事实 —— 引擎一直 Healthy，锁却会因为息屏/亮屏/闲置让位反复变化。
+     * 并在一起就得让监管器为它重发状态事件，那是更差的耦合。
+     */
+    private var keepAwakeJob: Job? = null
+
     @Volatile
     private var lastNotifText: String? = null
 
@@ -111,7 +120,19 @@ class EngineService : Service() {
     private fun observeState() {
         if (stateJob?.isActive == true) return
         stateJob = app.appScope.launch {
-            supervisor.state.collectLatest { st -> updateNotification(st, force = false) }
+            supervisor.state.collectLatest { st ->
+                // 每一拍都同步一次「引擎在不在跑」：KeepAwake 据此决定持不持锁。
+                // Healthy 之外的任何状态（Installing / Backoff / Failed / Stopped）
+                // 都当作不在跑 —— 那时也没有任务需要保活。
+                KeepAwake.onEngineState(st is EngineSupervisor.State.Healthy, supervisor.pid())
+                updateNotification(st, force = false)
+            }
+        }
+        if (keepAwakeJob?.isActive == true) return
+        keepAwakeJob = app.appScope.launch {
+            KeepAwake.status.collectLatest {
+                updateNotification(supervisor.state.value, force = false)
+            }
         }
     }
 
@@ -134,7 +155,11 @@ class EngineService : Service() {
         is EngineSupervisor.State.Installing ->
             getString(R.string.status_installing, (state.progress * 100).toInt())
         is EngineSupervisor.State.Starting -> getString(R.string.status_starting)
-        is EngineSupervisor.State.Healthy -> getString(R.string.status_healthy)
+        // 息屏持锁时把「后台还在跑」写进通知：用户锁屏后最容易怀疑的正是
+        // 「它到底还活着吗」，而这条常驻通知就是唯一能在锁屏上看到的答案。
+        is EngineSupervisor.State.Healthy ->
+            if (KeepAwake.status.value.held) getString(R.string.status_healthy_awake)
+            else getString(R.string.status_healthy)
         is EngineSupervisor.State.Backoff ->
             getString(R.string.status_backoff, state.delayMs / 1000, state.attempt)
         is EngineSupervisor.State.Failed -> state.reason
@@ -160,6 +185,11 @@ class EngineService : Service() {
         supervisor.markUserStopped()
         stateJob?.cancel()
         stateJob = null
+        keepAwakeJob?.cancel()
+        keepAwakeJob = null
+        // 订阅已取消，不会再有状态事件把「引擎停了」送进 KeepAwake ——
+        // 必须在这里显式放锁，否则用户点了退出、CPU 锁还挂着（电池白白被吸）。
+        KeepAwake.onEngineState(false, 0)
         pushStatusText(getString(R.string.status_exiting))
 
         Thread({
@@ -185,6 +215,12 @@ class EngineService : Service() {
 
     override fun onDestroy() {
         stateJob?.cancel()
+        keepAwakeJob?.cancel()
+        // 服务被销毁（划掉任务卡片）时先放锁：服务会被 START_STICKY 拉回来，
+        // 重新 onStartCommand 后按当时的引擎状态重新决定持不持 —— 比留着一把
+        // 没有归属的锁安全（进程若在重启窗口被杀，锁会由系统回收，但那是兜底，
+        // 不该当作正常路径）。
+        KeepAwake.onEngineState(false, 0)
         if (running === this) running = null
         super.onDestroy()
     }

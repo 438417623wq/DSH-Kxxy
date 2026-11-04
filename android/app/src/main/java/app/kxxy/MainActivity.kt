@@ -17,6 +17,7 @@ import app.kxxy.engine.PermCatalog
 import app.kxxy.engine.ShizukuBridge
 import app.kxxy.engine.WebBootLog
 import app.kxxy.service.EngineService
+import app.kxxy.service.KeepAwake
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -149,6 +150,21 @@ class MainActivity : Activity() {
             cacheMode = WebSettings.LOAD_DEFAULT
         }
 
+        /*
+         * 渲染进程优先级（息屏保活配套）。
+         *
+         * WebView 的渲染进程默认按「页面可见性」定优先级：页面一进后台就降级，
+         * 内存紧张时最先被回收。回收的直接后果是**前端与引擎之间的流式连接
+         * 断掉** —— 引擎侧任务还在跑，界面上却停在最后一条消息，用户回来只看到
+         * 一个「卡住」的会话。
+         *
+         * IMPORTANT + waivedWhenNotVisible=false：不可见时也不交还优先级。
+         * 代价是后台多占一点内存；对一台专门跑 Agent 的手机是值当的。
+         */
+        runCatching {
+            webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+        }.onFailure { Log.w(TAG, "renderer priority policy failed: ${it.message}") }
+
         // 诊断：把 console 消息与资源错误转发到 logcat，
         // 便于在用户设备上定位白屏（参考项目 v1.2.49 的做法）。
         webView.webChromeClient = object : WebChromeClient() {
@@ -222,8 +238,10 @@ class MainActivity : Activity() {
                 val url = request.url.toString()
                 // 宿主内建桥：kxxy://perm/request?name=…（设置页权限卡片）
                 //             kxxy://open?url=…（兼容层的 window.open 桥，见 handleOpenBridge）
+                //             kxxy://run/keepawake?on=…（息屏保活开关，见 handleRunBridge）
                 if (request.url.scheme == "kxxy") {
                     if (request.url.host == "open") return handleOpenBridge(request.url)
+                    if (request.url.host == "run") return handleRunBridge(request.url)
                     return handlePermissionBridge(request.url)
                 }
                 // 子框架一律放行。右侧栏「工作区文件」的 HTML 预览是宿主拼出
@@ -378,6 +396,37 @@ class MainActivity : Activity() {
                     .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
             )
         }.onFailure { Log.w(TAG, "open bridge failed: ${it.message}") }
+        return true
+    }
+
+    /**
+     * `kxxy://run/<action>?…` 桥 —— 设置页里**会改变原生行为**的开关走这里。
+     *
+     * 与 `kxxy://perm/request` 分开的理由：那条链路的语义是「要一项系统授权」，
+     * 分派目标是对话框/设置页；而这里的语义是「改一个原生运行参数」，主键是
+     * action 而不是权限名。混在一条 when 里，以后加开关时很容易被误当成权限项。
+     *
+     * 当前只有一个：`keepawake` —— 息屏保活开关，见 [app.kxxy.service.KeepAwake]。
+     */
+    private fun handleRunBridge(uri: android.net.Uri): Boolean {
+        val action = uri.path?.trim('/').orEmpty()
+        when (action) {
+            "keepawake" -> {
+                val on = uri.getQueryParameter("on") != "0"
+                KeepAwake.setEnabled(this, on)
+                Log.i(TAG, "run bridge: keepawake=$on")
+                if (on && !KeepAwake.isBatteryWhitelisted(this)) {
+                    // 顺手把 Doze 豁免要下来。不申请的话用户会以为「开关开了就该
+                    // 一直跑」，而息屏静止半小时后系统进入 Doze，唤醒锁会被无视、
+                    // 网络被掐断 —— 那正是本功能最容易被判「没用」的场景。
+                    KeepAwake.batteryWhitelistIntent(this)?.let { intent ->
+                        runCatching { startActivity(intent) }
+                            .onFailure { Log.w(TAG, "battery whitelist intent failed: ${it.message}") }
+                    }
+                }
+            }
+            else -> Log.w(TAG, "run bridge: unknown action \"$action\"")
+        }
         return true
     }
 

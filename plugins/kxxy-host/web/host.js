@@ -117,6 +117,11 @@
     toggleForeground: document.getElementById('toggle-foreground'),
     toggleWatchdog: document.getElementById('toggle-watchdog'),
     toggleLan: document.getElementById('toggle-lan'),
+    // 息屏保活（原生真实开关，走 kxxy://run/keepawake 桥，不写 kxxy-prefs.json）
+    toggleKeepAwake: document.getElementById('toggle-keepawake'),
+    keepAwakeDesc: document.getElementById('keepawake-desc'),
+    rowKeepAwakeWhitelist: document.getElementById('row-keepawake-whitelist'),
+    btnKeepAwakeWhitelist: document.getElementById('btn-keepawake-whitelist'),
     infoNodeVer: document.getElementById('info-node-ver'),
     infoDshVer: document.getElementById('info-dsh-ver'),
     infoPnpmVer: document.getElementById('info-pnpm-ver'),
@@ -530,6 +535,8 @@
       }
       // 6) 系统权限卡片
       renderPermissions(engine);
+      // 6a) 息屏保活：开关 + 实时状态（状态由原生 /proc 采样得出，前端不猜）
+      renderKeepAwake(engine);
       // 6b) 待确认请求（方案 B3）：与状态同一个轮询周期，不额外开定时器
       refreshAttention();
       // 终端 shell 缓存自愈（原「终端」页已删，这里静默处理）
@@ -660,6 +667,55 @@
     { title: '短信', ids: ['sms'] },
     { title: '设备与厂商开关', ids: ['sensors', 'miui_perms', 'app_settings'] }
   ];
+
+  /**
+   * 设置页「息屏继续运行」。
+   *
+   * 为什么不走 `apiPost('/kxxy/api/action', {set-toggle})`：那条路径只把偏好写进
+   * `kxxy-prefs.json`，引擎进程读得到、**原生层读不到**。而唤醒锁必须由原生持有，
+   * 所以这个开关走 `kxxy://run/keepawake` 桥；唯一的事实源是原生写进
+   * `kxxy-state.json` 的 `keepAwake` 快照（见 KeepAwake.kt）。
+   *
+   * 文案刻意做成「说现在」而不是「说功能」：用户锁屏十分钟后回来，第一件事是
+   * 确认刚才到底有没有在跑，静态描述回答不了这个问题。
+   */
+  function renderKeepAwake(engine) {
+    if (!dom.toggleKeepAwake) return;
+    const ka = engine.keepAwake;
+    // 老版本原生没有这个字段：禁用开关并说明，别让用户点了没反应
+    if (!ka || typeof ka !== 'object') {
+      dom.toggleKeepAwake.disabled = true;
+      if (dom.keepAwakeDesc) dom.keepAwakeDesc.textContent = '当前宿主版本不支持息屏保活（需要重新安装 APK）';
+      return;
+    }
+    dom.toggleKeepAwake.disabled = false;
+    dom.toggleKeepAwake.checked = ka.enabled === true;
+
+    // 白名单提示只在「开关开着 + 还没加白」时出现，否则是一行吓人的噪音
+    if (dom.rowKeepAwakeWhitelist) {
+      dom.rowKeepAwakeWhitelist.hidden = ka.batteryWhitelisted === true || ka.enabled !== true;
+    }
+    if (dom.keepAwakeDesc) dom.keepAwakeDesc.textContent = keepAwakeText(ka);
+  }
+
+  /** 一句话说清「现在到底在不在跑」。 */
+  function keepAwakeText(ka) {
+    if (ka.enabled !== true) return '已关闭：锁屏后系统会挂起 CPU，任务停在原地';
+    if (ka.held === true) {
+      const min = Math.floor(Number(ka.heldSec || 0) / 60);
+      return `正在保持 CPU 唤醒${min >= 1 ? `（已 ${min} 分钟）` : ''} · 锁屏后模型调用与工具执行继续`;
+    }
+    if (ka.screenOn === true) return '亮屏待命 · 锁屏后自动接管';
+    if (ka.idleRelaxed === true) return `已闲置 ${fmtIdleSec(ka.idleSec)} 让位省电 · 检测到任务活动会自动恢复`;
+    if (ka.engineRunning !== true) return '引擎未运行 · 起来后自动接管';
+    return '待命中';
+  }
+
+  function fmtIdleSec(sec) {
+    const s = Number(sec || 0);
+    if (s >= 60) return `${Math.floor(s / 60)} 分钟`;
+    return `${s} 秒`;
+  }
 
   /**
    * 设置页「系统权限」卡片：Android 能力开关的真实状态 + 逐项申请。
@@ -1931,6 +1987,34 @@
         }
       });
     });
+
+    /*
+     * 息屏保活开关 —— 与上面三个不是一类：它改的是**原生行为**（持不持
+     * PARTIAL_WAKE_LOCK），所以走 kxxy:// 桥而不是写 kxxy-prefs.json。
+     * 回读以原生快照为准：这里只做乐观文案，几百毫秒后 fetchState 会覆盖掉。
+     */
+    if (dom.toggleKeepAwake) {
+      dom.toggleKeepAwake.addEventListener('change', () => {
+        const on = dom.toggleKeepAwake.checked;
+        window.location.href = `kxxy://run/keepawake?on=${on ? '1' : '0'}`;
+        if (dom.keepAwakeDesc) {
+          dom.keepAwakeDesc.textContent = on
+            ? '正在启用…'
+            : '已关闭：锁屏后系统会挂起 CPU，任务停在原地';
+        }
+        // 原生是同步写偏好 + 异步刷状态，两个时点各拉一次足够
+        setTimeout(fetchState, 600);
+        setTimeout(fetchState, 2500);
+      });
+    }
+
+    if (dom.btnKeepAwakeWhitelist) {
+      dom.btnKeepAwakeWhitelist.addEventListener('click', () => {
+        window.location.href = 'kxxy://perm/request?name=battery';
+        setTimeout(fetchState, 1500);
+        setTimeout(fetchState, 4000);
+      });
+    }
   }
 
   // ==========================================

@@ -579,6 +579,36 @@
           </div>
 
           <div class="setting-list">
+            <!--
+              息屏继续运行：这一行是本组里唯一**真的改变原生行为**的开关。
+              另外三个（前台保活 / 无障碍看门狗 / 局域网反代）目前只是把偏好写进
+              kxxy-prefs.json，原生侧并没有对应的执行分支 —— 所以别照着这一行的
+              写法去理解它们。
+
+              状态文案由 host.js 按 /kxxy/api/state 的 keepAwake.* 实时改写：
+              息屏保持中 / 亮屏待命 / 已闲置让位 —— 用户锁屏后回来第一件事就是
+              确认「刚才到底有没有在跑」，静态描述回答不了这个问题。
+            -->
+            <div class="setting-row">
+              <div class="setting-info">
+                <span class="setting-title">息屏继续运行</span>
+                <span class="setting-desc" id="keepawake-desc">锁屏后保持 CPU 唤醒，模型调用与工具执行不会停（连续 10 分钟无任务动作会自动让位省电）</span>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-keepawake" checked>
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+
+            <!-- 电池优化白名单未加入时显示：Doze 会无视唤醒锁并掐断网络 -->
+            <div class="setting-row" id="row-keepawake-whitelist" hidden>
+              <div class="setting-info">
+                <span class="setting-title">电池优化白名单未加入</span>
+                <span class="setting-desc">长时间息屏后系统会进入 Doze：唤醒锁失效、网络被掐断。加入白名单才能整夜保持在线。</span>
+              </div>
+              <button class="button button-subtle button-sm" id="btn-keepawake-whitelist">去设置</button>
+            </div>
+
             <div class="setting-row">
               <div class="setting-info">
                 <span class="setting-title">前台保活服务</span>
