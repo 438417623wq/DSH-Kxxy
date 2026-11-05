@@ -2227,7 +2227,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * HTML 预览 iframe 都跑在 blob: 的独立全局里，`<head>` 注入够不到。
          * 分开标记可以让「只改了其中一份」时仍然强制重装。
          */
-        private const val MODERN_LAYER_MARKER = "kxxy-modern@2"
+        private const val MODERN_LAYER_MARKER = "kxxy-modern@3"
         private const val MODERN_LAYER_FILE = "lib/node_modules/kxxy-host/web/modern.js"
 
         /**

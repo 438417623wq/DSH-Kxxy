@@ -780,6 +780,15 @@
               <span class="info-key">Node.js 版本</span>
               <span class="info-val code-font" id="info-node-ver">v24.18.0</span>
             </div>
+            <!-- 系统 WebView 版本：由 host.js 从 navigator.userAgent 现读。
+                 ROM 决定它的版本、应用无法自带也无法升级，而 DSH 前端是按现代
+                 Chrome 写的 —— 2026-11-05 黑鲨5 Pro（WebView ≤ 99）就是因为缺
+                 AbortSignal.prototype.throwIfAborted 让所有 client API 全挂。
+                 报障时先看这一行，比描述现象省事得多。 -->
+            <div class="info-row">
+              <span class="info-key">系统 WebView</span>
+              <span class="info-val code-font" id="info-webview-ver">—</span>
+            </div>
             <!-- 上游 DSH 核心版本：同步桌面版发版后，这是设备上唯一能确认
                  「这次装的到底是哪个上游版本」的地方（应用版本只描述 APK）。 -->
             <div class="info-row">

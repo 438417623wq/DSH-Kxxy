@@ -57,6 +57,41 @@
   /** 上一次渲染用的 build 序列化串 —— 轮询每几秒一次，值没变就别碰 DOM。 */
   let lastBuildKey = '';
 
+  /** WebView 版本只跟设备有关，渲染一次就够（轮询是秒级的，别每轮都写字）。 */
+  let webViewInfoRendered = false;
+
+  /**
+   * 「关于」里的系统 WebView 版本。
+   *
+   * 为什么值得单独一行：DSH 前端是按现代 Chrome 写的，而 WebView 的版本由
+   * ROM 决定 —— 应用既不能自带、也不能替用户升级（只有 Google Play / 应用
+   * 商店能更新那套 `com.google.android.webview`）。2026-11-05 黑鲨5 Pro 那台
+   * 机器 WebView ≤ 99，缺 `AbortSignal.prototype.throwIfAborted`（Chrome 100），
+   * 让**每一笔** client API 都 TypeError（设置页四块全红、右下角一直
+   * 「重新连接中」）。这类报障只要版本号一句就能定位，比描述现象省事得多。
+   *
+   * 取数完全在浏览器本地（`navigator.userAgent`）：这个页面本身就运行在那台
+   * WebView 里，不需要引擎或原生层配合，也不会因为引擎没起来而拿不到。
+   */
+  function renderWebViewInfo() {
+    if (webViewInfoRendered || !dom.infoWebviewVer) return;
+    webViewInfoRendered = true;
+
+    const ua = navigator.userAgent || '';
+    const chrome = /(?:Chrome|CriOS)\/(\d+)(?:\.([\d.]+))?/.exec(ua);
+    if (!chrome) {
+      dom.infoWebviewVer.textContent = '未知';
+      dom.infoWebviewVer.title = ua || '读不到 User-Agent';
+      return;
+    }
+    const major = Number(chrome[1]);
+    const full = chrome[2] ? `${major}.${chrome[2]}` : String(major);
+    // 104 是本项目的兼容基线（开发机实测的那一版）。低于它意味着要靠
+    // web/modern.js + web/compat.js 补齐 —— 标出来，别让下一个人再猜。
+    dom.infoWebviewVer.textContent = major < 104 ? `${full} · 偏低（已兼容）` : full;
+    dom.infoWebviewVer.title = `完整 User-Agent：${ua}`;
+  }
+
   const CATEGORY_LABELS = {
     toolchain: '语言与编译链',
     media: '媒体与文档',
@@ -124,6 +159,7 @@
     btnKeepAwakeWhitelist: document.getElementById('btn-keepawake-whitelist'),
     infoNodeVer: document.getElementById('info-node-ver'),
     infoDshVer: document.getElementById('info-dsh-ver'),
+    infoWebviewVer: document.getElementById('info-webview-ver'),
     infoPnpmVer: document.getElementById('info-pnpm-ver'),
     aboutEntry: document.getElementById('about-entry'),
     aboutDialog: document.getElementById('about-dialog'),
@@ -512,6 +548,8 @@
       if (dom.infoDshVer && engine.dshVersion) {
         dom.infoDshVer.textContent = engine.dshVersion;
       }
+      // 系统 WebView 版本：本地读 UA，不需要引擎/原生配合（只渲染一次）
+      renderWebViewInfo();
 
       // 5b) 构建元数据（缺陷 DP）：值变了才重渲染 —— 轮询是最秒级的，
       // 每轮都去写六七个 textContent 会让「关于」弹窗打开时闪一下。

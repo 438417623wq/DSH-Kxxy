@@ -1,15 +1,19 @@
-/* kxxy-modern@2 */
+/* kxxy-modern@3 */
 /**
  * 现代 JS 内建补齐层 + blob 作用域注入。
  *
  * 为什么与 compat.js 分开：compat.js 解决的是「页面主作用域」的缺口（它的注入点
  * 是 <head> 内联脚本）。本文件解决两件事：
  *
- *   1. 把 DSH 前端用到的、Chrome 105–139 才有的 JS 内建一次性补齐，避免
+ *   1. 把 DSH 前端用到的、Chrome 85–139 才有的 JS 内建一次性补齐，避免
  *      「修好一个才暴露下一个」——真机实测的暴露顺序是：
  *        `v` 标志正则 SyntaxError（构建期补丁已改写）
  *        → `ReferenceError: Iterator is not defined`（本文件第 1 段）
  *        → 同一条 slot 反复崩溃，所有格式的右侧栏预览一起空白。
+ *      2026-11-05 起覆盖面往下探到 Chrome 85：黑鲨5 Pro（JOYUI 13，WebView
+ *      ≤ 99）上 `AbortSignal.prototype.throwIfAborted`（100）缺失，让**每一笔
+ *      RPC**都 TypeError（见第 3b 段），而 `structuredClone`（98）/
+ *      `findLast`（97）等同一代 API 也一并在缺。
  *   2. **把同一份补齐代码注入 blob: 作用域**。这是真机实测的关键结论：
  *      PDF 渲染 worker 与 HTML 预览 iframe 都跑在 `blob:` 地址的**独立全局**里，
  *      `<head>` 注入的 compat.js/modern.js 完全够不到它们。pdf.js 6.3.289 的
@@ -23,8 +27,9 @@
  * 的，拿到 URL 后无法再把内容读出来；而 `new Blob([前缀字符串, 原 Blob])` 是同步
  * 且廉价的（Blob 的 part 允许是 Blob，不会立即读字节）。
  *
- * 版本标记 `kxxy-modern@1`（首行）：RuntimeInstaller 的锚点按这个字符串判定资产
- * 是否过期。改动本文件后必须同步递增编号。
+ * 版本标记 `kxxy-modern@3`（首行）：RuntimeInstaller 的锚点按这个字符串判定资产
+ * 是否过期。改动本文件后必须同步递增编号（连同 RuntimeInstaller.MODERN_LAYER_MARKER
+ * 与 tools/simulate-install.mjs 的同名常量），否则老设备会带着旧补齐层跳过重装。
  *
  * 约束：本文件由宿主内联注入，先于一切页面脚本执行；必须幂等、必须不抛错
  * （任何一处抛错都会让整段失效，而错误只出现在 logcat 里）。
@@ -371,6 +376,56 @@
         }
         return controller.signal
       })
+
+      // ── AbortSignal.prototype.reason + AbortController.abort(reason)（98）──
+      // 旧引擎里 abort() 不接受参数、signal 上也没有 reason 属性，于是上游
+      // `signal.reason` 恒为 undefined —— `stream-client.js` 的
+      // `inbox.fail(signal.reason)` 会 reject(undefined)，报错信息变成空白，
+      // 排查时看不出是「用户取消」还是「真的出错」。这里用一张 WeakMap 把
+      // reason 记下来（只在原生没有 reason 时安装，不动新引擎的语义）。
+      if (typeof g.AbortController === 'function' && !('reason' in g.AbortSignal.prototype)) {
+        var abortReasons = new g.WeakMap()
+        var nativeAbort = g.AbortController.prototype.abort
+        if (typeof nativeAbort === 'function') {
+          g.AbortController.prototype.abort = function abort(reason) {
+            try {
+              if (!this.signal.aborted) {
+                abortReasons.set(this.signal, reason === undefined
+                  ? new g.DOMException('signal is aborted without reason', 'AbortError')
+                  : reason)
+              }
+            } catch (e) { /* 记不进就不记，abort 本身不能被打断 */ }
+            return nativeAbort.call(this, reason)
+          }
+        }
+        def(g.AbortSignal.prototype, 'reason', function () {
+          if (!this.aborted) return undefined
+          var known = abortReasons.get(this)
+          return known === undefined ? new g.DOMException('signal is aborted without reason', 'AbortError') : known
+        }, true)
+      }
+
+      // ── AbortSignal.prototype.throwIfAborted（100）★ 已证实致命项 ────────
+      // 2026-11-05 黑鲨5 Pro（JOYUI 13，WebView ≤ 99）实机：界面上一切能点，
+      // 但每个面板都停在错误态 ——
+      //   `client api: agentPresets/list failed: signal?.throwIfAborted is not a function`
+      //   `client api: llm/listProviders failed: signal?.throwIfAborted is not a function`
+      //   设置→通用：`permission catalog has no active Host connection`
+      //   设置→内置插件：`暂时无法读取插件。`，右下角一直「重新连接中…」
+      // 调用点是 `dsh-client-connection/lib/client.browser.js`（每笔 RPC 的
+      // 响应处理）与 `dsh-api-gateway/lib/stream-client.js`（每条流的每个
+      // 分片）—— 也就是说**连接层自己**在第一次就先崩，异常被
+      // `ConnectionController.loop()` 吞掉后表现为无限重连；上层各面板拿不到
+      // 数据，于是各报各的错。它不是某个插件的毛病，缺它等于所有 API 全挂。
+      // 语义：已取消 ⇒ 抛 reason；未取消 ⇒ 什么都不做。旧引擎没有 reason，
+      // 这里造一个 AbortError —— 直接 `throw undefined` 会让上游 catch 里
+      // 那句 `error.message` 再炸一次，把真正的取消原因彻底埋掉。
+      defIf(g.AbortSignal.prototype, 'throwIfAborted', function throwIfAborted() {
+        if (!this.aborted) return undefined
+        var reason = this.reason
+        if (reason !== undefined) throw reason
+        throw new g.DOMException('signal is aborted without reason', 'AbortError')
+      })
     }
 
     // ────────────────────────────────────────────────────────────
@@ -537,6 +592,243 @@
         return g.ArrayBuffer.prototype.transfer.call(this, newLength)
       })
     }
+
+    // ────────────────────────────────────────────────────────────
+    // 7c. 老 ROM 内建（Chrome 85–100）★ 2026-11-05 黑鲨5 Pro 实机
+    //
+    // 上面 3b 的 `throwIfAborted` 只是**最先暴露**的那一个：那台机器的
+    // WebView 由 ROM 决定，比开发机（104）还老一代。同一批 API 在本仓库
+    // 客户端 bundle 里的用处（都不是边角料）：
+    //   · structuredClone(98) —— `dsh-client-ui-settings-*` 的 `mutate(ops)`
+    //     先克隆再提交；pdf.js 的 LoopbackPort.postMessage 也靠它。缺 ⇒
+    //     设置页任何一次保存都 TypeError。
+    //   · findLast(97) —— 会话时间线取「最后一条非空文本/最后一个非文本块」，
+    //     缺 ⇒ 消息流渲染直接崩。
+    //   · Object.hasOwn(93) / Array.prototype.at(92) —— 散见于各 client.js。
+    //   · replaceAll(85) / AggregateError(85) —— 同上，属 ES2021 基线。
+    //   · Intl.Segmenter(87) —— `dsh-client-ui-...` 主 chunk **模块顶层**就
+    //     `new Intl.Segmenter(...)`：缺它不是某条路径报错，而是整个插件入口
+    //     求值失败。这里给一个近似实现（只切码位/词边界，够截断用）。
+    // 全部 `defIf`：新引擎有原生实现时原样跳过，零语义改动。
+    // ────────────────────────────────────────────────────────────
+    function atIndex(index, len) {
+      var i = Number(index)
+      if (!isFinite(i)) i = 0
+      i = i < 0 ? Math.ceil(i) : Math.floor(i)
+      if (i < 0) i += len
+      return i
+    }
+
+    if (g.Array && g.Array.prototype) {
+      defIf(g.Array.prototype, 'at', function at(index) {
+        var len = this.length >>> 0
+        var i = atIndex(index, len)
+        return i < 0 || i >= len ? undefined : this[i]
+      })
+      defIf(g.Array.prototype, 'findLast', function findLast(predicate, thisArg) {
+        for (var i = this.length - 1; i >= 0; i--) {
+          if (predicate.call(thisArg, this[i], i, this)) return this[i]
+        }
+        return undefined
+      })
+      defIf(g.Array.prototype, 'findLastIndex', function findLastIndex(predicate, thisArg) {
+        for (var i = this.length - 1; i >= 0; i--) {
+          if (predicate.call(thisArg, this[i], i, this)) return i
+        }
+        return -1
+      })
+    }
+
+    if (TypedProto) {
+      defIf(TypedProto, 'at', function at(index) {
+        var len = this.length
+        var i = atIndex(index, len)
+        return i < 0 || i >= len ? undefined : this[i]
+      })
+      defIf(TypedProto, 'findLast', function findLast(predicate, thisArg) {
+        for (var i = this.length - 1; i >= 0; i--) {
+          if (predicate.call(thisArg, this[i], i, this)) return this[i]
+        }
+        return undefined
+      })
+      defIf(TypedProto, 'findLastIndex', function findLastIndex(predicate, thisArg) {
+        for (var i = this.length - 1; i >= 0; i--) {
+          if (predicate.call(thisArg, this[i], i, this)) return i
+        }
+        return -1
+      })
+    }
+
+    if (g.Object) {
+      defIf(g.Object, 'hasOwn', function hasOwn(target, key) {
+        if (target === null || target === undefined) {
+          throw new g.TypeError('Cannot convert undefined or null to object')
+        }
+        return g.Object.prototype.hasOwnProperty.call(g.Object(target), key)
+      })
+    }
+
+    if (g.String && g.String.prototype) {
+      defIf(g.String.prototype, 'at', function at(index) {
+        var s = String(this)
+        var len = s.length
+        var i = atIndex(index, len)
+        return i < 0 || i >= len ? undefined : s.charAt(i)
+      })
+      defIf(g.String.prototype, 'replaceAll', function replaceAll(search, replacement) {
+        var s = String(this)
+        if (search instanceof g.RegExp) {
+          if (!search.global) {
+            throw new g.TypeError('String.prototype.replaceAll called with a non-global RegExp argument')
+          }
+          return s.replace(search, replacement)
+        }
+        // 字符串形态：转成等价的全局正则再交给原生 replace —— GetSubstitution
+        // （`$&` / `$1` / 回调参数）与规范一致，不用自己拼一遍替换语义。
+        var escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        return s.replace(new g.RegExp(escaped, 'g'), replacement)
+      })
+    }
+
+    if (typeof g.AggregateError !== 'function') {
+      var AggregateError = function AggregateError(errors, message) {
+        var list = []
+        var it = errors[Symbol.iterator]()
+        for (;;) {
+          var step = it.next()
+          if (step.done) break
+          list.push(step.value)
+        }
+        var err = new g.Error(message === undefined ? '' : String(message))
+        err.name = 'AggregateError'
+        err.errors = list
+        if (g.Object.setPrototypeOf) g.Object.setPrototypeOf(err, AggregateError.prototype)
+        return err
+      }
+      AggregateError.prototype = g.Object.create(g.Error.prototype, {
+        constructor: { value: AggregateError, writable: true, configurable: true },
+        name: { value: 'AggregateError', writable: true, configurable: true },
+      })
+      if (g.Object.setPrototypeOf) g.Object.setPrototypeOf(AggregateError, g.Error)
+      def(g, 'AggregateError', AggregateError)
+    }
+
+    // Intl.Segmenter 的近似实现：只用于「按字素/词边界截断文本」这类展示用途，
+    // 不实现 `containing()`，也不合并 ZWJ emoji 序列（最坏结果是把 emoji 切成
+    // 两半显示一个方框）。比「整个插件入口求值失败」好得多，取舍写在注释里。
+    if (g.Intl) {
+      var KxxySegmenter = function Segmenter(locales, options) {
+        if (!(this instanceof KxxySegmenter)) return new KxxySegmenter(locales, options)
+        var g2 = options && options.granularity
+        this.granularity = g2 === 'word' || g2 === 'sentence' ? g2 : 'grapheme'
+      }
+      KxxySegmenter.prototype.segment = function segment(input) {
+        var text = String(input)
+        var out = []
+        var push = function (part, at, wordLike) {
+          out.push({ segment: part, index: at, input: text, isWordLike: wordLike === true })
+        }
+        if (this.granularity === 'grapheme') {
+          // 码位 + 紧随其后的组合记号算一个字素簇（覆盖有声调/变音符的拉丁文）。
+          var i = 0
+          while (i < text.length) {
+            var start = i
+            var cp = text.codePointAt(i)
+            i += cp > 0xffff ? 2 : 1
+            while (i < text.length && /[\u0300-\u036f\u1ab0-\u1aff\u20d0-\u20f0\ufe20-\ufe2f]/.test(text.charAt(i))) {
+              i += 1
+            }
+            push(text.slice(start, i), start, true)
+          }
+        } else if (this.granularity === 'word') {
+          var re = /\s+|[^\s]+/g
+          var m
+          while ((m = re.exec(text)) !== null) {
+            push(m[0], m.index, !/^\s+$/.test(m[0]))
+          }
+        } else {
+          var sre = /[^.!?。！？]+[.!?。！？]*\s*/g
+          var sm
+          while ((sm = sre.exec(text)) !== null) push(sm[0], sm.index, true)
+        }
+        return out
+      }
+      defIf(g.Intl, 'Segmenter', KxxySegmenter)
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // 7d. structuredClone（98）
+    //     语义按「能序列化的结构化数据」实现：原始值 / 数组 / 普通对象与
+    //     可枚举自有属性 / Date / RegExp / Map / Set / ArrayBuffer / 各类
+    //     TypedArray / DataView，带环处理；函数与 DOM 节点抛 DataCloneError。
+    //     Blob / File 直接共享引用（真正克隆它们要读字节，是异步的，而
+    //     structuredClone 必须同步 —— 上游也没有克隆这两类的用法）。
+    //     不支持 `{transfer}` 的分离语义：JS 侧无法分离原生缓冲，忽略该选项
+    //     （modern.js 自己的 transferView 也只把它当「尽力而为」）。
+    // ────────────────────────────────────────────────────────────
+    function cloneError(message) {
+      if (typeof g.DOMException === 'function') {
+        try { return new g.DOMException(message, 'DataCloneError') } catch (e) { /* 落到下面 */ }
+      }
+      var err = new g.Error(message)
+      err.name = 'DataCloneError'
+      return err
+    }
+
+    defIf(g, 'structuredClone', function structuredClone(value, options) {
+      var seen = new g.Map()
+      function clone(v) {
+        if (v === null || typeof v !== 'object') {
+          if (typeof v === 'function') throw cloneError('function could not be cloned')
+          return v
+        }
+        if (seen.has(v)) return seen.get(v)
+        if (g.Blob && v instanceof g.Blob) return v
+        if (v.nodeType !== undefined) throw cloneError('Node could not be cloned')
+        if (g.Array.isArray(v)) {
+          var arr = new g.Array(v.length)
+          seen.set(v, arr)
+          for (var i = 0; i < v.length; i++) arr[i] = clone(v[i])
+          return arr
+        }
+        if (v instanceof g.Date) return new g.Date(v.getTime())
+        if (v instanceof g.RegExp) {
+          var re = new g.RegExp(v.source, v.flags)
+          re.lastIndex = v.lastIndex
+          return re
+        }
+        if (g.ArrayBuffer && v instanceof g.ArrayBuffer) {
+          var buf = new g.ArrayBuffer(v.byteLength)
+          new g.Uint8Array(buf).set(new g.Uint8Array(v))
+          return buf
+        }
+        if (g.ArrayBuffer && g.ArrayBuffer.isView && g.ArrayBuffer.isView(v)) {
+          if (g.DataView && v instanceof g.DataView) {
+            return new g.DataView(clone(v.buffer), v.byteOffset, v.byteLength)
+          }
+          return new v.constructor(clone(v.buffer), v.byteOffset, v.length)
+        }
+        if (g.Map && v instanceof g.Map) {
+          var map = new g.Map()
+          seen.set(v, map)
+          v.forEach(function (val, key) { map.set(clone(key), clone(val)) })
+          return map
+        }
+        if (g.Set && v instanceof g.Set) {
+          var set = new g.Set()
+          seen.set(v, set)
+          v.forEach(function (val) { set.add(clone(val)) })
+          return set
+        }
+        // 普通对象与类实例：保留原型链，只拷自有可枚举字符串键。
+        var out = g.Object.create(g.Object.getPrototypeOf(v))
+        seen.set(v, out)
+        var keys = g.Object.keys(v)
+        for (var k = 0; k < keys.length; k++) out[keys[k]] = clone(v[keys[k]])
+        return out
+      }
+      return clone(value)
+    })
 
     // ────────────────────────────────────────────────────────────
     // 8. String（isWellFormed / toWellFormed，111）

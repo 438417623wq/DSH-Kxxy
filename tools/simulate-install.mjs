@@ -74,12 +74,13 @@ const COMPAT_LAYER_MARKER = "kxxy-webview-compat@12";
 /**
  * 与 RuntimeInstaller.MODERN_LAYER_MARKER 保持一致（锚点 6 的第二份资产）。
  *
- * modern.js 补齐 Chrome 105–139 才有的 JS 内建，并包装
+ * modern.js 补齐 Chrome 85–139 才有的 JS 内建（2026-11-05 起把下界从 104 探到
+ * 85：黑鲨5 Pro 那台机器的 WebView 连 `throwIfAborted`（100）都没有），并包装
  * `URL.createObjectURL` 把同一份代码注入 blob worker / blob iframe。
  * 缺它时 PDF 渲染 worker 与 HTML 预览 iframe 都会在独立全局里抛
  * `ReferenceError: Iterator is not defined`。
  */
-const MODERN_LAYER_MARKER = "kxxy-modern@2";
+const MODERN_LAYER_MARKER = "kxxy-modern@3";
 
 /**
  * 与 RuntimeInstaller.PTY_NODE_MARKER 保持一致（锚点 7）。

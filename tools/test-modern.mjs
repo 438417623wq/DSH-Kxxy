@@ -318,5 +318,242 @@ console.log("[5] 前置源码可独立执行（模拟 blob worker 的独立全�
   assert(bare2.run("typeof Iterator") === "function", "HTML 片段注入后裸沙箱里 Iterator 被补齐");
 }
 
+/**
+ * 最小 AbortController / AbortSignal / DOMException。
+ *
+ * 为什么必须自己造而不用宿主的那份：`vm.createContext` 的 realm 里没有
+ * `AbortController` 这类 Web 全局（它们不是语言内建）。把宿主的类注进去再删
+ * 原型方法，改到的是**宿主自己**的原型 —— 后面几条断言会因此互相污染，
+ * 测出来的红绿都是假的（本文件 [3] 段的注释踩过同一个坑）。
+ * 这里在 realm 内建一份，语义按 Chrome 96：有 `aborted`，`abort()` 不收
+ * reason、`reason` 属性**不存在**（由 DEGRADE_96 删掉）。
+ */
+const ABORT_SHIM = `
+  class KxxyDOMException extends Error {
+    constructor(message, name) { super(message === undefined ? '' : String(message)); this.name = name || 'Error' }
+  }
+  class KxxyAbortSignal {
+    constructor() { this.__aborted = false; this.__reason = undefined; this.__listeners = [] }
+    get aborted() { return this.__aborted }
+    get reason() { return this.__reason }
+    addEventListener(type, fn, opts) {
+      if (type !== 'abort' || typeof fn !== 'function') return
+      this.__listeners.push({ fn: fn, once: !!(opts && opts.once) })
+    }
+    removeEventListener(type, fn) {
+      if (type !== 'abort') return
+      this.__listeners = this.__listeners.filter(function (l) { return l.fn !== fn })
+    }
+    __fire() {
+      var list = this.__listeners.slice()
+      this.__listeners = this.__listeners.filter(function (l) { return !l.once })
+      for (var i = 0; i < list.length; i++) {
+        try { list[i].fn.call(this, { type: 'abort', target: this }) } catch (e) { /* 监听器异常不影响 abort */ }
+      }
+    }
+  }
+  class KxxyAbortController {
+    constructor() { this.__signal = new KxxyAbortSignal() }
+    get signal() { return this.__signal }
+    abort(reason) {
+      if (this.__signal.__aborted) return
+      this.__signal.__aborted = true
+      if (arguments.length > 0) this.__signal.__reason = reason
+      this.__signal.__fire()
+    }
+  }
+  globalThis.AbortSignal = KxxyAbortSignal
+  globalThis.AbortController = KxxyAbortController
+  globalThis.DOMException = KxxyDOMException
+`;
+
+/**
+ * 「比 104 还老一代」的差额：Chrome 85–100 才有的内建。
+ *
+ * 现场：2026-11-05 黑鲨5 Pro（JOYUI 13，ROM 自带 WebView ≤ 99）。它连
+ * `AbortSignal.prototype.throwIfAborted`（100）都没有 —— 而
+ * `dsh-client-connection` 与 `dsh-api-gateway` 的每一笔请求/每一片流都先调它，
+ * 于是整块 client API 全挂（界面表现见 README 缺陷 DZ）。
+ * 这里把整个「< 104 差额」都删掉：真实老设备不可能只缺一个。
+ */
+const DEGRADE_96 = `
+  // 100：AbortSignal.prototype.throwIfAborted ← 本次真机故障点
+  try { delete AbortSignal.prototype.throwIfAborted } catch (e) {}
+  // 98：AbortSignal.reason（以及 abort(reason) 的参数语义）
+  try { delete AbortSignal.prototype.reason } catch (e) {}
+  try { delete Promise.withResolvers } catch (e) {}
+  // 98：structuredClone
+  try { delete globalThis.structuredClone } catch (e) {}
+  // 97：findLast / findLastIndex
+  try { delete Array.prototype.findLast } catch (e) {}
+  try { delete Array.prototype.findLastIndex } catch (e) {}
+  try { delete Object.getPrototypeOf(Uint8Array.prototype).findLast } catch (e) {}
+  try { delete Object.getPrototypeOf(Uint8Array.prototype).findLastIndex } catch (e) {}
+  // 93 / 92 / 85：Object.hasOwn、Array.prototype.at、String.prototype.at、replaceAll
+  try { delete Object.hasOwn } catch (e) {}
+  try { delete Array.prototype.at } catch (e) {}
+  try { delete String.prototype.at } catch (e) {}
+  try { delete Object.getPrototypeOf(Uint8Array.prototype).at } catch (e) {}
+  try { delete String.prototype.replaceAll } catch (e) {}
+  try { delete globalThis.AggregateError } catch (e) {}
+  // 87：Intl.Segmenter（客户端主 chunk 顶层就 new 了它）
+  try { delete Intl.Segmenter } catch (e) {}
+`;
+
+/** 建一个「WebView 96」的裸沙箱：**故意不注入宿主的 structuredClone**。 */
+function makeSandbox96() {
+  const ctx = vm.createContext({});
+  vm.runInContext(ABORT_SHIM, ctx, { filename: "abort-shim-96.js" });
+  vm.runInContext(DEGRADE, ctx, { filename: "degrade-104.js" });
+  vm.runInContext(DEGRADE_96, ctx, { filename: "degrade-96.js" });
+  return {
+    ctx,
+    run: (code, name) => vm.runInContext(code, ctx, { filename: name ?? "eval.js" }),
+    created: () => vm.runInContext("globalThis.__created", ctx),
+  };
+}
+
+console.log("[6] 老 ROM（WebView 96）缺口");
+{
+  const box = makeSandbox96();
+  // 先确认沙箱真的退化（否则后面的断言全是假绿）
+  assert(box.run("typeof AbortSignal.prototype.throwIfAborted") === "undefined", "夹具：throwIfAborted 确实不存在");
+  assert(box.run("typeof globalThis.structuredClone") === "undefined", "夹具：structuredClone 确实不存在");
+  assert(box.run("typeof Array.prototype.findLast") === "undefined", "夹具：findLast 确实不存在");
+
+  try {
+    box.run(source, "modern.js");
+    ok("96 沙箱里求值未抛错");
+  } catch (e) {
+    fail(`96 沙箱里求值抛错：${e.message}`);
+  }
+
+  // ── AbortSignal.prototype.throwIfAborted ──
+  assert(box.run("typeof AbortSignal.prototype.throwIfAborted") === "function", "throwIfAborted 已补齐");
+  assert(
+    box.run("(function(){var c=new AbortController();return c.signal.throwIfAborted()===undefined})()") === true,
+    "未取消时 throwIfAborted 是空操作",
+  );
+  assert(
+    box.run("(function(){var c=new AbortController();c.abort('boom');try{c.signal.throwIfAborted();return 'no'}catch(e){return String(e)}})()") === "boom",
+    "取消后 throwIfAborted 抛出传入的 reason",
+  );
+  assert(
+    box.run("(function(){var c=new AbortController();c.abort();try{c.signal.throwIfAborted();return 'no'}catch(e){return e.name+':'+(e instanceof Error||e.code!==undefined)}})()").startsWith("AbortError"),
+    "没有 reason 时抛 AbortError（不是 throw undefined）",
+  );
+  // reason 补齐：上游 `stream-client.js` 的 inbox.fail(signal.reason) 靠它给出可读错误
+  assert(
+    box.run("(function(){var c=new AbortController();c.abort(new Error('cancelled'));return c.signal.reason.message})()") === "cancelled",
+    "AbortController.abort(reason) 的 reason 可读回",
+  );
+  assert(
+    box.run("(function(){var c=new AbortController();return c.signal.reason===undefined})()") === true,
+    "未取消时 reason 为 undefined（不污染正常路径）",
+  );
+  // 真机故障的最小复现：就是这两句在客户端连接层里
+  assert(
+    box.run("(function(){var c=new AbortController();var signal=c.signal;signal?.throwIfAborted();return 'ok'})()") === "ok",
+    "`signal?.throwIfAborted()`（dsh-client-connection 的原句）可执行",
+  );
+  assert(
+    box.run("(function(){var a=new AbortController();var b=new AbortController();var any=AbortSignal.any([a.signal,b.signal]);b.abort('second');try{any.throwIfAborted();return 'no'}catch(e){return String(e)}})()") === "second",
+    "AbortSignal.any + throwIfAborted（stream-client 组合）可用",
+  );
+
+  // ── structuredClone ──
+  assert(box.run("typeof globalThis.structuredClone") === "function", "structuredClone 已补齐");
+  assert(
+    box.run("(function(){var s={a:1,b:[1,2,{c:{d:3}}]};var t=structuredClone(s);return [t.a,t.b[2].c.d,t.b!==s.b].join(':')})()") === "1:3:true",
+    "structuredClone 深拷贝（嵌套对象/数组不同引用）",
+  );
+  assert(
+    box.run("(function(){var s={};s.self=s;var t=structuredClone(s);return t.self===t})()") === true,
+    "structuredClone 处理循环引用",
+  );
+  assert(
+    box.run("(function(){var m=new Map([['k',{n:1}]]);var t=structuredClone(m);return t.get('k').n===1&&t!==m})()") === true,
+    "structuredClone 克隆 Map",
+  );
+  assert(
+    box.run("(function(){var t=structuredClone(new Set([1,2]));return t.size})()") === 2,
+    "structuredClone 克隆 Set",
+  );
+  assert(
+    box.run("(function(){var d=new Date(1700000000000);var t=structuredClone(d);return t.getTime()===d.getTime()&&t!==d})()") === true,
+    "structuredClone 克隆 Date",
+  );
+  assert(
+    box.run("(function(){var u=new Uint8Array([1,2,3]);var t=structuredClone(u);return [t.constructor.name,t.join(',')].join(':')})()") === "Uint8Array:1,2,3",
+    "structuredClone 克隆 TypedArray（同类型）",
+  );
+  assert(
+    box.run("(function(){try{structuredClone(function(){});return 'no'}catch(e){return e.name}})()") === "DataCloneError",
+    "structuredClone 对函数抛 DataCloneError",
+  );
+  // 设置域的真实用法：克隆后提交，原对象不被改写
+  assert(
+    box.run("(function(){var ops=[{path:['a'],after:1}];var owned=structuredClone(ops);ops[0].after=9;return owned[0].after})()") === 1,
+    "structuredClone 后改原对象不影响副本",
+  );
+
+  // ── 其余老内建 ──
+  assert(box.run("[1,2,3].at(-1)") === 3, "Array.prototype.at 支持负索引");
+  assert(box.run("[1,2,3].at(3)") === undefined, "Array.prototype.at 越界返回 undefined");
+  assert(box.run("'abc'.at(-1)") === "c", "String.prototype.at 支持负索引");
+  assert(box.run("[1,2,3,4].findLast(function (x) { return x % 2 === 1 })") === 3, "findLast 从尾部找");
+  assert(box.run("[1,2,3,4].findLastIndex(function (x) { return x % 2 === 0 })") === 3, "findLastIndex 返回下标");
+  assert(box.run("new Uint8Array([1,2,3]).findLast(function (x) { return x < 3 })") === 2, "TypedArray.findLast 可用");
+  assert(box.run("Object.hasOwn({a:1},'a')") === true, "Object.hasOwn 命中自有属性");
+  assert(box.run("Object.hasOwn(Object.create({a:1}),'a')") === false, "Object.hasOwn 不认原型链");
+  assert(box.run("'a-b-c'.replaceAll('-','+')") === "a+b+c", "replaceAll 替换全部");
+  assert(box.run("'x.x'.replaceAll('.', '[$&]')") === "x[.]x", "replaceAll 的 $& 语义");
+  assert(
+    box.run("(function(){try{'a'.replaceAll(/a/, 'b');return 'no'}catch(e){return e.constructor.name}})()") === "TypeError",
+    "replaceAll 对非全局正则抛 TypeError（与规范一致）",
+  );
+  assert(
+    box.run("(function(){var e=new AggregateError([1,2],'boom');return [e.name,e.message,e.errors.length,e instanceof Error].join(':')})()") === "AggregateError:boom:2:true",
+    "AggregateError 补齐且 instanceof Error",
+  );
+  // 客户端主 chunk 顶层就是 `new Intl.Segmenter(void 0, {granularity:'grapheme'})`
+  assert(
+    box.run("(function(){var s=new Intl.Segmenter(void 0,{granularity:'grapheme'});return [...s.segment('héllo')].length})()") === 5,
+    "Intl.Segmenter 按字素切分（客户端顶层构造不再抛）",
+  );
+  assert(
+    box.run("(function(){var s=new Intl.Segmenter(void 0,{granularity:'word'});return [...s.segment('a b')].filter(function (x) { return x.isWordLike }).length})()") === 2,
+    "Intl.Segmenter 的 word 档给出 isWordLike",
+  );
+
+  // ── 幂等 ──
+  const firstThrow = box.run("AbortSignal.prototype.throwIfAborted");
+  const firstClone = box.run("structuredClone");
+  try {
+    box.run(source, "modern.js");
+    ok("96 沙箱二次求值未抛错");
+  } catch (e) {
+    fail(`96 沙箱二次求值抛错：${e.message}`);
+  }
+  assert(box.run("AbortSignal.prototype.throwIfAborted") === firstThrow, "二次求值未重复定义 throwIfAborted");
+  assert(box.run("structuredClone") === firstClone, "二次求值未重复定义 structuredClone");
+
+  // ── blob 作用域：同一份源码注入 worker 后也要补齐 ──
+  const bare = makeSandbox96();
+  let injected = "";
+  try {
+    const host = makeSandbox96();
+    host.run(source, "modern.js");
+    host.run("URL.createObjectURL(new Blob(['/*worker*/'], { type: 'text/javascript' }))");
+    injected = host.created().at(-1).parts[0];
+    bare.run(injected, "blob-injected-96.js");
+    ok("前置源码在 96 裸沙箱里求值未抛错");
+  } catch (e) {
+    fail(`前置源码在 96 裸沙箱里抛错：${e.message}`);
+  }
+  assert(bare.run("typeof AbortSignal.prototype.throwIfAborted") === "function", "worker 作用域里 throwIfAborted 被补齐");
+  assert(bare.run("typeof globalThis.structuredClone") === "function", "worker 作用域里 structuredClone 被补齐");
+}
+
 console.log(failures === 0 ? "\n结论：modern.js 单测全部通过" : `\n结论：${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);
