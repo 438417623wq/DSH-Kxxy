@@ -170,12 +170,19 @@ ok('网络指纹不依赖定位权限（不取 SSID）', !/getConnectionInfo|\.s
 ok('成功判据是 onPageFinished，不是「点了连接」', /if \(remoteMode\)[\s\S]{0,200}markUsed\(this@MainActivity, it, true\)/.test(activity))
 ok('自动连接有看门狗（连得上但不回包时不会一直白屏）', has(activity, 'AUTO_CONNECT_TIMEOUT_MS') && has(activity, 'remoteWatchdog'))
 ok('自动失败静默回本机并给一句提示', has(activity, '已回到本机'))
-ok('前端每页只自动连一次', has(js, 'autoConnectTried'))
-ok('「取消」会真的取消（不是只把提示条藏起来）', /btnRemoteAutoCancel[\s\S]{0,400}postRemote\('disconnect'\)/.test(js))
+ok(
+  '冷启动自动连接在原生（页面加载前就判），不依赖宿主页 JS',
+  /fun loadEngineUrl[\s\S]{0,900}autoCandidate\(this\)[\s\S]{0,200}enterRemote\(auto, auto = true\)/.test(activity),
+  'App 启动加载的是官方对话页 `/`，宿主页要用户点进去才加载 —— 判在 JS 里等于永远不触发',
+)
+ok(
+  '通知/会话意图优先，不被自动连接顶掉',
+  /pendingAttentionId == null && pendingSessionId == null[\s\S]{0,200}autoCandidate/.test(activity),
+)
 ok('信任提示由原生 trustTip 驱动，前端不复述条件', has(js, 'remote.trustTip') && has(store, 'fun trustTip(ctx: Context): Device?'))
 ok('列表里能开关自动连', has(js, 'data-remote-act="${d.trusted ? \'untrust\' : \'trust\'}"'))
 ok('二维码/连接串带机器名且做了编码', /encodeURIComponent\(os\.hostname\(\)/.test(connectorSrc))
-ok('样式齐全（提示条/扫码/信任/开关）', ['.remote-autoconnect', '.remote-scan-button', '.remote-trust-tip', '.remote-trust'].every((c) => css.includes(c)))
+ok('样式齐全（扫码/信任/开关）', ['.remote-scan-button', '.remote-trust-tip', '.remote-trust'].every((c) => css.includes(c)))
 
 // ---------------------------------------------------------------------------
 // [A] 契约：前端

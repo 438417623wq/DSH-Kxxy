@@ -233,9 +233,6 @@
     remoteTrustName: document.getElementById('remote-trust-name'),
     btnTrustYes: document.getElementById('btn-trust-yes'),
     btnTrustNo: document.getElementById('btn-trust-no'),
-    remoteAutoConnect: document.getElementById('remote-autoconnect'),
-    remoteAutoConnectText: document.getElementById('remote-autoconnect-text'),
-    btnRemoteAutoCancel: document.getElementById('btn-remote-autoconnect-cancel'),
 
     // 导航 Tab
     tabItems: document.querySelectorAll('.tab-item'),
@@ -294,17 +291,6 @@
    * 就被下一次轮询收起来 —— 所以只在第一份快照时定初值，之后完全交给用户。
    */
   let remoteStepsResolved = false;
-
-  /**
-   * 本页生命周期内是否已经尝试过自动连接。
-   *
-   * 一次就够：失败后原生会写一段退避窗口（避免「刚失败又立刻重试」的死循环），
-   * 而这里再拦一道 —— 轮询每 2 秒来一份快照，没有这个标记就会反复弹提示条。
-   */
-  let autoConnectTried = false;
-
-  /** 「正在连接…」条的延时句柄。留几百毫秒是给「取消」按得到的窗口。 */
-  let autoConnectTimer = 0;
 
   function remoteKindLabel(device) {
     return device.kind === 'lan' ? '局域网' : '隧道';
@@ -372,49 +358,6 @@
     });
     const qs = query.toString();
     window.location.href = `kxxy://remote/${action}${qs ? `?${qs}` : ''}`;
-  }
-
-  /**
-   * 「正在连接 X…」条的显示/隐藏。
-   *
-   * 不用 Toast：Toast 会自动消失，而这条要一直挂到页面被替换或用户取消 ——
-   * 自动连接最长要等 4.5 秒，Toast 的 2 秒生命周期会留下「提示没了但还在转圈」
-   * 的空窗。也不用全屏遮罩：用户可能只是想看一眼概览，遮屏等于强行接管。
-   */
-  function showAutoConnectBar(label) {
-    if (!dom.remoteAutoConnect) return;
-    if (dom.remoteAutoConnectText) {
-      dom.remoteAutoConnectText.textContent = `正在连接「${label || '这台电脑'}」…`;
-    }
-    dom.remoteAutoConnect.hidden = false;
-  }
-
-  function hideAutoConnectBar() {
-    if (dom.remoteAutoConnect) dom.remoteAutoConnect.hidden = true;
-  }
-
-  /**
-   * 自动连接：快照说「有候选」就发起，本页只发起一次。
-   *
-   * 判定（信任、冷却、失败降级、网络指纹）**全在原生**，这里只做一件事：
-   * 有条目就连。规则放两边会分叉，而分叉之后用户看到的是「有时候连、有时候
-   * 不连」——那种问题没法自查。
-   */
-  function maybeAutoConnect(remote) {
-    if (autoConnectTried) return;
-    const target = remote && remote.autoConnect;
-    if (!target || !target.id) {
-      // 没有候选也把标记立起来：说明原生已经判过一轮（没信任/在冷却/降级），
-      // 不必等下一次轮询再判。
-      autoConnectTried = true;
-      return;
-    }
-    autoConnectTried = true;
-    showAutoConnectBar(target.label);
-    // 600ms：够用户看清是谁、也够他按取消；再长就成了「打开了却什么都没发生」。
-    autoConnectTimer = window.setTimeout(() => {
-      postRemote('connect', { id: target.id, auto: '1' });
-    }, 600);
   }
 
   /**
@@ -504,10 +447,6 @@
 
     renderRemoteList(devices);
     renderTrustTip(remote);
-
-    // 自动连接放在最后：前面几件事把列表/提示先画出来，页面不会出现
-    // 「整屏空白 → 突然被连接条顶下去」的跳动。
-    maybeAutoConnect(remote);
 
     const err = remote.error || {};
     if (typeof err.seq === 'number' && err.seq > remoteErrorSeq) {
@@ -633,14 +572,6 @@
       }
       postRemote('skiptip', { id });
       if (dom.remoteTrustTip) dom.remoteTrustTip.hidden = true;
-    });
-
-    dom.btnRemoteAutoCancel?.addEventListener('click', () => {
-      window.clearTimeout(autoConnectTimer);
-      hideAutoConnectBar();
-      // 取消要有后果：若连接已经发起，这就是一次「断开」（并留下 10 分钟冷却），
-      // 否则用户按了取消、页面半秒后照样跳走，那个按钮就成了摆设。
-      postRemote('disconnect');
     });
 
     dom.btnRemoteSubmit?.addEventListener('click', () => {

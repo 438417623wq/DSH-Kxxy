@@ -57,22 +57,6 @@
     <!-- 浮动通知条 (Toast) -->
     <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
-    <!--
-      自动连接的"正在连…"条。
-
-      放在 app-main **之上**而不是某个视图里：冷启动落在哪一屏都有可能
-      （概览/对话/上次停留的视图），而自动连接是在页面刚就绪时触发的，
-      只有放在壳层才保证用户一定看得到、且一定有"取消"可点。
-
-      为什么要有取消：自动连接是应用主动发起的行为，用户必须能一句话否掉
-      （"我现在不想连"）。取消同时会写一个 10 分钟冷却，避免刚取消又被连回去。
-    -->
-    <div class="remote-autoconnect" id="remote-autoconnect" hidden>
-      <span class="remote-autoconnect-dot" aria-hidden="true"></span>
-      <span class="remote-autoconnect-text" id="remote-autoconnect-text">正在连接…</span>
-      <button class="remote-autoconnect-cancel" id="btn-remote-autoconnect-cancel" type="button">取消</button>
-    </div>
-
     <!-- 主体视口容器 -->
     <main class="app-main">
       <!-- 1. 概览视图 -->

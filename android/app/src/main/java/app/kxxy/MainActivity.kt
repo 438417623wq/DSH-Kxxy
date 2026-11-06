@@ -1244,6 +1244,23 @@ class MainActivity : Activity() {
         if (urlLoaded) return
         urlLoaded = true
 
+        // 冷启动的自动连接就在这里，而不是在网页里。
+        //
+        // 网页侧做不到：App 启动加载的是官方对话页 `/`，宿主管理页 `/kxxy` 要用户
+        // 自己点进去才会加载 —— 把自动连接写在管理页的 JS 里，等于「只有用户先
+        // 打开控制台才会自动连」，这与「打开 App 直接进去」正好相反。
+        //
+        // 例外：从通知/分享进来的「跳到某个会话」意图优先。用户点的是那条通知，
+        // 不是「随便连一台电脑」，不能把它顶掉。
+        if (pendingAttentionId == null && pendingSessionId == null) {
+            val auto = RemoteStore.autoCandidate(this)
+            if (auto != null) {
+                Log.i(TAG, "cold start auto connect: ${auto.label}")
+                enterRemote(auto, auto = true)
+                return
+            }
+        }
+
         val target = tokenUrl ?: "http://127.0.0.1:${EngineConfig.DEFAULT_PORT}/"
         Log.i(TAG, "loading engine url: ${target.take(64)}…")
         webView.loadUrl(target)

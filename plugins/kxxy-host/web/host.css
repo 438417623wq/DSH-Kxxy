@@ -3347,57 +3347,6 @@ input, textarea, select {
    扫码 / 自动连接 / 信任（v0.9.15）
    ========================================================================== */
 
-/* 自动连接提示条 —— 挂在壳层，不属于任何视图 */
-.remote-autoconnect {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 8px 16px 0;
-  padding: 9px 12px;
-  border-radius: var(--radius-md);
-  background: rgba(65, 118, 230, 0.14);
-  border: 1px solid rgba(65, 118, 230, 0.28);
-}
-
-.remote-autoconnect[hidden] {
-  display: none;
-}
-
-.remote-autoconnect-dot {
-  flex: none;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent-blue);
-  animation: remoteAutoPulse 1.2s ease-in-out infinite;
-}
-
-@keyframes remoteAutoPulse {
-  0%, 100% { opacity: 0.35; }
-  50% { opacity: 1; }
-}
-
-.remote-autoconnect-text {
-  flex: 1;
-  min-width: 0;
-  font-size: 12.5px;
-  color: var(--text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.remote-autoconnect-cancel {
-  flex: none;
-  background: none;
-  border: none;
-  color: var(--accent-blue);
-  font-size: 12.5px;
-  font-weight: 600;
-  padding: 6px 8px;
-  cursor: pointer;
-}
-
 /* 扫码主按钮 */
 .remote-scan-button {
   display: flex;

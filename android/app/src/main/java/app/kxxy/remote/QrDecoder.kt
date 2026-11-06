@@ -41,7 +41,6 @@ object QrDecoder {
 
     /** 解码成功返回文本；不是码 / 解不出返回 null（不抛异常）。 */
     fun decode(image: ImageProxy): String? {
-        val plane = image.planes.firstOrNull() ?: return null
         val width = image.width
         val height = image.height
         if (width <= 0 || height <= 0) return null
