@@ -2894,6 +2894,311 @@ input, textarea, select {
 }
 
 /* 动效降级偏好支持 */
+/* ==========================================
+   远程控制（手机控电脑）
+   ==========================================
+
+   设计稿：docs/mockups/2026-11-06-远程控制界面.html（第 ①②③ 屏）。
+   这里只落概览入口与设备管理两处；「已连接」那条设备条是原生的
+   （RemoteBar.kt）—— 因为那时 WebView 里跑的是电脑上的前端，注入不进去。
+*/
+
+.remote-card .card-title-row {
+  margin-bottom: 12px;
+}
+
+.remote-link {
+  flex: none;
+  background: none;
+  border: none;
+  padding: 4px 2px;
+  font-size: 12.5px;
+  color: var(--accent-blue);
+  cursor: pointer;
+  min-height: 32px;
+}
+
+.remote-link:active {
+  opacity: 0.6;
+}
+
+/* 有设备时的一行式入口：点一次就进，不做二次确认 */
+.remote-hero {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+
+.remote-hero[hidden] {
+  display: none;
+}
+
+.remote-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--accent-green);
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.15);
+}
+
+.remote-dot.is-stale {
+  background: var(--accent-orange);
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
+}
+
+.remote-hero-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.remote-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-meta {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.remote-empty[hidden] {
+  display: none;
+}
+
+.remote-empty-text {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+/* ---------- 设备管理视图 ---------- */
+
+.remote-view-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.remote-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: none;
+  border: none;
+  padding: 6px 8px 6px 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  min-height: var(--touch-min);
+}
+
+.remote-back:active {
+  opacity: 0.6;
+}
+
+.remote-view-title {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.remote-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 10px;
+  padding: 11px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  outline: none;
+  -webkit-appearance: none;
+  /* 16px 以下字号在部分 WebView 上聚焦会放大视口，宿主已开 useWideViewPort，
+     这里再显式固定行高，避免输入后页面跳动。 */
+  line-height: 1.4;
+}
+
+.remote-input::placeholder {
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+}
+
+.remote-input:focus {
+  border-color: var(--accent-blue);
+}
+
+.remote-hint {
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--accent-red);
+}
+
+.remote-hint[hidden] {
+  display: none;
+}
+
+.remote-list-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 20px 2px 8px;
+}
+
+.remote-list-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+}
+
+.remote-list-count {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.remote-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.remote-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+}
+
+.remote-item.is-down {
+  opacity: 0.62;
+}
+
+.remote-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.remote-item-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.remote-item-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-item-meta {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-badge {
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: var(--radius-pill);
+  background: rgba(65, 118, 230, 0.16);
+  color: var(--accent-blue);
+}
+
+.remote-badge.is-tunnel {
+  background: rgba(245, 158, 11, 0.16);
+  color: var(--accent-orange);
+}
+
+.remote-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.remote-delete {
+  background: none;
+  border: none;
+  padding: 8px;
+  color: var(--text-muted);
+  cursor: pointer;
+  min-height: var(--touch-min);
+  min-width: 36px;
+}
+
+.remote-delete:active {
+  color: var(--accent-red);
+}
+
+.remote-note-card {
+  margin-top: 16px;
+}
+
+.remote-note-title {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.remote-note-list {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.remote-note-list li {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;

@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kxxy 远程控制 · 界面预览</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0a0a0c;
+    color: #e9e9ec;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 48px 40px 72px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page-head { max-width: 1720px; margin: 0 auto 40px; }
+  .page-head h1 { font-size: 22px; font-weight: 500; letter-spacing: -0.2px; }
+  .page-head p { font-size: 14px; color: #86868c; margin-top: 8px; line-height: 1.7; }
+  .page-head .accent { color: #7aaaff; }
+
+  .board { display: flex; gap: 44px; max-width: 1720px; margin: 0 auto; overflow-x: auto; padding-bottom: 12px; }
+  .slot { flex: 0 0 auto; width: 375px; }
+  .slot-cap { display: flex; align-items: baseline; gap: 8px; margin-bottom: 14px; padding-left: 2px; }
+  .slot-num { font-size: 11px; color: #5c5c62; font-variant-numeric: tabular-nums; }
+  .slot-name { font-size: 13px; color: #b9b9bf; font-weight: 500; }
+  .slot-desc { font-size: 11px; color: #66666d; margin: 0 0 16px 2px; line-height: 1.6; min-height: 34px; }
+
+  .phone {
+    width: 375px; height: 812px; border-radius: 38px; overflow: hidden;
+    background: #151517; position: relative;
+    border: 1px solid #2a2a2e;
+    box-shadow: 0 24px 60px rgba(0,0,0,.55), inset 0 0 0 1px rgba(255,255,255,.02);
+    display: flex; flex-direction: column;
+  }
+  .statusbar {
+    height: 44px; flex: 0 0 44px; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 22px; font-size: 12px; color: #d3d3d7; font-weight: 500;
+  }
+  .statusbar .icons { display: flex; gap: 5px; align-items: center; opacity: .85; }
+
+  .app { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+
+  .topbar {
+    flex: 0 0 56px; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 18px; border-bottom: 1px solid rgba(255,255,255,.058);
+    background: rgba(21,21,23,.92);
+  }
+  .topbar .tt { font-size: 15px; font-weight: 500; letter-spacing: .1px; }
+  .topbar .meta { font-size: 10px; color: #6f6f76; margin-top: 2px; }
+  .topbar-right { display: flex; align-items: center; gap: 10px; }
+  .link { font-size: 12px; color: #8f8f96; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 9px;
+    border-radius: 999px; background: rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.07); font-size: 11px; color: #c8c8ce;
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; flex: 0 0 auto; }
+  .dot.idle { background: #6b7280; }
+  .dot.warn { background: #f59e0b; }
+
+  .scroll { flex: 1; overflow: hidden; padding: 16px 16px 12px; display: flex; flex-direction: column; gap: 12px; }
+
+  .card {
+    background: #1b1b1c; border: 1px solid rgba(255,255,255,.058);
+    border-radius: 14px; padding: 14px;
+  }
+  .card.soft { background: #18181a; }
+  .card.blue {
+    background: rgba(65,118,230,.10); border-color: rgba(65,118,230,.28);
+  }
+
+  .hero-row { display: flex; align-items: center; gap: 11px; }
+  .hero-dot { width: 10px; height: 10px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 4px rgba(34,197,94,.13); }
+  .hero-title { font-size: 16px; font-weight: 500; }
+  .badges { display: flex; gap: 6px; margin-top: 7px; flex-wrap: wrap; }
+  .badge {
+    font-size: 10px; padding: 2px 7px; border-radius: 5px;
+    background: rgba(255,255,255,.055); color: #9b9ba2; border: 1px solid rgba(255,255,255,.05);
+  }
+  .badge.acc { background: rgba(65,118,230,.16); color: #92b6ff; border-color: rgba(65,118,230,.24); }
+  .badge.ok { background: rgba(34,197,94,.13); color: #79d99a; border-color: rgba(34,197,94,.2); }
+  .badge.off { background: rgba(255,255,255,.04); color: #6b6b72; }
+
+  .metrics { display: flex; gap: 10px; }
+  .metric { flex: 1; background: #1b1b1c; border: 1px solid rgba(255,255,255,.058); border-radius: 12px; padding: 11px 12px; }
+  .metric .k { font-size: 10px; color: #7d7d84; }
+  .metric .v { font-size: 17px; font-weight: 500; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .metric .v span { font-size: 10px; color: #6f6f76; margin-left: 3px; font-weight: 400; }
+
+  .card-h { display: flex; align-items: center; justify-content: space-between; margin-bottom: 3px; }
+  .card-t { font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 7px; }
+  .card-s { font-size: 11px; color: #75757c; margin-top: 3px; line-height: 1.5; }
+
+  .dev-row { display: flex; align-items: center; gap: 11px; padding: 9px 0; }
+  .dev-icon {
+    width: 34px; height: 34px; border-radius: 9px; flex: 0 0 34px;
+    background: rgba(255,255,255,.05); display: flex; align-items: center; justify-content: center;
+    color: #a8a8af;
+  }
+  .dev-icon.on { background: rgba(65,118,230,.14); color: #7ea9ff; }
+  .dev-main { flex: 1; min-width: 0; }
+  .dev-name { font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
+  .dev-sub { font-size: 10.5px; color: #737380; margin-top: 2px; display: flex; align-items: center; gap: 5px; }
+  .dev-state { display: flex; align-items: center; gap: 4px; }
+
+  .btn {
+    height: 30px; padding: 0 13px; border-radius: 8px; border: 1px solid rgba(255,255,255,.1);
+    background: transparent; color: #d6d6db; font-size: 12px; font-family: inherit;
+    display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  }
+  .btn.primary { background: #4176e6; border-color: #4176e6; color: #fff; font-weight: 500; }
+  .btn.ghost { color: #8b8b93; border-color: rgba(255,255,255,.085); }
+  .btn.disabled { color: #55555c; border-color: rgba(255,255,255,.05); }
+  .btn.block { width: 100%; height: 42px; font-size: 13.5px; border-radius: 11px; }
+  .btn.block.dash { border-style: dashed; color: #9a9aa2; }
+
+  .divider { height: 1px; background: rgba(255,255,255,.055); margin: 2px 0; }
+  .row-link { display: flex; align-items: center; justify-content: space-between; padding-top: 11px; margin-top: 3px; border-top: 1px solid rgba(255,255,255,.055); font-size: 12px; color: #9a9aa2; }
+
+  .tabbar {
+    flex: 0 0 58px; display: flex; border-top: 1px solid rgba(255,255,255,.058);
+    background: rgba(21,21,23,.94); padding-bottom: 6px;
+  }
+  .tab { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; font-size: 9.5px; color: #6b6b73; }
+  .tab.on { color: #7ea9ff; }
+
+  .seg { display: flex; background: rgba(255,255,255,.045); border-radius: 9px; padding: 3px; gap: 2px; }
+  .seg div { flex: 1; text-align: center; font-size: 12px; padding: 6px 0; border-radius: 7px; color: #8b8b93; }
+  .seg div.on { background: #2a2a2e; color: #eeeef1; font-weight: 500; }
+
+  .code-row { display: flex; gap: 9px; }
+  .code-cell {
+    flex: 1; height: 54px; border-radius: 11px; background: #202022;
+    border: 1px solid rgba(255,255,255,.08);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px; font-weight: 500; font-variant-numeric: tabular-nums; color: #f0f0f3;
+  }
+  .code-cell.filled { border-color: rgba(65,118,230,.45); background: rgba(65,118,230,.10); color: #cfe0ff; }
+  .code-cell.cursor { border-color: #4176e6; box-shadow: 0 0 0 3px rgba(65,118,230,.15); }
+  .caret { width: 1.5px; height: 24px; background: #4176e6; animation: blink 1.1s steps(1) infinite; }
+  @keyframes blink { 0%,49% { opacity: 1; } 50%,100% { opacity: 0; } }
+
+  .field {
+    height: 42px; border-radius: 11px; background: #202022; border: 1px solid rgba(255,255,255,.08);
+    display: flex; align-items: center; padding: 0 12px; gap: 8px;
+    font-size: 12.5px; color: #b6b6bd;
+  }
+  .field .mono { font-family: "SF Mono", Consolas, Menlo, monospace; font-size: 11.5px; color: #d8d8de; }
+
+  .scan-box {
+    height: 190px; border-radius: 14px; background: #101012;
+    border: 1px solid rgba(255,255,255,.07); position: relative;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .corner { position: absolute; width: 22px; height: 22px; border: 2px solid #4176e6; }
+  .c1 { top: 24px; left: 24px; border-right: 0; border-bottom: 0; border-radius: 5px 0 0 0; }
+  .c2 { top: 24px; right: 24px; border-left: 0; border-bottom: 0; border-radius: 0 5px 0 0; }
+  .c3 { bottom: 24px; left: 24px; border-right: 0; border-top: 0; border-radius: 0 0 0 5px; }
+  .c4 { bottom: 24px; right: 24px; border-left: 0; border-top: 0; border-radius: 0 0 5px 0; }
+  .scan-line {
+    position: absolute; left: 28px; right: 28px; height: 1.5px;
+    background: linear-gradient(90deg, transparent, #4176e6, transparent);
+    animation: sweep 2.6s ease-in-out infinite;
+  }
+  @keyframes sweep { 0%,100% { top: 34px; opacity: .25; } 50% { top: 152px; opacity: .9; } }
+
+  .hint { font-size: 11px; color: #6f6f78; line-height: 1.65; display: flex; gap: 6px; }
+  .hint .n { color: #5a5a62; font-variant-numeric: tabular-nums; }
+
+  .remote-bar {
+    flex: 0 0 50px; display: flex; align-items: center; gap: 10px; padding: 0 14px;
+    background: #1d1f26; border-bottom: 1px solid rgba(65,118,230,.22);
+    box-shadow: inset 3px 0 0 #4176e6;
+  }
+  .remote-bar .rb-name { font-size: 13px; font-weight: 500; }
+  .remote-bar .rb-sub { font-size: 10px; color: #85858d; margin-top: 1px; display: flex; align-items: center; gap: 4px; }
+  .rb-back { color: #a9a9b1; display: flex; }
+
+  .chat { flex: 1; overflow: hidden; padding: 16px 16px 8px; display: flex; flex-direction: column; gap: 14px; background: #151517; }
+  .chat-head { display: flex; align-items: center; justify-content: space-between; }
+  .chat-title { font-size: 13px; font-weight: 500; }
+  .msg-user {
+    align-self: flex-end; max-width: 78%; background: #2b3550; color: #e9eeff;
+    padding: 10px 13px; border-radius: 14px 14px 4px 14px; font-size: 13px; line-height: 1.6;
+  }
+  .msg-ai { font-size: 13px; line-height: 1.75; color: #d8d8de; }
+  .tool-card { margin-top: 10px; background: #1b1b1c; border: 1px solid rgba(255,255,255,.06); border-radius: 11px; overflow: hidden; }
+  .tool-h { display: flex; align-items: center; gap: 7px; padding: 9px 11px; font-size: 11.5px; color: #b9b9c1; border-bottom: 1px solid rgba(255,255,255,.05); }
+  .tool-h .ok { margin-left: auto; color: #79d99a; font-size: 10.5px; }
+  .file { display: flex; align-items: center; gap: 7px; padding: 6px 11px; font-size: 11px; color: #8f8f98; font-family: "SF Mono", Consolas, Menlo, monospace; }
+  .file .plus { color: #79d99a; }
+  .file .minus { color: #f09595; }
+
+  .composer {
+    flex: 0 0 auto; padding: 10px 14px 14px; border-top: 1px solid rgba(255,255,255,.058); background: rgba(21,21,23,.96);
+  }
+  .composer-in {
+    height: 44px; border-radius: 12px; background: #202022; border: 1px solid rgba(255,255,255,.08);
+    display: flex; align-items: center; padding: 0 6px 0 13px; gap: 8px;
+  }
+  .composer-in .ph { flex: 1; font-size: 13px; color: #66666e; }
+  .send { width: 32px; height: 32px; border-radius: 9px; background: #4176e6; display: flex; align-items: center; justify-content: center; }
+
+  .note {
+    background: rgba(245,158,11,.09); border: 1px solid rgba(245,158,11,.22);
+    border-radius: 11px; padding: 10px 12px; font-size: 11px; color: #d5b57e; line-height: 1.6;
+  }
+
+  .toast {
+    position: absolute; left: 16px; right: 16px; bottom: 74px;
+    background: #26262a; border: 1px solid rgba(255,255,255,.09); border-radius: 11px;
+    padding: 11px 13px; font-size: 12px; color: #dcdce2; display: flex; gap: 9px; align-items: center;
+    box-shadow: 0 10px 26px rgba(0,0,0,.45);
+  }
+
+  .legend { max-width: 1720px; margin: 44px auto 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .lg { background: #131315; border: 1px solid rgba(255,255,255,.06); border-radius: 14px; padding: 16px 18px; }
+  .lg h3 { font-size: 12.5px; font-weight: 500; margin-bottom: 8px; color: #d6d6dc; }
+  .lg p { font-size: 12px; color: #7e7e87; line-height: 1.75; }
+  .lg code { font-family: "SF Mono", Consolas, Menlo, monospace; font-size: 11px; color: #9fb8e6; }
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <h1>Kxxy 远程控制 · 界面预览</h1>
+  <p>主方向：<span class="accent">手机控制电脑</span>。手机通过局域网直连或用户自带的 HTTPS 隧道接入电脑上的 DSH 桌面端，会话与命令都在电脑执行，手机只做显示与输入。</p>
+</div>
+
+<div class="board">
+
+  <div class="slot">
+    <div class="slot-cap"><span class="slot-num">01</span><span class="slot-name">概览 · 新增入口</span></div>
+    <div class="slot-desc">现有概览页底部加一张「远程控制」卡。只有一台设备时直接显示它，点击一次即连。</div>
+    <div class="phone">
+      <div class="statusbar"><span>9:41</span><div class="icons"><svg width="15" height="10" viewBox="0 0 15 10" fill="currentColor"><rect x="0" y="6" width="2.5" height="4" rx=".6"/><rect x="4" y="4" width="2.5" height="6" rx=".6"/><rect x="8" y="2" width="2.5" height="8" rx=".6"/><rect x="12" y="0" width="2.5" height="10" rx=".6"/></svg><svg width="20" height="10" viewBox="0 0 20 10" fill="none" stroke="currentColor" stroke-width="1"><rect x=".5" y=".5" width="16" height="9" rx="2.5" opacity=".5"/><rect x="2" y="2" width="12" height="6" rx="1.5" fill="currentColor" stroke="none"/><path d="M18 3.5v3" stroke-linecap="round" opacity=".6"/></svg></div></div>
+      <div class="app">
+        <div class="topbar">
+          <div>
+            <div class="tt">DSH Kxxy 控制台</div>
+            <div class="meta">v0.9.12 + d12d939</div>
+          </div>
+          <div class="topbar-right">
+            <span class="link">对话</span>
+            <span class="pill"><span class="dot"></span>引擎正常</span>
+          </div>
+        </div>
+
+        <div class="scroll">
+          <div class="card">
+            <div class="hero-row">
+              <div class="hero-dot"></div>
+              <div>
+                <div class="hero-title">引擎运行中</div>
+                <div class="badges">
+                  <span class="badge acc">PID 28419</span>
+                  <span class="badge">aarch64</span>
+                  <span class="badge">Node v24.18.0</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="metrics">
+            <div class="metric"><div class="k">内存占用</div><div class="v">142<span>MB</span></div></div>
+            <div class="metric"><div class="k">运行时长</div><div class="v">3.4<span>h</span></div></div>
+            <div class="metric"><div class="k">工作区</div><div class="v">8.2<span>GB</span></div></div>
+          </div>
+
+          <div class="card">
+            <div class="card-h">
+              <div class="card-t">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#7ea9ff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                远程控制
+              </div>
+              <span class="badge ok">1 台在线</span>
+            </div>
+            <div class="card-s">在电脑上继续这个工作区</div>
+
+            <div class="dev-row">
+              <div class="dev-icon on">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+              </div>
+              <div class="dev-main">
+                <div class="dev-name">Mac mini</div>
+                <div class="dev-sub"><span class="dev-state"><span class="dot"></span>在线</span><span>·</span><span>局域网 8ms</span></div>
+              </div>
+              <button class="btn primary">连接</button>
+            </div>
+
+            <div class="row-link">
+              <span>管理设备</span>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity=".5"><path d="M9 5l7 7-7 7"/></svg>
+            </div>
+          </div>
+
+          <div class="card soft">
+            <div class="card-h" style="margin-bottom:8px">
+              <div class="card-t">最近会话</div>
+              <span style="font-size:11px;color:#6f6f76">全部</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:9px;padding:7px 0;border-top:1px solid rgba(255,255,255,.045)">
+              <span style="width:5px;height:5px;border-radius:50%;background:#4176e6"></span>
+              <span style="flex:1;font-size:12px;color:#c8c8ce">重构导出模块</span>
+              <span style="font-size:10.5px;color:#6a6a72">12 分钟前</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:9px;padding:7px 0 2px;border-top:1px solid rgba(255,255,255,.045)">
+              <span style="width:5px;height:5px;border-radius:50%;background:#3a3a40"></span>
+              <span style="flex:1;font-size:12px;color:#a8a8b0">排查 CI 缓存失效</span>
+              <span style="font-size:10.5px;color:#6a6a72">昨天</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="tabbar">
+          <div class="tab on"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.6"/><rect x="14" y="3" width="7" height="7" rx="1.6"/><rect x="3" y="14" width="7" height="7" rx="1.6"/><rect x="14" y="14" width="7" height="7" rx="1.6"/></svg>概览</div>
+          <div class="tab"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>扩展</div>
+          <div class="tab"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 6.2L21 9.2l-5 4.1 1.6 6.4L12 16.2 6.4 19.7 8 13.3 3 9.2l6.6-1z"/></svg>插件</div>
+          <div class="tab"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>设置</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slot">
+    <div class="slot-cap"><span class="slot-num">02</span><span class="slot-name">远程设备列表</span></div>
+    <div class="slot-desc">局域网与隧道两种接入混排，用徽章区分。离线设备保留但禁用连接，避免「设备凭空消失」。</div>
+    <div class="phone">
+      <div class="statusbar"><span>9:41</span><div class="icons"><svg width="15" height="10" viewBox="0 0 15 10" fill="currentColor"><rect x="0" y="6" width="2.5" height="4" rx=".6"/><rect x="4" y="4" width="2.5" height="6" rx=".6"/><rect x="8" y="2" width="2.5" height="8" rx=".6"/><rect x="12" y="0" width="2.5" height="10" rx=".6"/></svg><svg width="20" height="10" viewBox="0 0 20 10" fill="none" stroke="currentColor" stroke-width="1"><rect x=".5" y=".5" width="16" height="9" rx="2.5" opacity=".5"/><rect x="2" y="2" width="12" height="6" rx="1.5" fill="currentColor" stroke="none"/><path d="M18 3.5v3" stroke-linecap="round" opacity=".6"/></svg></div></div>
+      <div class="app">
+        <div class="topbar">
+          <div style="display:flex;align-items:center;gap:10px">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#c9c9cf" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5L8 12l7 7"/></svg>
+            <div class="tt">远程设备</div>
+          </div>
+          <span class="link" style="color:#7ea9ff">添加</span>
+        </div>
+
+        <div class="scroll">
+          <div class="card blue" style="padding:12px 13px">
+            <div style="font-size:11.5px;color:#a9c1e8;line-height:1.65">
+              连上之后，会话、文件改动、终端命令都在对方电脑上执行。手机只是它的屏幕和键盘。
+            </div>
+          </div>
+
+          <div class="card" style="padding:6px 14px 10px">
+            <div class="dev-row">
+              <div class="dev-icon on">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+              </div>
+              <div class="dev-main">
+                <div class="dev-name">Mac mini</div>
+                <div class="dev-sub"><span class="dot"></span>在线 · 8ms</div>
+              </div>
+            </div>
+            <div style="display:flex;gap:6px;margin:0 0 10px 45px">
+              <span class="badge">工作室</span>
+              <span class="badge acc">局域网</span>
+            </div>
+            <button class="btn primary block" style="height:36px;font-size:12.5px">连接</button>
+          </div>
+
+          <div class="card" style="padding:6px 14px 10px">
+            <div class="dev-row">
+              <div class="dev-icon on">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h11a2 2 0 0 1 2 2v9a2 2 0 0 0 2 2h1"/><rect x="2" y="16" width="14" height="5" rx="1.5"/></svg>
+              </div>
+              <div class="dev-main">
+                <div class="dev-name">MacBook Pro</div>
+                <div class="dev-sub"><span class="dot"></span>在线 · 46ms</div>
+              </div>
+            </div>
+            <div style="display:flex;gap:6px;margin:0 0 10px 45px">
+              <span class="badge">公司</span>
+              <span class="badge ok">隧道</span>
+            </div>
+            <button class="btn block" style="height:36px;font-size:12.5px">连接</button>
+          </div>
+
+          <div class="card" style="padding:6px 14px 10px;opacity:.55">
+            <div class="dev-row">
+              <div class="dev-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+              </div>
+              <div class="dev-main">
+                <div class="dev-name">家里的台式机</div>
+                <div class="dev-sub"><span class="dot idle"></span>离线 · 3 天前</div>
+              </div>
+            </div>
+            <div style="display:flex;gap:6px;margin:0 0 10px 45px">
+              <span class="badge off">家里</span>
+              <span class="badge off">隧道</span>
+            </div>
+            <button class="btn block disabled" style="height:36px;font-size:12.5px">离线</button>
+          </div>
+
+          <button class="btn block dash">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+            添加电脑
+          </button>
+
+          <div style="font-size:11px;color:#66666e;text-align:center;line-height:1.7">
+            远程连接需要 HTTPS 隧道<br><span style="color:#7ea9ff">查看配置方法</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slot">
+    <div class="slot-cap"><span class="slot-num">03</span><span class="slot-name">添加电脑 · 配对</span></div>
+    <div class="slot-desc">扫码为主路径，配对码兜底。隧道地址放在同一屏的下半部分，避免用户以为「远程要另外配一套」。</div>
+    <div class="phone">
+      <div class="statusbar"><span>9:41</span><div class="icons"><svg width="15" height="10" viewBox="0 0 15 10" fill="currentColor"><rect x="0" y="6" width="2.5" height="4" rx=".6"/><rect x="4" y="4" width="2.5" height="6" rx=".6"/><rect x="8" y="2" width="2.5" height="8" rx=".6"/><rect x="12" y="0" width="2.5" height="10" rx=".6"/></svg><svg width="20" height="10" viewBox="0 0 20 10" fill="none" stroke="currentColor" stroke-width="1"><rect x=".5" y=".5" width="16" height="9" rx="2.5" opacity=".5"/><rect x="2" y="2" width="12" height="6" rx="1.5" fill="currentColor" stroke="none"/><path d="M18 3.5v3" stroke-linecap="round" opacity=".6"/></svg></div></div>
+      <div class="app">
+        <div class="topbar">
+          <div style="display:flex;align-items:center;gap:10px">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#c9c9cf" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5L8 12l7 7"/></svg>
+            <div class="tt">添加电脑</div>
+          </div>
+        </div>
+
+        <div class="scroll">
+          <div class="seg">
+            <div class="on">配对码</div>
+            <div>扫码</div>
+            <div>隧道地址</div>
+          </div>
+
+          <div class="card-s" style="text-align:center;margin-top:2px">
+            在电脑上打开 <span style="color:#c8c8ce">DSH → 设置 → 远程访问</span><br>读出 6 位配对码
+          </div>
+
+          <div class="code-row">
+            <div class="code-cell filled">3</div>
+            <div class="code-cell filled">8</div>
+            <div class="code-cell filled">4</div>
+            <div class="code-cell cursor"><div class="caret"></div></div>
+            <div class="code-cell"></div>
+            <div class="code-cell"></div>
+          </div>
+
+          <div style="font-size:11px;color:#6f6f78;text-align:center">配对码 09:41 后失效 · 剩余 4 分 12 秒</div>
+
+          <div style="display:flex;align-items:center;gap:12px;margin:4px 0">
+            <div style="flex:1;height:1px;background:rgba(255,255,255,.06)"></div>
+            <span style="font-size:10.5px;color:#5f5f67">或 通过隧道</span>
+            <div style="flex:1;height:1px;background:rgba(255,255,255,.06)"></div>
+          </div>
+
+          <div class="field">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6f6f78" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></svg>
+            <span class="mono" style="flex:1">kxxy-mac.trycloudflare.com</span>
+          </div>
+          <div class="hint"><span class="n">·</span><span>隧道地址自带 HTTPS，适合不在同一 WiFi 时使用。手机不会上传任何数据到中转服务器。</span></div>
+
+          <button class="btn primary block" style="margin-top:2px">连接</button>
+
+          <div class="note">
+            首次连接会记住对方证书指纹，指纹变化时拒绝连接。
+          </div>
+
+          <div class="card soft" style="padding:12px 13px;display:flex;flex-direction:column;gap:8px">
+            <div style="font-size:12px;font-weight:500;color:#c8c8ce">连接后会怎样</div>
+            <div class="hint"><span class="n">1</span><span>同一 WiFi 下自动走局域网直连，不经过任何服务器，延迟通常低于 15ms。</span></div>
+            <div class="hint"><span class="n">2</span><span>电脑休眠会断开，唤醒后自动重连并回到原会话，不用重新配对。</span></div>
+            <div class="hint"><span class="n">3</span><span>随时可以在电脑端的「远程访问」里吊销这台手机，立即失效。</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slot">
+    <div class="slot-cap"><span class="slot-num">04</span><span class="slot-name">远程会话 · 已连接</span></div>
+    <div class="slot-desc">远程模式下收起 Kxxy 自己的四页签，换成一条 50px 的设备条。左侧蓝边 + 设备名，随时知道自己在操作谁。</div>
+    <div class="phone">
+      <div class="statusbar"><span>9:41</span><div class="icons"><svg width="15" height="10" viewBox="0 0 15 10" fill="currentColor"><rect x="0" y="6" width="2.5" height="4" rx=".6"/><rect x="4" y="4" width="2.5" height="6" rx=".6"/><rect x="8" y="2" width="2.5" height="8" rx=".6"/><rect x="12" y="0" width="2.5" height="10" rx=".6"/></svg><svg width="20" height="10" viewBox="0 0 20 10" fill="none" stroke="currentColor" stroke-width="1"><rect x=".5" y=".5" width="16" height="9" rx="2.5" opacity=".5"/><rect x="2" y="2" width="12" height="6" rx="1.5" fill="currentColor" stroke="none"/><path d="M18 3.5v3" stroke-linecap="round" opacity=".6"/></svg></div></div>
+      <div class="app">
+        <div class="remote-bar">
+          <div class="rb-back">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5L8 12l7 7"/></svg>
+          </div>
+          <div style="flex:1;min-width:0">
+            <div class="rb-name">Mac mini</div>
+            <div class="rb-sub"><span class="dot" style="width:5px;height:5px"></span>工作室 · 局域网 8ms</div>
+          </div>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#8a8a93" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg>
+        </div>
+
+        <div class="chat">
+          <div class="chat-head">
+            <div class="chat-title">重构导出模块</div>
+            <span class="badge">deepseek-v4</span>
+          </div>
+
+          <div class="msg-user">把 report 页面里的图表全换成暗色主题，轴标签用次要文字色</div>
+
+          <div class="msg-ai">
+            改完 3 个文件，图表容器现在从主题变量取色，浅色模式下不受影响。
+            <div class="tool-card">
+              <div class="tool-h">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#79d99a" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                编辑 3 个文件
+                <span class="ok">+48 −31</span>
+              </div>
+              <div class="file"><span class="plus">+</span>src/report/Chart.tsx</div>
+              <div class="file"><span class="plus">+</span>src/report/theme.ts</div>
+              <div class="file"><span class="minus">−</span>src/report/colors.json</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="composer">
+          <div class="composer-in">
+            <span class="ph">在这台 Mac 上继续…</span>
+            <div class="send">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="legend">
+  <div class="lg">
+    <h3>为什么要一条设备条</h3>
+    <p>远程会话和本地会话长得一模一样。不标出来，用户会在自己手机上找「刚才改的文件」而找不到——它其实在电脑上。左侧 3px 蓝边是低成本的身份提示。</p>
+  </div>
+  <div class="lg">
+    <h3>局域网 / 隧道在同一入口</h3>
+    <p>两者对用户只是「快」和「能在外面用」的差别，不该变成两套功能。设备卡片上的徽章足够区分，连接时自动选择可达路径。</p>
+  </div>
+  <div class="lg">
+    <h3>离线设备不隐藏</h3>
+    <p>电脑关机后设备从列表消失，会让人以为配对丢了、要重新扫一次。保留卡片并标「3 天前」，符合意图。</p>
+  </div>
+</div>
+
+</body>
+</html>

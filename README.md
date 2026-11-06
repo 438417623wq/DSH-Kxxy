@@ -21,6 +21,7 @@
 │  RuntimeInstaller   解包 runtime.zip（含 LINK 物化 / 十五锚点自愈）│
 │  EngineService      前台服务保活（specialUse）                     │
 │  KeepAwake          息屏持 PARTIAL_WAKE_LOCK（CPU 不挂起，闲置让位）│
+│  RemoteLink/Store   连接串解析 + 设备簿（手机控电脑的凭据与白名单） │
 │  Privilege          Normal / Shizuku / Root 三级权限               │
 │  dsh_pty.c          forkpty 原生 PTY（Android 无 posix_openpt）    │
 │  dsh_pty_node.c     node-pty 的 N-API 实现（终端侧栏用）           │
@@ -805,3 +806,47 @@ about:blank 再回来**（无发起者的跨站导航不带 Strict cookie → 40
 - 同类 attention 5 秒窗口内只留最新；单会话最多 3 条（`setGroup` 合并）。
 - 勿扰模式不绕过，但会带 `setTimeoutAfter`，避免过期请求永远占着通知栏。
 - 防回退断言在 `tools/smoke-plugin.mjs`：四段（渠道 / getBroadcast / Manifest 注册 /  kxxy-host 三路由）任一段被删都会立刻失败。
+
+---
+
+## 十一、远程控制（手机控电脑）
+
+手机上的 Kxxy 可以直接操作**电脑上**的 DSH —— 在外面接着看那边的会话。方向是
+单向的：手机是控制端，电脑是被控端。完整设计见
+`docs/2026-11-06-手机控电脑.md`，这里只记要点。
+
+### 为什么不改上游
+
+DSH 桌面端只监听 `127.0.0.1`，Host 校验只认回环与显式 `trustedHosts`，
+而 `--host 0.0.0.0` 被源码主动拒绝。我们改不了它的 asar（下次更新也会覆盖），
+所以在电脑上放一个反代 `tools/remote-connector.mjs`：对外监听 8080，
+**转发时把 `Host` 改回 `127.0.0.1:3080`**。上游于是认为请求来自本机，整套
+origin / cookie 校验原样通过。
+
+反过来「保留 Host + 让上游信任它」是不行的：cookie 签名绑定了 `host:port`，
+换 Host 就 401。
+
+### 四条安全边界
+
+1. **远程模式下 `kxxy://` 桥硬拒绝** —— 那套桥能申请系统权限，而远端页面是
+   别人机器上的代码。`remoteMode = true` 必须在 `loadUrl()` 之前置位，否则存在
+   「页面已导航、标记还是 false」的窗口。
+2. 只有**已配对 origin** 留在应用内，其余交给系统浏览器。
+3. **SSL 错误只对已配对 host 放行**（自签证书隧道需要），host 不在设备簿就 cancel。
+4. 配对 cookie 是 `HttpOnly + SameSite=Lax`；局域网里谁都能扫到 8080，
+   但没有配对码只能看到一张中文引导页。
+
+### 隧道
+
+一期不自研隧道。Tailscale / Cloudflare Tunnel / frp 把**连接器端口 8080**
+暴露出去即可（不是 3080），连接串换成隧道域名。中继带宽、证书、DNS 交给成熟工具。
+
+### 验证
+
+```bash
+node tools/test-remote.mjs     # 74 项
+```
+
+契约段钉原生接线与安全边界（Kotlin 本地跑不起来）；真跑段起真 HTTP 服务验
+配对门、Host 改写、**WebSocket upgrade 透传**（漏了它表现为「界面能开、
+一发消息就断」）、上游不可达时的 502 可读页。

@@ -688,8 +688,11 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * `kxxy-host/web` 新增了设置页的「息屏继续运行」开关与状态行。同一个坑：
  * 用户装完新 APK，设置页却找不到那一行，因为设备上还跑着 `@10` 解出来的旧
  * host 资源。判据放宽成一句话：**zip 里任何会影响运行时行为的文件变了，都要 +1**。
+ *
+ * 11 → 12：手机控电脑（2026-11-06）。`kxxy-host/web` 新增「远程控制」视图与
+ * 概览入口卡 ---- 同样是自有插件前端资源的实质改动，同一个坑。
  */
-const PATCHSET_MARKER = "kxxy-patchset@11";
+const PATCHSET_MARKER = "kxxy-patchset@12";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

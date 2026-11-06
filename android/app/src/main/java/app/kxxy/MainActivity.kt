@@ -16,6 +16,9 @@ import app.kxxy.engine.EngineSupervisor
 import app.kxxy.engine.PermCatalog
 import app.kxxy.engine.ShizukuBridge
 import app.kxxy.engine.WebBootLog
+import app.kxxy.remote.RemoteBar
+import app.kxxy.remote.RemoteLink
+import app.kxxy.remote.RemoteStore
 import app.kxxy.service.EngineService
 import app.kxxy.service.KeepAwake
 import kotlinx.coroutines.Job
@@ -45,6 +48,29 @@ class MainActivity : Activity() {
     private val supervisor: EngineSupervisor get() = app.supervisor
 
     private lateinit var webView: WebView
+
+    private lateinit var rootLayout: FrameLayout
+
+    /**
+     * 远程会话的设备条（远程模式下可见）。
+     *
+     * 延迟创建：绝大多数启动都是本地模式，没必要为它解析主题色、建一堆 View。
+     */
+    private var remoteBar: RemoteBar? = null
+
+    /**
+     * 当前是否处于「手机控电脑」的远程会话。
+     *
+     * 这个标记有两个作用，二者都是安全边界而非 UI 状态：
+     *   ① 远程页面禁止调用 `kxxy://` 桥（那套桥能申请系统权限）；
+     *   ② 返回键语义从「本地页与宿主页之间跳」变成「断开远程」。
+     */
+    @Volatile
+    private var remoteMode = false
+
+    /** 正在连接的设备 id —— 用于回写「上次连接是否成功」。 */
+    @Volatile
+    private var remoteDeviceId: String? = null
 
     @Volatile
     private var urlLoaded = false
@@ -96,20 +122,27 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
 
         webView = WebView(this)
-        setContentView(
-            FrameLayout(this).apply {
-                // 跟随系统深浅色：原先硬编码深色，浅色主题下会在 WebView
-                // 首次绘制前闪一块深底。取值见 res/values{,-night}/colors.xml。
-                setBackgroundColor(getColor(R.color.kxxy_window_bg))
-                addView(
-                    webView,
-                    FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                    ),
-                )
-            }
-        )
+        val root = FrameLayout(this).apply {
+            // 跟随系统深浅色：原先硬编码深色，浅色主题下会在 WebView
+            // 首次绘制前闪一块深底。取值见 res/values{,-night}/colors.xml。
+            setBackgroundColor(getColor(R.color.kxxy_window_bg))
+            addView(
+                webView,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                ),
+            )
+        }
+        rootLayout = root
+        setContentView(root)
+
+        // 远程设备条常驻但默认隐藏；进入远程模式时才 show，并把 WebView 下移，
+        // 避免盖住远端页面自己的顶栏（详见 RemoteBar 的类注释）。
+        remoteBar = RemoteBar(this).also {
+            it.attachTo(root, webView)
+            it.onDisconnect = { exitRemote() }
+        }
 
         setupWebView()
         EngineService.start(this)
@@ -149,6 +182,24 @@ class MainActivity : Activity() {
             // 缓存策略：引擎重启后前端资源未变，允许缓存以加速
             cacheMode = WebSettings.LOAD_DEFAULT
         }
+
+        /*
+         * 远端 cookie。
+         *
+         * 远程模式的认证靠 cookie 承载（连接器配对成功后下发的会话凭据，
+         * 或引擎 `?token=` 换来的 HttpOnly cookie）。WebView 默认接受 cookie，
+         * 但**不落盘** —— 进程一被回收，下次连接就要重新配对。远程场景下
+         * 用户恰恰是「隔几天想起来用一次」，所以这里显式打开持久化，
+         * 并在 onPause 时 flush（见该处注释）。
+         */
+        runCatching {
+            val cm = android.webkit.CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            // 连接器可能把前端放在子路径、跨站资源也在同源下，第三方一并不必开；
+            // 保持默认（关闭）可以少一个被外部页面写 cookie 的入口。
+
+            // 自定义 scheme 只允许 http(s)，cookie 不落到 file:// 与 content://
+        }.onFailure { Log.w(TAG, "cookie manager init failed: ${it.message}") }
 
         /*
          * 渲染进程优先级（息屏保活配套）。
@@ -239,9 +290,22 @@ class MainActivity : Activity() {
                 // 宿主内建桥：kxxy://perm/request?name=…（设置页权限卡片）
                 //             kxxy://open?url=…（兼容层的 window.open 桥，见 handleOpenBridge）
                 //             kxxy://run/keepawake?on=…（息屏保活开关，见 handleRunBridge）
+                //             kxxy://remote/…（远程设备清单与连接，见 handleRemoteBridge）
                 if (request.url.scheme == "kxxy") {
+                    // 远程模式下整条桥一律拒绝。
+                    //
+                    // 这不是「小心一点」级别的防御：`kxxy://perm/request` 能拉起
+                    // 系统权限对话框，`kxxy://open` 能打开任意外链。远程模式下
+                    // 页面的来源是**用户配对的另一台机器** —— 一旦那台机器被
+                    // 拿下（或隧道域名被顶掉），这些能力就是现成的提权面。
+                    // 本地页面永远在 127.0.0.1 下加载，所以不需要例外。
+                    if (remoteMode) {
+                        Log.w(TAG, "bridge rejected in remote session: ${url.take(80)}")
+                        return true
+                    }
                     if (request.url.host == "open") return handleOpenBridge(request.url)
                     if (request.url.host == "run") return handleRunBridge(request.url)
+                    if (request.url.host == "remote") return handleRemoteBridge(request.url)
                     return handlePermissionBridge(request.url)
                 }
                 // 子框架一律放行。右侧栏「工作区文件」的 HTML 预览是宿主拼出
@@ -257,8 +321,15 @@ class MainActivity : Activity() {
                 when (request.url.scheme) {
                     "blob", "data", "about", "javascript" -> return false
                 }
-                // 只放行回环地址；其余交给系统浏览器
+                // 只放行回环地址与**已配对设备**的 origin；其余交给系统浏览器。
+                //
+                // 已配对 origin 由用户粘贴连接串时显式建立（见 RemoteLink），
+                // 不是「局域网内都信任」—— 后者在任意公共 WiFi 下都等于把
+                // 内建桥暴露给同网段的任意主机。
                 if (url.startsWith("http://127.0.0.1:") || url.startsWith("http://localhost:")) {
+                    return false
+                }
+                if (RemoteStore.isTrustedUrl(this@MainActivity, url)) {
                     return false
                 }
                 Log.i(TAG, "external url intercepted: $url")
@@ -266,6 +337,50 @@ class MainActivity : Activity() {
                     startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, request.url))
                 }
                 return true
+            }
+
+            /**
+             * 远程连不上时的提示。
+             *
+             * 只处理主框架错误：远端页面里的子资源失败（某个 chunk 404）
+             * 在官方前端自己有降级，不该把整条设备条变成红色告警。
+             */
+            override fun onReceivedError(
+                view: WebView,
+                request: WebResourceRequest,
+                error: android.webkit.WebResourceError,
+            ) {
+                super.onReceivedError(view, request, error)
+                if (!request.isForMainFrame || !remoteMode) return
+                Log.w(TAG, "remote load failed: ${error.errorCode} ${error.description}")
+                remoteDeviceId?.let { RemoteStore.markUsed(this@MainActivity, it, false) }
+                remoteBar?.flashHint("连不上这台电脑：${error.description}", 6_000L)
+            }
+
+            /**
+             * 自签证书的 HTTPS 隧道。
+             *
+             * 默认实现是「一律取消」，而 Cloudflare / Tailscale / frp 之外的
+             * 自建隧道很常见就是自签。放行条件必须收得很紧：
+             * **只对已配对 origin 放行，且只在远程模式下**。本地回环走 http，
+             * 永远走不到这里；一旦有人把用户骗去连一个陌生域名，那个域名
+             * 不在设备簿里，仍然会被拦住。
+             */
+            override fun onReceivedSslError(
+                view: WebView,
+                handler: android.webkit.SslErrorHandler,
+                error: android.net.http.SslError,
+            ) {
+                val host = runCatching { android.net.Uri.parse(error.url).host }.getOrNull()
+                val trusted = remoteMode && host != null &&
+                    RemoteStore.devices(this@MainActivity).any { it.host == host?.lowercase() }
+                if (trusted) {
+                    Log.w(TAG, "ssl error accepted for paired host: $host (${error.primaryError})")
+                    handler.proceed()
+                } else {
+                    Log.w(TAG, "ssl error rejected: $host (${error.primaryError})")
+                    handler.cancel()
+                }
             }
 
             override fun onPageFinished(view: WebView, url: String) {
@@ -429,6 +544,111 @@ class MainActivity : Activity() {
         }
         return true
     }
+
+    /**
+     * `kxxy://remote/<action>?…` 桥 —— 「手机控电脑」的设备簿与连接。
+     *
+     * 与 `kxxy://run/<action>` 分开的理由：这里的每个 action 都会**改变 WebView 加载
+     * 哪个 origin**，属于导航级操作；混进「改一个原生运行参数」的 when 里，
+     * 以后加开关时很容易被误放行。
+     *
+     * 没有返回值 —— 结果统一走 `/kxxy/api/state` 的 `remote` 字段（前端本来
+     * 就在轮询），形状见 [RemoteStore.snapshotJson]。校验失败会写一条
+     * 带序号的消息，前端靠序号变化决定弹不弹 toast，避免每次轮询都弹一遍。
+     *
+     * action 一览：
+     *   `add?url=…&label=…`  添加或更新（按 origin 去重）
+     *   `remove?id=…`
+     *   `rename?id=…&label=…`
+     *   `connect?id=…`       进入远程会话
+     *   `disconnect`         断开（与设备条按钮等价）
+     */
+    private fun handleRemoteBridge(uri: android.net.Uri): Boolean {
+        val action = uri.path?.trim('/').orEmpty()
+        when (action) {
+            "add" -> {
+                val parsed = RemoteLink.parse(uri.getQueryParameter("url"))
+                if (parsed == null) {
+                    RemoteStore.noteError(
+                        this,
+                        "连接串无效：需要 http(s) 地址，并带 ?token= 或 ?code= 之一",
+                    )
+                    return true
+                }
+                RemoteStore.upsert(this, parsed, uri.getQueryParameter("label"))
+            }
+            "open" -> {
+                // 保存 + 立刻进入。合成一个 action 是因为桥拿不到返回值：
+                // 分成 add → connect 两步时，第二步需要的设备 id 由原生生成，
+                // 前端根本无从得知。
+                val parsed = RemoteLink.parse(uri.getQueryParameter("url"))
+                if (parsed == null) {
+                    RemoteStore.noteError(
+                        this,
+                        "连接串无效：需要 http(s) 地址，并带 ?token= 或 ?code= 之一",
+                    )
+                } else {
+                    enterRemote(RemoteStore.upsert(this, parsed, uri.getQueryParameter("label")))
+                }
+            }
+            "remove" -> uri.getQueryParameter("id")?.let { RemoteStore.remove(this, it) }
+            "rename" -> {
+                val id = uri.getQueryParameter("id")
+                val label = uri.getQueryParameter("label")
+                if (id != null && !label.isNullOrBlank()) RemoteStore.rename(this, id, label.trim())
+            }
+            "connect" -> {
+                val id = uri.getQueryParameter("id")
+                val device = id?.let { RemoteStore.find(this, it) }
+                if (device == null) {
+                    RemoteStore.noteError(this, "设备不存在，可能已被删除")
+                } else {
+                    enterRemote(device)
+                }
+            }
+            "disconnect" -> exitRemote()
+            else -> Log.w(TAG, "remote bridge: unknown action \"$action\"")
+        }
+        // 设备簿变了，立刻把快照重写一次 —— 否则前端最多要等 5 秒心跳才看到
+        // 列表变化（用户会以为没生效而重复点击）。
+        if (action == "add" || action == "remove" || action == "rename" || action == "open") {
+            supervisor.republishState()
+        }
+        return true
+    }
+
+    /**
+     * 进入远程会话。
+     *
+     * 顺序有讲究：先把 `remoteMode` 立起来**再** loadUrl。反过来会出现一个
+     * 极短的窗口 —— 页面已开始导航、标记还是 false，此时若远端页面第一帧就
+     * 尝试 `kxxy://` 跳转，桥会按本地规则执行（那是安全漏洞，不是时序瑕疵）。
+     */
+    private fun enterRemote(device: RemoteStore.Device) {
+        remoteDeviceId = device.id
+        remoteMode = true
+        urlLoaded = true
+        pendingAttentionId = null
+        pendingSessionId = null
+        remoteBar?.bind(device)
+        remoteBar?.show()
+        Log.i(TAG, "enter remote session: ${device.label} @ ${device.origin}")
+        webView.loadUrl(device.url)
+    }
+
+    /** 断开远程，回到本机宿主页的「远程控制」视图。 */
+    private fun exitRemote() {
+        if (!remoteMode) return
+        remoteMode = false
+        remoteDeviceId?.let { RemoteStore.markUsed(this, it, true) }
+        remoteDeviceId = null
+        remoteBar?.hide()
+        Log.i(TAG, "exit remote session")
+        webView.loadUrl(localOverviewUrl() + "#remote")
+    }
+
+    private fun localOverviewUrl(): String =
+        "http://127.0.0.1:${EngineConfig.DEFAULT_PORT}/kxxy"
 
     /**
      * `kxxy://perm/request?name=…` 桥（设置页「系统权限」卡片触发）。
@@ -751,6 +971,19 @@ class MainActivity : Activity() {
             super.onBackPressed()
             return
         }
+        // 远程会话：返回键是逃生通道。远端页面自己可能也有「返回上一层」的
+        // 语义（弹层/侧栏），但那些都能在页面里点掉；而这里是**唯一**能离开
+        // 远程模式的键盘入口，所以给它最高优先级 —— 代价是双击确认防误触。
+        if (remoteMode) {
+            val now = System.currentTimeMillis()
+            if (now - lastBackAt < EXIT_CONFIRM_WINDOW_MS) {
+                exitRemote()
+                return
+            }
+            lastBackAt = now
+            remoteBar?.flashHint("再按一次返回本机", EXIT_CONFIRM_WINDOW_MS)
+            return
+        }
         val path = currentPath
         if (path != null && path.startsWith("/kxxy")) {
             val now = System.currentTimeMillis()
@@ -905,6 +1138,10 @@ class MainActivity : Activity() {
         if (::webView.isInitialized) {
             runCatching { webView.resumeTimers() }
         }
+        // 远端 cookie 落盘。WebView 只在内存里维护 cookie，进程被回收就丢；
+        // 用户下次打开又要重新配对。这里在每次退到后台时刷一次（成本极低，
+        // 且 flush 在 IO 线程完成）。
+        runCatching { android.webkit.CookieManager.getInstance().flush() }
     }
 
     override fun onDestroy() {

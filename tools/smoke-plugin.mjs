@@ -481,14 +481,22 @@ console.log('[1] GET /kxxy（宿主管理页）')
   // 只能靠肉眼发现，所以在这里钉死「页签 ↔ 视图」一一对应。
   const tabTargets = [...r.text.matchAll(/class="tab-item[^"]*"\s+data-target="([^"]+)"/g)].map((m) => m[1])
   const viewNames = [...r.text.matchAll(/class="view-pane[^"]*"\s+data-view="([^"]+)"/g)].map((m) => m[1])
+  // 「远程控制」刻意没有底栏入口：它是从概览卡进出的二级页面，放进四宫格
+  // 会让人以为远程是第五个平级功能。所以视图数 = 页签数 + 无页签视图。
+  const NO_TAB_VIEWS = ['remote']
   if (tabTargets.length === 0 || viewNames.length === 0) {
     fail('解析不出页签或视图（index.html 的 class/data-* 写法变了？）')
-  } else if (tabTargets.length !== viewNames.length) {
-    fail(`底部页签 ${tabTargets.length} 个，视图 ${viewNames.length} 个，数量不一致`)
+  } else if (viewNames.length !== tabTargets.length + NO_TAB_VIEWS.length) {
+    fail(
+      `底部页签 ${tabTargets.length} 个，视图 ${viewNames.length} 个，` +
+        `预期 ${tabTargets.length + NO_TAB_VIEWS.length} 个（${NO_TAB_VIEWS.join('/')} 无页签）`,
+    )
   } else {
     const missing = tabTargets.filter((t) => !viewNames.includes(t))
+    const orphan = viewNames.filter((v) => !tabTargets.includes(v) && !NO_TAB_VIEWS.includes(v))
     if (missing.length > 0) fail(`页签指向不存在的视图：${missing.join(', ')}`)
-    else ok(`底部页签与视图一一对应（${tabTargets.length} 个：${tabTargets.join(' / ')}）`)
+    else if (orphan.length > 0) fail(`视图既没有页签也没登记为二级页：${orphan.join(', ')}`)
+    else ok(`底部页签与视图一一对应（${tabTargets.length} 个页签：${tabTargets.join(' / ')}；二级页：${NO_TAB_VIEWS.join('/')}）`)
   }
 
   // ── 「关于」入口卡与弹窗必须成对存在 ────────────────────────────────

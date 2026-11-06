@@ -139,6 +139,42 @@
         </div>
 
         <!--
+          ===== 远程控制（手机控电脑）=====
+
+          为什么放在指标卡下面第一屏：远程的高频动作只有一个 ——「出门在外，
+          接着用电脑上那台」。它比「看内存占用」重要，所以不埋进设置页。
+
+          两种形态互斥：
+            · 没有配对设备 → 摊开成一行引导 + 「添加电脑」
+            · 有设备      → 直接给出**最近用的那台**与一个「连接」按钮。
+                            多台时这里不铺开列表（那会让首屏变成设备管理器），
+                            「管理」进独立视图。
+        -->
+        <div class="card remote-card" id="remote-card">
+          <div class="card-title-row">
+            <div class="card-title-group" style="margin-bottom:0">
+              <span class="card-title">远程控制</span>
+              <span class="card-subtitle" id="remote-card-sub">连到电脑上的 DSH，接着那边的会话</span>
+            </div>
+            <button class="remote-link" id="btn-remote-manage" type="button">管理</button>
+          </div>
+
+          <div class="remote-hero" id="remote-hero" hidden>
+            <span class="remote-dot" id="remote-hero-dot" aria-hidden="true"></span>
+            <div class="remote-hero-text">
+              <span class="remote-name" id="remote-hero-name">—</span>
+              <span class="remote-meta" id="remote-hero-meta">—</span>
+            </div>
+            <button class="button button-primary button-sm" id="btn-remote-connect" type="button">连接</button>
+          </div>
+
+          <div class="remote-empty" id="remote-empty">
+            <p class="remote-empty-text">在电脑上跑一次连接器，把连接串粘进来就能连。</p>
+            <button class="button button-subtle button-sm" id="btn-remote-add" type="button">添加电脑</button>
+          </div>
+        </div>
+
+        <!--
           ===== 启动体检（原「体检」页整页并入概览）=====
 
           原先它是底栏的独立页签。并进来的理由：底栏五个页签在手机上每个只剩
@@ -506,6 +542,70 @@
       </section>
 
       <!-- 4. 设置视图 -->
+      <!--
+        远程控制视图（手机控电脑）。
+
+        刻意**不进底栏**：底栏留给「这台手机上正在发生的事」（概览/扩展/插件/
+        设置），远程是一个「偶尔要离开本机」的模态动作。给它一个第五个页签，
+        等于把「离开」和一个常驻目的地并列，语义是不对的。
+
+        进入方式两种：概览卡上的「管理」，或断开远程后原生侧的 `#remote` 跳回。
+      -->
+      <section class="view-pane" data-view="remote" id="view-remote">
+        <div class="remote-view-head">
+          <button class="remote-back" id="btn-remote-back" type="button" aria-label="返回概览">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="15 18 9 12 15 6"/>
+            </svg>
+            <span>概览</span>
+          </button>
+          <h2 class="remote-view-title">远程控制</h2>
+        </div>
+
+        <div class="card remote-add-card">
+          <div class="card-title-group">
+            <span class="card-title">添加电脑</span>
+            <span class="card-subtitle">粘贴连接器给出的连接串（含配对码）</span>
+          </div>
+          <input
+            class="remote-input"
+            id="remote-url-input"
+            type="text"
+            inputmode="url"
+            autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+            placeholder="http://192.168.1.23:8080/__kxxy_pair?code=…"
+          >
+          <input
+            class="remote-input"
+            id="remote-label-input"
+            type="text"
+            maxlength="24"
+            placeholder="给它起个名字（可选）"
+          >
+          <button class="button button-primary button-block" id="btn-remote-submit" type="button">添加并连接</button>
+          <p class="remote-hint" id="remote-add-error" hidden></p>
+        </div>
+
+        <div class="remote-list-head">
+          <span class="remote-list-label">已配对的电脑</span>
+          <span class="remote-list-count" id="remote-list-count"></span>
+        </div>
+        <div class="remote-list" id="remote-list"></div>
+        <div class="empty-state" id="remote-list-empty" hidden>还没有配对的电脑</div>
+
+        <div class="card remote-note-card">
+          <span class="remote-note-title">连接之后</span>
+          <ul class="remote-note-list">
+            <li>同一 WiFi 下自动走局域网直连，不经过任何服务器。</li>
+            <li>电脑关机时这条记录会保留，点「连接」会提示连不上，不会丢配对。</li>
+            <li>远程会话里顶部会出现设备条，右侧「断开」随时回到本机。</li>
+          </ul>
+        </div>
+      </section>
+
       <section class="view-pane" data-view="settings" id="view-settings">
         <!-- 外观（读写官方 ui-theme 偏好：控制台与对话界面同步生效） -->
         <div class="card block-card">

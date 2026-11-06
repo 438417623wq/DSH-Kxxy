@@ -208,6 +208,24 @@
     btnHealthUndo: document.getElementById('btn-health-undo'),
     attentionHost: document.getElementById('attention-host'),
 
+    // 远程控制（手机控电脑）—— 设计稿见 docs/mockups/2026-11-06-远程控制界面.html
+    remoteHero: document.getElementById('remote-hero'),
+    remoteHeroDot: document.getElementById('remote-hero-dot'),
+    remoteHeroName: document.getElementById('remote-hero-name'),
+    remoteHeroMeta: document.getElementById('remote-hero-meta'),
+    remoteEmpty: document.getElementById('remote-empty'),
+    btnRemoteManage: document.getElementById('btn-remote-manage'),
+    btnRemoteAdd: document.getElementById('btn-remote-add'),
+    btnRemoteConnect: document.getElementById('btn-remote-connect'),
+    btnRemoteBack: document.getElementById('btn-remote-back'),
+    remoteUrlInput: document.getElementById('remote-url-input'),
+    remoteLabelInput: document.getElementById('remote-label-input'),
+    btnRemoteSubmit: document.getElementById('btn-remote-submit'),
+    remoteAddError: document.getElementById('remote-add-error'),
+    remoteList: document.getElementById('remote-list'),
+    remoteListEmpty: document.getElementById('remote-list-empty'),
+    remoteListCount: document.getElementById('remote-list-count'),
+
     // 导航 Tab
     tabItems: document.querySelectorAll('.tab-item'),
     viewPanes: document.querySelectorAll('.view-pane')
@@ -238,6 +256,235 @@
         }
       }, 300);
     }, 4200);
+  }
+
+  // ==========================================
+  // 远程控制（手机控电脑）
+  // ==========================================
+  /*
+   * 事实源全部在原生侧（RemoteStore）。
+   *
+   * 这里只做两件事：把 `/kxxy/api/state` 里的 `remote` 快照画出来，以及把用户
+   * 动作转成 `kxxy://remote/*` 跳转。**不做本地缓存** —— 设备清单会被原生侧
+   * 的「连接 / 断开 / 失败回写」改变，而页面在远程模式下是卸载的，任何一份
+   * 前端缓存回到本地都已过期。
+   */
+
+  /** 上一条已展示过的错误序号。桥没有返回值，只能靠序号变化判断「是不是新错误」。 */
+  let remoteErrorSeq = 0;
+
+  /** 最近一次拿到的快照，供热路径（连接按钮）读 id 用。 */
+  let remoteSnapshot = null;
+
+  function remoteKindLabel(device) {
+    return device.kind === 'lan' ? '局域网' : '隧道';
+  }
+
+  /** 「3 分钟前 / 昨天 / 9 月 12 日」——不引入依赖，够用即可。 */
+  function relativeTime(ms) {
+    if (!ms) return '未连接过';
+    const diff = Date.now() - ms;
+    if (diff < 0) return '刚刚';
+    const min = Math.floor(diff / 60000);
+    if (min < 1) return '刚刚';
+    if (min < 60) return `${min} 分钟前`;
+    const hour = Math.floor(min / 60);
+    if (hour < 24) return `${hour} 小时前`;
+    const day = Math.floor(hour / 24);
+    if (day === 1) return '昨天';
+    if (day < 30) return `${day} 天前`;
+    const d = new Date(ms);
+    return `${d.getMonth() + 1} 月 ${d.getDate()} 日`;
+  }
+
+  /**
+   * 连接串的本地校验。
+   *
+   * 原生侧的 RemoteLink 是权威实现，这里只是同规则的**前置镜像**：
+   * 桥是单向的，提交后要等下一次轮询才知道成功与否，而「粘贴错了」是最高频
+   * 的失败，不该让用户盯着一个没反应的按钮等 3 秒。
+   * 两边规则不一致也无害 —— 原生拒绝时仍会通过 error 通道提示。
+   */
+  function validateConnString(raw) {
+    const text = (raw || '').trim().replace(/^[<'"`]+|[>'"`]+$/g, '');
+    if (!text) return '请先粘贴连接串';
+    let url;
+    try {
+      url = new URL(/^https?:\/\//i.test(text) ? text : `http://${text}`);
+    } catch (e) {
+      return '这不是一个有效的地址';
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return '只支持 http / https 地址';
+    const keys = ['token', 'code', 'pair', 'key'];
+    const hasCredential = keys.some((k) => (url.searchParams.get(k) || '').length > 0);
+    if (!hasCredential) return '连接串里少了配对码（?code= 或 ?token=）';
+    return '';
+  }
+
+  function showRemoteError(message) {
+    if (!dom.remoteAddError) return;
+    dom.remoteAddError.textContent = message || '';
+    dom.remoteAddError.hidden = !message;
+  }
+
+  /**
+   * 触发一条原生桥。
+   *
+   * 用 `location.href` 而不是 fetch：自定义 scheme 只能靠导航触发，
+   * 这与设置页的权限桥、兼容层的 window.open 桥是同一条路径
+   * （见 MainActivity.shouldOverrideUrlLoading）。
+   */
+  function postRemote(action, params) {
+    const query = new URLSearchParams();
+    Object.keys(params || {}).forEach((k) => {
+      const v = params[k];
+      if (v !== undefined && v !== null && v !== '') query.set(k, v);
+    });
+    const qs = query.toString();
+    window.location.href = `kxxy://remote/${action}${qs ? `?${qs}` : ''}`;
+  }
+
+  function renderRemoteList(devices) {
+    if (!dom.remoteList) return;
+    dom.remoteListCount.textContent = devices.length ? `${devices.length} 台` : '';
+    dom.remoteListEmpty.hidden = devices.length > 0;
+
+    if (!devices.length) {
+      dom.remoteList.innerHTML = '';
+      return;
+    }
+
+    dom.remoteList.innerHTML = devices
+      .map(
+        (d) => `
+      <div class="remote-item${d.ok === false ? ' is-down' : ''}">
+        <div class="remote-item-main">
+          <div class="remote-item-top">
+            <span class="remote-item-name">${escapeHtml(d.label)}</span>
+            <span class="remote-badge${d.kind === 'tunnel' ? ' is-tunnel' : ''}">${remoteKindLabel(d)}</span>
+          </div>
+          <span class="remote-item-meta">${escapeHtml(d.host)}</span>
+        </div>
+        <div class="remote-item-actions">
+          <button class="button button-primary button-sm" data-remote-act="connect" data-id="${escapeHtml(d.id)}" type="button">连接</button>
+          <button class="remote-delete" data-remote-act="remove" data-id="${escapeHtml(d.id)}" type="button" aria-label="删除 ${escapeHtml(d.label)}">✕</button>
+        </div>
+      </div>`
+      )
+      .join('');
+  }
+
+  /** 概览卡 + 设备列表的统一渲染入口（由 fetchState 每轮喂一次快照）。 */
+  function renderRemote(remote) {
+    if (!remote || !dom.remoteHero) return;
+    remoteSnapshot = remote;
+    const devices = Array.isArray(remote.devices) ? remote.devices : [];
+
+    const lastId = remote.lastUsedId;
+    const hero = devices.find((d) => d.id === lastId) || devices[0] || null;
+
+    if (hero) {
+      dom.remoteHero.hidden = false;
+      dom.remoteEmpty.hidden = true;
+      dom.remoteHeroName.textContent = hero.label;
+      dom.remoteHeroMeta.textContent = `${remoteKindLabel(hero)} · ${hero.host} · ${relativeTime(hero.lastUsedAt)}`;
+      dom.remoteHeroDot.classList.toggle('is-stale', hero.ok === false);
+      dom.btnRemoteConnect.dataset.id = hero.id;
+    } else {
+      dom.remoteHero.hidden = true;
+      dom.remoteEmpty.hidden = false;
+      dom.btnRemoteConnect.dataset.id = '';
+    }
+
+    renderRemoteList(devices);
+
+    const err = remote.error || {};
+    if (typeof err.seq === 'number' && err.seq > remoteErrorSeq) {
+      remoteErrorSeq = err.seq;
+      if (err.message) showToast(err.message, 'error');
+    }
+  }
+
+  /**
+   * 切到远程视图。
+   *
+   * 不复用 `goToView`：那个函数靠「点底栏对应 Tab」实现，而远程刻意没有
+   * 底栏入口（理由见 index.html 里该 section 的注释）。切走时高亮要还给概览，
+   * 否则底栏会停在「扩展」之类的上一个选中项上，看起来像卡住了。
+   */
+  function showRemoteView() {
+    dom.viewPanes.forEach((pane) => {
+      pane.classList.toggle('active', pane.getAttribute('data-view') === 'remote');
+    });
+    dom.tabItems.forEach((item) => item.classList.remove('active'));
+    stopHealthPolling();
+    // 列表由轮询驱动，进页面立刻要一份最新值
+    fetchState();
+  }
+
+  function hideRemoteView() {
+    showRemoteError('');
+    goToView('overview');
+  }
+
+  function initRemote() {
+    if (!dom.remoteHero) return;
+
+    dom.btnRemoteManage?.addEventListener('click', () => showRemoteView());
+    dom.btnRemoteAdd?.addEventListener('click', () => {
+      showRemoteView();
+      dom.remoteUrlInput?.focus();
+    });
+    dom.btnRemoteBack?.addEventListener('click', () => hideRemoteView());
+
+    dom.btnRemoteConnect?.addEventListener('click', () => {
+      const id = dom.btnRemoteConnect.dataset.id;
+      if (!id) return;
+      postRemote('connect', { id });
+    });
+
+    dom.btnRemoteSubmit?.addEventListener('click', () => {
+      const raw = dom.remoteUrlInput?.value || '';
+      const problem = validateConnString(raw);
+      if (problem) {
+        showRemoteError(problem);
+        return;
+      }
+      showRemoteError('');
+      // `open` = 保存 + 立刻进入远程会话。分成 add→connect 两步的话，前端
+      // 拿不到原生生成的新设备 id（桥无返回值），第二步无从发起。
+      postRemote('open', { url: raw.trim(), label: dom.remoteLabelInput?.value || '' });
+    });
+
+    // 输错立刻消除提示，不必等下一次提交
+    dom.remoteUrlInput?.addEventListener('input', () => showRemoteError(''));
+
+    dom.remoteList?.addEventListener('click', async (event) => {
+      const btn = event.target.closest('[data-remote-act]');
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const act = btn.dataset.remoteAct;
+      if (!id) return;
+
+      if (act === 'connect') {
+        postRemote('connect', { id });
+        return;
+      }
+      if (act === 'remove') {
+        const device = (remoteSnapshot?.devices || []).find((d) => d.id === id);
+        const ok = await confirmDialog({
+          title: '移除这台电脑',
+          desc: `将从手机里移除「${device?.label || '这台设备'}」的配对记录。电脑上的 DSH 不受影响，重新粘贴连接串即可再配上。`,
+          tone: 'warning',
+          okText: '移除',
+        });
+        if (ok) postRemote('remove', { id });
+      }
+    });
+
+    // 从远程断开后原生侧会回到 `/kxxy#remote`，落地即打开设备页 ——
+    // 用户刚从一个远程会话退出来，下一步要么重连、要么换一台，都在这里。
+    if (location.hash === '#remote') showRemoteView();
   }
 
   // ==========================================
@@ -486,6 +733,9 @@
       const engine = data.engine || {};
       const runtime = data.runtime || {};
       lastStateSnapshot = engine;
+
+      // 远程设备清单（原生快照，含脱敏后的连接串）
+      renderRemote(data.remote);
 
       // 1) 顶部 Header 状态
       if (dom.headerPulseDot && dom.headerStatusLabel) {
@@ -2779,6 +3029,7 @@
     initHealth();
     initPlugins();
     initLifecycle();
+    initRemote();
 
     // 启动初始拉取
     startPolling();

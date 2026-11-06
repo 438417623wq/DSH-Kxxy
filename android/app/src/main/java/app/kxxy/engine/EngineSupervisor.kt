@@ -77,6 +77,17 @@ class EngineSupervisor(private val ctx: Context) {
 
     val state: StateFlow<State> get() = _state.state
 
+    /**
+     * 立即重写一次状态快照，不必等 5 秒心跳。
+     *
+     * 给「改了原生侧状态、但引擎状态本身没变」的场景用 —— 目前是远程设备簿
+     * 的增删：用户点完「移除」，期望列表立刻少一行；等心跳的话会有最长 5 秒
+     * 的延迟，看起来像没生效，于是他会再点一次（这时已经删掉了，于是困惑）。
+     */
+    fun republishState() {
+        runCatching { publishState(_state.value) }
+    }
+
     private val _installProgress = MutableStateFlow(0f)
     val installProgress: StateFlow<Float> = _installProgress.asStateFlow()
 
@@ -811,6 +822,15 @@ class EngineSupervisor(private val ctx: Context) {
                  * 前端自己猜的。同上，kxxy-host 用 Object.assign 摊平。
                  */
                 append("  \"keepAwake\": ${app.kxxy.service.KeepAwake.snapshotJson()},\n")
+                /*
+                 * 远程设备清单（手机控电脑）。
+                 *
+                 * 必须走这条通道，而不是让前端直接读 —— 设备簿存在原生
+                 * SharedPreferences 里（理由见 RemoteStore 的类注释），前端
+                 * 拿不到。连接串在这里**已脱敏**（token 换成圆点）：这份 JSON
+                 * 会落盘成 kxxy-state.json，对插件可读，明文凭证不该出现在那儿。
+                 */
+                append("  \"remote\": ${app.kxxy.remote.RemoteStore.snapshotJson(ctx)},\n")
                 append("  \"updatedAt\": ${System.currentTimeMillis()}\n")
                 append("}\n")
             }
