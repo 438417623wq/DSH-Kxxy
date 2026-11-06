@@ -702,8 +702,14 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * RemoteStore 的信任字段）随 APK 生效；网页那部分是 host 资源，不递增编号设备上
  * 就还跑 `@13` 解出来的旧页面 —— 用户会看到「新 APK 装好了，远程页却没有扫码按钮」，
  * 而且因为旧页面里没有 `scan` 动作，连点的地方都找不到。
+ *
+ * 14 → 15：上手引导改版（2026-11-06）。引导卡的主路径从「跑一条命令」改成
+ * 「在桌面端装远程接入插件」，并给出插件仓库链接与安装命令；命令行连接器降为
+ * 折叠兜底。改动全在 `kxxy-host/web`（index.html / host.js / host.css），
+ * 不升编号的话设备上仍是 @14 的旧页面 —— 而这次的问题恰好是「页面在教用户用
+ * 一条连不上的路径」，比缺个按钮更糟：用户会照着做完，然后卡在那句英文 401 上。
  */
-const PATCHSET_MARKER = "kxxy-patchset@14";
+const PATCHSET_MARKER = "kxxy-patchset@15";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

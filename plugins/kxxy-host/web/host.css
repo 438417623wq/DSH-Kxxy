@@ -3288,7 +3288,12 @@ input, textarea, select {
   font-size: 11.5px;
   line-height: 1.5;
   color: var(--text-secondary);
-  word-break: break-all;
+  /* 只在必要时才断词。原来用 break-all 会把 git clone 那条命令切成
+     「…dshKXHL.g / it; cd …」这种从单词中间断开的样子 —— 能读，但看起来
+     像乱码。这里改成 anywhere：优先在空格处折行，只有单个超长 URL 放不下
+     才在字符间切，配合文案里的 <wbr> 落点更自然。 */
+  word-break: normal;
+  overflow-wrap: anywhere;
 }
 
 .remote-copy {
@@ -3341,6 +3346,92 @@ input, textarea, select {
   font-size: 12.5px;
   line-height: 1.6;
   color: var(--text-muted);
+}
+
+/* 插件仓库链接（v0.9.16）。
+   它不是普通正文里的文字链接 —— 它是这一步唯一的操作入口，做成一块可点的
+   横条，右侧标「打开」，免得用户以为要自己抄地址到电脑上输入。
+   点击由原生 shouldOverrideUrlLoading 交给系统浏览器（非回环、非已配对 origin
+   一律外抛），所以在应用内不会把页面导航走。 */
+.remote-plugin-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 4px;
+  padding: 9px 11px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-elevated);
+  color: var(--text-primary);
+  text-decoration: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.remote-plugin-link:active {
+  opacity: 0.65;
+}
+
+.remote-plugin-link svg {
+  flex: none;
+  color: var(--accent-blue);
+}
+
+.remote-plugin-link-text {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  /* 同 .remote-code code：优先在斜杠处断（文案里插了 <wbr>），
+     实在放不下才在字符间切，避免出现「…/d / shKXHL」这种硬切。 */
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+.remote-plugin-link-go {
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-blue);
+}
+
+/* 兜底折叠（不装插件怎么连）。比主步骤低一档：字号更小、颜色更淡，
+   展开之前不跟主路径抢注意力。 */
+.remote-fallback {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border-subtle);
+}
+
+.remote-fallback > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 44px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  cursor: pointer;
+  list-style: none;
+}
+
+.remote-fallback > summary::-webkit-details-marker {
+  display: none;
+}
+
+.remote-fallback .chevron-icon {
+  flex: none;
+  transition: transform 0.18s ease;
+}
+
+.remote-fallback[open] .chevron-icon {
+  transform: rotate(180deg);
+}
+
+.remote-fallback-body {
+  padding-bottom: 4px;
 }
 
 /* ==========================================================================

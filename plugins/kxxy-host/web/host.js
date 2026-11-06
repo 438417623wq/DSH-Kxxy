@@ -226,8 +226,6 @@
     remoteListEmpty: document.getElementById('remote-list-empty'),
     remoteListCount: document.getElementById('remote-list-count'),
     remoteSteps: document.getElementById('remote-steps'),
-    remoteConnectorCmd: document.getElementById('remote-connector-cmd'),
-    btnRemoteCopy: document.getElementById('btn-remote-copy'),
     btnRemoteScan: document.getElementById('btn-remote-scan'),
     remoteTrustTip: document.getElementById('remote-trust-tip'),
     remoteTrustName: document.getElementById('remote-trust-name'),
@@ -526,17 +524,24 @@
     dom.btnRemoteBack?.addEventListener('click', () => hideRemoteView());
 
     /*
-     * 「复制命令」。
+     * 「复制命令」—— 引导卡里所有 `.remote-copy` 按钮共用一套。
+     *
+     * 用事件委托而不是逐个绑定：卡片里的命令会随文案迭代增删（v0.9.16 就从
+     * 一条变成两条），逐个 querySelector 的写法每加一行命令都要回来改 JS，
+     * 漏一次就是「按钮点下去没反应」。
      *
      * 走 clipboard API 优先、textarea + execCommand 兜底 —— 远程会话里页面
      * 跑在隧道/局域网的 http 上，不是 secure context，`navigator.clipboard`
-     * 直接不存在（与终端 iframe 同一个坑）。命令本身很短，兜底路径完全够用。
+     * 直接不存在（与终端 iframe 同一个坑）。
      */
-    dom.btnRemoteCopy?.addEventListener('click', async () => {
-      const text = (dom.remoteConnectorCmd?.textContent || '').trim();
+    document.addEventListener('click', async (event) => {
+      const btn = event.target instanceof Element ? event.target.closest('.remote-copy') : null;
+      if (!btn) return;
+      // 命令文本取同一个 .remote-code 里的 <code>，按钮本身不用带 id。
+      const text = (btn.parentElement?.querySelector('code')?.textContent || '').trim();
       if (!text) return;
       const ok = await copyText(text);
-      showToast(ok ? '命令已复制，粘到电脑的 PowerShell 里回车' : '复制失败，请手动长按选中', ok ? 'success' : 'error');
+      showToast(ok ? '已复制，粘到电脑的终端里回车' : '复制失败，请手动长按选中', ok ? 'success' : 'error');
     });
 
     dom.btnRemoteConnect?.addEventListener('click', () => {

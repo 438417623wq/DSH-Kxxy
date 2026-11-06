@@ -29,6 +29,9 @@ const bar = norm(read('android/app/src/main/java/app/kxxy/remote/RemoteBar.kt'))
 const activity = norm(read('android/app/src/main/java/app/kxxy/MainActivity.kt'))
 const supervisor = norm(read('android/app/src/main/java/app/kxxy/engine/EngineSupervisor.kt'))
 const html = norm(read('plugins/kxxy-host/web/index.html'))
+// `<wbr>` 是纯排版断点（没有文本内容，复制时不会带出去）。比对文案前先去掉它，
+// 否则「命令是否完整给出」这类断言会因为中间多了一个断点标记而假失败。
+const htmlText = html.replace(/<wbr\s*\/?>/g, '')
 const js = norm(read('plugins/kxxy-host/web/host.js'))
 const css = norm(read('plugins/kxxy-host/web/host.css'))
 const runtime = norm(read('tools/build-runtime.mjs'))
@@ -199,6 +202,34 @@ ok('渲染走 data.remote，不本地缓存设备清单', has(js, 'renderRemote(
 ok('错误按 seq 去重，避免每次轮询弹一次 toast', has(js, 'seq > remoteErrorSeq'))
 ok('设备名做 HTML 转义', has(js, 'escapeHtml(d.label)'))
 ok('样式类齐全（卡片/英雄区/条目/徽章）', ['.remote-card', '.remote-hero', '.remote-item', '.remote-badge'].every((c) => css.includes(c)))
+
+// ---------------------------------------------------------------------------
+// [A] 契约：上手引导（v0.9.16）
+// ---------------------------------------------------------------------------
+console.log('\n[A] 上手引导')
+
+/*
+ * 引导卡是「第一次连不上」唯一能自救的地方，所以每一条都钉住。
+ *
+ * 缺链接 = 用户不知道要装什么；缺「必须装」这一句 = 他会跳过这步去粘
+ * 连接串，然后卡在 `dsh web authentication required` 上 —— 那正是 v0.9.14
+ * 收到的原样反馈。文案里删一行不至于报错，但功能上等于把这条路又堵回去。
+ */
+const PLUGIN_REPO = 'https://github.com/438417623wq/dshKXHL'
+ok('引导卡里有插件仓库链接', has(html, `href="${PLUGIN_REPO}"`))
+ok('链接是真的 <a href>，不是一段要用户手抄的纯文本', new RegExp(`<a[^>]*href="${PLUGIN_REPO}"`).test(html))
+ok('写明「这一步不能省」并解释原因', /这一步不能省/.test(html) && /只监听本机回环/.test(html))
+ok('给出安装命令（clone 与 install 同一条）', has(htmlText, 'git clone https://github.com/438417623wq/dshKXHL.git') && has(htmlText, 'node scripts/install.mjs'))
+ok('命令带 <wbr> 断点，窄屏不会从单词中间硬切', /<wbr>/.test(html))
+ok('提醒装完要完全退出 DSH 再开', /完全退出 DSH/.test(html))
+ok('插件面板步骤在（启动接入 → 二维码）', /启动接入/.test(html))
+ok('命令行连接器降为折叠兜底，不在主步骤里', /<details class="remote-fallback">/.test(html))
+ok('兜底里说清 token 要手填一次', /手填一次/.test(html))
+ok('两个端口都标了（插件 8765 / 命令行 8080），隧道映射不会搞混', /8765/.test(html) && /8080/.test(html))
+ok('外网备注改为「别暴露 DSH 的 3080」', /别去暴露/.test(html))
+ok('复制按钮走通用委托，不依赖固定 id', /closest\('\.remote-copy'\)/.test(js))
+ok('复制按钮按同块 <code> 取文本（加命令不用改 JS）', /querySelector\('code'\)/.test(js))
+ok('引导卡样式补齐（链接条 / 兜底折叠）', ['.remote-plugin-link', '.remote-fallback'].every((c) => css.includes(c)))
 
 // ---------------------------------------------------------------------------
 // [A] 契约：出包一致性

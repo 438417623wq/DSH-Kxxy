@@ -588,12 +588,17 @@
           界面只写了「粘贴连接器给出的连接串」，但**没人知道连接器在哪、怎么跑**。
           一个只有内行看得懂的入口，等于没有入口。
 
-          所以这里把「电脑上要做什么」明写成三步，且把命令原样给出来可复制。
+          所以这里把「电脑上要做什么」一步步写出来，命令原样给出可复制。
           默认展开（没有已配对设备时），有设备后自动收起，不占老用户的版面。
+
+          v0.9.16 调整：主路径从「跑一条命令」改成「装插件」。命令行连接器确实还能用，
+          但它拿不到 DSH 进程的 launch token，用户得自己去「高级」里手填一次 ——
+          对第一次连的人来说是条死路（症状就是那句全屏英文 dsh web authentication
+          required）。插件是唯一不需要用户理解鉴权的方式，所以把命令行收进兜底。
         -->
         <details class="card remote-steps" id="remote-steps" open>
           <summary class="remote-steps-summary">
-            <span class="remote-steps-title">第一次连接？电脑上跑一条命令就行</span>
+            <span class="remote-steps-title">第一次连接？电脑上装个插件就行</span>
             <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="6 9 12 15 18 9"></polyline>
             </svg>
@@ -605,19 +610,39 @@
                 <span class="remote-step-desc">连的是那台电脑上的 DSH —— 桌面端没开，后面连上也只会是一个空壳。</span>
               </li>
               <li>
-                <span class="remote-step-title">在电脑上跑一次连接器</span>
-                <span class="remote-step-desc">把这条命令粘到 PowerShell（在 DSH-Kxxy 目录下）回车：</span>
+                <span class="remote-step-title">在桌面端装「远程接入」插件</span>
+                <span class="remote-step-desc">
+                  <b>这一步不能省。</b>DSH 本身只监听本机回环，手机在同一个 WiFi 下也指不进来；
+                  插件在它旁边另开一个带配对码的口子，还替你处理 DSH 的会话鉴权。
+                </span>
+                <a
+                  class="remote-plugin-link"
+                  href="https://github.com/438417623wq/dshKXHL"
+                  rel="noopener"
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                    <polyline points="15 3 21 3 21 9"/>
+                    <line x1="10" y1="14" x2="21" y2="3"/>
+                  </svg>
+                  <span class="remote-plugin-link-text">github.com/<wbr>438417623wq/<wbr>dshKXHL</span>
+                  <span class="remote-plugin-link-go">打开</span>
+                </a>
+                <span class="remote-step-desc">在电脑上打开终端（需要 Node.js 18+），粘这一行回车：</span>
                 <div class="remote-code">
-                  <code id="remote-connector-cmd">node tools/remote-connector.mjs</code>
-                  <button class="remote-copy" id="btn-remote-copy" type="button">复制</button>
+                  <code>git clone https://github.com/<wbr>438417623wq/<wbr>dshKXHL.git; cd dshKXHL; node <wbr>scripts/install.mjs</code>
+                  <button class="remote-copy" type="button">复制</button>
                 </div>
                 <span class="remote-step-desc">
-                  窗口会打印一行「连接串」，长这样（每次启动都会变，以打印出来的为准）：
+                  装完<b>完全退出 DSH 再打开</b>（关窗口不算），左侧导航会多出一行「远程接入」。
                 </span>
-                <div class="remote-code is-sample">
-                  <code>http://192.168.1.23:8080/__kxxy_pair?code=ab12cd34</code>
-                </div>
-                <span class="remote-step-desc">窗口别关 —— 关掉或重启会换一个配对码，手机就要重新粘一次。</span>
+              </li>
+              <li>
+                <span class="remote-step-title">点「启动接入」，屏幕上就有二维码了</span>
+                <span class="remote-step-desc">
+                  侧栏「远程接入」→ 启动接入 → 面板上出现二维码和连接串，对着它扫就行。
+                  默认端口 8765，被别的程序占了就在面板里换一个。
+                </span>
               </li>
               <li>
                 <span class="remote-step-title">手机扫一下，或者把连接串粘进来</span>
@@ -627,11 +652,49 @@
             <div class="remote-steps-note">
               <span class="remote-steps-note-title">想在外面（4G / 别的网络）连？</span>
               <span class="remote-steps-note-desc">
-                先用 Tailscale、Cloudflare Tunnel、frp 之类的工具，把电脑上的
-                <b>8080 端口</b>（不是 3080）映射成一条 https 地址，再把连接串里的
-                <code class="remote-inline-code">192.168.1.23:8080</code> 换成那条隧道域名即可。
+                Kxxy 自己不做打洞。用 Tailscale、Cloudflare Tunnel、frp 之类的工具，把电脑上的
+                <b>接入端口</b>（插件默认 <code class="remote-inline-code">8765</code>）映射成一条地址，
+                再把连接串里的 <code class="remote-inline-code">192.168.1.23:8765</code> 换成那条隧道域名即可。
+                别去暴露 DSH 自己的 3080 —— 它的登录凭证只认本机，而且没有配对门。
               </span>
             </div>
+
+            <!--
+              兜底：不装插件怎么连。
+
+              收进折叠是因为它不该出现在主路径上 —— 命令行连接器拿不到 DSH 进程的
+              launch token，用户必须去「高级」里手填一次，而第一次连的人根本不知道
+              token 是什么。留着是为了插件装不上（Node 版本、公司电脑禁 git）时还有条路。
+            -->
+            <details class="remote-fallback">
+              <summary>
+                <span>装不上插件？用命令行连接器（要手填一次 token）</span>
+                <svg class="chevron-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </summary>
+              <div class="remote-fallback-body">
+                <span class="remote-step-desc">在 DSH-Kxxy 目录下跑：</span>
+                <div class="remote-code">
+                  <code>node tools/remote-connector.mjs</code>
+                  <button class="remote-copy" type="button">复制</button>
+                </div>
+                <span class="remote-step-desc">
+                  窗口会打印连接串，长这样（每次启动都会变，以打印出来的为准）：
+                </span>
+                <div class="remote-code is-sample">
+                  <code>http://192.168.1.23:8080/__kxxy_pair?code=ab12cd34</code>
+                </div>
+                <span class="remote-step-desc">
+                  窗口别关。但命令行拿不到 DSH 的 launch token，手机第一次打开多半会卡在那句
+                  <code class="remote-inline-code">dsh web authentication required</code> ——
+                  这时要按连接器输出里的提示，把 token 手填一次。这也是推荐装插件的原因。
+                </span>
+                <span class="remote-step-desc">
+                  端口默认 <code class="remote-inline-code">8080</code>，和插件的 8765 不是一个，写隧道映射时别混。
+                </span>
+              </div>
+            </details>
           </div>
         </details>
 
