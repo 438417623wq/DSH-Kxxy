@@ -228,6 +228,14 @@
     remoteSteps: document.getElementById('remote-steps'),
     remoteConnectorCmd: document.getElementById('remote-connector-cmd'),
     btnRemoteCopy: document.getElementById('btn-remote-copy'),
+    btnRemoteScan: document.getElementById('btn-remote-scan'),
+    remoteTrustTip: document.getElementById('remote-trust-tip'),
+    remoteTrustName: document.getElementById('remote-trust-name'),
+    btnTrustYes: document.getElementById('btn-trust-yes'),
+    btnTrustNo: document.getElementById('btn-trust-no'),
+    remoteAutoConnect: document.getElementById('remote-autoconnect'),
+    remoteAutoConnectText: document.getElementById('remote-autoconnect-text'),
+    btnRemoteAutoCancel: document.getElementById('btn-remote-autoconnect-cancel'),
 
     // 导航 Tab
     tabItems: document.querySelectorAll('.tab-item'),
@@ -286,6 +294,17 @@
    * 就被下一次轮询收起来 —— 所以只在第一份快照时定初值，之后完全交给用户。
    */
   let remoteStepsResolved = false;
+
+  /**
+   * 本页生命周期内是否已经尝试过自动连接。
+   *
+   * 一次就够：失败后原生会写一段退避窗口（避免「刚失败又立刻重试」的死循环），
+   * 而这里再拦一道 —— 轮询每 2 秒来一份快照，没有这个标记就会反复弹提示条。
+   */
+  let autoConnectTried = false;
+
+  /** 「正在连接…」条的延时句柄。留几百毫秒是给「取消」按得到的窗口。 */
+  let autoConnectTimer = 0;
 
   function remoteKindLabel(device) {
     return device.kind === 'lan' ? '局域网' : '隧道';
@@ -355,6 +374,68 @@
     window.location.href = `kxxy://remote/${action}${qs ? `?${qs}` : ''}`;
   }
 
+  /**
+   * 「正在连接 X…」条的显示/隐藏。
+   *
+   * 不用 Toast：Toast 会自动消失，而这条要一直挂到页面被替换或用户取消 ——
+   * 自动连接最长要等 4.5 秒，Toast 的 2 秒生命周期会留下「提示没了但还在转圈」
+   * 的空窗。也不用全屏遮罩：用户可能只是想看一眼概览，遮屏等于强行接管。
+   */
+  function showAutoConnectBar(label) {
+    if (!dom.remoteAutoConnect) return;
+    if (dom.remoteAutoConnectText) {
+      dom.remoteAutoConnectText.textContent = `正在连接「${label || '这台电脑'}」…`;
+    }
+    dom.remoteAutoConnect.hidden = false;
+  }
+
+  function hideAutoConnectBar() {
+    if (dom.remoteAutoConnect) dom.remoteAutoConnect.hidden = true;
+  }
+
+  /**
+   * 自动连接：快照说「有候选」就发起，本页只发起一次。
+   *
+   * 判定（信任、冷却、失败降级、网络指纹）**全在原生**，这里只做一件事：
+   * 有条目就连。规则放两边会分叉，而分叉之后用户看到的是「有时候连、有时候
+   * 不连」——那种问题没法自查。
+   */
+  function maybeAutoConnect(remote) {
+    if (autoConnectTried) return;
+    const target = remote && remote.autoConnect;
+    if (!target || !target.id) {
+      // 没有候选也把标记立起来：说明原生已经判过一轮（没信任/在冷却/降级），
+      // 不必等下一次轮询再判。
+      autoConnectTried = true;
+      return;
+    }
+    autoConnectTried = true;
+    showAutoConnectBar(target.label);
+    // 600ms：够用户看清是谁、也够他按取消；再长就成了「打开了却什么都没发生」。
+    autoConnectTimer = window.setTimeout(() => {
+      postRemote('connect', { id: target.id, auto: '1' });
+    }, 600);
+  }
+
+  /**
+   * 信任提示。
+   *
+   * 显隐完全由原生算的 `trustTip` 决定（成功过 / 未信任 / 未被拒绝过），
+   * 前端不复述这套条件 —— 否则「以后再说」之后它还会在本地逻辑里冒出来。
+   */
+  function renderTrustTip(remote) {
+    if (!dom.remoteTrustTip) return;
+    const tip = remote && remote.trustTip;
+    if (!tip || !tip.id) {
+      dom.remoteTrustTip.hidden = true;
+      dom.remoteTrustTip.dataset.id = '';
+      return;
+    }
+    dom.remoteTrustTip.hidden = false;
+    dom.remoteTrustTip.dataset.id = tip.id;
+    if (dom.remoteTrustName) dom.remoteTrustName.textContent = tip.label || '这台电脑';
+  }
+
   function renderRemoteList(devices) {
     if (!dom.remoteList) return;
     dom.remoteListCount.textContent = devices.length ? `${devices.length} 台` : '';
@@ -377,6 +458,13 @@
           <span class="remote-item-meta">${escapeHtml(d.host)}</span>
         </div>
         <div class="remote-item-actions">
+          <button
+            class="remote-trust${d.trusted ? ' is-on' : ''}"
+            data-remote-act="${d.trusted ? 'untrust' : 'trust'}"
+            data-id="${escapeHtml(d.id)}"
+            type="button"
+            title="${d.trusted ? '已开启自动连接，点击关闭' : '信任这台电脑，下次打开 App 自动连接'}"
+          >自动连</button>
           <button class="button button-primary button-sm" data-remote-act="connect" data-id="${escapeHtml(d.id)}" type="button">连接</button>
           <button class="remote-delete" data-remote-act="remove" data-id="${escapeHtml(d.id)}" type="button" aria-label="删除 ${escapeHtml(d.label)}">✕</button>
         </div>
@@ -415,6 +503,11 @@
     }
 
     renderRemoteList(devices);
+    renderTrustTip(remote);
+
+    // 自动连接放在最后：前面几件事把列表/提示先画出来，页面不会出现
+    // 「整屏空白 → 突然被连接条顶下去」的跳动。
+    maybeAutoConnect(remote);
 
     const err = remote.error || {};
     if (typeof err.seq === 'number' && err.seq > remoteErrorSeq) {
@@ -513,6 +606,43 @@
       postRemote('connect', { id });
     });
 
+    /*
+     * 扫码。原生自己开相机页、自己保存、自己进入 —— 这条桥没有返回值，
+     * 成功与否都体现在下一次轮询的 `remote.devices` 里。
+     *
+     * 之所以不做「先在前端解析 URL 再提交」：二维码内容的校验规则在
+     * RemoteLink（原生）里，前端再实现一遍就会有两份规则，而扫码是**没有
+     * 输入框可以回显**的路径 —— 一旦两边判断不一致，用户看到的是「扫了但
+     * 什么也没发生」，连错在哪都指不出来。
+     */
+    dom.btnRemoteScan?.addEventListener('click', () => postRemote('scan'));
+
+    dom.btnTrustYes?.addEventListener('click', () => {
+      const id = dom.remoteTrustTip?.dataset.id;
+      if (!id) return;
+      postRemote('trust', { id });
+      if (dom.remoteTrustTip) dom.remoteTrustTip.hidden = true;
+      showToast('已信任：下次打开 App 会自动连这台', 'success');
+    });
+
+    dom.btnTrustNo?.addEventListener('click', () => {
+      const id = dom.remoteTrustTip?.dataset.id;
+      if (!id) {
+        if (dom.remoteTrustTip) dom.remoteTrustTip.hidden = true;
+        return;
+      }
+      postRemote('skiptip', { id });
+      if (dom.remoteTrustTip) dom.remoteTrustTip.hidden = true;
+    });
+
+    dom.btnRemoteAutoCancel?.addEventListener('click', () => {
+      window.clearTimeout(autoConnectTimer);
+      hideAutoConnectBar();
+      // 取消要有后果：若连接已经发起，这就是一次「断开」（并留下 10 分钟冷却），
+      // 否则用户按了取消、页面半秒后照样跳走，那个按钮就成了摆设。
+      postRemote('disconnect');
+    });
+
     dom.btnRemoteSubmit?.addEventListener('click', () => {
       const raw = dom.remoteUrlInput?.value || '';
       const problem = validateConnString(raw);
@@ -538,6 +668,16 @@
 
       if (act === 'connect') {
         postRemote('connect', { id });
+        return;
+      }
+      if (act === 'trust' || act === 'untrust') {
+        const device = (remoteSnapshot?.devices || []).find((d) => d.id === id);
+        const name = device?.label || '这台电脑';
+        postRemote(act, { id });
+        showToast(
+          act === 'trust' ? `已信任「${name}」：同一网络下打开 App 会直接连` : `已关闭「${name}」的自动连接`,
+          act === 'trust' ? 'success' : 'info'
+        );
         return;
       }
       if (act === 'remove') {

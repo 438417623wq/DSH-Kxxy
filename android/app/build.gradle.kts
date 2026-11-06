@@ -504,6 +504,24 @@ dependencies {
     // 不依赖该私有方法，因此 13.1.5 的 API 面足够且长期稳定。
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+
+    // 扫码（手机控电脑的「扫一下就连」）。
+    //
+    // CameraX：预览 + 逐帧分析。选它而不是 Camera2 手写，是因为我们在
+    // targetSdk 28 上还要兼容 API 26 的机器，而 Camera2 的设备差异（尤其是
+    // 前置/后置切换、对焦模式）足以吃掉好几天。
+    //
+    // zxing core：纯 JVM 的二维码解码（约 600 KB，无 native、不依赖 GMS）。
+    // 不用 ML Kit 的理由见 QrDecoder 的类注释 —— 我们只解自己生成的码。
+    //
+    // camera-view 会把 lifecycle / core 一起带进来；`camera-lifecycle` 是
+    // bindToLifecycle 的实现所在，必须显式声明（别依赖传递依赖的传递）。
+    val camerax = "1.3.4"
+    implementation("androidx.camera:camera-core:$camerax")
+    implementation("androidx.camera:camera-camera2:$camerax")
+    implementation("androidx.camera:camera-lifecycle:$camerax")
+    implementation("androidx.camera:camera-view:$camerax")
+    implementation("com.google.zxing:core:3.5.3")
 }
 
 /**

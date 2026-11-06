@@ -132,6 +132,22 @@
             android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <!--
+          扫码页（手机控电脑的「扫一下就连」）。
+
+          独立 Activity 而不是 Dialog：要跑 CameraX 预览 + 自己申请相机权限，
+          弹窗形态下生命周期只有「显示/消失」，相机解绑时机很难和对话框的
+          dismiss 对齐（常见的后果是关掉后预览画面还亮着几百毫秒）。
+
+          exported=false：只能由本应用拉起。它不是通用扫码入口 —— 谁都能调起
+          一个扫码页没有意义，反而多一个可被第三方触发的界面。
+        -->
+        <activity
+            android:name=".remote.QrScanActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Kxxy"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <!-- 引擎前台服务：保活第一层 -->
         <service
             android:name=".service.EngineService"

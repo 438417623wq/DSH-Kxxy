@@ -33,6 +33,12 @@ const js = norm(read('plugins/kxxy-host/web/host.js'))
 const css = norm(read('plugins/kxxy-host/web/host.css'))
 const runtime = norm(read('tools/build-runtime.mjs'))
 const installer = norm(read('android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt'))
+const scan = norm(read('android/app/src/main/java/app/kxxy/remote/QrScanActivity.kt'))
+const decoder = norm(read('android/app/src/main/java/app/kxxy/remote/QrDecoder.kt'))
+const netPrint = norm(read('android/app/src/main/java/app/kxxy/remote/NetFingerprint.kt'))
+const gradle = norm(read('android/app/build.gradle.kts'))
+const connectorSrc = norm(read('tools/remote-connector.mjs'))
+const manifest = norm(read('android/app/src/main/AndroidManifest.xml'))
 
 let pass = 0
 let fail = 0
@@ -49,6 +55,14 @@ function ok(name, cond, extra = '') {
 
 /** 去空白后比对，避免缩进/换行让断言假失败。 */
 const has = (haystack, needle) => haystack.replace(/\s+/g, ' ').includes(needle.replace(/\s+/g, ' '))
+
+/**
+ * 剥掉注释再断言。
+ *
+ * 必要性很具体：注释里为了解释「为什么不用某 API」会写到那个 API 的名字，
+ * 而断言想看的是**代码里没有调用它**。不去注释就永远互相打架。
+ */
+const codeOnly = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 
 // ---------------------------------------------------------------------------
 // [A] 契约：连接串解析
@@ -111,12 +125,57 @@ ok('断开远程回到本机宿主页并落到 #remote', has(activity, '#remote'
 // ---------------------------------------------------------------------------
 console.log('\n[A] 桥与状态')
 
-for (const action of ['add', 'open', 'remove', 'rename', 'connect', 'disconnect']) {
+for (const action of ['add', 'open', 'remove', 'rename', 'connect', 'disconnect', 'scan', 'trust', 'untrust', 'skiptip']) {
   ok(`桥动作 ${action} 存在`, new RegExp(`"${action}" ->`).test(activity))
 }
 ok('设备簿变更后立刻重发状态（否则要等心跳）', has(activity, 'supervisor.republishState()'))
 ok('publishState 带 remote 快照', has(supervisor, '\\"remote\\": ${app.kxxy.remote.RemoteStore.snapshotJson(ctx)}'))
 ok('设备条是覆盖层而不是塞进 WebView（远端页面的 DOM 我们改不了）', /class RemoteBar|object RemoteBar/.test(bar) || /RemoteBar/.test(activity))
+
+// ---------------------------------------------------------------------------
+// [A] 契约：扫码
+// ---------------------------------------------------------------------------
+console.log('\n[A] 扫码')
+
+ok('扫码页在清单里注册且不导出', /android:name="\.remote\.QrScanActivity"[\s\S]{0,120}android:exported="false"/.test(manifest))
+ok('相机依赖齐（CameraX 预览 + 分析）', ['camera-core', 'camera-camera2', 'camera-lifecycle', 'camera-view'].every((d) => gradle.includes(d)))
+ok('二维码解码用 zxing core（纯 JVM，不拉 GMS/ML Kit）', gradle.includes('com.google.zxing:core') && !/mlkit|play-services/.test(gradle))
+ok('只解二维码格式（不放 MultiFormatReader 白烧 CPU）', has(decoder, 'DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE)'))
+ok('按 rowStride 逐行搬运（否则图像斜切，能看见却扫不出）', has(decoder, 'if (rowStride == width)') && has(decoder, 'System.arraycopy(row, 0, out, written, width)'))
+ok('每帧都 close，否则背压队列卡死后不再给新帧', has(scan, 'image.close()'))
+ok('解码串行化（同一时刻只解一帧）', has(scan, 'decoding.compareAndSet(false, true)'))
+ok(
+  '扫到的内容复用 RemoteLink 校验，不另写一套规则',
+  has(scan, 'RemoteLink.parse(text)') && has(activity, 'RemoteLink.parse(text)'),
+  '两份规则一旦分叉，扫码失败将无法定位',
+)
+ok('扫码保存与进入复用 upsert + enterRemote', /enterRemote\(RemoteStore\.upsert\(this, parsed, null\)/.test(activity))
+ok('扫错码只换提示、不退出相机', has(scan, 'quietUntil') && has(scan, '这不是 Kxxy 的连接码'))
+ok('权限被拒给两个出口（去设置 / 改用粘贴）', has(scan, 'ACTION_APPLICATION_DETAILS_SETTINGS') && has(scan, '改用粘贴连接串'))
+ok('扫码入口在主按钮上', has(html, 'id="btn-remote-scan"') && has(js, "postRemote('scan')"))
+
+// ---------------------------------------------------------------------------
+// [A] 契约：信任与自动连接
+// ---------------------------------------------------------------------------
+console.log('\n[A] 信任与自动连接')
+
+ok('设备簿有信任/失败次数/成功时间字段', ['trusted', 'failStreak', 'lastOkAt', 'netFingerprint'].every((f) => store.includes(f)))
+ok('重新配对时继承信任状态（换配对码不该丢自动连）', has(store, 'trusted = existing?.trusted ?: false'))
+ok('自动连接候选由原生判定', has(store, 'fun autoCandidate(ctx: Context): Device?'))
+ok('手动断开写入冷却（否则断开会被立刻连回去）', has(store, 'DISCONNECT_COOLDOWN_MS') && has(activity, 'exitRemote(cooldown = true)'))
+ok('连续失败降级为手动', has(store, 'MAX_AUTO_FAILS'))
+ok('自动失败后有退避窗口（避免本机页重载即重试）', has(store, 'AUTO_RETRY_BACKOFF_MS'))
+ok('隧道设备不受网络指纹限制（外网连本来就是正常用法）', has(store, 'if (device.kind == "tunnel") return true'))
+ok('网络指纹不依赖定位权限（不取 SSID）', !/getConnectionInfo|\.ssid|ACCESS_FINE_LOCATION/.test(codeOnly(netPrint)))
+ok('成功判据是 onPageFinished，不是「点了连接」', /if \(remoteMode\)[\s\S]{0,200}markUsed\(this@MainActivity, it, true\)/.test(activity))
+ok('自动连接有看门狗（连得上但不回包时不会一直白屏）', has(activity, 'AUTO_CONNECT_TIMEOUT_MS') && has(activity, 'remoteWatchdog'))
+ok('自动失败静默回本机并给一句提示', has(activity, '已回到本机'))
+ok('前端每页只自动连一次', has(js, 'autoConnectTried'))
+ok('「取消」会真的取消（不是只把提示条藏起来）', /btnRemoteAutoCancel[\s\S]{0,400}postRemote\('disconnect'\)/.test(js))
+ok('信任提示由原生 trustTip 驱动，前端不复述条件', has(js, 'remote.trustTip') && has(store, 'fun trustTip(ctx: Context): Device?'))
+ok('列表里能开关自动连', has(js, 'data-remote-act="${d.trusted ? \'untrust\' : \'trust\'}"'))
+ok('二维码/连接串带机器名且做了编码', /encodeURIComponent\(os\.hostname\(\)/.test(connectorSrc))
+ok('样式齐全（提示条/扫码/信任/开关）', ['.remote-autoconnect', '.remote-scan-button', '.remote-trust-tip', '.remote-trust'].every((c) => css.includes(c)))
 
 // ---------------------------------------------------------------------------
 // [A] 契约：前端

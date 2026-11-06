@@ -418,7 +418,10 @@ if (isMain()) {
       const host = addr.address === '0.0.0.0' ? '<本机局域网 IP>' : addr.address
       const lan = connector.lanAddresses()
       const primary = lan[0]?.address || host
-      const link = `http://${primary}:${connector.port}${PAIR_PATH}?code=${connector.code}`
+      // 带机器名，手机端拿它当设备名（否则多台电脑在列表里全是「局域网设备 · IP」）。
+      // 编码是必须的：中文/含空格的主机名直接拼进 query，手机侧会解析成空值。
+      const label = encodeURIComponent(os.hostname() || '电脑')
+      const link = `http://${primary}:${connector.port}${PAIR_PATH}?code=${connector.code}&label=${label}`
 
       // 上游是否真的在跑，启动时就说清楚。
       //
@@ -442,7 +445,7 @@ if (isMain()) {
         console.log('')
         console.log('  其它网卡（上面那条连不通时试这里）')
         for (const item of lan.slice(1)) {
-          console.log(`    http://${item.address}:${connector.port}${PAIR_PATH}?code=${connector.code}   ${item.iface}`)
+          console.log(`    http://${item.address}:${connector.port}${PAIR_PATH}?code=${connector.code}&label=${label}   ${item.iface}`)
         }
       }
       console.log('')

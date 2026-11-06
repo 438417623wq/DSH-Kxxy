@@ -3343,6 +3343,182 @@ input, textarea, select {
   color: var(--text-muted);
 }
 
+/* ==========================================================================
+   扫码 / 自动连接 / 信任（v0.9.15）
+   ========================================================================== */
+
+/* 自动连接提示条 —— 挂在壳层，不属于任何视图 */
+.remote-autoconnect {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 16px 0;
+  padding: 9px 12px;
+  border-radius: var(--radius-md);
+  background: rgba(65, 118, 230, 0.14);
+  border: 1px solid rgba(65, 118, 230, 0.28);
+}
+
+.remote-autoconnect[hidden] {
+  display: none;
+}
+
+.remote-autoconnect-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-blue);
+  animation: remoteAutoPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes remoteAutoPulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.remote-autoconnect-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-autoconnect-cancel {
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--accent-blue);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+/* 扫码主按钮 */
+.remote-scan-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 4px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(65, 118, 230, 0.35);
+  background: rgba(65, 118, 230, 0.12);
+  color: var(--accent-blue);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--transition-fast);
+}
+
+.remote-scan-button:active {
+  background: rgba(65, 118, 230, 0.22);
+}
+
+.remote-scan-icon {
+  flex: none;
+}
+
+.remote-scan-label {
+  flex: none;
+}
+
+.remote-scan-hint {
+  flex: 1;
+  text-align: right;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+/* 「或者粘贴连接串」分隔 */
+.remote-or {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0 10px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.remote-or::before,
+.remote-or::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+/* 信任提示卡 */
+.remote-trust-tip {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-color: rgba(34, 197, 94, 0.32);
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.remote-trust-tip[hidden] {
+  display: none;
+}
+
+.remote-trust-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.remote-trust-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.remote-trust-title b {
+  font-weight: 600;
+  color: var(--accent-green);
+}
+
+.remote-trust-desc {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.remote-trust-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* 设备条里的「自动连」开关：开=实心绿，关=空心灰 */
+.remote-trust {
+  flex: none;
+  min-height: 30px;
+  padding: 5px 9px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.remote-trust.is-on {
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.16);
+  color: var(--accent-green);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;

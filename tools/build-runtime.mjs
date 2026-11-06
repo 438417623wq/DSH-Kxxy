@@ -696,8 +696,14 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 「第一次连接」三步引导与复制按钮。**注意这次的 bug 不在 web 层** —— 顶部那条
  * 50dp 空白是 `RemoteBar` 的 topMargin 造成的（原生侧，随 APK 生效，与补丁集无关）；
  * 编号只是为了把新的 host 资源发下去。
+ *
+ * 13 → 14：扫码与自动连接（2026-11-06）。`kxxy-host/web` 的远程页新增扫码入口、
+ * 「正在连接…」条、信任提示与设备条上的「自动连」开关。原生侧（QrScanActivity /
+ * RemoteStore 的信任字段）随 APK 生效；网页那部分是 host 资源，不递增编号设备上
+ * 就还跑 `@13` 解出来的旧页面 —— 用户会看到「新 APK 装好了，远程页却没有扫码按钮」，
+ * 而且因为旧页面里没有 `scan` 动作，连点的地方都找不到。
  */
-const PATCHSET_MARKER = "kxxy-patchset@13";
+const PATCHSET_MARKER = "kxxy-patchset@14";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

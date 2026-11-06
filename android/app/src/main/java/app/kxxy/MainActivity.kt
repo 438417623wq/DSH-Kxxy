@@ -16,6 +16,7 @@ import app.kxxy.engine.EngineSupervisor
 import app.kxxy.engine.PermCatalog
 import app.kxxy.engine.ShizukuBridge
 import app.kxxy.engine.WebBootLog
+import app.kxxy.remote.QrScanActivity
 import app.kxxy.remote.RemoteBar
 import app.kxxy.remote.RemoteLink
 import app.kxxy.remote.RemoteStore
@@ -71,6 +72,38 @@ class MainActivity : Activity() {
     /** 正在连接的设备 id —— 用于回写「上次连接是否成功」。 */
     @Volatile
     private var remoteDeviceId: String? = null
+
+    /**
+     * 本次进入远程是「自动连接」发起的（而不是用户点的）。
+     *
+     * 只影响失败处理：自动连接失败要**悄悄退回本机并给一句话**，不能把用户
+     * 晾在一个白页面 + 一条设备条上 —— 他压根没打算现在连，凭什么要他动手断开。
+     */
+    @Volatile
+    private var remoteAuto = false
+
+    /** 远端页面是否真的加载完成（onPageFinished）。自动连接的成败判据。 */
+    @Volatile
+    private var remotePageLoaded = false
+
+    /**
+     * 自动连接的看门狗。
+     *
+     * 为什么需要它：`onReceivedError` 只覆盖「连不上/404」这类明确失败，
+     * 而**连得上但对方不回包**（电脑休眠、防火墙丢 SYN）在 WebView 里
+     * 就是一直转圈，没有任何回调。没有看门狗的话，用户开着 App 会看到
+     * 一个空白的远程页，而且因为已经在远程模式，返回键的语义也变了。
+     */
+    private val remoteWatchdog = Runnable {
+        if (!remoteMode || remotePageLoaded) return@Runnable
+        val id = remoteDeviceId ?: return@Runnable
+        val label = RemoteStore.find(this, id)?.label ?: "这台电脑"
+        Log.w(TAG, "auto connect timed out: $id")
+        RemoteStore.markUsed(this, id, false)
+        RemoteStore.startAutoBackoff(this)
+        RemoteStore.noteError(this, "没连上「$label」，已回到本机")
+        exitRemote()
+    }
 
     @Volatile
     private var urlLoaded = false
@@ -141,7 +174,7 @@ class MainActivity : Activity() {
         // 避免盖住远端页面自己的顶栏（详见 RemoteBar 的类注释）。
         remoteBar = RemoteBar(this).also {
             it.attachTo(root, webView)
-            it.onDisconnect = { exitRemote() }
+            it.onDisconnect = { exitRemote(cooldown = true) }
         }
 
         setupWebView()
@@ -353,8 +386,20 @@ class MainActivity : Activity() {
                 super.onReceivedError(view, request, error)
                 if (!request.isForMainFrame || !remoteMode) return
                 Log.w(TAG, "remote load failed: ${error.errorCode} ${error.description}")
-                remoteDeviceId?.let { RemoteStore.markUsed(this@MainActivity, it, false) }
-                remoteBar?.flashHint("连不上这台电脑：${error.description}", 6_000L)
+                webView.removeCallbacks(remoteWatchdog)
+                val id = remoteDeviceId
+                val auto = remoteAuto
+                id?.let { RemoteStore.markUsed(this@MainActivity, it, false) }
+                if (auto && id != null) {
+                    // 自动连接失败：静默退回本机，只留一句提示。
+                    // 用户没有主动发起这次连接，不应该被丢在一个白页面上。
+                    val label = RemoteStore.find(this@MainActivity, id)?.label ?: "这台电脑"
+                    RemoteStore.startAutoBackoff(this@MainActivity)
+                    RemoteStore.noteError(this@MainActivity, "没连上「$label」，已回到本机")
+                    exitRemote()
+                } else {
+                    remoteBar?.flashHint("连不上这台电脑：${error.description}", 6_000L)
+                }
             }
 
             /**
@@ -386,6 +431,15 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 Log.i(TAG, "page finished: $url")
+                // 「连上了」的判据只有这一处。
+                //
+                // 退出远程时回写成功是错的（断开一次成功会话和加载成功是两件事），
+                // 而自动连接必须知道**真的能打开**才敢把一次连接记成成功。
+                if (remoteMode) {
+                    remotePageLoaded = true
+                    webView.removeCallbacks(remoteWatchdog)
+                    remoteDeviceId?.let { RemoteStore.markUsed(this@MainActivity, it, true) }
+                }
                 currentPath = pathOf(url)
                 // 页面就绪后立刻把挂起的 attention 意图送进去（冷启动路径）。
                 flushPendingAttention()
@@ -405,6 +459,14 @@ class MainActivity : Activity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_SCAN) {
+            // 取消返回时 resultCode 是 RESULT_CANCELED，text 为 null —— 静默即可，
+            // 用户主动退出相机不需要任何提示。
+            if (resultCode == Activity.RESULT_OK) {
+                handleScannedText(data?.getStringExtra(QrScanActivity.EXTRA_TEXT))
+            }
+            return
+        }
         if (requestCode != REQUEST_FILE_CHOOSER) return
         val callback = filePathCallback
         filePathCallback = null
@@ -561,7 +623,11 @@ class MainActivity : Activity() {
      *   `remove?id=…`
      *   `rename?id=…&label=…`
      *   `connect?id=…`       进入远程会话
-     *   `disconnect`         断开（与设备条按钮等价）
+     *   `open?url=…&label=…` 保存并立刻进入（扫码与手粘共用）
+     *   `scan`               打开相机扫码
+     *   `trust?id=…` / `untrust?id=…`   信任开关（决定能否自动连）
+     *   `skiptip?id=…`       拒绝「下次自动连」的提示
+     *   `disconnect`         断开（与设备条按钮等价，带 10 分钟自动连冷却）
      */
     private fun handleRemoteBridge(uri: android.net.Uri): Boolean {
         val action = uri.path?.trim('/').orEmpty()
@@ -603,18 +669,73 @@ class MainActivity : Activity() {
                 if (device == null) {
                     RemoteStore.noteError(this, "设备不存在，可能已被删除")
                 } else {
-                    enterRemote(device)
+                    // auto=1 由页面在自动连接时带上：失败处理完全不同（静默回退），
+                    // 所以不能让它和「用户主动点连接」混成同一件事。
+                    enterRemote(device, auto = uri.getQueryParameter("auto") == "1")
                 }
             }
-            "disconnect" -> exitRemote()
+            "disconnect" -> exitRemote(cooldown = true)
+            /*
+             * 扫码：不传参数，原生自己开相机页。
+             *
+             * 结果不经前端 —— 桥是单向的，扫码成功后原生直接 upsert + 进入，
+             * 页面在下一次轮询里就会看到新设备（如果中途失败了，还留在本机页）。
+             * 这和 `open` action 的形状一致，前端不需要为扫码写任何回调逻辑。
+             */
+            "scan" -> openQrScanner()
+            "trust" -> {
+                uri.getQueryParameter("id")?.let { RemoteStore.setTrusted(this, it, true) }
+            }
+            "untrust" -> {
+                uri.getQueryParameter("id")?.let { RemoteStore.setTrusted(this, it, false) }
+            }
+            "skiptip" -> {
+                uri.getQueryParameter("id")?.let { RemoteStore.skipTrustPrompt(this, it) }
+            }
             else -> Log.w(TAG, "remote bridge: unknown action \"$action\"")
         }
         // 设备簿变了，立刻把快照重写一次 —— 否则前端最多要等 5 秒心跳才看到
         // 列表变化（用户会以为没生效而重复点击）。
-        if (action == "add" || action == "remove" || action == "rename" || action == "open") {
+        if (action in setOf("add", "remove", "rename", "open", "trust", "untrust", "skiptip")) {
             supervisor.republishState()
         }
         return true
+    }
+
+    /**
+     * 打开扫码页。
+     *
+     * 权限不放这里申请：相机权限被拒时，用户需要的是「再问一次 / 去设置」，
+     * 而那套交互本来就该待在扫码页里 —— 从本机页弹一个和扫码无关的权限框，
+     * 用户会不知道它在为哪一步要权限。
+     */
+    private fun openQrScanner() {
+        val intent = android.content.Intent(this, QrScanActivity::class.java)
+        runCatching { startActivityForResult(intent, REQ_SCAN) }
+            .onFailure {
+                Log.w(TAG, "cannot open scanner: ${it.message}")
+                RemoteStore.noteError(this, "打不开扫码页，请改用粘贴连接串")
+                supervisor.republishState()
+            }
+    }
+
+    /**
+     * 扫码结果的落地。
+     *
+     * 复用 `RemoteLink.parse` + `upsert` + `enterRemote`，和手粘连接串**完全
+     * 同一条路**。这是刻意的：扫码只是换了一种输入方式，如果它为快捷路径
+     * 单独写一套保存逻辑，两条路就会在「去重键、凭证校验、信任继承」上慢慢
+     * 分叉，而用户看到的是「扫的码和粘的码行为不一样」。
+     */
+    private fun handleScannedText(text: String?) {
+        val parsed = RemoteLink.parse(text)
+        if (parsed == null) {
+            Log.w(TAG, "scan rejected: ${text?.take(60)}")
+            RemoteStore.noteError(this, "这不是 Kxxy 的连接码（需要带配对码的地址）")
+            supervisor.republishState()
+            return
+        }
+        enterRemote(RemoteStore.upsert(this, parsed, null), auto = false)
     }
 
     /**
@@ -624,26 +745,37 @@ class MainActivity : Activity() {
      * 极短的窗口 —— 页面已开始导航、标记还是 false，此时若远端页面第一帧就
      * 尝试 `kxxy://` 跳转，桥会按本地规则执行（那是安全漏洞，不是时序瑕疵）。
      */
-    private fun enterRemote(device: RemoteStore.Device) {
+    private fun enterRemote(device: RemoteStore.Device, auto: Boolean = false) {
         remoteDeviceId = device.id
         remoteMode = true
+        remoteAuto = auto
+        remotePageLoaded = false
         urlLoaded = true
         pendingAttentionId = null
         pendingSessionId = null
         remoteBar?.bind(device)
         remoteBar?.show()
-        Log.i(TAG, "enter remote session: ${device.label} @ ${device.origin}")
+        Log.i(TAG, "enter remote session: ${device.label} @ ${device.origin} (auto=$auto)")
         webView.loadUrl(device.url)
+        webView.removeCallbacks(remoteWatchdog)
+        if (auto) webView.postDelayed(remoteWatchdog, AUTO_CONNECT_TIMEOUT_MS)
     }
 
     /** 断开远程，回到本机宿主页的「远程控制」视图。 */
-    private fun exitRemote() {
+    private fun exitRemote(cooldown: Boolean = false) {
         if (!remoteMode) return
+        webView.removeCallbacks(remoteWatchdog)
         remoteMode = false
-        remoteDeviceId?.let { RemoteStore.markUsed(this, it, true) }
         remoteDeviceId = null
+        remoteAuto = false
+        remotePageLoaded = false
         remoteBar?.hide()
-        Log.i(TAG, "exit remote session")
+        if (cooldown) {
+            // 用户主动说「不要了」。10 分钟内不再自动连，否则退出远程会立刻
+            // 被自动连接逻辑拽回去，断开按钮看起来就是坏的。
+            RemoteStore.startCooldown(this)
+        }
+        Log.i(TAG, "exit remote session (cooldown=$cooldown)")
         webView.loadUrl(localOverviewUrl() + "#remote")
     }
 
@@ -977,7 +1109,7 @@ class MainActivity : Activity() {
         if (remoteMode) {
             val now = System.currentTimeMillis()
             if (now - lastBackAt < EXIT_CONFIRM_WINDOW_MS) {
-                exitRemote()
+                exitRemote(cooldown = true)
                 return
             }
             lastBackAt = now
@@ -1169,6 +1301,18 @@ class MainActivity : Activity() {
 
         private const val REQUEST_FILE_CHOOSER = 4201
         private const val REQ_PERM_NOTIFICATIONS = 4202
+
+        /** 扫码页的回执码。 */
+        private const val REQ_SCAN = 4203
+
+        /**
+         * 自动连接的等待上限。
+         *
+         * 局域网内配对页是本地 HTTP，正常 200ms 内就有响应；给到 4.5 秒是为了
+         * 覆盖「刚解锁的手机 + 省电模式下 WiFi 唤醒」这一段。再长就违背了
+         * 自动连接的初衷 —— 用户宁可手动点一次，也不愿意盯一个白屏。
+         */
+        private const val AUTO_CONNECT_TIMEOUT_MS = 4_500L
 
         /** 设置页里「相机」「麦克风」「媒体」「短信」等单项授权共用的回执码。 */
         private const val REQ_PERM_MEDIA = 4204

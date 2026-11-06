@@ -57,6 +57,22 @@
     <!-- 浮动通知条 (Toast) -->
     <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
+    <!--
+      自动连接的"正在连…"条。
+
+      放在 app-main **之上**而不是某个视图里：冷启动落在哪一屏都有可能
+      （概览/对话/上次停留的视图），而自动连接是在页面刚就绪时触发的，
+      只有放在壳层才保证用户一定看得到、且一定有"取消"可点。
+
+      为什么要有取消：自动连接是应用主动发起的行为，用户必须能一句话否掉
+      （"我现在不想连"）。取消同时会写一个 10 分钟冷却，避免刚取消又被连回去。
+    -->
+    <div class="remote-autoconnect" id="remote-autoconnect" hidden>
+      <span class="remote-autoconnect-dot" aria-hidden="true"></span>
+      <span class="remote-autoconnect-text" id="remote-autoconnect-text">正在连接…</span>
+      <button class="remote-autoconnect-cancel" id="btn-remote-autoconnect-cancel" type="button">取消</button>
+    </div>
+
     <!-- 主体视口容器 -->
     <main class="app-main">
       <!-- 1. 概览视图 -->
@@ -169,7 +185,7 @@
           </div>
 
           <div class="remote-empty" id="remote-empty">
-            <p class="remote-empty-text">先在电脑上跑一次连接器（点进去有分步说明），把打印出来的连接串粘进来就能连。</p>
+            <p class="remote-empty-text">电脑上跑一次连接器（点进去有分步说明），然后用手机扫它给出的二维码，或者把连接串粘进来。</p>
             <button class="button button-subtle button-sm" id="btn-remote-add" type="button">添加电脑</button>
           </div>
         </div>
@@ -563,6 +579,25 @@
         </div>
 
         <!--
+          信任提示：刚连上一次之后出现。
+
+          位置刻意在最上面（引导卡之前）：它是"我连接之后要能保存方案"这句话
+          的落点 —— 用户此刻刚验证过"这台能连"，是最愿意把这条路径固化成
+          默认行为的时候。放进设置页等于让用户为了一个还不确定有用的开关
+          主动去找入口。
+        -->
+        <div class="card remote-trust-tip" id="remote-trust-tip" hidden>
+          <div class="remote-trust-text">
+            <span class="remote-trust-title">下次自动连「<b id="remote-trust-name">这台电脑</b>」？</span>
+            <span class="remote-trust-desc">信任后，在同一个网络下打开 App 会直接进去，不用再点连接</span>
+          </div>
+          <div class="remote-trust-actions">
+            <button class="button button-primary button-sm" id="btn-trust-yes" type="button">信任</button>
+            <button class="button button-subtle button-sm" id="btn-trust-no" type="button">以后再说</button>
+          </div>
+        </div>
+
+        <!--
           第一次连接的引导。
 
           存在理由：v0.9.13 上线后收到的第一个问题就是「我怎么连接我的电脑啊」——
@@ -601,8 +636,8 @@
                 <span class="remote-step-desc">窗口别关 —— 关掉或重启会换一个配对码，手机就要重新粘一次。</span>
               </li>
               <li>
-                <span class="remote-step-title">把连接串粘到下面</span>
-                <span class="remote-step-desc">手机和电脑连同一个 WiFi 就能连上；连上后这条记录会一直留在手机里。</span>
+                <span class="remote-step-title">手机扫一下，或者把连接串粘进来</span>
+                <span class="remote-step-desc">手机和电脑连同一个 WiFi 就能连上。连上之后可以勾「信任」——下次打开 App 直接进去，不必再扫。</span>
               </li>
             </ol>
             <div class="remote-steps-note">
@@ -619,8 +654,31 @@
         <div class="card remote-add-card">
           <div class="card-title-group">
             <span class="card-title">添加电脑</span>
-            <span class="card-subtitle">粘贴连接器给出的连接串（含配对码）</span>
+            <span class="card-subtitle">扫码最快；没有二维码就粘贴连接串</span>
           </div>
+
+          <!--
+            扫码是主按钮，粘贴是次选。
+
+            v0.9.14 之前这里只有输入框 —— 用户要在手机上手打/跨设备复制一串
+            带配对码的 URL，而电脑上那个连接器本来就把同一串东西显示成了
+            二维码。能扫的不让粘，是这个页面最没必要的一道摩擦。
+          -->
+          <button class="remote-scan-button" id="btn-remote-scan" type="button">
+            <svg class="remote-scan-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 8V5a2 2 0 0 1 2-2h3"/>
+              <path d="M16 3h3a2 2 0 0 1 2 2v3"/>
+              <path d="M21 16v3a2 2 0 0 1-2 2h-3"/>
+              <path d="M8 21H5a2 2 0 0 1-2-2v-3"/>
+              <rect x="7.5" y="7.5" width="4" height="4" rx="0.6"/>
+              <rect x="12.5" y="12.5" width="4" height="4" rx="0.6"/>
+            </svg>
+            <span class="remote-scan-label">扫码连接</span>
+            <span class="remote-scan-hint">对着电脑上的二维码</span>
+          </button>
+
+          <div class="remote-or"><span>或者粘贴连接串</span></div>
+
           <input
             class="remote-input"
             id="remote-url-input"
