@@ -73,3 +73,6 @@ plugins/kxxy-host/web/theme.css
 tools/_*
 # versionCode 落盘下限（本机状态，随构建机变化，不入库）
 android/.kxxy-version-code-floor
+
+# 交付副本（1.7 GiB，不入库；由 build-apk.ps1 生成）
+dist/

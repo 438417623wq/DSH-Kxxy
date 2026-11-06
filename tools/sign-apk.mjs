@@ -43,9 +43,12 @@
  */
 import { spawnSync } from 'node:child_process'
 import {
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -354,6 +357,61 @@ function parseCerts(text) {
     dn: dn ? dn[1].trim() : null,
     v1: /Verified using v1 scheme[^:]*:\s*(true|false)/i.exec(text)?.[1] ?? null,
     v2: /Verified using v2 scheme[^:]*:\s*(true|false)/i.exec(text)?.[1] ?? null,
+    v3: /Verified using v3 scheme[^:]*:\s*(true|false)/i.exec(text)?.[1] ?? null,
+  }
+}
+
+/**
+ * 从 zip 的中央目录里列出 `META-INF/*.SF` —— 也就是「v1(JAR) 签名是否写进去了」。
+ *
+ * 为什么不直接读 apksigner 的 `Verified using v1 scheme: false`：那一行是
+ * **按 minSdkVersion 决定的**。本包 minSdk=26，apksigner 判定「不需要 v1」，
+ * 于是即便 v1 签名好好地在包里，它也打印 false（甚至不校验它）。看到这行就
+ * 以为「v1 没签」是完全合理的误读 —— 2026-11-06 就因此被质疑「签名不对」。
+ *
+ * 只读中央目录，不解压任何内容，1.7 GiB 的包也是毫秒级。
+ * 解析失败（zip64、异常结构）时返回 null，调用方降级为「不显示」而不是猜。
+ */
+function readV1Manifests(apk) {
+  let fd
+  try {
+    fd = openSync(apk, 'r')
+    const size = statSync(apk).size
+    const tailLen = Math.min(size, 66_560 + 22)
+    const tail = Buffer.alloc(tailLen)
+    readSync(fd, tail, 0, tailLen, size - tailLen)
+
+    // EOCD 从文件尾往前找（注释最长 65535 字节）
+    let eocd = -1
+    for (let i = tail.length - 22; i >= 0; i--) {
+      if (tail.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
+    }
+    if (eocd < 0) return null
+
+    const total = tail.readUInt16LE(eocd + 10)
+    const cdSize = tail.readUInt32LE(eocd + 12)
+    const cdOffset = tail.readUInt32LE(eocd + 16)
+    if (total === 0xffff || cdOffset === 0xffffffff || cdSize === 0xffffffff) return null // zip64
+
+    const cd = Buffer.alloc(cdSize)
+    readSync(fd, cd, 0, cdSize, cdOffset)
+
+    const names = []
+    let p = 0
+    for (let i = 0; i < total && p + 46 <= cd.length; i++) {
+      if (cd.readUInt32LE(p) !== 0x02014b50) return null
+      const nameLen = cd.readUInt16LE(p + 28)
+      const extraLen = cd.readUInt16LE(p + 30)
+      const commentLen = cd.readUInt16LE(p + 32)
+      const name = cd.toString('utf8', p + 46, p + 46 + nameLen)
+      if (/^META-INF\/[^/]+\.(SF|RSA|DSA|EC)$/i.test(name)) names.push(name)
+      p += 46 + nameLen + extraLen + commentLen
+    }
+    return names
+  } catch {
+    return null
+  } finally {
+    if (fd !== undefined) closeSync(fd)
   }
 }
 
@@ -365,7 +423,41 @@ function printCerts(apk, tool, java) {
   const r = runApksigner(tool, java, ['verify', '-v', '--print-certs', apk], { quiet: true })
   const certs = parseCerts(r.text)
   if (!certs.sha256) {
+    // 区分「没签名」与「签名被破坏」：后者最常见，且症状和「签名不对」一模一样。
+    const broken = /DOES NOT VERIFY|Signature stripped|no such signature was found/i.test(r.text)
+    if (broken) {
+      die(
+        `这个包没有有效签名：${apk}\n` +
+          `  apksigner 原话：${r.text.trim().split('\n').filter(Boolean).slice(-2).join(' / ')}\n` +
+          '  典型成因：签名**之后**又改动过 zip 字节（注入资源 / zipalign / 手改文件），\n' +
+          '  v2 签名块被撕掉，但 META-INF 里旧的 CERT.SF 还留着 —— 看起来像签过。\n' +
+          '  这种包装到设备上就是「签名不对 / 解析包出错」。请重新走一遍\n' +
+          '  tools/build-apk.ps1（顺序必须是：注入 → zipalign → 签名）。',
+      )
+    }
     die(`读不出证书指纹（apksigner exit ${r.status}）：\n${r.text.trim()}`)
+  }
+
+  // v1 的真相要单独确认：见 readV1Manifests 的注释（minSdk≥24 时那行永远是 false）。
+  const v1Files = readV1Manifests(apk)
+  certs.v1Files = v1Files
+  if (v1Files === null) {
+    certs.v1Note = '解析不出中央目录（zip64？）'
+  } else if (!v1Files.some((n) => /\.SF$/i.test(n))) {
+    certs.v1Note = '未写入'
+  } else if (certs.v1 === 'true') {
+    certs.v1Note = '已签'
+  } else {
+    // 有 .SF 不等于有效（注入步骤会把 v2 撕掉、却留下旧的 CERT.SF）。
+    // 强制按 minSdk 21 复核一次，让 apksigner 真的去验 JAR 签名。
+    const strict = runApksigner(
+      tool,
+      java,
+      ['verify', '-v', '--min-sdk-version', '21', '--print-certs', apk],
+      { quiet: true },
+    )
+    certs.v1 = /Verified using v1 scheme[^:]*:\s*(true|false)/i.exec(strict.text)?.[1] ?? certs.v1
+    certs.v1Note = certs.v1 === 'true' ? '已签（按 minSdk21 复核）' : '存在但校验失败'
   }
   return certs
 }
@@ -399,7 +491,7 @@ function main() {
     note(`  APK       = ${apk}（${human(statSync(apk).size)}）`)
     note(`  实际指纹  = ${formatSha256(certs.sha256)}`)
     note(`  DN        = ${certs.dn ?? '?'}`)
-    note(`  v1 / v2   = ${certs.v1 ?? '?'} / ${certs.v2 ?? '?'}`)
+    note(`  签名方案  = v1(JAR) ${certs.v1Note ?? '?'} / v2 ${certs.v2 ?? '?'} / v3 ${certs.v3 ?? '?'}`)
     if (opts.check) {
       if (certs.sha256 !== cfg.certSha256) {
         die(
@@ -410,6 +502,18 @@ function main() {
         )
       }
       note('  ✓ 指纹与仓库内固定密钥一致')
+      // v2 是 Android 7+ 的硬门槛：没有它，设备直接
+      // INSTALL_PARSE_FAILED_NO_CERTIFICATES —— 而 zip 里可能还留着 v1 的
+      // CERT.SF，看着像「签过」。注入/重打包步骤最容易犯这个错。
+      if (certs.v2 !== 'true') {
+        die(
+          'v2 签名缺失。这个包在 Android 7 及以上装不上（INSTALL_PARSE_FAILED_NO_CERTIFICATES）。\n' +
+            '  常见成因：签名之后又改动过 zip 字节（注入资源 / zipalign）。顺序必须是「先对齐，再签名」。',
+        )
+      }
+      if (certs.v1Note && /失败|未写入/.test(certs.v1Note)) {
+        note(`  ! v1(JAR) 签名${certs.v1Note} —— 少数第三方安装器可能拒绝，v2 正常的设备不受影响`)
+      }
     }
     return
   }

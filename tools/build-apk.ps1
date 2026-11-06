@@ -349,13 +349,54 @@ try {
 
     if (-not $KeepAligned) { Remove-Item -Force -ErrorAction SilentlyContinue $aligned }
 
+    # ── 7) 把 gradle 的中间产物挪开（真实事故：装错文件报「签名不对」）──────
+    #
+    # 第 4 步的流式注入重写了 zip 的字节，gradle 原本用 v2 签好的 app-debug.apk
+    # 到这一步**签名已经失效**，但 META-INF 里的 CERT.SF / CERT.RSA 还留着 ——
+    # 于是它看起来「有签名」，`apksigner verify` 却报
+    #
+    #     ERROR: JAR signature META-INF/CERT.SF indicates the APK is signed
+    #     using APK Signature Scheme v2 but no such signature was found.
+    #
+    # 两个 ~1.7 GiB 的文件并排躺在同一个目录里、名字只差一个后缀，装错了就报
+    # 「签名不对 / 解析包出错」。2026-11-06 真的踩到了。
+    #
+    # 所以出包后主动把中间产物改名成 .unsigned：目录里从此只剩一个能装的包。
+    # （下次 assembleDebug 会自动重新生成 app-debug.apk，不影响任何流程。）
+    if (Test-Path $apk) {
+        $dead = "$apk.unsigned"
+        Remove-Item -Force -ErrorAction SilentlyContinue $dead
+        Move-Item -Force $apk $dead
+        Write-Host "      中间产物已改名：app-debug.apk.unsigned（签名已被注入步骤破坏，不可安装）" -ForegroundColor DarkGray
+    }
+
+    # 交付副本：名字带版本号，避免和任何中间产物混淆
+    $dist = "$Project\dist"
+    New-Item -ItemType Directory -Force -Path $dist | Out-Null
+    $verTag = "0.0.0"
+    $metaFile = Join-Path (Split-Path $signed) "output-metadata.json"
+    if (Test-Path $metaFile) {
+        try {
+            $meta = Get-Content $metaFile -Raw | ConvertFrom-Json
+            $vn = [string]$meta.elements[0].versionName
+            if ($vn) { $verTag = ($vn -split '\+')[0] }   # 0.9.14+1.cad3990 → 0.9.14
+        } catch { }
+    }
+    $distApk = "$dist\Kxxy-$verTag.apk"
+    Copy-Item -Force $signed $distApk
+    $sha = (Get-FileHash -Algorithm SHA256 $distApk).Hash.ToLower()
+
     $final = (Get-Item $signed).Length
     Write-Host ""
-    Write-Host ("完成：{0}" -f $signed) -ForegroundColor Green
+    Write-Host ("完成：{0}" -f $distApk) -ForegroundColor Green
     Write-Host ("      {0:N0} B（{1:N2} MiB）" -f $final, ($final / 1MB)) -ForegroundColor Green
+    Write-Host ("      SHA-256 {0}" -f $sha) -ForegroundColor Green
+    Write-Host "      （传手机后先核对大小与 SHA-256 —— 1.7 GiB 的包最常出事的是传输截断）" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host ("同一份包也在：{0}" -f $signed) -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "安装到真机（patchset 版本未变时必须 pm clear，否则 isComplete() 判真不重装）：" -ForegroundColor Yellow
-    Write-Host "  adb install -r `"$signed`""
+    Write-Host "  adb install -r `"$distApk`""
     Write-Host "  adb shell pm clear app.kxxy"
     Write-Host "  adb shell monkey -p app.kxxy -c android.intent.category.LAUNCHER 1"
     Write-Host ""
