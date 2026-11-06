@@ -116,34 +116,64 @@ class RemoteBar(context: Context) : LinearLayout(context) {
         }, durationMs)
     }
 
+    /** 设备条高度（dp）。WebView 的让位量也取自它。 */
+    private val barHeight = dp(50)
+
+    /** 需要通过 topMargin 让位的 WebView（attachTo 时记下）。 */
+    private var webTarget: View? = null
+
     /**
-     * 叠加到 WebView 之上，并把 WebView 往下让出这条的高度。
+     * 叠加到 WebView 之上。
      *
      * 不用 `alignParentTop` 直接压上去：远端页面自己的顶栏（会话标题、
-     * 侧栏按钮）会被遮住，而那些按钮没有别的入口。
+     * 侧栏按钮）会被遮住，而那些按钮没有别的入口。所以改成「把 WebView
+     * 往下推一条的高度」——远端页面于是整块落在设备条下面。
+     *
+     * ⚠️ 让位只在设备条**可见**时生效（见 [show] / [hide]）。
+     *
+     * 这里踩过一个真实事故：最初 attachTo 里直接把 `web.layoutParams
+     * .topMargin` 设成 50dp 就完事，但 attachTo 是在 onCreate 里无条件调用
+     * 的，而设备条默认 GONE —— 于是**本机页面顶部永久多出一条 50dp 空白**
+     * （截图实测：状态栏下面一大块留白，看起来像 WebView 没铺满）。
+     * 更隐蔽的是退出远程时只 hide 不回收 margin，回到本机页依旧带着它。
+     * 结论：margin 必须跟 visibility 同生共死，不能挂在一次性初始化上。
      */
     fun attachTo(root: FrameLayout, web: View) {
-        val height = dp(50)
         root.addView(
             this,
-            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, height).apply {
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, barHeight).apply {
                 gravity = Gravity.TOP
             },
         )
-        (web.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-            lp.topMargin = height
-            web.layoutParams = lp
-        }
+        webTarget = web
+        applyWebOffset(0)
         visibility = View.GONE
     }
 
     fun show() {
         visibility = View.VISIBLE
         actionView.isEnabled = true
+        applyWebOffset(barHeight)
     }
 
     fun hide() {
         visibility = View.GONE
+        applyWebOffset(0)
+    }
+
+    /**
+     * 调整 WebView 让位量。
+     *
+     * 值没变就不碰 layoutParams —— 每帧 setLayoutParams 会触发一次完整
+     * requestLayout，而 show/hide 在「连接→断开→再连接」时可能连着调，
+     * 无谓的重排会让远端页面白闪一下。
+     */
+    private fun applyWebOffset(offsetPx: Int) {
+        val web = webTarget ?: return
+        val lp = web.layoutParams as? FrameLayout.LayoutParams ?: return
+        if (lp.topMargin == offsetPx) return
+        lp.topMargin = offsetPx
+        web.layoutParams = lp
     }
 
     private fun dp(v: Int): Int =

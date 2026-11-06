@@ -3199,6 +3199,150 @@ input, textarea, select {
   color: var(--text-muted);
 }
 
+/* ---------- 「第一次连接」三步引导 ---------- */
+
+/* 折叠卡：padding 交给 summary / body 各自管，否则标题会缩进一次、正文再缩进一次 */
+.remote-steps {
+  padding: 0;
+}
+
+.remote-steps-summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 16px;
+}
+
+.remote-steps-summary::-webkit-details-marker {
+  display: none;
+}
+
+.remote-steps-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.remote-steps[open] .chevron-icon {
+  transform: rotate(180deg);
+}
+
+.remote-steps-body {
+  padding: 12px 16px 16px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.remote-steps-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.remote-steps-list > li {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* 序号染成主色，视线能顺着 1-2-3 走下来 */
+.remote-steps-list > li::marker {
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.remote-step-title {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.remote-step-desc {
+  display: block;
+  margin-top: 3px;
+}
+
+/* 命令行：等宽 + 可换行。老 WebView 不支持 pre-wrap 的 overflow 省略，
+   这里宁可让它折行，也不要横向溢出把整页撑宽。 */
+.remote-code {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-elevated);
+}
+
+.remote-code code {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.remote-copy {
+  flex: none;
+  padding: 4px 8px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--accent-blue);
+  font-size: 12px;
+  cursor: pointer;
+  min-height: 28px;
+}
+
+/* 示例串（不可复制的那个）：样式与命令行一致，但不带按钮，避免「这里也能点」的错觉 */
+.remote-code.is-sample code {
+  color: var(--text-muted);
+}
+
+.remote-copy:active {
+  opacity: 0.6;
+}
+
+.remote-inline-code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  background-color: var(--bg-elevated);
+  padding: 1px 4px;
+  border-radius: 4px;
+  word-break: break-all;
+}
+
+.remote-steps-note {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border-subtle);
+}
+
+.remote-steps-note-title {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.remote-steps-note-desc {
+  display: block;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;

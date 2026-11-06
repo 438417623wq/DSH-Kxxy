@@ -169,7 +169,7 @@
           </div>
 
           <div class="remote-empty" id="remote-empty">
-            <p class="remote-empty-text">在电脑上跑一次连接器，把连接串粘进来就能连。</p>
+            <p class="remote-empty-text">先在电脑上跑一次连接器（点进去有分步说明），把打印出来的连接串粘进来就能连。</p>
             <button class="button button-subtle button-sm" id="btn-remote-add" type="button">添加电脑</button>
           </div>
         </div>
@@ -561,6 +561,60 @@
           </button>
           <h2 class="remote-view-title">远程控制</h2>
         </div>
+
+        <!--
+          第一次连接的引导。
+
+          存在理由：v0.9.13 上线后收到的第一个问题就是「我怎么连接我的电脑啊」——
+          界面只写了「粘贴连接器给出的连接串」，但**没人知道连接器在哪、怎么跑**。
+          一个只有内行看得懂的入口，等于没有入口。
+
+          所以这里把「电脑上要做什么」明写成三步，且把命令原样给出来可复制。
+          默认展开（没有已配对设备时），有设备后自动收起，不占老用户的版面。
+        -->
+        <details class="card remote-steps" id="remote-steps" open>
+          <summary class="remote-steps-summary">
+            <span class="remote-steps-title">第一次连接？电脑上跑一条命令就行</span>
+            <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </summary>
+          <div class="remote-steps-body">
+            <ol class="remote-steps-list">
+              <li>
+                <span class="remote-step-title">电脑上打开 DSH 桌面端</span>
+                <span class="remote-step-desc">连的是那台电脑上的 DSH —— 桌面端没开，后面连上也只会是一个空壳。</span>
+              </li>
+              <li>
+                <span class="remote-step-title">在电脑上跑一次连接器</span>
+                <span class="remote-step-desc">把这条命令粘到 PowerShell（在 DSH-Kxxy 目录下）回车：</span>
+                <div class="remote-code">
+                  <code id="remote-connector-cmd">node tools/remote-connector.mjs</code>
+                  <button class="remote-copy" id="btn-remote-copy" type="button">复制</button>
+                </div>
+                <span class="remote-step-desc">
+                  窗口会打印一行「连接串」，长这样（每次启动都会变，以打印出来的为准）：
+                </span>
+                <div class="remote-code is-sample">
+                  <code>http://192.168.1.23:8080/__kxxy_pair?code=ab12cd34</code>
+                </div>
+                <span class="remote-step-desc">窗口别关 —— 关掉或重启会换一个配对码，手机就要重新粘一次。</span>
+              </li>
+              <li>
+                <span class="remote-step-title">把连接串粘到下面</span>
+                <span class="remote-step-desc">手机和电脑连同一个 WiFi 就能连上；连上后这条记录会一直留在手机里。</span>
+              </li>
+            </ol>
+            <div class="remote-steps-note">
+              <span class="remote-steps-note-title">想在外面（4G / 别的网络）连？</span>
+              <span class="remote-steps-note-desc">
+                先用 Tailscale、Cloudflare Tunnel、frp 之类的工具，把电脑上的
+                <b>8080 端口</b>（不是 3080）映射成一条 https 地址，再把连接串里的
+                <code class="remote-inline-code">192.168.1.23:8080</code> 换成那条隧道域名即可。
+              </span>
+            </div>
+          </div>
+        </details>
 
         <div class="card remote-add-card">
           <div class="card-title-group">

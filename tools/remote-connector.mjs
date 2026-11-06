@@ -218,6 +218,9 @@ export function createConnector(options = {}) {
     port,
     token,
     targetAuthority,
+    /** 拆开给启动探测用（[probeUpstream] 要单独发一个请求）。 */
+    targetHost,
+    targetPort,
     listen: () =>
       new Promise((resolve, reject) => {
         server.once('error', reject)
@@ -241,6 +244,31 @@ export function createConnector(options = {}) {
 export function generateCode() {
   const hex = randomBytes(6).toString('hex') // 12 位，取 8
   return `${hex.slice(0, 4)}${hex.slice(4, 8)}`
+}
+
+/**
+ * 一次性探测上游是否可达。
+ *
+ * 只看「有没有 HTTP 响应」，不看状态码：401 也说明上游活着（只是没带 token），
+ * 那本身就是有用的信息 —— 用户接下来要解决的是认证，不是「桌面端没开」。
+ */
+function probeUpstream(authority, timeoutMs = 1500) {
+  const [host, portText] = String(authority).split(':')
+  const port = Number(portText || 80)
+  return new Promise((resolve) => {
+    const req = http.request({ host, port, path: '/', method: 'GET', headers: { host: authority } }, (res) => {
+      res.resume()
+      resolve(true)
+    })
+    // 桌面端在忙（例如正在启动 WebView）时可能迟迟不回 —— 超时按不可达处理，
+    // 这只是个提示，不该把启动卡住。
+    req.setTimeout(timeoutMs, () => {
+      req.destroy()
+      resolve(false)
+    })
+    req.on('error', () => resolve(false))
+    req.end()
+  })
 }
 
 function hasPairCookie(req, code) {
@@ -386,15 +414,26 @@ if (isMain()) {
 
   connector
     .listen()
-    .then((addr) => {
+    .then(async (addr) => {
       const host = addr.address === '0.0.0.0' ? '<本机局域网 IP>' : addr.address
       const lan = connector.lanAddresses()
       const primary = lan[0]?.address || host
       const link = `http://${primary}:${connector.port}${PAIR_PATH}?code=${connector.code}`
 
+      // 上游是否真的在跑，启动时就说清楚。
+      //
+      // 不探的话，用户会先经历「手机连上了 → 页面 502」这一圈，才回来怀疑
+      // 是桌面端没开或端口不对；而这两件事在电脑上是**一眼可见**的，没理由
+      // 让手机端去当那个报错的地方。
+      const upstreamUp = await probeUpstream(connector.targetAuthority)
+
       console.log('')
       console.log('  Kxxy 远程连接器已启动')
       console.log(`  上游        ${connector.targetAuthority}${connector.token ? '（已带 token）' : ''}`)
+      console.log(`  上游状态    ${upstreamUp ? '✓ 连得上' : '✗ 连不上 —— 先打开 DSH 桌面端'}`)
+      if (!upstreamUp) {
+        console.log('              端口不是 3080 的话，用 --target http://127.0.0.1:<端口>/ 指定')
+      }
       console.log(`  配对码      ${connector.code}`)
       console.log('')
       console.log('  连接串（粘到 Kxxy → 概览 → 远程控制 → 添加电脑）')

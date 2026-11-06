@@ -225,6 +225,9 @@
     remoteList: document.getElementById('remote-list'),
     remoteListEmpty: document.getElementById('remote-list-empty'),
     remoteListCount: document.getElementById('remote-list-count'),
+    remoteSteps: document.getElementById('remote-steps'),
+    remoteConnectorCmd: document.getElementById('remote-connector-cmd'),
+    btnRemoteCopy: document.getElementById('btn-remote-copy'),
 
     // 导航 Tab
     tabItems: document.querySelectorAll('.tab-item'),
@@ -275,6 +278,14 @@
 
   /** 最近一次拿到的快照，供热路径（连接按钮）读 id 用。 */
   let remoteSnapshot = null;
+
+  /**
+   * 引导卡的展开状态是否已经「按设备情况定过一次」。
+   *
+   * 快照每 2 秒来一份，如果每次都按 `devices.length` 写 `open`，用户刚点开
+   * 就被下一次轮询收起来 —— 所以只在第一份快照时定初值，之后完全交给用户。
+   */
+  let remoteStepsResolved = false;
 
   function remoteKindLabel(device) {
     return device.kind === 'lan' ? '局域网' : '隧道';
@@ -383,6 +394,13 @@
     const lastId = remote.lastUsedId;
     const hero = devices.find((d) => d.id === lastId) || devices[0] || null;
 
+    // 还没有配对过任何电脑时，引导卡默认展开（那正是用户最需要它的时候）；
+    // 已经配过就收起，不占老用户版面。只定初值一次，见 remoteStepsResolved。
+    if (!remoteStepsResolved && dom.remoteSteps) {
+      remoteStepsResolved = true;
+      dom.remoteSteps.open = devices.length === 0;
+    }
+
     if (hero) {
       dom.remoteHero.hidden = false;
       dom.remoteEmpty.hidden = true;
@@ -427,6 +445,44 @@
     goToView('overview');
   }
 
+  /**
+   * 复制一段文本，返回是否成功。
+   *
+   * 两条路径的理由见调用处：ip http 下没有 `navigator.clipboard`；
+   * 而 execCommand 在 WebView 里要 `select()` + `setSelectionRange()` 都做，
+   * 只做 select 的老版本会复制出空串（历史坑）。
+   */
+  async function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (_) {
+        /* 落到兜底，不上报 —— 权限被拒和「不支持」对用户是同一件事 */
+      }
+    }
+    return legacyCopyText(text);
+  }
+
+  function legacyCopyText(text) {
+    try {
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.setAttribute('readonly', '');
+      area.style.position = 'fixed';
+      area.style.top = '-2000px';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      area.setSelectionRange(0, text.length);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(area);
+      return ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function initRemote() {
     if (!dom.remoteHero) return;
 
@@ -436,6 +492,20 @@
       dom.remoteUrlInput?.focus();
     });
     dom.btnRemoteBack?.addEventListener('click', () => hideRemoteView());
+
+    /*
+     * 「复制命令」。
+     *
+     * 走 clipboard API 优先、textarea + execCommand 兜底 —— 远程会话里页面
+     * 跑在隧道/局域网的 http 上，不是 secure context，`navigator.clipboard`
+     * 直接不存在（与终端 iframe 同一个坑）。命令本身很短，兜底路径完全够用。
+     */
+    dom.btnRemoteCopy?.addEventListener('click', async () => {
+      const text = (dom.remoteConnectorCmd?.textContent || '').trim();
+      if (!text) return;
+      const ok = await copyText(text);
+      showToast(ok ? '命令已复制，粘到电脑的 PowerShell 里回车' : '复制失败，请手动长按选中', ok ? 'success' : 'error');
+    });
 
     dom.btnRemoteConnect?.addEventListener('click', () => {
       const id = dom.btnRemoteConnect.dataset.id;

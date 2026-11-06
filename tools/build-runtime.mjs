@@ -691,8 +691,13 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  *
  * 11 → 12：手机控电脑（2026-11-06）。`kxxy-host/web` 新增「远程控制」视图与
  * 概览入口卡 ---- 同样是自有插件前端资源的实质改动，同一个坑。
+ *
+ * 12 → 13：顶部空白修复 + 连接引导（2026-11-06）。`kxxy-host/web` 的远程页新增
+ * 「第一次连接」三步引导与复制按钮。**注意这次的 bug 不在 web 层** —— 顶部那条
+ * 50dp 空白是 `RemoteBar` 的 topMargin 造成的（原生侧，随 APK 生效，与补丁集无关）；
+ * 编号只是为了把新的 host 资源发下去。
  */
-const PATCHSET_MARKER = "kxxy-patchset@12";
+const PATCHSET_MARKER = "kxxy-patchset@13";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**
