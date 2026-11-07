@@ -572,10 +572,41 @@ console.log('\n[E] 平台边界与网络诊断')
   ok('自愈覆盖悬空软链与 wrapper 两种形状',
     /healBinEntry/.test(extinstallSrc) && /repairWrapperRefs/.test(extinstallSrc))
 
-  // NDK：装不进包里，但必须真的接线 —— 否则用户把 NDK 放进去也不会生效
-  ok('NDK 三处探测（引擎根两份 + home）并写进 GYP_DEFINES',
-    /android_ndk_path=/.test(kotlinConfig) && /File\(root, "ndk"\)/.test(kotlinConfig))
-  ok('PLATFORM 说明缺 NDK 时该放哪里', /<引擎根>\/ndk|引擎根>\/ndk/.test(healthSrc))
+  // NDK：装不进包里，但必须真的接线 —— 而且**不能要求用户下 NDK**。
+  // android_ndk_path 只被 gyp 用来拼一个 include 路径，指向空目录也能过
+  // configure；官方 NDK 的 host 工具链是 linux-x86_64，arm64 手机上跑不了。
+  // 所以断言的是"默认就有桩"，不是"有 NDK 才接"。
+  ok('android_ndk_path 默认指向桩目录（不需要真 NDK）',
+    /kxxy-ndk-stub/.test(kotlinConfig) && /GYP_DEFINES=\$gypDefines/.test(kotlinConfig))
+  ok('真 NDK 存在时优先用它（少数包要读 ANDROID_NDK_* 找 sysroot）',
+    /ANDROID_NDK_ROOT=\$ndkPath/.test(kotlinConfig) && /toolchains/.test(kotlinConfig))
+  ok('GYP_DEFINES 已设时不整条覆盖（追加 android_ndk_path）',
+    /inheritedGyp/.test(kotlinConfig) && /contains\("android_ndk_path="\)/.test(kotlinConfig))
+  ok('~/.bashrc 兜一层 GYP_DEFINES（shell 不是引擎拉起时）',
+    /kxxy-shell@3/.test(kotlinConfig) && /android_ndk_path=\$\{'\$'\}_ndkstub/.test(kotlinConfig))
+  ok('NATIVE 体检项解释原生编译链（含 npm 12 的安装脚本闸门）',
+    /code = 'NATIVE'/.test(healthSrc) && /install-scripts approve/.test(healthSrc))
+
+  // ── raw 直链：方案 C（换接口，不换域名）────────────────────────────
+  //
+  // 实测结论：用 DoH 拿到真实 IP 直连也是 Connection reset —— 所以"换 DNS"
+  // 与"换域名代理"都可能不通，能用的那条是 api.github.com 的 Contents API。
+  const ghrawSrc = norm(read('plugins/kxxy-host/lib/ghraw.mjs'))
+  ok('raw → Contents API 的映射存在', /https:\/\/api\.github\.com\/repos\//.test(ghrawSrc))
+  ok('ref 与 path 的边界给了候选序列（分支名可含 /）',
+    /function apiCandidates/.test(ghrawSrc) && /MAX_REF_SEGMENTS/.test(ghrawSrc))
+  ok('raw 内容走 Accept: application/vnd.github.raw',
+    /application\/vnd\.github\.raw/.test(ghrawSrc))
+  ok('助手脚本落进 $DSH_HOME/.kxxy/bin 且幂等',
+    /HELPER_DIR_REL = '\.kxxy\/bin'/.test(ghrawSrc) && /unchanged/.test(ghrawSrc))
+  ok('PATH 里真有那个目录', /\.kxxy\/bin/.test(kotlinConfig))
+  ok('启动时安装助手（不是只提供一个函数）', /lastHelpers = runHelperInstall\(\)/.test(hostLib))
+  ok('控制台有补装入口', /case 'install-ghraw'/.test(hostLib) && /action: 'install-ghraw'/.test(norm(read('plugins/kxxy-host/web/host.js'))))
+  ok('/state 顶层带 helpers', /helpers: lastHelpers/.test(hostLib))
+  ok('netdiag 会实测 API 路线而不只是镜像',
+    /probeApiRoute/.test(netSrc) && /next\.api = api/.test(netSrc))
+  ok('体检在黑洞时优先报 API 路线', /ghraw <raw-url>/.test(healthSrc))
+  ok('PLATFORM 不再声称"没有 NDK 就装不上"', !/没有 NDK：node-gyp/.test(healthSrc))
 }
 
 // 生成器

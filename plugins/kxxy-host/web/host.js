@@ -215,6 +215,7 @@
     btnExportLogs: document.getElementById('btn-export-logs'),
     btnHealExt: document.getElementById('btn-heal-ext'),
     btnRawMirror: document.getElementById('btn-raw-mirror'),
+    btnGhraw: document.getElementById('btn-ghraw'),
 
     // 插件视图（对话页白屏时的停用入口）
     pluginList: document.getElementById('plugin-list'),
@@ -2531,6 +2532,29 @@
           showToast('实测的镜像都不通：换网络，或在电脑上 clone 后把文件传进来', 'warning');
         } finally {
           dom.btnRawMirror.disabled = false;
+        }
+      });
+    }
+
+    // GitHub 直链助手（ghraw / raw2api）
+    //
+    // 为什么这个按钮存在：raw 被拦时，真正在读直链的是用户在终端里敲的
+    // curl / 安装脚本，不是我们的代码 —— 能帮上忙的只有"把工具放到 PATH 上"。
+    // 助手在每次引擎启动时也会自动装（幂等），这里是用户手删之后的补装口。
+    if (dom.btnGhraw) {
+      dom.btnGhraw.addEventListener('click', async () => {
+        dom.btnGhraw.disabled = true;
+        showToast('正在写入 $HOME/.kxxy/bin ...', 'info');
+        try {
+          const res = await apiPost('/kxxy/api/action', { action: 'install-ghraw' });
+          if (res && res.ok) {
+            const what = (res.written || []).length
+              ? `已更新 ${res.written.join('、')}`
+              : '已是最新版本';
+            showToast(`${what}；用法 ghraw <raw-url>。`, 'success');
+          }
+        } finally {
+          dom.btnGhraw.disabled = false;
         }
       });
     }

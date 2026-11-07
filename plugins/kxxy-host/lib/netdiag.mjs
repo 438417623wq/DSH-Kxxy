@@ -16,6 +16,17 @@
  * 真的没网时解析会抛 `ENOTFOUND` / `EAI_AGAIN`，那是另一回事，不能混为一谈。
  * 把这两种情况分开报，是这个小模块的全部价值。
  *
+ * ── 后来补的一条：不只是 DNS ──────────────────────────────────────────────
+ *
+ * 真机复核发现，用 DoH 拿到真实 IP（`185.199.109.133`）后 `curl --resolve`
+ * 直连，连续四次全是 `Connection reset`。也就是说「换 DNS」这条路本来就走不通
+ * （何况工具走 netd，根本不读 resolv.conf），而且**代理型镜像也常被同一层拦**。
+ *
+ * 真正稳的绕法是换接口：`api.github.com` 通着，用 Contents API + `Accept:
+ * application/vnd.github.raw` 取同一份文件（实现见 lib/ghraw.mjs）。所以这里
+ * 在确认黑洞之后，除了实测镜像，还会实测一次 API 路线，把**当前网络下最靠谱
+ * 的那一条**写进结论，而不是笼统让人去"换个镜像试试"。
+ *
  * ── 为什么不"顺手修掉" ────────────────────────────────────────────────────
  *
  * 唯一能改的是 `<root>/etc/resolv.conf`（由 RuntimeInstaller.ensureResolvConf
@@ -34,6 +45,8 @@
 import { promises as dns } from 'node:dns'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+
+import { probeApiRoute } from './ghraw.mjs'
 
 /**
  * 被探测的主机。
@@ -194,14 +207,20 @@ export function startProbe(root) {
       const summary = summarize(results, resolvServers(root))
       const next = { ...summary, at: Date.now(), targets: results }
       /*
-       * 只有在**确认被黑洞**时才去实测镜像。
+       * 只有在**确认被黑洞**时才去实测绕行路线。
        *
        * 理由：正常网络里没必要把用户请求引向第三方代理；而一旦确认 raw 被拦，
-       * 那几个候选能不能用就变成唯一有信息量的问题 —— 用户按提示手填一个
-       * 恰好也不通的镜像，等于白折腾一轮。
+       * "哪条路还能走"就变成唯一有信息量的问题 —— 用户按提示手填一个恰好也
+       * 不通的镜像，等于白折腾一轮。
        *
-       * 镜像结果单独一份缓存（30 分钟）：DNS 结论 5 分钟就过期，但"哪个镜像
-       * 能用"变化慢得多，每 5 分钟重试四个外部站点纯属浪费。
+       * 两条并测：
+       *   · `api`：`api.github.com` 的 Contents API（换接口，不换域名）——
+       *     实测最稳，因为同域其他主机没被拦；
+       *   · `mirrors`：第三方代理（换域名）—— 经常被同一层连带拦掉，所以
+       *     只作为第二选择报出来。
+       *
+       * 结果单独一份缓存（30 分钟）：DNS 结论 5 分钟就过期，但"哪条路能用"
+       * 变化慢得多，每 5 分钟重打四个外部站点纯属浪费。
        */
       if (summary.level === 'selective' || summary.level === 'blackhole') {
         const prev = b.result?.mirrors
@@ -209,12 +228,19 @@ export function startProbe(root) {
         if (Array.isArray(prev) && Date.now() - prevAt < MIRROR_TTL_MS) {
           next.mirrors = prev
           next.mirrorsAt = prevAt
+          next.api = b.result?.api ?? null
         } else {
           try {
-            next.mirrors = await probeMirrors()
+            // 一次探测三个请求，并行发：API 那条最重要，别让它排在镜像后面。
+            const [api, mirrors] = await Promise.all([
+              probeApiRoute().catch(() => null),
+              probeMirrors().catch(() => []),
+            ])
+            next.api = api
+            next.mirrors = mirrors
             next.mirrorsAt = Date.now()
           } catch {
-            // 探测镜像失败不影响 DNS 结论
+            // 探测失败不影响 DNS 结论
           }
         }
       }

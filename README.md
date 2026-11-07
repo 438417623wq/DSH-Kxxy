@@ -1085,3 +1085,57 @@ DNS 解析层的单域名黑洞，改不了（bin/ 里那些二进制都走 Andr
 `<root>/etc/net.json` 的 `rawMirror`，重启后由原生层落成
 `url.<mirror>.insteadOf`。**仍然不预置任何第三方地址**——这类代理存亡无常，
 写死一个等于埋一颗"几个月后突然不工作"的雷。
+
+### 原生模块与 raw 直链：两条「边界」其实都能修（v0.9.22）
+
+上一版把这两条写成「平台做不到」。理由都成立（NDK 3–4 GB、DNS 改不了），但结论错了。
+
+**① `gyp: Undefined variable android_ndk_path` —— 只需要一个桩目录**
+
+Termux 的 node 是 `android/arm64` 构建，它的 `common.gypi` 无条件引用
+`-I<(android_ndk_path)/sources/android/cpufeatures`；这个值在 node 编译期固化成
+`(unset)`，于是加载 `binding.gyp` 就死，一个 `.node` 都产不出来。
+
+**这个变量在这里只用来拼一个 include 路径**，给它一个空目录就够了 —— 真正的编译
+用的是 runtime 自带的 clang 与 sysroot。而官方 NDK 的 host 工具链是
+`linux-x86_64`，arm64 手机跑不了，所以「下个 NDK 放进去」方向上就是错的。
+
+现在 `EngineConfig` **默认**就把 `GYP_DEFINES=android_ndk_path=<home>/.cache/kxxy-ndk-stub`
+设好（用户真放了 NDK 就优先用真的，走 `ANDROID_NDK_*`），`~/.bashrc` 升到
+`# kxxy-shell@3` 再兜一层。第二道闸是 npm 12 默认拦截安装脚本：
+
+```
+npm install <pkg>
+npm install-scripts approve <pkg>
+npm rebuild <pkg>          # 不能省，否则仍报 install scripts blocked
+```
+
+体检新增 `NATIVE` 项：`android_ndk_path` 没设就报黄并给出那一行 export；设了就报
+绿，并把当前 npm 版本与上面三步一起写出来。
+
+**② raw 直链：不是 DNS 层，是整条链路被拦**
+
+用户补的证据很关键：用 DoH 拿到真实 IP 后 `curl --resolve` 直连，**连续四次全被
+reset**。所以「换 DNS」和「换域名代理」都靠不住 —— 后者也常被同一层连带拦掉。
+
+能用的那条是**换接口，不换域名**：
+
+```
+raw : https://raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>
+api : https://api.github.com/repos/<owner>/<repo>/contents/<path>?ref=<ref>
+      Accept: application/vnd.github.raw
+```
+
+真正在读直链的是你在终端里敲的 `curl` / 安装脚本，所以做成了两个 POSIX 助手，装进
+`$DSH_HOME/.kxxy/bin`（已在 PATH 上，每次引擎启动幂等刷新，控制台也有
+「装 GitHub 直链助手」）：
+
+```
+ghraw <raw-url>                    # 取同一份内容
+ghraw <owner> <repo> <ref> <path>  # 分支名带 / 时用它（URL 形式判不出边界）
+echo <raw-url> | raw2api           # 只转 URL，交给别的工具
+```
+
+未认证 `api.github.com` 限流 60 次/小时（按 IP），批量取请设 `GH_TOKEN`；整仓下载用
+`codeload.github.com/<owner>/<repo>/tar.gz/refs/heads/<ref>`。体检 `NET` 现在会先报
+这条路线是否实测可用，镜像降为第二选择。

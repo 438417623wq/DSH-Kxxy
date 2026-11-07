@@ -1,6 +1,7 @@
 package app.kxxy.engine
 
 import android.content.Context
+import android.util.Log
 import java.io.File
 
 /**
@@ -665,6 +666,11 @@ object EngineConfig {
             val yarnBin = File(root, "share/yarn/bin")
             if (yarnBin.isDirectory) add(yarnBin.absolutePath)
             add(File(root, "bin").absolutePath)
+            // `$HOME/.kxxy/bin`：我们自己的命令放宽（目前是 ghraw / raw2api，
+            // 见 plugins/kxxy-host/lib/ghraw.mjs）。放在 `<root>/bin` 之后：
+            // 扩展带的同名命令优先，避免我们的助手遮蔽用户装的东西。
+            // 目录可能还没建（插件启动时才写），PATH 里挂着空目录无害。
+            add(File(home, ".kxxy/bin").absolutePath)
             // git-core 的 `git-remote-https` / `git-remote-http` 等 helper 与
             // termux-api 的 shim 都在 `<root>/libexec`。不在这里的话
             // `git clone https://…` 会报 `git: 'remote-https' is not a git command`。
@@ -1135,37 +1141,58 @@ object EngineConfig {
             env += "GOFLAGS=-mod=mod"
         }
 
-        // NDK 的接线（问题清单：node-gyp 的 `android_ndk_path`）。
+        // node-gyp 的 `android_ndk_path`（问题清单：原生 addon 装不上）。
         //
-        // Termux 的 node 是 `android/arm64` 构建，node-gyp 在这类目标下会去读
-        // `process.config.variables.android_ndk_path` 拿 sysroot 与交叉工具链。
-        // 这个值在 **node 编译期**就固化了，本运行时那份是 `(unset)` —— 于是任何
-        // 引用它的 `binding.gyp` 都在 configure 阶段就死：
+        // Termux 的 node 是 `android/arm64` 构建，它的 `common.gypi` **无条件**
+        // 引用这个变量：
+        //
+        //     'cflags': [ '-fPIC', '-I<(android_ndk_path)/sources/android/cpufeatures' ]
+        //
+        // 而 gyp / node-gyp 都不给它默认值，运行时那份
+        // `process.config.variables.android_ndk_path` 是 `(unset)` ⇒ 加载
+        // `binding.gyp` 这一步就死：
         //
         //     gyp: Undefined variable android_ndk_path in binding.gyp
         //     gyp ERR! configure error
         //
-        // 一个 `.node` 都产不出来，凡是没发 android-arm64 预编译包的 npm 包
-        // （sqlite / pty / 图像处理）全都装不上。
+        // 一个 `.node` 都产不出来，凡是没发 android-arm64 预编译包的包全装不上。
         //
-        // NDK 本体 3–4 GB，装不进安装包，所以这里只做接线，不假装有：
-        //   1. 用户把 NDK 解到 `<root>/ndk` 或 `<root>/android-ndk` 之后，把三家
-        //      约定的环境变量（ANDROID_NDK_HOME / ANDROID_NDK_ROOT / NDK_ROOT）
-        //      一并指过去；
-        //   2. 用 `GYP_DEFINES` 把 `android_ndk_path` 塞进 gyp 的变量表 —— gyp 的
-        //      `Load()` 会吸收这个环境变量，等于把 node 里缺的那条编译期常量补上，
-        //      `binding.gyp` 里的 `<(android_ndk_path)` 才有值。
-        // 没有 NDK 就一条都不设，体检里 PLATFORM 会说明缺的是什么、要放哪里。
-        val ndkDir = listOf(File(root, "ndk"), File(root, "android-ndk"), File(home, "ndk"))
+        // 关键事实：**它只用来拼一个 include 路径**，指向不存在的目录也能过
+        // configure（gcc 对不存在的 `-I` 静默跳过）。所以正解是给一个桩目录，
+        // 而不是下官方 NDK —— NDK 的 host 工具链是 `linux-x86_64`，arm64 手机上
+        // 根本跑不了，那是"看起来在努力、其实一步也走不通"。真机已验证：
+        // 自写 addon 与 microtime 都能编译加载。
+        //
+        // 用户真把 NDK 解到 `<root>/ndk` 之类位置时优先用它（少数包会读
+        // ANDROID_NDK_* 去找 sysroot）；没有就退到桩。两种情况都必须设
+        // GYP_DEFINES，否则 configure 阶段必挂。gyp 读取的是这个环境变量的
+        // `key=value` 列表（`pylib/gyp/__init__.py` 的 `Load()`），所以已经设了
+        // 别的定义时要把我们这条**追加**进去，不能整条覆盖。
+        val ndkReal = listOf(File(root, "ndk"), File(root, "android-ndk"), File(home, "ndk"))
             .firstOrNull { File(it, "toolchains").isDirectory }
-        if (ndkDir != null) {
-            val ndkPath = ndkDir.absolutePath
+        val ndkPath: String
+        if (ndkReal != null) {
+            ndkPath = ndkReal.absolutePath
             env += "ANDROID_NDK_HOME=$ndkPath"
             env += "ANDROID_NDK_ROOT=$ndkPath"
             env += "ANDROID_NDK_PATH=$ndkPath"
             env += "NDK_ROOT=$ndkPath"
-            env += "GYP_DEFINES=android_ndk_path=$ndkPath"
+        } else {
+            // 桩目录：`sources/android/cpufeatures` 是 common.gypi 真正 include 的
+            // 那一层，建出来让 `-I` 有落点（不建也能过，只是日志里多一条无关
+            // 的 include 失败）。
+            val stub = File(home, ".cache/kxxy-ndk-stub")
+            ndkPath = stub.absolutePath
+            runCatching { File(stub, "sources/android/cpufeatures").mkdirs() }
+                .onFailure { Log.w(TAG, "ndk-stub: 建 ${stub.path} 失败：${it.message}") }
         }
+        val inheritedGyp = (System.getenv("GYP_DEFINES") ?: "").trim()
+        val gypDefines = when {
+            inheritedGyp.isEmpty() -> "android_ndk_path=$ndkPath"
+            inheritedGyp.contains("android_ndk_path=") -> inheritedGyp
+            else -> "$inheritedGyp android_ndk_path=$ndkPath"
+        }
+        env += "GYP_DEFINES=$gypDefines"
 
         // PHP 的 ini 与扩展目录（缺陷 BL）。
         //
@@ -1655,9 +1682,15 @@ object EngineConfig {
      * `gdb` 会退回「现场编译 `system/repl` 下的 .scm」，真机实测 **160 秒**。
      * 扩展树里那份 ccache 是持久资产（`runtime` 重装从不碰 `extensions/`），
      * 所以在这里补一道判断即可。
+     *
+     * `# kxxy-shell@3` 再追加一段 `GYP_DEFINES` 兜底：`android_ndk_path` 是
+     * node-gyp 在 android 目标下必读的变量（`common.gypi` 无条件引用它拼
+     * include 路径），缺了就在 configure 阶段死。它只需要一个桩目录，不需要
+     * 真 NDK（见 [buildEnv] 里的长注释）。引擎进程本身已经带着这条，这里补的是
+     * "shell 不是引擎拉起的"场景。
      */
     private fun userShellInitContent(): String = """
-        # kxxy-shell@2
+        # kxxy-shell@3
         # [dsh-kxxy] 官方终端在 Android 上的默认交互式 shell 初始化。
         #
         # 上游以 `bash --rcfile <临时文件> -i` 启动终端，那个临时 rcfile 的第一行是
@@ -1694,8 +1727,29 @@ object EngineConfig {
             done
             unset _gl
         fi
+
+        # ── node-gyp 的 android_ndk_path（原生 addon 编译）──────────────────
+        # Termux 的 node 是 android/arm64 构建，它的 common.gypi 无条件引用
+        #     -I<(android_ndk_path)/sources/android/cpufeatures
+        # 而 gyp / node-gyp 都不给这个变量默认值，于是加载 binding.gyp 时就死：
+        #     gyp: Undefined variable android_ndk_path
+        # 它只用来拼一个 include 路径，指向空目录也能过 configure —— 不需要
+        # 真 NDK（官方 NDK 的 host 工具链是 linux-x86_64，arm64 手机跑不了）。
+        # 引擎进程启动时已经带着这条变量，这里补的是「shell 不是引擎拉起的」
+        # 那种情况，以及用户手动 unset 之后的兜底。
+        if [ -z "${'$'}{GYP_DEFINES:-}" ]; then
+            _ndkstub="${'$'}HOME/.cache/kxxy-ndk-stub"
+            if [ ! -d "${'$'}_ndkstub/sources/android/cpufeatures" ]; then
+                mkdir -p "${'$'}_ndkstub/sources/android/cpufeatures" 2>/dev/null
+            fi
+            export GYP_DEFINES="android_ndk_path=${'$'}_ndkstub"
+            unset _ndkstub
+        fi
     """.trimIndent() + "\n"
 
     /** 首行标记前缀，用于识别「这个 .bashrc 是我们写的」，避免覆盖用户自定义。 */
     private const val USER_SHELL_INIT_TAG = "# kxxy-shell@"
+
+    /** 日志 TAG（本文件以前不打日志，接 node-gyp 桩目录后需要一条失败记录）。 */
+    private const val TAG = "KxxyEngineConfig"
 }

@@ -46,6 +46,12 @@ const FAKE_ENGINE_ROOT = mkdtempSync(join(tmpdir(), 'kxxy-smoke-'))
 process.env.KXXY_ENGINE_ROOT = FAKE_ENGINE_ROOT
 delete process.env.KXXY_STATE_FILE
 
+// ghraw 助手写在 `$DSH_HOME/.kxxy/bin`。必须钉成临时目录：真机上这个值由
+// EngineConfig 注入，测试里若留空会落到开发机的真实 HOME —— 跑一次测试就
+// 在 `~/.kxxy` 里塞两个脚本，还会让后面某个用例的"文件已存在"判定失真。
+const FAKE_DSH_HOME = mkdtempSync(join(tmpdir(), 'kxxy-smoke-home-'))
+process.env.DSH_HOME = FAKE_DSH_HOME
+
 let failures = 0
 const ok = (m) => console.log(`  ✓ ${m}`)
 const fail = (m) => {
@@ -945,6 +951,19 @@ console.log('\n[8d] 已迁移与未知动作：明确报错而非假成功')
   if (r4.status !== 200) fail(`heal-ext 应 200，实为 ${r4.status}`)
   else if (typeof heal?.repaired !== 'number') fail(`heal-ext 应答缺 repaired：${JSON.stringify(heal)}`)
   else ok(`heal-ext → 200（repaired=${heal.repaired}，scanned=${heal.scanned}）`)
+
+  // install-ghraw：启动时已装过一次，这里是补装口。断言真的落在
+  // `$DSH_HOME/.kxxy/bin` 下（不是只回个 ok），且第二次是「已是最新」。
+  const r5 = await post({ action: 'install-ghraw' })
+  let gh = null
+  try { gh = await r5.json() } catch { gh = null }
+  if (r5.status !== 200) fail(`install-ghraw 应 200，实为 ${r5.status}（${JSON.stringify(gh)}）`)
+  else if (!gh?.ok) fail(`install-ghraw 报失败：${JSON.stringify(gh)}`)
+  else if (!existsSync(join(FAKE_DSH_HOME, '.kxxy', 'bin', 'ghraw'))) {
+    fail(`ghraw 没落盘到 ${gh.dir}`)
+  } else if ((gh.written ?? []).length !== 0) {
+    fail(`第二次补装应无写入，实为 ${(gh.written ?? []).join(',')}`)
+  } else ok(`install-ghraw → 200（内容已是最新，dir=${gh.dir}）`)
 }
 
 console.log('\n[9] POST /kxxy/api/action 非法 JSON')
@@ -1030,6 +1049,12 @@ console.log('\n[5b] 设备簿透传（缺陷 DV：已配对的电脑列表永远
       ok(`顶层 heal 快照透出（scanned=${j.heal.scanned}, repaired=${j.heal.repaired}）`)
     } else {
       fail(`顶层 heal 缺失或形状不对：${JSON.stringify(j.heal)}`)
+    }
+    // ghraw 助手同理由：PATH 是原生拼的，装没装成只有这里能看见。
+    if (j.helpers && j.helpers.ok && Array.isArray(j.helpers.written)) {
+      ok(`顶层 helpers 快照透出（dir=${j.helpers.dir}）`)
+    } else {
+      fail(`顶层 helpers 缺失或形状不对：${JSON.stringify(j.helpers)}`)
     }
   }
 
@@ -1328,13 +1353,21 @@ console.log('\n[14b] /kxxy/api/health（启动配置体检）')
       if (bad.length) fail(`不应有 BAD 项：${bad.map((c) => `${c.code}:${c.detail}`).join(' | ')}`)
       else ok('无 BAD 项')
 
-      // 平台边界项永远 OK（它不占告警位），但**必须存在** —— 用户撞上
-      // `gyp: Undefined variable android_ndk_path` 时，唯一的解释就在这里。
+      // 平台边界项永远 OK（它不占告警位），但**必须存在**。
       const platform = j.checks.find((c) => c.code === 'PLATFORM')
       if (!platform) fail('缺 PLATFORM 项（平台边界没进体检）')
       else if (platform.verdict !== 'OK') fail(`PLATFORM 应恒为 OK，实为 ${platform.verdict}`)
-      else if (!/NDK/.test(platform.detail)) fail(`PLATFORM 未提 NDK：${platform.detail}`)
-      else ok('PLATFORM 常绿且写明了 NDK 边界')
+      else ok('PLATFORM 常绿')
+
+      // NDK 从边界项挪到了 NATIVE：它**能修**（给个桩目录即可），不再是"平台
+      // 决定的"。缺 GYP_DEFINES 时报黄并给出那一行 export —— 这条断言在测试
+      // 机（大概率没设 GYP_DEFINES）与真机（引擎一定设了）两种环境下都要成立，
+      // 所以只钉"它说到了点子上"，不钉 verdict。
+      const native = j.checks.find((c) => c.code === 'NATIVE')
+      if (!native) fail('缺 NATIVE 项（原生编译链没进体检）')
+      else if (!/android_ndk_path|npm|NDK/i.test(native.detail)) {
+        fail(`NATIVE 没说清原因：${native.detail}`)
+      } else ok(`NATIVE = ${native.verdict}（${native.detail.slice(0, 48)}…）`)
 
       // 网络项三态都可能（测试机可能没网）—— 只钉"它在、且不是 BAD"
       const net = j.checks.find((c) => c.code === 'NET')

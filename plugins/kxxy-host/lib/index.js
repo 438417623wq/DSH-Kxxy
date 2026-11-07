@@ -34,6 +34,7 @@
  *      term-key       → 写 stdin.request，原生层写进引擎 PTY
  *      heal-ext       → 重跑扩展接入自愈（悬空链 / wrapper 缺兄弟文件）
  *      apply-raw-mirror → 实测镜像并写进 etc/net.json（重启后 git 生效）
+ *      install-ghraw  → 重装 $HOME/.kxxy/bin/{ghraw,raw2api}（走 API 取 raw）
  *      install-ext / switch-mirror → 已迁往专用端点，此处明确 400
  *      未知动作       → 501，让前端抛错回滚按钮而不是假成功
  *
@@ -46,6 +47,7 @@ import { join, dirname, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import * as extinstall from './extinstall.mjs'
+import * as ghraw from './ghraw.mjs'
 import * as health from './health.mjs'
 import * as mirror from './mirror.mjs'
 import * as netdiag from './netdiag.mjs'
@@ -908,6 +910,25 @@ async function dispatchAction(payload) {
       }
     }
 
+    // ── 重装 raw 直链助手（启动时已装；用户手删过、或刚升级引擎时用）──
+    case 'install-ghraw': {
+      const res = runHelperInstall()
+      if (!res.ok) {
+        return { status: 500, body: { error: res.error || '安装失败', ...res } }
+      }
+      return {
+        status: 200,
+        body: {
+          ...res,
+          note:
+            `已写入 ${res.dir}（` +
+            (res.written.length ? `新写/更新 ${res.written.join('、')}` : '内容已是最新') +
+            '）。用法：ghraw <raw-url> 或 ghraw <owner> <repo> <ref> <path>；' +
+            '只转 URL 用 raw2api。新开的终端才有 PATH，已开着的 shell 要重开',
+        },
+      }
+    }
+
     // ── 已迁往专用端点的旧动作：明确报错并指引，绝不假成功 ──────────
     case 'install-ext':
       return {
@@ -931,6 +952,9 @@ async function dispatchAction(payload) {
 
 /** 最近一次扩展接入自愈的结果（写进 /state 供控制台展示）。 */
 let lastHeal = null
+
+/** 最近一次 ghraw 助手安装的结果（同上）。 */
+let lastHelpers = null
 
 /**
  * 跑一次扩展接入自愈，并把结果记进 [lastHeal]。
@@ -957,6 +981,29 @@ function runHeal(root) {
     lastHeal = { ...lastHeal, scanned: result.scanned }
   }
   return lastHeal
+}
+
+/**
+ * 把两个 raw 直链助手写进 `$DSH_HOME/.kxxy/bin`，并记进 [lastHelpers]。
+ *
+ * 只用 `DSH_HOME`（原生注入），不 PWD 猜：写错目录等于给用户塞一堆看不见的
+ * 垃圾文件。拿不到就如实报错，控制台会显示"没装成"而不是"装好了"。
+ *
+ * @returns {{at: number, ok: boolean, dir: string, written: string[], unchanged: string[], error?: string}}
+ */
+function runHelperInstall() {
+  // 只用 DSH_HOME。回落到 HOME 是危险的：真机上 HOME 一般就是 DSH_HOME，但
+  // 测试/CLI 环境里它可能是开发机的家目录 —— 那会在用户机器上凭空长出
+  // `~/.kxxy/bin`，而 PATH 指的又不是那里。宁可不装并报错。
+  const home = process.env.DSH_HOME || ''
+  let res
+  try {
+    res = ghraw.installHelpers(home)
+  } catch (e) {
+    res = { ok: false, dir: '', written: [], unchanged: [], error: String(e?.message ?? e) }
+  }
+  lastHelpers = { at: Date.now(), ...res }
+  return lastHelpers
 }
 
 /**
@@ -1000,6 +1047,20 @@ export function apply(ctx) {
           .map((i) => `${i.ext}/${i.entry}`)
           .join(', ')}）`,
       )
+    }
+
+    // ── GitHub 直链的绕行助手（缺陷 EH 的方案 C）────────────────────────
+    //
+    // raw.githubusercontent.com 在部分网络里解析到 0.0.0.0，而且拿真实 IP 直连
+    // 也会被 reset —— 换 DNS 和换域名代理这两条都靠不住，能用的那条是**换接口**
+    // （api.github.com 的 Contents API）。转换逻辑在 lib/ghraw.mjs，这里只负责
+    // 把两个 shell 助手落进 `$DSH_HOME/.kxxy/bin`（原生已把它加进 PATH）。
+    //
+    // 每次启动写一次、内容比对后才落盘：runtime 升级不会碰 $HOME，但用户可能
+    // 手删；幂等成本是两个小文件的字符串比较。
+    lastHelpers = runHelperInstall()
+    if (lastHelpers.written.length) {
+      ctx.logger?.info?.(`[kxxy-host] ghraw 助手已更新：${lastHelpers.written.join(', ')}`)
     }
 
     // ── 布局迁移：把旧代码装的扩展重新装配一遍 ────────────────────────
@@ -1270,6 +1331,8 @@ export function apply(ctx) {
               net: netdiag.netSnapshot(),
               // 扩展接入自愈的最近一次结果（启动时跑，也可由 heal-ext 动作重跑）
               heal: lastHeal,
+              // raw 直链绕行助手的安装结果（ghraw / raw2api 在 PATH 上）
+              helpers: lastHelpers,
             })
             return
           }

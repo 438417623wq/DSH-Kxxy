@@ -1010,6 +1010,16 @@
               <span>实测直链镜像</span>
             </button>
 
+            <!-- GitHub API 助手：raw 被 DNS 黑洞（且 IP 直连被 reset）时，
+                 唯一稳的绕法是换接口 —— 把 ghraw / raw2api 落到 PATH 上 -->
+            <button class="button button-subtle button-block" id="btn-ghraw">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 17l6-6-6-6"/>
+                <path d="M12 19h8"/>
+              </svg>
+              <span>装 GitHub 直链助手</span>
+            </button>
+
             <!-- 直达插件页：对话页白屏时用户第一反应是「把刚装的插件关掉」，
                  从概览的维护区进来比在底栏五个页签里找更直觉 -->
             <button class="button button-subtle button-block" id="btn-open-plugins">

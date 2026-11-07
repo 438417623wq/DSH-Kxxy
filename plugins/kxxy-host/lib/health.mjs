@@ -687,18 +687,28 @@ function checkNetwork() {
   const code = 'NET'
   const title = 'GitHub 直链'
   const snap = netSnapshot()
-  // 被黑洞时后台会实测几个镜像（见 netdiag.probeMirrors）。把**这台机器当前
-  // 网络下真的能通的那一个**写出来，比笼统说"换成镜像"有用得多 —— 用户照着
-  // 帖子随便挑一个镜像，很可能恰好也不通，然后以为诊断在瞎说。
+  // 被黑洞时后台会并测两条绕行路线（见 netdiag.startProbe）：
+  //   · api —— 换接口不换域名（Contents API），实测最稳；
+  //   · mirrors —— 换域名（第三方代理），常被同一层连带拦掉。
+  // 把**这台机器当前网络下真能通的那条**写进结论，比笼统说"换成镜像"有用得多。
+  const api = snap.api && typeof snap.api === 'object' ? snap.api : null
+  const apiOk = Boolean(api && api.ok)
   const working = Array.isArray(snap.mirrors) ? snap.mirrors.find((m) => m.ok) : null
-  const moveText = working
-    ? `实测可用：${working.base}（写进 <引擎根>/etc/net.json 的 rawMirror，重启后 git 走它）`
-    : Array.isArray(snap.mirrors) && snap.mirrors.length
-      ? `实测的 ${snap.mirrors.length} 个镜像都不通，只能换网络或在电脑上取文件`
-      : '正在实测镜像可用性（结果在下一次刷新出现）'
+
+  const route = apiOk
+    ? '最稳的绕法已实测可用：`ghraw <raw-url>`（走 api.github.com 的 Contents API，' +
+      '助手脚本已装在 PATH 上，等价于 curl 那份内容）；批量取记得设 GH_TOKEN，' +
+      '未认证只有 60 次/小时'
+    : working
+      ? `实测可用的镜像：${working.base}（写进 <引擎根>/etc/net.json 的 rawMirror，重启后 git 走它）`
+      : Array.isArray(snap.mirrors) && snap.mirrors.length
+        ? `API 与实测的 ${snap.mirrors.length} 个镜像都不通，只能换网络或在电脑上取文件`
+        : '正在实测绕行路线（结果在下一次刷新出现）'
+
   const hint =
-    '这不是手机能改的：DNS 对单个域名返 0.0.0.0，系统 DNS 也换不了。' +
-    `绕过办法：${moveText}。` +
+    '这不是手机能改的：DNS 对单个域名返 0.0.0.0，系统 DNS 也换不了；' +
+    '而且拿真实 IP 直连同样被 reset —— 不只是解析层。' +
+    `绕过办法：${route}。` +
     'git clone / api.github.com / codeload 都正常，受影响的只有 raw 直链。'
 
   if (snap.level === 'probing') {
@@ -712,14 +722,16 @@ function checkNetwork() {
     return check(code, title, Verdict.OK, addrs || '解析正常')
   }
   if (snap.level === 'selective') {
-    const dns = Array.isArray(snap.servers) && snap.servers.length
-      ? `（当前 DNS：${snap.servers.slice(0, 2).join('、')}）`
-      : ''
+    const dns =
+      Array.isArray(snap.servers) && snap.servers.length
+        ? `（当前 DNS：${snap.servers.slice(0, 2).join('、')}）`
+        : ''
     return check(
       code,
       title,
       Verdict.WARN,
       `raw.githubusercontent.com 解析到空地址，而 github.com 正常${dns} —— 单域名被 DNS 拦截，不是本机配置。` +
+        (apiOk ? 'api.github.com 实测可用（换接口即可）。' : '') +
         (working ? `实测镜像 ${working.base} 可用。` : ''),
       hint,
     )
@@ -729,22 +741,96 @@ function checkNetwork() {
       code,
       title,
       Verdict.WARN,
-      'GitHub 相关域名全部解析到空地址（DNS 层黑洞）' + (working ? `；实测镜像 ${working.base} 可用` : ''),
+      'GitHub 相关域名全部解析到空地址（DNS 层黑洞）' +
+        (apiOk ? '；api.github.com 实测可用' : '') +
+        (working ? `；实测镜像 ${working.base} 可用` : ''),
       hint,
     )
   }
   return check(code, title, Verdict.UNKNOWN, `${snap.headline}（分不清是没网还是被拦，下次刷新再判）`)
 }
 
+/** 读 `<root>/lib/node_modules/npm/package.json` 的版本号（同步、够快，轮询不心疼）。 */
+function readNpmVersion(root) {
+  if (!root) return ''
+  try {
+    const file = join(root, 'lib', 'node_modules', 'npm', 'package.json')
+    if (!existsSync(file)) return ''
+    const v = JSON.parse(readFileSync(file, 'utf8'))?.version
+    return typeof v === 'string' ? v : ''
+  } catch {
+    return ''
+  }
+}
+
 /**
- * 平台边界：两件「装了也好不了」的事，写在这里是因为**它们是解释器**。
+ * 原生模块编译链：`android_ndk_path` 与 npm 的安装脚本闸门。
  *
- * 用户撞上 `gyp: Undefined variable android_ndk_path` 或
- * `touch /tmp/x: Permission denied` 时，会以为是我们装坏了。列在这儿
+ * ── 为什么会「配了也不生效」 ──────────────────────────────────────────────
+ *
+ * Termux 的 node 是 `android/arm64` 构建，它的 `common.gypi` 里**无条件**引用
+ * `<(android_ndk_path)`：
+ *
+ *     'cflags': ['-fPIC', '-I<(android_ndk_path)/sources/android/cpufeatures']
+ *
+ * 而 gyp / node-gyp 都不给这个变量默认值，运行时那份
+ * `process.config.variables.android_ndk_path` 是 `(unset)` —— 于是加载
+ * `binding.gyp` 这一步就死，连编译都没开始。
+ *
+ * 关键事实：**这个变量只用来拼一个 include 路径**，路径不存在也能过 configure。
+ * 所以正确做法是给它一个桩目录，而不是下载官方 NDK —— NDK 的 host 工具链是
+ * `linux-x86_64`，arm64 手机上根本跑不了（那是"看起来很努力、其实一步也走不通"
+ * 的典型）。`EngineConfig` 现在默认就设这个桩。
+ *
+ * 第二道闸是 npm 12：默认拦截安装脚本，`npm i` 之后**必须**显式 approve 再
+ * rebuild，否则包在但产物不在。这条没有配置能自动替用户点，只能写清楚。
+ */
+function checkNative(root) {
+  const code = 'NATIVE'
+  const title = '原生模块编译'
+  const gyp = String(process.env.GYP_DEFINES || '')
+  const m = /android_ndk_path=([^;\s]+)/.exec(gyp)
+
+  if (!m) {
+    return check(
+      code,
+      title,
+      Verdict.WARN,
+      'GYP_DEFINES 里没有 android_ndk_path：node-gyp 加载 binding.gyp 时就报 ' +
+        '`Undefined variable android_ndk_path`，一个 .node 都产不出来。',
+      'export GYP_DEFINES="android_ndk_path=$HOME/.cache/kxxy-ndk-stub" 即可 —— ' +
+        '不需要真 NDK（官方 NDK 的 host 工具链是 linux-x86_64，arm64 手机跑不了；' +
+        '这个变量只用来拼一个 include 路径）。引擎启动时会自动设好，缺这条说明引擎版本旧了。',
+    )
+  }
+
+  const notes = [`android_ndk_path → ${m[1]}（gyp 只拿它拼 include 路径，目录不存在也能过 configure）`]
+  const npmVer = readNpmVersion(root)
+  if (npmVer) {
+    const major = Number.parseInt(npmVer.split('.')[0], 10)
+    if (Number.isFinite(major) && major >= 12) {
+      notes.push(
+        `npm ${npmVer} 默认拦截安装脚本：npm i <包> → npm install-scripts approve <包> → ` +
+          'npm rebuild <包>（第三步不能省，否则仍报 install scripts blocked）',
+      )
+    } else {
+      notes.push(`npm ${npmVer}（未拦截安装脚本）`)
+    }
+  }
+  return check(code, title, Verdict.OK, notes.join('；'))
+}
+
+/**
+ * 平台边界：沙箱里真正改不了的那几件，写在这里是因为**它们是解释器**。
+ *
+ * 用户撞上 `touch /tmp/x: Permission denied` 时，会以为是我们装坏了。列在这儿
  * （永远 OK，不占告警位），能让人一眼看到"这是平台决定的"而不是去重装 APK。
  *
- * 为什么不用 WARN：这两条**永远**成立，标黄等于把告警位浪费掉，之后就没人
+ * 为什么不用 WARN：这些**永远**成立，标黄等于把告警位浪费掉，之后就没人
  * 看这个角标了。
+ *
+ * 注：NDK / `android_ndk_path` 曾经也在这里，但它**能修**（给个桩目录即可），
+ * 现在归 [checkNative]。
  */
 function checkPlatform(root) {
   const code = 'PLATFORM'
@@ -781,21 +867,8 @@ function checkPlatform(root) {
     )
   }
 
-  // NDK：`<root>/ndk`、`<root>/android-ndk`、`<home>/ndk` 三处任一有 toolchains/
-  // 就算装了 —— EngineConfig 会把它同时写进 ANDROID_NDK_* 与 GYP_DEFINES。
-  const ndk =
-    process.env.ANDROID_NDK_PATH ||
-    process.env.ANDROID_NDK_ROOT ||
-    [root && join(root, 'ndk'), root && join(root, 'android-ndk')].find(
-      (d) => d && existsSync(join(d, 'toolchains')),
-    ) ||
-    ''
-  notes.push(
-    ndk
-      ? `NDK 见 ${ndk}（已接入 node-gyp 的 android_ndk_path）`
-      : '没有 NDK：node-gyp 在 android 目标下报 `Undefined variable android_ndk_path`，' +
-        '没发 arm64 预编译包的原生模块装不上；把 NDK 解压到 <引擎根>/ndk 后重启即自动接入（3~4 GB，不随安装包分发）',
-  )
+  // NDK 那条移到 NATIVE 里了（它现在是「已接线」的绿项，不再属于边界）；
+  // 这里只剩真正改不了的那两件。
 
   return check(code, title, Verdict.OK, notes.join('；'))
 }
@@ -821,9 +894,11 @@ export function runHealthCheck(root) {
     checkRuntime(p.engineRoot),
     checkGuard(p.guardDir),
     checkWebBoot(boot),
-    // 后两条不是"启动配置"，而是"为什么装不上/下不动"的解释器：
-    // NET 会随网络变化报黄，PLATFORM 永远绿（平台边界，标黄等于浪费告警位）。
+    // 后三条不是"启动配置"，而是"为什么装不上/下不动"的解释器：
+    // NET 会随网络变化报黄；NATIVE 缺 GYP_DEFINES 时报黄；PLATFORM 永远绿
+    // （平台边界，标黄等于浪费告警位）。
     checkNetwork(),
+    checkNative(p.engineRoot),
     checkPlatform(p.engineRoot),
   ]
 
