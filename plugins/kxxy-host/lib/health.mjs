@@ -21,10 +21,11 @@
  * @module kxxy-host/health
  */
 
-import { existsSync, readFileSync, statSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, readdirSync, accessSync, constants as fsConstants } from 'node:fs'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import { collectBootReport } from './bootreport.mjs'
+import { netSnapshot } from './netdiag.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -673,6 +674,95 @@ export const CORE_BUNDLES = [
  * 返回的 `level` 是「建议的修复力度」，与原生 `RecoveryManager.Level`
  * 对应：NONE 表示不需要修复（页面显示全绿即可，不给按钮）。
  */
+/**
+ * 网络：GitHub 直链是否被 DNS 黑洞（缺陷 EH）。
+ *
+ * 结论来自 netdiag 的后台探测缓存 —— 这里必须是同步的：整份体检在每次
+ * `/kxxy/api/state` 轮询里重算，不能因为一次 DNS 超时把响应拖住。
+ *
+ * 只有在「目标被黑洞、同域对照组正常」时才报 WARN。真的没网（ENOTFOUND /
+ * 超时）报 UNKNOWN 并明说分不清 —— 让用户去查网络，别来查这个 App。
+ */
+function checkNetwork() {
+  const code = 'NET'
+  const title = 'GitHub 直链'
+  const snap = netSnapshot()
+  const hint =
+    '这不是手机能改的：DNS 对单个域名返 0.0.0.0，系统 DNS 也换不了。' +
+    '绕过办法是把 raw.githubusercontent.com 换成镜像（jsDelivr / ghproxy），' +
+    '或在电脑上 clone 后把文件传进来。'
+
+  if (snap.level === 'probing') {
+    return check(code, title, Verdict.UNKNOWN, '正在后台探测（结果在下一次刷新出现）')
+  }
+  if (snap.level === 'ok') {
+    const addrs = (snap.targets || [])
+      .filter((t) => t.status === 'ok')
+      .map((t) => `${t.host} → ${t.addresses[0]}`)
+      .join('，')
+    return check(code, title, Verdict.OK, addrs || '解析正常')
+  }
+  if (snap.level === 'selective') {
+    const dns = Array.isArray(snap.servers) && snap.servers.length
+      ? `（当前 DNS：${snap.servers.slice(0, 2).join('、')}）`
+      : ''
+    return check(
+      code,
+      title,
+      Verdict.WARN,
+      `raw.githubusercontent.com 解析到空地址，而 github.com 正常${dns} —— 单域名被 DNS 拦截，不是本机配置。`,
+      hint,
+    )
+  }
+  if (snap.level === 'blackhole') {
+    return check(code, title, Verdict.WARN, 'GitHub 相关域名全部解析到空地址（DNS 层黑洞）', hint)
+  }
+  return check(code, title, Verdict.UNKNOWN, `${snap.headline}（分不清是没网还是被拦，下次刷新再判）`)
+}
+
+/**
+ * 平台边界：两件「装了也好不了」的事，写在这里是因为**它们是解释器**。
+ *
+ * 用户撞上 `gyp: Undefined variable android_ndk_path` 或
+ * `touch /tmp/x: Permission denied` 时，会以为是我们装坏了。列在这儿
+ * （永远 OK，不占告警位），能让人一眼看到"这是平台决定的"而不是去重装 APK。
+ *
+ * 为什么不用 WARN：这两条**永远**成立，标黄等于把告警位浪费掉，之后就没人
+ * 看这个角标了。
+ */
+function checkPlatform(root) {
+  const code = 'PLATFORM'
+  const title = '平台边界'
+  const notes = []
+
+  let tmpWritable = false
+  try {
+    accessSync('/tmp', fsConstants.W_OK)
+    tmpWritable = true
+  } catch {
+    tmpWritable = false
+  }
+  const tmpdir = process.env.TMPDIR || ''
+  notes.push(
+    tmpWritable
+      ? '/tmp 可写'
+      : `/tmp 不可写（Android 上属 shell:shell 771，app 不在 shell 组）；` +
+        `已用 TMPDIR=${tmpdir || '(未设置)'} 兜底，硬编码 /tmp 的脚本仍会失败`,
+  )
+
+  const ndk =
+    process.env.ANDROID_NDK_PATH ||
+    process.env.ANDROID_NDK_ROOT ||
+    (root && existsSync(join(root, 'ndk')) ? join(root, 'ndk') : '')
+  notes.push(
+    ndk
+      ? `NDK 见 ${ndk}`
+      : '没有 NDK：需要 node-gyp 现场编译的原生模块装不上（有预编译产物的包不受影响）',
+  )
+
+  return check(code, title, Verdict.OK, notes.join('；'))
+}
+
 export function runHealthCheck(root) {
   const p = healthPaths(root)
 
@@ -694,6 +784,10 @@ export function runHealthCheck(root) {
     checkRuntime(p.engineRoot),
     checkGuard(p.guardDir),
     checkWebBoot(boot),
+    // 后两条不是"启动配置"，而是"为什么装不上/下不动"的解释器：
+    // NET 会随网络变化报黄，PLATFORM 永远绿（平台边界，标黄等于浪费告警位）。
+    checkNetwork(),
+    checkPlatform(p.engineRoot),
   ]
 
   const bad = checks.filter((c) => c.verdict === Verdict.BAD)

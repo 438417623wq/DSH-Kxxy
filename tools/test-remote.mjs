@@ -497,6 +497,63 @@ console.log('\n[C] 安全边界（鉴权 / 脱敏）')
   ok('补换完成后由 onPageFinished 转去控制台', activity.includes('pendingConsole && !remoteMode'))
 }
 
+// ---------------------------------------------------------------------------
+// [D] 写操作 nonce（v0.9.19）
+// ---------------------------------------------------------------------------
+//
+// 三道 CSRF 语义都依赖浏览器**自愿**发的头，nonce 是唯一"对方拿不到"的那条。
+// 这里钉住三件事：服务端生成/注入/校验、前端统一加头、以及"旧 nonce 仍可用"
+// （插件热重载后已打开的页面不该立刻 403）。
+console.log('\n[D] 写操作 nonce')
+{
+  const authSrc = norm(read('plugins/kxxy-host/lib/auth.mjs'))
+  const js = norm(read('plugins/kxxy-host/web/host.js'))
+  const html = norm(read('plugins/kxxy-host/web/index.html'))
+
+  ok('服务端用 crypto 随机生成 nonce', hostLib.includes('randomBytes(32)'))
+  ok('nonce 注入到页面 head', hostLib.includes('name="kxxy-nonce"') && hostLib.includes('injectNonce('))
+  ok('写请求校验 nonce', hostLib.includes('checkNonce(req, acceptedNonces())'))
+  ok('比较用 timingSafeEqual（不给计时侧信道）', authSrc.includes('timingSafeEqual'))
+  ok('保留最近若干个 nonce（热重载后老页面不立刻失效）',
+    authSrc.includes('NONCE_SEEN_MAX') && authSrc.includes('acceptedNonces'))
+  ok('nonce 挂在 globalThis（模块重载后仍在）', authSrc.includes('Symbol.for') && authSrc.includes('globalThis['))
+  ok('页面读 meta 里的 nonce', js.includes("meta[name=\"kxxy-nonce\"]"))
+  ok('前端统一包 fetch 加头（不靠每个调用点自觉）', js.includes("headers.set('x-kxxy-nonce'"))
+  ok('只给 /kxxy/api/ 的写请求加（不给外部地址加）',
+    js.includes("url.indexOf('/kxxy/api/') >= 0") && js.includes('WRITE_METHODS'))
+  // 静态页里不该出现 nonce 字面量：它是运行时注入的，写死在模板里等于公开
+  ok('静态 index.html 不含 nonce 字面量', !html.includes('kxxy-nonce'))
+}
+
+// ---------------------------------------------------------------------------
+// [E] 平台边界：DNS 黑洞诊断 + 体检项（v0.9.19）
+// ---------------------------------------------------------------------------
+console.log('\n[E] 平台边界与网络诊断')
+{
+  const netSrc = norm(read('plugins/kxxy-host/lib/netdiag.mjs'))
+  const healthSrc = norm(read('plugins/kxxy-host/lib/health.mjs'))
+  const kotlinInstaller = norm(read('android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt'))
+
+  ok('空地址判定覆盖 0.0.0.0 与 127.x', netSrc.includes("'0.0.0.0'") && netSrc.includes("startsWith('127.')"))
+  ok('有对照组主机（区分"只拦这一个"与"整体没网"）', netSrc.includes("id: 'github'") && netSrc.includes('controlOk'))
+  ok('DNS 查询带超时（不能把 /state 拖住）', netSrc.includes('LOOKUP_TIMEOUT_MS'))
+  ok('探测结果缓存（5 分钟）', netSrc.includes('TTL_MS') && netSrc.includes('5 * 60 * 1000'))
+  ok('体检里分三种结论', /'selective'/.test(netSrc) && /'offline'/.test(netSrc) && /'blackhole'/.test(netSrc))
+  ok('网络项只报黄不报红（不影响启动）',
+    /code = 'NET'/.test(healthSrc) &&
+      !/Verdict\.BAD/.test(
+        healthSrc.slice(
+          healthSrc.indexOf('function checkNetwork'),
+          healthSrc.indexOf('function checkPlatform'),
+        ),
+      ))
+  ok('平台边界项常绿', /code = 'PLATFORM'/.test(healthSrc))
+  ok('/state 顶层带 net 快照', hostLib.includes('net: netdiag.netSnapshot()'))
+  ok('raw 镜像从 etc/net.json 读（默认不预置第三方地址）',
+    kotlinInstaller.includes('etc/net.json') && kotlinInstaller.includes('insteadOf = https://raw.githubusercontent.com/'))
+  ok('临时目录每次启动真写一次（失败会指名道姓）', kotlinInstaller.includes('.kxxy-writable'))
+}
+
 // 生成器
 const codes = new Set()
 for (let i = 0; i < 200; i++) codes.add(generateCode())

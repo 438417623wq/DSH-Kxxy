@@ -960,3 +960,25 @@ kxxy-host 判定请求可信 → ctx.get('authorization').isTrustedRequest(req)
 同一版补了四个运行时默认值：yarn 的 bin/share 分离链接、ImageMagick 的 CJK
 默认字体、`~/.gitconfig` 身份、pip 清华镜像。NDK、`/tmp`、`raw.githubusercontent.com`
 被 DNS 拦截这三条属于平台边界，只在文档与诊断里说清，不假装能修。
+
+### 写操作 nonce 与平台边界（v0.9.19）
+
+v0.9.18 的三道 CSRF 语义（JSON content-type / `sec-fetch-site` / `Origin` 同源）
+全是**浏览器自愿发的头**：老 WebView 不发 `sec-fetch-site`，少数导航型提交不带
+`Origin` —— 同时缺失就是空白地带。这一版补 nonce：服务端往页面 `<head>` 塞
+`<meta name="kxxy-nonce">`，写请求必须带回 `x-kxxy-nonce`（`timingSafeEqual` 比较），
+跨源页面读不到也猜不中。
+
+两处实现取舍：**保留最近 6 个 nonce**（插件热重载后已打开的页面不会立刻 403，
+那会表现成「点按钮没反应」）；**前端包 `window.fetch`** 而不是每个 POST 手写头
+（这类校验最容易死于「新增端点忘了带」）。
+
+体检里多了两项。`GitHub 直链` 在单域名被 DNS 黑洞时报黄 —— 判据是「解析到空地址
+**且**同域对照组正常」，与「真的没网」（`ENOTFOUND`/超时）分开报，否则会把人送去
+重连 Wi-Fi。`平台边界` **永远绿**：`/tmp` 可写性与生效的 `TMPDIR`、有没有 NDK；
+常绿是刻意的，这两条永远成立，标黄等于把告警位浪费掉。
+
+`/tmp`（`shell:shell 771`，无 root）与 NDK（3–4 GB）都是平台边界，不做假装修复，
+只做诊断。想绕过 `raw.githubusercontent.com` 的 DNS 拦截，填
+`<root>/etc/net.json` 的 `rawMirror`，下次启动会把 `insteadOf` 写进 `~/.gitconfig`
+（自己那一段用注释边界标记，不碰你手改的内容）。

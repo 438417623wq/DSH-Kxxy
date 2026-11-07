@@ -1497,6 +1497,43 @@ class RuntimeInstaller(private val ctx: Context) {
             return
         }
 
+        /*
+         * 真写一次（缺陷 EI）。
+         *
+         * `TMPDIR` 是所有子进程共用的落点，它坏掉的表现是**一串互不相干的
+         * 报错**：`ENOSPC`、`EACCES`、`mktemp: failed to create file`、
+         * python 的 `No usable temporary directory found`。查起来要从这些
+         * 表象倒推回这里，代价很大。
+         *
+         * 所以每次启动探一次：写一个空文件再删掉。代价是两次 syscall，
+         * 换来的是"临时目录不可写"这件事会在启动日志里被指名道姓地说出来。
+         */
+        runCatching {
+            val probe = File(tmp, ".kxxy-writable")
+            probe.writeText("ok", Charsets.UTF_8)
+            probe.delete()
+        }.onFailure { first ->
+            // 写不进去先试着修一次权限：目录被别的工具 chmod 成 0500 之后，
+            // 后续所有临时文件操作都会连锁失败，而这里是最便宜的修复点。
+            tmp.setReadable(true, true)
+            tmp.setWritable(true, true)
+            tmp.setExecutable(true, true)
+            val fixed = runCatching {
+                File(tmp, ".kxxy-writable").writeText("ok", Charsets.UTF_8)
+                File(tmp, ".kxxy-writable").delete()
+                true
+            }.getOrDefault(false)
+            if (fixed) {
+                Log.i(TAG, "ensureTmpDir: 权限被改坏，已修复 ${tmp.absolutePath}")
+            } else {
+                Log.w(
+                    TAG,
+                    "ensureTmpDir: ${tmp.absolutePath} 不可写（${first.message}）—— " +
+                        "TMPDIR/TMP/TEMP/GOTMPDIR/XDG_RUNTIME_DIR 都指向这里，临时文件相关操作会连锁失败",
+                )
+            }
+        }
+
         // 让 `getprop` / 三方脚本眼里的 `/tmp` 也指向同一处。Android 上
         // `/tmp` 通常不存在且 `/` 只读，这里失败是**预期**，不记错误。
         val slashTmp = File("/tmp")
@@ -1758,6 +1795,107 @@ class RuntimeInstaller(private val ctx: Context) {
             .onFailure { Log.w(TAG, "ensurePipConfig crashed: ${it.message}") }
         runCatching { ensureImageMagickTypes(root) }
             .onFailure { Log.w(TAG, "ensureImageMagickTypes crashed: ${it.message}") }
+        runCatching { ensureNetConfig(root) }
+            .onFailure { Log.w(TAG, "ensureNetConfig crashed: ${it.message}") }
+    }
+
+    /** 由 [ensureNetConfig] 写进 `.gitconfig` 的管理块边界标记。 */
+    private val RAW_MIRROR_BEGIN = "# kxxy:raw-mirror begin"
+    private val RAW_MIRROR_END = "# kxxy:raw-mirror end"
+
+    /**
+     * 可选的 GitHub 直链镜像（缺陷 EH 的**绕行**，不是修复）。
+     *
+     * 背景：`raw.githubusercontent.com` 在部分网络里被 DNS 返 `0.0.0.0`，
+     * 而同域的 `github.com` 正常 —— 这是解析层的单域名黑洞，App 改不了
+     * （详见 `plugins/kxxy-host/lib/netdiag.mjs` 的注释：绝大多数工具走 netd，
+     * 连 `resolv.conf` 都不读）。
+     *
+     * 所以这里只做一件事：**留一个配置口**。`<root>/etc/net.json` 里写
+     *
+     *     { "rawMirror": "https://ghproxy.net/https://raw.githubusercontent.com/" }
+     *
+     * 下次启动就把 `url.<mirror>.insteadOf = https://raw.githubusercontent.com/`
+     * 落进 `~/.gitconfig`，于是 `git clone` / `curl` 之外的 git 系操作能绕过去。
+     * 留空（默认）就什么都不写，并**主动删掉**自己以前写过的块 —— 换回来要能换干净。
+     *
+     * ⚠️ 刻意不预置任何第三方镜像地址：这类服务存亡无常，写死一个等于给用户
+     * 埋一颗"过几个月突然不工作"的雷。
+     */
+    private fun ensureNetConfig(root: File) {
+        val cfg = File(root, "etc/net.json")
+        var mirror = ""
+        if (cfg.isFile) {
+            mirror = runCatching {
+                org.json.JSONObject(cfg.readText(Charsets.UTF_8)).optString("rawMirror", "").trim()
+            }.getOrElse {
+                // 用户手改坏了不该导致引擎起不来：按"未配置"处理并留一条日志
+                Log.w(TAG, "ensureNetConfig: 解析 ${cfg.name} 失败（${it.message}），按未配置处理")
+                ""
+            }
+        }
+        runCatching { applyGitRawMirror(mirror) }
+            .onFailure { Log.w(TAG, "ensureNetConfig: applyGitRawMirror failed: ${it.message}") }
+
+        if (!cfg.isFile && root.isDirectory) {
+            runCatching {
+                cfg.parentFile?.mkdirs()
+                cfg.writeText("{\n  \"rawMirror\": \"\"\n}\n", Charsets.UTF_8)
+                Log.i(TAG, "ensureNetConfig: wrote ${cfg.path}")
+            }.onFailure { Log.w(TAG, "ensureNetConfig: 写 ${cfg.name} 失败：${it.message}") }
+        }
+    }
+
+    /**
+     * 把镜像块写进（或从）`~/.gitconfig`。
+     *
+     * 只动自己那一段：用户自己加的 `[url]`、`[alias]`、改过的身份全都原样保留。
+     * 这也是为什么用注释当边界而不是整份重写 —— 那份文件明确标了"可手改"。
+     */
+    private fun applyGitRawMirror(mirror: String) {
+        val target = File(EngineConfig.dshHome(ctx), ".gitconfig")
+        val existing = runCatching { if (target.isFile) target.readText(Charsets.UTF_8) else "" }
+            .getOrDefault("")
+
+        val withoutBlock = stripRawMirrorBlock(existing).trimEnd()
+        // 没配镜像 + 原本也没有块 ⇒ 什么都不用做（不要为"没配置"去创建文件，
+        // 那份文件由 ensureGitIdentity 负责，它有自己的模板）
+        if (mirror.isEmpty() && withoutBlock == existing.trimEnd()) return
+
+        val block = if (mirror.isEmpty()) "" else buildString {
+            append(RAW_MIRROR_BEGIN).append('\n')
+            append("[url \"").append(mirror).append("\"]\n")
+            append("\tinsteadOf = https://raw.githubusercontent.com/\n")
+            append(RAW_MIRROR_END).append('\n')
+        }
+        val next = (block + withoutBlock).trimEnd() + "\n"
+        if (next == existing) return
+        target.parentFile?.mkdirs()
+        target.writeText(next, Charsets.UTF_8)
+        Log.i(
+            TAG,
+            if (mirror.isEmpty()) "applyGitRawMirror: 已移除镜像块"
+            else "applyGitRawMirror: raw.githubusercontent.com → $mirror",
+        )
+    }
+
+    /** 去掉 [RAW_MIRROR_BEGIN]..[RAW_MIRROR_END] 之间的内容（含标记行）。 */
+    private fun stripRawMirrorBlock(text: String): String {
+        if (!text.contains(RAW_MIRROR_BEGIN)) return text
+        val out = StringBuilder()
+        var inside = false
+        for (line in text.split('\n')) {
+            if (line.trim() == RAW_MIRROR_BEGIN) {
+                inside = true
+                continue
+            }
+            if (inside && line.trim() == RAW_MIRROR_END) {
+                inside = false
+                continue
+            }
+            if (!inside) out.append(line).append('\n')
+        }
+        return out.toString()
     }
 
     /** 极简 XML 文本转义（路径里可能有 `&`，虽然 Android 上基本不会）。 */
@@ -2521,7 +2659,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 同理，**自有插件（kxxy-host）的前端资源有实质改动**也要 +1 —— 那些
          * 文件同样在 runtime.zip 里，标记不变就等于「新 APK 装了个旧设置页」。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@17"
+        private const val PATCHSET_MARKER = "kxxy-patchset@18"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**

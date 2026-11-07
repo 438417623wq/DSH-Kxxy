@@ -45,6 +45,8 @@
  * @module kxxy-host/auth
  */
 
+import { timingSafeEqual } from 'node:crypto'
+
 /** 判定结果：可信。 */
 export const AUTH_ALLOW = 'allow'
 /** 判定结果：请求没有有效会话 cookie。 */
@@ -84,6 +86,111 @@ export function authVerdict(ctx, req) {
     // 判定器自己抛错时也按「判不了」处理，绝不当成通过
     return AUTH_UNAVAILABLE
   }
+}
+
+/**
+ * 页面 nonce：写在管理页 HTML 里、由前端随每个写请求带回来的一次性口令。
+ *
+ * ── 为什么在三道 CSRF 语义之外还要它 ──────────────────────────────────────
+ *
+ * `sec-fetch-site` 与 `origin` 都是**浏览器自愿提供**的头：
+ *   · 老 WebView 不发 `sec-fetch-site`（我们刻意不把「缺失」当跨站，否则老设备
+ *     全废），于是那一条在它们身上等于不存在；
+ *   · `origin` 在少数导航型提交里也为空。
+ * 两者叠加就会出现「既没 sec-fetch-site、也没 origin」的空白地带。
+ *
+ * nonce 补的是这个洞：它能被同源页面读到（ attackers 读不到跨源响应），
+ * 而写请求必须带上它。跨站页面拿不到、猜不中（32 字节随机、进程内有效）。
+ *
+ * ── 为什么要留一串而不是一个 ──────────────────────────────────────────────
+ *
+ * 插件热重载会重新求值本模块。如果只认「当前这一个」，重载瞬间已经打开的页面
+ * （HTML 里是旧 nonce）所有写操作立刻 403 —— 用户看到的是「点按钮没反应」。
+ * 所以保留最近若干个：新页面用新的，老页面在下次刷新前还能用。
+ */
+const NONCE_SEEN_MAX = 6
+
+/**
+ * nonce 存放处。
+ *
+ * 挂在 `globalThis` 而不是模块变量上，理由同上：模块会被重新求值，
+ * globalThis 不会。键用 Symbol.for，避免与宿主其它插件撞名。
+ */
+const NONCE_BOX = Symbol.for('kxxy.host.pageNonce')
+
+function nonceBox() {
+  let box = globalThis[NONCE_BOX]
+  if (!box || typeof box !== 'object') {
+    box = { current: '', seen: [] }
+    globalThis[NONCE_BOX] = box
+  }
+  return box
+}
+
+/**
+ * 取当前 nonce（没有就生成一个）。
+ *
+ * @param {() => string} mint 生成函数（由调用方注入 `crypto.randomBytes` 的封装，
+ *   这样本模块不必依赖 node:crypto，也便于测试注入固定值）
+ * @returns {string}
+ */
+export function currentNonce(mint) {
+  const box = nonceBox()
+  if (!box.current) {
+    box.current = mint()
+  }
+  return box.current
+}
+
+/** 记一个新 nonce 为当前值，旧值降级为「仍可接受」。 */
+export function rotateNonce(mint) {
+  const box = nonceBox()
+  if (box.current) {
+    box.seen.push(box.current)
+    if (box.seen.length > NONCE_SEEN_MAX) box.seen.splice(0, box.seen.length - NONCE_SEEN_MAX)
+  }
+  box.current = mint()
+  return box.current
+}
+
+/** 当前 nonce 与最近若干个旧值（服务端下发页面时用 current，校验时用全部）。 */
+export function acceptedNonces() {
+  const box = nonceBox()
+  return box.current ? [box.current, ...box.seen] : [...box.seen]
+}
+
+/**
+ * 校验写请求带来的 nonce。
+ *
+ * 用定长比较：`===` 会在第一个不同字节处返回，理论上可被计时侧信道逐字节猜。
+ * 这里只是纵深防御（攻击者还得先能发请求），但代价是零。
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {string[]} accepted 可接受的 nonce 列表
+ * @returns {{ok: true} | {ok: false, status: number, error: string}}
+ */
+export function checkNonce(req, accepted) {
+  const list = Array.isArray(accepted) ? accepted.filter((x) => typeof x === 'string' && x) : []
+  if (list.length === 0) {
+    // 服务端自己没准备好（理论不可达：页面能出来就说明生成过）。按「判不了」处理。
+    return { ok: false, status: 503, error: 'nonce unavailable' }
+  }
+  const got = String(req?.headers?.['x-kxxy-nonce'] ?? '')
+  if (!got) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'missing x-kxxy-nonce (刷新页面后再试)',
+    }
+  }
+  const a = Buffer.from(got, 'utf8')
+  for (const candidate of list) {
+    const b = Buffer.from(candidate, 'utf8')
+    // 长度不同直接跳过：timingSafeEqual 对不等长会抛
+    if (a.length !== b.length) continue
+    if (timingSafeEqual(a, b)) return { ok: true }
+  }
+  return { ok: false, status: 403, error: 'invalid x-kxxy-nonce (页面已过期，刷新后再试)' }
 }
 
 /**

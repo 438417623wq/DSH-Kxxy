@@ -428,11 +428,21 @@ async function get(path, headers = {}) {
  * forbidden header name 并**静默剥掉**，于是「非回环 Host 应被拒」这条
  * 断言会永远拿到 200（请求实际带着真实回环 Host 发出），
  * 变成一条假绿/假红。node:http 不做这层过滤。
+ *
+ * `write` 默认给非 GET 请求带上页面 nonce（v0.9.19）。要测「没带 nonce」时
+ * 传 `nonce: null` 显式关掉 —— 让"故意不带"成为一处显式的写法，而不是靠
+ * 记住某几条断言要特判。
  */
-function raw(path, { method = 'GET', headers = {}, body } = {}) {
+function raw(path, { method = 'GET', headers = {}, body, nonce } = {}) {
+  const finalHeaders = { ...headers }
+  const isWrite = method !== 'GET' && method !== 'HEAD'
+  const wanted = nonce === undefined ? pageNonce : nonce
+  if (isWrite && wanted && !finalHeaders['x-kxxy-nonce']) {
+    finalHeaders['x-kxxy-nonce'] = wanted
+  }
   return new Promise((resolve, reject) => {
     const req = httpRequest(
-      { host: '127.0.0.1', port: server.address().port, path, method, headers },
+      { host: '127.0.0.1', port: server.address().port, path, method, headers: finalHeaders },
       (res) => {
         const chunks = []
         res.on('data', (c) => chunks.push(c))
@@ -445,6 +455,35 @@ function raw(path, { method = 'GET', headers = {}, body } = {}) {
     if (body) req.write(body)
     req.end()
   })
+}
+
+// ── 页面 nonce（v0.9.19）──────────────────────────────────────────
+//
+// 写操作现在要求 `x-kxxy-nonce`，值由服务端注入管理页 HTML 的 meta 里。
+// 这里用与浏览器完全相同的办法拿：GET 页面，再从 meta 读。
+//
+// 拿到之后把 global fetch 包一层统一加头，**不是**在每个用例里手写 ——
+// 与 host.js 里的做法一致，也是为了证明"客户端只需在一个地方加"。
+// 显式想测"没带 nonce"的用例走 raw(..., { nonce: null })。
+const pageNonce = (
+  /<meta name="kxxy-nonce" content="([^"]+)"/.exec((await get('/kxxy')).text) || []
+)[1] || ''
+if (!pageNonce) fail('管理页未注入 kxxy-nonce（写操作会全部被拒）')
+else ok(`管理页注入了 kxxy-nonce（${pageNonce.length} 字符）`)
+
+{
+  const nativeFetch = globalThis.fetch
+  globalThis.fetch = function (input, init) {
+    const opts = init ? { ...init } : {}
+    const url = typeof input === 'string' ? input : String((input && input.url) || '')
+    const method = String(opts.method || (input && input.method) || 'GET').toUpperCase()
+    if (method !== 'GET' && method !== 'HEAD' && url.includes('/kxxy/api/')) {
+      const headers = new Headers(opts.headers || (input && input.headers) || undefined)
+      headers.set('x-kxxy-nonce', pageNonce)
+      opts.headers = headers
+    }
+    return nativeFetch(input, opts)
+  }
 }
 
 console.log('[1] GET /kxxy（宿主管理页）')
@@ -1245,6 +1284,20 @@ console.log('\n[14b] /kxxy/api/health（启动配置体检）')
       const bad = j.checks.filter((c) => c.verdict === 'BAD')
       if (bad.length) fail(`不应有 BAD 项：${bad.map((c) => `${c.code}:${c.detail}`).join(' | ')}`)
       else ok('无 BAD 项')
+
+      // 平台边界项永远 OK（它不占告警位），但**必须存在** —— 用户撞上
+      // `gyp: Undefined variable android_ndk_path` 时，唯一的解释就在这里。
+      const platform = j.checks.find((c) => c.code === 'PLATFORM')
+      if (!platform) fail('缺 PLATFORM 项（平台边界没进体检）')
+      else if (platform.verdict !== 'OK') fail(`PLATFORM 应恒为 OK，实为 ${platform.verdict}`)
+      else if (!/NDK/.test(platform.detail)) fail(`PLATFORM 未提 NDK：${platform.detail}`)
+      else ok('PLATFORM 常绿且写明了 NDK 边界')
+
+      // 网络项三态都可能（测试机可能没网）—— 只钉"它在、且不是 BAD"
+      const net = j.checks.find((c) => c.code === 'NET')
+      if (!net) fail('缺 NET 项（DNS 黑洞诊断没进体检）')
+      else if (net.verdict === 'BAD') fail('NET 不该报红（网络问题不影响启动）')
+      else ok(`NET = ${net.verdict}（${net.detail.slice(0, 40)}…）`)
     }
 
     // ② 空补丁文件：官方 yaml.load('') → undefined → 非数组 → 启动终止。
@@ -1603,6 +1656,57 @@ console.log('\n[13b] 写操作 CSRF 语义')
   })
   if (sameOrigin.status !== 501) fail(`同源未知动作应仍走到 501，实为 ${sameOrigin.status}`)
   else ok('同源 JSON → 放行到业务层（501 未知动作，对照组）')
+}
+
+// ── 页面 nonce（v0.9.19）──────────────────────────────────────────
+//
+// 三道 CSRF 语义都是浏览器**自愿**提供的头：老 WebView 不发 sec-fetch-site，
+// 少数导航型提交不带 origin。nonce 是唯一"对方拿不到就发不出来"的那条。
+console.log('\n[13d] 写操作 nonce')
+{
+  const body = JSON.stringify({ action: 'make-coffee' })
+  const okHeaders = {
+    host: '127.0.0.1:3080',
+    'content-type': 'application/json',
+    'sec-fetch-site': 'same-origin',
+  }
+
+  const noNonce = await raw('/kxxy/api/action', {
+    method: 'POST',
+    headers: okHeaders,
+    body,
+    nonce: null,
+  })
+  if (noNonce.status !== 403) fail(`不带 nonce 的写请求应 403，实为 ${noNonce.status}`)
+  else if (!noNonce.text.includes('x-kxxy-nonce')) fail('403 正文没说明缺的是 nonce')
+  else ok('不带 nonce → 403 且说明缺的是 nonce')
+
+  const badNonce = await raw('/kxxy/api/action', {
+    method: 'POST',
+    headers: { ...okHeaders, 'x-kxxy-nonce': 'not-the-nonce' },
+    body,
+    nonce: null,
+  })
+  if (badNonce.status !== 403) fail(`错误 nonce 应 403，实为 ${badNonce.status}`)
+  else ok('错误 nonce → 403')
+
+  // 反过来：带着正确 nonce、但把那些"能被伪造"的头全去掉，仍应放行到业务层。
+  // 这条才是 nonce 的意义所在 —— 它不依赖浏览器发任何头。
+  const bare = await raw('/kxxy/api/action', {
+    method: 'POST',
+    headers: { host: '127.0.0.1:3080', 'content-type': 'application/json' },
+    body,
+  })
+  if (bare.status !== 501) fail(`只带 nonce 的写请求应放行到 501，实为 ${bare.status}`)
+  else ok('只带 nonce（无 sec-fetch-site / origin）→ 放行到业务层')
+
+  const page = await get('/kxxy')
+  const metaCount = (page.text.match(/name="kxxy-nonce"/g) || []).length
+  if (metaCount !== 1) fail(`页面应只注入一处 kxxy-nonce，实为 ${metaCount}`)
+  else ok('页面只注入一处 kxxy-nonce')
+  if (!page.text.includes('<head>')) fail('页面缺少 <head>')
+  else if (page.text.indexOf('kxxy-nonce') > page.text.indexOf('</head>')) fail('nonce 跑到了 head 之后')
+  else ok('nonce 注入在 head 内（解析前就可用）')
 }
 
 // ── 日志出口脱敏（缺陷 EB）────────────────────────────────────────

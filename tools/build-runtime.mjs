@@ -714,8 +714,13 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 里，前端读不到 ⇒「手机连上了，已配对的电脑一直空」）；`web/` 把两张长检查卡
  * 改成折叠。插件树指纹（锚点 8）本来也能判出这次变化，这里照约定一起递增：
  * 两个判据指向同一次重装，谁先命中都不影响结果。
+ *
+ * 17 → 18：写操作 nonce（2026-11-07）。`web/host.js` 包装了 `window.fetch` 统一
+ * 给写请求加 `x-kxxy-nonce`，`lib/index.js` 校验它。**前端与后端必须同版本**：
+ * 新页面配旧插件 = 多带一个被忽略的头（无害），旧页面配新插件 = 所有写操作 403。
+ * 正因为这种组合会"静默变砖"，补丁集必须涨 —— 它是唯一能保证两边一起换的锚点。
  */
-const PATCHSET_MARKER = "kxxy-patchset@17";
+const PATCHSET_MARKER = "kxxy-patchset@18";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

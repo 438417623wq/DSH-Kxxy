@@ -37,15 +37,17 @@
  */
 
 import { readFileSync, existsSync, readdirSync, statSync, writeFileSync, mkdirSync, createReadStream, renameSync, unlinkSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { join, dirname, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import * as extinstall from './extinstall.mjs'
 import * as health from './health.mjs'
 import * as mirror from './mirror.mjs'
+import * as netdiag from './netdiag.mjs'
 import * as plugins from './plugins.mjs'
 import { tarGzSync } from './tar.mjs'
-import { AUTH_ALLOW, AUTH_DENY, AUTH_UNAVAILABLE, authVerdict, checkWriteRequest, deniedPageHtml } from './auth.mjs'
+import { AUTH_ALLOW, AUTH_DENY, AUTH_UNAVAILABLE, authVerdict, checkNonce, checkWriteRequest, acceptedNonces, rotateNonce, deniedPageHtml } from './auth.mjs'
 import { redactLogTail } from './redact.mjs'
 
 /** 插件名。 */
@@ -64,6 +66,40 @@ const WEB_DIR = join(HERE, '..', 'web')
 
 /** 宿主管理页 HTML 的缓存（首次读取后常驻）。 */
 let cachedIndexHtml = null
+
+/**
+ * 生成一个页面 nonce。
+ *
+ * 32 字节 base64url（43 字符）：足以排除猜测，又短到能塞进 meta 标签。
+ * 不用 `randomUUID` —— 它带连字符且长度固定，没有优势；这里要的是不可预测。
+ */
+function mintNonce() {
+  return randomBytes(32).toString('base64url')
+}
+
+/**
+ * 把 nonce 注入页面 HTML。
+ *
+ * 注入点选 `<head>` 之后的第一行，而不是重写整个 HTML：
+ *   · 页面可能被替换/降级成兜底的极简页（没有 head），这时前置也能工作 ——
+ *     浏览器容忍 head 外出现 meta；
+ *   · 已经带 nonce 的页面（开发时手工改过）不重复插。
+ *
+ * @param {Buffer} buf 原始 HTML
+ * @returns {Buffer} 注入后的 HTML（长度会变，调用方必须重新取 length）
+ */
+function injectNonce(buf) {
+  let html = buf.toString('utf8')
+  if (html.includes('name="kxxy-nonce"')) return buf
+  // 每次下发都换一个，旧的进「仍可接受」列表（插件热重载后老页面不至于立刻失效）
+  const nonce = rotateNonce(mintNonce)
+  const meta = `<meta name="kxxy-nonce" content="${nonce}">`
+  const headOpen = html.match(/<head[^>]*>/i)
+  html = headOpen
+    ? html.replace(headOpen[0], `${headOpen[0]}\n  ${meta}`)
+    : `${meta}\n${html}`
+  return Buffer.from(html, 'utf8')
+}
 
 /**
  * 主题偏好缓存（三轮优化 ①）。
@@ -1063,6 +1099,19 @@ export function apply(ctx) {
               sendJson(res, check.status, { error: check.error })
               return
             }
+            /*
+             * nonce 才是这条链上「不靠浏览器自觉」的那道。
+             *
+             * content-type / sec-fetch-site / origin 三个都是浏览器**自愿**提供的：
+             * 老 WebView 不发 sec-fetch-site（我们也不能把「缺失」当跨站，否则
+             * 老设备全废），少数导航型提交不带 origin。两者叠起来就有空白地带。
+             * nonce 只能从同源页面读到，跨站拿不到也猜不中 —— 洞就补在这里。
+             */
+            const nonce = checkNonce(req, acceptedNonces())
+            if (!nonce.ok) {
+              sendJson(res, nonce.status, { error: nonce.error })
+              return
+            }
           }
           if (path === '/kxxy/api/state' && req.method === 'GET') {
             // 主题偏好随轮询刷新：官方设置页改了主题，控制台几秒内跟随
@@ -1081,12 +1130,22 @@ export function apply(ctx) {
              * 这里抽到顶层并从 engine 里删掉：同一份数据出现在两个地方，
              * 迟早有人读错那一份，而这次的 bug 就是读错的那一份。
              */
-            const remote = engine.remote ?? null
+            // 网络诊断顺带续期：缓存过期后由这里重新触发，不必另起定时器。
+          // 有缓存时是空操作，所以放在每 3 秒一次的轮询里不心疼。
+          try {
+            netdiag.startProbe(extinstall.engineRoot())
+          } catch {
+            // 同上，失败不影响 /state
+          }
+          const remote = engine.remote ?? null
             delete engine.remote
             sendJson(res, 200, {
               engine,
               runtime: collectRuntimeState(),
               remote,
+              // DNS 黑洞诊断（缺陷 EH）：同步取缓存，后台由 startProbe 刷新。
+              // 放开在顶层而不是 engine 里 —— 它跟引擎毫无关系，是网络环境的读数。
+              net: netdiag.netSnapshot(),
             })
             return
           }
@@ -1589,11 +1648,11 @@ export function apply(ctx) {
       }
       if (cachedIndexHtml === null) {
         const buf = readWebAsset('index.html')
-        cachedIndexHtml = buf ?? Buffer.from(
+        cachedIndexHtml = injectNonce(buf ?? Buffer.from(
           '<!doctype html><meta charset="utf-8"><title>DSH Kxxy</title>' +
           '<p>宿主管理页资源缺失（web/index.html）。</p>',
           'utf8',
-        )
+        ))
       }
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
@@ -1618,6 +1677,18 @@ export function apply(ctx) {
     })
 
     ctx.logger?.info?.('[kxxy-host] mounted: /kxxy (page), /kxxy/assets (prefix), /kxxy/media (prefix), /kxxy/api (prefix), index compat tap')
+
+    /*
+     * 网络诊断：挂载时先跑一次，之后由 /state 的轮询顺带续期（缓存 5 分钟）。
+     *
+     * 不在这里 await：DNS 挂掉时 getaddrinfo 能拖十几秒，插件挂载不能被它堵住。
+     * 结果是"第一屏可能显示正在探测"，一两次轮询之后就准了。
+     */
+    try {
+      netdiag.startProbe(extinstall.engineRoot())
+    } catch {
+      // 引擎根未知（测试/异常部署）时静默跳过：体检里会显示「正在探测」
+    }
 
     return () => {
       disposePageSlash()

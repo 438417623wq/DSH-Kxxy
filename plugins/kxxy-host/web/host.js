@@ -16,6 +16,43 @@
   'use strict';
 
   // ==========================================
+  // 写请求带 nonce
+  // ==========================================
+  /**
+   * 服务端塞在页面里的 nonce（`<meta name="kxxy-nonce">`）。
+   *
+   * 为什么在 fetch 上统一加，而不是在每个 POST 手写一行头：
+   * 「新增端点忘了带」是这类校验最容易出事的地方，而忘了的表现是按钮点了没反应
+   * （403），排查成本远高于在这里包一层。包一层之后，任何走 fetch 的写请求
+   * 都自动带上，包括以后新写的。
+   *
+   * 只给 `/kxxy/api/` 的写请求加：给外部地址加自定义头会改变 CORS 预检行为，
+   * 那是另一种坏法。
+   */
+  const KXXY_NONCE = (document.querySelector('meta[name="kxxy-nonce"]') || {}).content || '';
+
+  if (KXXY_NONCE && typeof window.fetch === 'function') {
+    const rawFetch = window.fetch.bind(window);
+    const WRITE_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'];
+    window.fetch = function (input, init) {
+      try {
+        const opts = init ? Object.assign({}, init) : {};
+        const url = typeof input === 'string' ? input : String((input && input.url) || '');
+        const method = String(opts.method || (input && input.method) || 'GET').toUpperCase();
+        if (WRITE_METHODS.indexOf(method) >= 0 && url.indexOf('/kxxy/api/') >= 0) {
+          const headers = new Headers(opts.headers || (input && input.headers) || undefined);
+          headers.set('x-kxxy-nonce', KXXY_NONCE);
+          opts.headers = headers;
+        }
+        return rawFetch(input, opts);
+      } catch (err) {
+        // 包装层自己出错时退回原生行为：宁可少一个头被 403 拒，也不能把请求吞掉
+        return rawFetch(input, init);
+      }
+    };
+  }
+
+  // ==========================================
   // 常量与状态配置
   // ==========================================
   const POLL_INTERVAL = 5000;
