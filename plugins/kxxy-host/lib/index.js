@@ -15,12 +15,14 @@
  *
  * 2. **同 origin 复用官方鉴权，不另造一套**
  *    管理页与官方前端同在 127.0.0.1:3080，因此自动共享官方的会话 cookie。
- *    判定走 `connection.isAuthenticated(req)`（`dsh-client-connection` 的公开方法，
- *    校验的是绑定 Host 的签名 cookie），见 auth.mjs。
+ *    判定走 `connection.admit(req)`（`dsh-client-connection` 的公开入口：先过
+ *    Host/Origin 围栏，再验绑定 Host 的签名 cookie），见 auth.mjs。
  *
  *    ⚠️ 这里曾经写成 `ctx.get('authorization').isTrustedRequest(req)` —— 那个服务
  *    是「凭证获取流程」注册表，压根没有这个方法，于是恒走「Host 是回环就放行」的
  *    兜底，而本机请求的 Host 天然是 127.0.0.1:3080，等于门一直开着（缺陷 DZ）。
+ *    随后又只改服务名不改方法名（`connection.isAuthenticated`，那是内部
+ *    `browserAuth` 的方法，服务上没有），于是每一页都变成「鉴权服务不可用」。
  *    改这条判定时请连着读 auth.mjs 的文件头，别再"退化"回去。
  *
  * 3. **动作真做，做不到就明确失败**
@@ -47,7 +49,7 @@ import * as mirror from './mirror.mjs'
 import * as netdiag from './netdiag.mjs'
 import * as plugins from './plugins.mjs'
 import { tarGzSync } from './tar.mjs'
-import { AUTH_ALLOW, AUTH_DENY, AUTH_UNAVAILABLE, authVerdict, checkNonce, checkWriteRequest, acceptedNonces, rotateNonce, deniedPageHtml } from './auth.mjs'
+import { AUTH_ALLOW, AUTH_DENY, AUTH_UNAVAILABLE, authVerdict, authDetail, checkNonce, checkWriteRequest, acceptedNonces, rotateNonce, deniedPageHtml } from './auth.mjs'
 import { redactLogTail } from './redact.mjs'
 
 /** 插件名。 */
@@ -286,20 +288,22 @@ function sendJson(res, status, payload, extraHeaders = null) {
 let authWarned = null
 function denyApi(ctx, res, verdict, surface) {
   // 只记一次：轮询页面每 3 秒一次 401，会把日志刷满而掩盖真正的病因。
-  if (authWarned !== verdict) {
-    authWarned = verdict
+  const detail = authDetail()
+  if (authWarned !== `${verdict}/${detail}`) {
+    authWarned = `${verdict}/${detail}`
     ctx?.logger?.warn?.(
-      `[kxxy-host] 拒绝未认证请求（${verdict}）：${surface}。` +
+      `[kxxy-host] 拒绝未认证请求（${verdict}，判定 ${detail}）：${surface}。` +
         (verdict === AUTH_UNAVAILABLE
-          ? '找不到 connection 服务 —— 管理接口已关闭。'
-          : '缺少会话 cookie —— 从 DSH 打开的链接进入一次即可。'),
+          ? 'connection 服务缺失或没有 admit 入口 —— 管理接口已关闭。'
+          : '未通过 connection.admit —— 缺少会话 cookie，或 Host 不在信任列表。'),
     )
   }
   if (verdict === AUTH_UNAVAILABLE) {
     sendJson(res, 503, {
       error: 'auth-unavailable',
       surface,
-      hint: '找不到 connection 服务，管理接口已关闭。请反馈 DSH 版本与这条信息。',
+      detail,
+      hint: '拿不到 connection.admit，管理接口已关闭。请反馈 DSH 版本与 detail。',
     })
     return
   }
@@ -309,6 +313,7 @@ function denyApi(ctx, res, verdict, surface) {
     {
       error: 'unauthorized',
       surface,
+      detail,
       hint: '缺少 DSH 会话 cookie。请从 DSH 打印的链接打开一次，或从 Kxxy App 进入。',
     },
     { 'www-authenticate': 'Cookie realm="dsh"' },
@@ -322,7 +327,10 @@ function denyApi(ctx, res, verdict, surface) {
  * 和「服务挂了」两件事糊成一件，用户只能理解成「又坏了」。
  */
 function denyPage(res, verdict) {
-  const html = deniedPageHtml(verdict === AUTH_UNAVAILABLE ? AUTH_UNAVAILABLE : AUTH_DENY)
+  const html = deniedPageHtml(
+    verdict === AUTH_UNAVAILABLE ? AUTH_UNAVAILABLE : AUTH_DENY,
+    authDetail(),
+  )
   const body = Buffer.from(html, 'utf8')
   res.writeHead(200, {
     'content-type': 'text/html; charset=utf-8',

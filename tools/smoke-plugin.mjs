@@ -99,31 +99,58 @@ const indexTaps = []
  * 「Host 是回环就放行」的兜底（缺陷 DZ）。这里必须按**真实接口**建模，
  * 否则测试会把错的形状钉成"对的"。
  *
- * 三种模式供断言切换：
- *   · 'auth'    —— 请求可信（等价于浏览器带着绑定该 Host 的有效 cookie）
- *   · 'anon'    —— 一律不可信（验 401）
- *   · 'missing' —— 服务不存在（验 503）
- *   · 'throw'   —— 判定器抛错（同样按"判不了"处理 → 503）
+ * ⚠️ v0.9.20 又踩了同一个坑的另一半：服务名对了，方法名不对。
+ * `HostConnectionService` 对外只有
  *
- * 注意 `isAuthenticated` 的第二个参数（secure）与 Host 绑定语义：
- * 真实实现把 Host 编进 cookie 的 authority，所以「Host 不对」在真实世界里
- * 表现为「cookie 对不上」，这里照着建模，别让 [11] 那条断言变成假绿。
+ *     admit(req) → { peer } | { rejection: 401 | 403 }
+ *
+ * `isAuthenticated` / `authenticateApi` 属于内部的 `browserAuth`，**没有**被
+ * 转发到服务上。照着假方法写的判定永远返回「不可用」，而当时这组测试因为桩
+ * 也用了假方法而全绿 —— 桩的形状必须等于真机的形状，否则测的是幻觉。
+ *
+ * 模式：
+ *   · 'auth'     —— 真实入口 admit 放行（等价于浏览器带着绑定该 Host 的 cookie）
+ *   · 'anon'     —— admit 返回 { rejection: 401 }
+ *   · 'missing'  —— 服务不存在（验 503）
+ *   · 'throw'    —— 判定器抛错（同样按"判不了"处理 → 503）
+ *   · 'legacy'   —— 只提供老布尔接口（验兼容分支仍然工作）
+ *   · 'noverify' —— 服务在但没有任何判定入口（验 503，而不是放行）
+ *
+ * Host 绑定语义：真实实现把 Host 编进 cookie 的 authority，所以「Host 不对」
+ * 在真实世界里表现为「cookie 对不上」，这里照着建模，别让 [11] 那条断言变成假绿。
  */
 let authMode = 'auth'
 const connection = {
-  isAuthenticated(req) {
+  admit(req) {
     if (authMode === 'throw') throw new Error('connection stub exploded')
-    if (authMode !== 'auth') return false
+    if (authMode !== 'auth') return { rejection: 401 }
+    const host = String(req.headers?.host ?? '')
+    const trusted = host.startsWith('127.0.0.1:') || host.startsWith('localhost:')
+    return trusted ? { peer: { id: 'stub-peer' } } : { rejection: 401 }
+  },
+  // 真实实现里还有这个薄封装。桩故意让它抛：admit 必须优先，走不到这里。
+  requestRejection() {
+    throw new Error('requestRejection 不该被调用（admit 优先）')
+  },
+}
+/** 老形状：只有布尔接口（v0.9.18 以为的那个 API）。 */
+const legacyConnection = {
+  isAuthenticated(req) {
     const host = String(req.headers?.host ?? '')
     return host.startsWith('127.0.0.1:') || host.startsWith('localhost:')
   },
 }
+/** 有服务、没入口 —— 最危险的「看起来能判」。 */
+const noVerifierConnection = { isTrusted: () => true }
 
 const logs = []
 const ctx = {
   get: (name) => {
     if (name !== 'connection') return undefined
-    return authMode === 'missing' ? undefined : connection
+    if (authMode === 'missing') return undefined
+    if (authMode === 'legacy') return legacyConnection
+    if (authMode === 'noverify') return noVerifierConnection
+    return connection
   },
   webServer,
   logger: { info: (m) => logs.push(m), warn: (m) => logs.push(`WARN ${m}`) },
@@ -1610,6 +1637,29 @@ console.log('\n[13] 会话判定三态（缺陷 DZ）')
     const r = await get('/kxxy/api/state')
     if (r.status !== 503) fail(`判定器抛错时 API 应 503，实为 ${r.status}`)
     else ok('判定器抛错 → 503（异常不得当成通过）')
+    const j = JSON.parse(r.text)
+    if (!String(j.detail ?? '').startsWith('threw:')) fail(`503 应答缺少判定细节，实为 ${j.detail}`)
+    else ok(`503 带判定细节（${j.detail.slice(0, 24)}…）`)
+  }
+
+  // 服务在、但没有一个认得的判定入口：这是「看起来能判」的陷阱 ——
+  // 之前的假方法就是这种形状（服务对象在，方法名不对）。
+  authMode = 'noverify'
+  {
+    const r = await get('/kxxy/api/state')
+    if (r.status !== 503) fail(`没有判定入口时 API 应 503，实为 ${r.status}`)
+    else ok('服务在但没有 admit/requestRejection → 503')
+    const j = JSON.parse(r.text)
+    if (j.detail !== 'no-verifier') fail(`细节应为 no-verifier，实为 ${j.detail}`)
+    else ok('细节 no-verifier（一眼看出是接口形状变了）')
+  }
+
+  // 老布尔接口仍然工作（兼容分支不该死，但主路必须是 admit）
+  authMode = 'legacy'
+  {
+    const r = await get('/kxxy/api/state')
+    if (r.status !== 200) fail(`只有 isAuthenticated 的实现也应放行，实为 ${r.status}`)
+    else ok('只有 isAuthenticated 的旧实现 → 200（兼容分支）')
   }
 
   authMode = prev
@@ -1617,6 +1667,8 @@ console.log('\n[13] 会话判定三态（缺陷 DZ）')
     const r = await get('/kxxy/api/state')
     if (r.status !== 200) fail(`恢复会话后 API 应 200，实为 ${r.status}`)
     else ok('恢复会话 → 200（对照组）')
+    const j = JSON.parse(r.text)
+    if (j.detail !== undefined) fail('200 应答不该带 detail 字段')
   }
 }
 

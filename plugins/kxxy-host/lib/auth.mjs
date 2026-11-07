@@ -21,13 +21,27 @@
  * 实测复核过：`Host: evil.example` 会被拒（403），改回 `127.0.0.1:3080` 就放行，
  * 证明走的正是这条 Host 兜底。
  *
- * ── 正解 ──────────────────────────────────────────────────────────────────
+ * ── 正解（v0.9.20 修正）───────────────────────────────────────────────────
  *
- * `ctx.get('connection')`（`@deepseek-ai/dsh-client-connection`）才是请求级判定：
+ * `ctx.get('connection')`（`@deepseek-ai/dsh-client-connection`）确实是请求级
+ * 判定，但**服务实例上没有 `isAuthenticated`**。v0.9.18 只改了服务名、没核对
+ * 方法名，于是 `typeof conn.isAuthenticated !== 'function'` 立刻成立 →
+ * 每一页都是「鉴权服务不可用」（真机截图复现，v0.9.19 状态）。
  *
- *     isAuthenticated(request, secure)  // 校验 authority 绑定的签名 cookie
- *     authenticateApi(request, secure)  // 只认 API 凭证
+ * 真实形状（`lib/index.js` 的 `HostConnectionService`）：
  *
+ *     super(ctx, 'connection')          // 服务名 = connection ✓
+ *     admit(request)                    // → { peer } | { rejection: 401 | 403 }
+ *     requestRejection(request)         // → undefined | 401 | 403（薄封装）
+ *     isTrusted(request)                // 只做 Host/Origin 围栏，**不认凭证**
+ *
+ * `isAuthenticated` / `authenticateApi` 属于内部的 `browserAuth`（`BrowserAuth`），
+ * 服务没有把它们转发出来。README 里对外承诺的入口就是 `admit(request)`：
+ * 「检查信任与浏览器或 API 认证，返回凭据对应的存活 Peer 或拒绝状态」。
+ *
+ * `admit()` 一次干两件事，正好是我们要的：
+ *   ① Host/Origin 围栏（`trustedHosts` + webServer 的 host/protocol）；
+ *   ② 校验 authority 绑定的签名 cookie，或 API 凭证对应的存活 Peer。
  * cookie 里的 `authority` 就是 Host，所以「127.0.0.1:3080 的 cookie 拿到
  * 192.168.1.23:8765 用」天然无效 —— 这正是我们一直想要的那层绑定。
  *
@@ -55,21 +69,79 @@ export const AUTH_DENY = 'deny'
 export const AUTH_UNAVAILABLE = 'unavailable'
 
 /**
+ * 最近一次判定的细节，给日志与说明页用（`admit:403`、`no-service` …）。
+ *
+ * 为什么值得记：三态判定一旦落到 `unavailable`，现场只剩「不可用」三个字，
+ * 分不清是服务没注册、接口改名，还是判定器抛错 —— 而这三者的处理动作完全不同。
+ */
+let lastDetail = 'init'
+
+/** 最近一次判定的细节串（供日志/说明页展示，便于远程排障）。 */
+export function authDetail() {
+  return lastDetail
+}
+
+/**
+ * 取 `connection` 服务实例。
+ *
+ * 三条路依次试：
+ *   ① `ctx.get(name)`  —— cordis 里**绕过 inject 声明**读服务的入口
+ *      （`ctx.connection` 在没声明 inject 时会直接抛，所以不能只写属性访问）；
+ *   ② `ctx.connection` —— 兼容 get 不可见但属性可见的实现；
+ *   ③ `ctx.root.get(name)` —— 插件被 fork/isolate 时，服务挂在根上下文上。
+ * 三路都失败才是「服务不在」，由调用方关掉接口。
+ */
+function getConnection(ctx) {
+  try {
+    if (typeof ctx?.get === 'function') {
+      const viaGet = ctx.get('connection')
+      if (viaGet) return viaGet
+    }
+  } catch {
+    /* 落到下一条 */
+  }
+  try {
+    if (ctx?.connection) return ctx.connection
+  } catch {
+    /* 没声明 inject 时属性访问会抛，正常 */
+  }
+  try {
+    const root = ctx?.root
+    if (root && typeof root.get === 'function') {
+      const viaRoot = root.get('connection')
+      if (viaRoot) return viaRoot
+    }
+  } catch {
+    /* 忽略 */
+  }
+  return null
+}
+
+/** 把拒绝码并进细节串。403 与 401 对排障意义不同（围栏 vs 凭证）。 */
+function noteRejection(method, rejection) {
+  lastDetail = `${method}:${rejection === undefined ? '?' : String(rejection)}`
+  return AUTH_DENY
+}
+
+/**
  * 判定请求是否来自已认证的浏览器。
  *
- * @param {{get: (name: string) => unknown}} ctx 插件上下文
+ * 方法名按真实实现**从新到旧**依次尝试，任何一步拿不准都落到 `unavailable`：
+ *
+ *  ① `admit(req)`            官方文档化入口，返回 `{ peer }` 或 `{ rejection }`；
+ *  ② `requestRejection(req)` 同一实现的薄封装，只给拒绝码；
+ *  ③ `isAuthenticated(req, secure)` 更早的布尔形状（保留兼容，不依赖它）。
+ *
+ * @param {{get?: (name: string) => unknown, connection?: unknown}} ctx 插件上下文
  * @param {import('node:http').IncomingMessage} req
  * @returns {'allow' | 'deny' | 'unavailable'}
  */
 export function authVerdict(ctx, req) {
-  let conn = null
-  try {
-    conn = typeof ctx?.get === 'function' ? ctx.get('connection') : null
-  } catch {
-    // 服务未注册/注册失败：落到 unavailable，由调用方关掉接口
-    conn = null
+  const conn = getConnection(ctx)
+  if (!conn) {
+    lastDetail = 'no-service'
+    return AUTH_UNAVAILABLE
   }
-  if (!conn || typeof conn.isAuthenticated !== 'function') return AUTH_UNAVAILABLE
 
   // `secure` 决定默认端口与 cookie 的 authority 口径。回环 listener 是明文，
   // 真正上 TLS 时 socket 上会有 encrypted 标记 —— 以实际连接为准，不猜配置。
@@ -81,9 +153,44 @@ export function authVerdict(ctx, req) {
   }
 
   try {
-    return conn.isAuthenticated(req, secure) ? AUTH_ALLOW : AUTH_DENY
-  } catch {
+    // ① 首选：一次性给出「围栏通过 + 凭证有效」的结论
+    if (typeof conn.admit === 'function') {
+      const admission = conn.admit(req)
+      if (!admission || typeof admission !== 'object') {
+        lastDetail = 'admit:shape'
+        return AUTH_UNAVAILABLE
+      }
+      if ('rejection' in admission) return noteRejection('admit', admission.rejection)
+      // 只有真拿到 Peer 才算通过：返回了别的形状说明接口又变了，别猜
+      if (!admission.peer) {
+        lastDetail = 'admit:nopeer'
+        return AUTH_UNAVAILABLE
+      }
+      lastDetail = 'admit:peer'
+      return AUTH_ALLOW
+    }
+
+    // ② 次选：只要拒绝码
+    if (typeof conn.requestRejection === 'function') {
+      const rejection = conn.requestRejection(req)
+      if (rejection !== undefined) return noteRejection('requestRejection', rejection)
+      lastDetail = 'requestRejection:pass'
+      return AUTH_ALLOW
+    }
+
+    // ③ 兜底兼容：老形状直接给布尔
+    if (typeof conn.isAuthenticated === 'function') {
+      const ok = conn.isAuthenticated(req, secure)
+      lastDetail = `isAuthenticated:${ok ? 'true' : 'false'}`
+      return ok ? AUTH_ALLOW : AUTH_DENY
+    }
+
+    // 服务在、但没有一个认得的判定方法 —— 最危险的那种「看起来能判」
+    lastDetail = 'no-verifier'
+    return AUTH_UNAVAILABLE
+  } catch (error) {
     // 判定器自己抛错时也按「判不了」处理，绝不当成通过
+    lastDetail = `threw:${error instanceof Error ? error.message : String(error)}`
     return AUTH_UNAVAILABLE
   }
 }
@@ -247,22 +354,35 @@ export function checkWriteRequest(req) {
  * 「是没带凭证」还是「判定器不见了」，两者的处理动作完全不同。
  *
  * @param {'deny' | 'unavailable'} verdict
+ * @param {string} [detail] 判定细节（`authDetail()`），直接印在页脚便于反馈
  * @returns {string} HTML
  */
-export function deniedPageHtml(verdict) {
+export function deniedPageHtml(verdict, detail = '') {
   const unavailable = verdict === AUTH_UNAVAILABLE
-  const title = unavailable ? '鉴权服务不可用' : '未授权访问'
-  const badge = unavailable ? 'AUTH UNAVAILABLE' : 'UNAUTHORIZED'
+  // 403 是 Host/Origin 围栏拒的，不是凭证的问题 —— 让人去「重新打开链接」只会瞎折腾。
+  const fenced = !unavailable && /:403$/.test(String(detail))
+  const title = unavailable ? '鉴权服务不可用' : fenced ? '来源不被信任' : '未授权访问'
+  const badge = unavailable ? 'AUTH UNAVAILABLE' : fenced ? 'UNTRUSTED HOST' : 'UNAUTHORIZED'
   const body = unavailable
     ? [
-        '找不到 <code>connection</code> 服务，或它在判定时抛错，所以管理接口已整体关闭。',
-        '这通常意味着 DSH 大版本变更了鉴权接口。请把这条信息反馈给 Kxxy，',
-        '在此之前控制台的管理功能不可用（这是有意的：判不了就不放行）。',
+        '拿不到 <code>connection</code> 服务，或它没有可用的判定入口（<code>admit</code>），',
+        '所以管理接口已整体关闭。这通常意味着 DSH 大版本变更了鉴权接口。',
+        '请把页脚那行判定细节反馈给 Kxxy；在此之前控制台的管理功能不可用',
+        '（这是有意的：判不了就不放行）。',
       ].join('')
-    : [
-        '这个页面需要 DSH 的会话 cookie。请从 DSH 窗口打印的链接打开一次，',
-        '或在手机 App 里进入控制台 —— 直接输地址、或用 <code>curl</code> 裸访都会被拒。',
-      ].join('')
+    : fenced
+      ? [
+          '这次请求的 <code>Host</code> / <code>Origin</code> 不在引擎信任的地址里，',
+          '所以连凭证都没看就拒了。常见于「用局域网 IP 或代理地址直接访问管理页」。',
+          '改从 DSH 打印的回环链接打开，或在配对设备里进入远程控制。',
+        ].join('')
+      : [
+          '这个页面需要 DSH 的会话 cookie。请从 DSH 窗口打印的链接打开一次，',
+          '或在手机 App 里进入控制台 —— 直接输地址、或用 <code>curl</code> 裸访都会被拒。',
+        ].join('')
+  const foot = detail
+    ? `kxxy-host · connection.${detail}`
+    : 'kxxy-host · 会话校验走 DSH 的 connection 服务'
 
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -296,7 +416,7 @@ export function deniedPageHtml(verdict) {
     <span class="badge">${badge}</span>
     <h1>${title}</h1>
     <p>${body}</p>
-    <div class="foot">kxxy-host · 会话校验走 DSH 的 connection 服务</div>
+    <div class="foot">${foot}</div>
   </div>
 </body></html>`
 }

@@ -480,7 +480,14 @@ console.log('\n[C] 安全边界（鉴权 / 脱敏）')
   const authSrc = norm(read('plugins/kxxy-host/lib/auth.mjs'))
   const redactSrc = norm(read('plugins/kxxy-host/lib/redact.mjs'))
 
-  ok('判定走 connection.isAuthenticated', authSrc.includes("ctx.get('connection')") && authSrc.includes('isAuthenticated'))
+  /*
+   * 钉住的是「必须调哪个方法」：这次的根因两连击 —— 先调了一个不存在的
+   * `authorization.isTrustedRequest`（于是走 Host 兜底、门全开），修的时候
+   * 又换成了 `connection.isAuthenticated`（服务上同样没有，于是每页都变成
+   * 「鉴权服务不可用」）。真实入口是 `connection.admit(req)`。
+   */
+  ok('判定走 connection.admit(req)', authSrc.includes("ctx.get('connection')") && /conn\.admit\(req\)/.test(authSrc))
+  ok('admit 之前先拿服务，缺失即 unavailable', /lastDetail = 'no-service'/.test(authSrc))
   ok('判定器缺失/抛错 → unavailable（判不了不放行）', /AUTH_UNAVAILABLE/.test(authSrc) && /return AUTH_UNAVAILABLE/.test(authSrc))
   ok('主模块不再调用 isTrustedRequest', !/isTrustedRequest\s*\(\s*ctx\s*,/.test(hostLib))
   ok('媒体 / API / 页面三处都过同一道判定', (hostLib.match(/authVerdict\(ctx, req\)/g) ?? []).length >= 3)

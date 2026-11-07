@@ -129,6 +129,10 @@ class MainActivity : Activity() {
     @Volatile
     private var pendingConsole = false
 
+    /** 补换完成后落到控制台的锚点（`#remote` 从远程退出时用，其余场景为空）。 */
+    @Volatile
+    private var pendingConsoleAnchor = "#remote"
+
     private var stateJob: Job? = null
 
     /** 当前页面路径（onPageFinished + onDoUpdateVisitedHistory 双钩子维护）。 */
@@ -473,7 +477,7 @@ class MainActivity : Activity() {
                     if (p == "/" || p.isNullOrEmpty()) {
                         pendingConsole = false
                         localSessionMinted = true
-                        webView.loadUrl(localOverviewUrl() + "#remote")
+                        webView.loadUrl(localOverviewUrl() + pendingConsoleAnchor)
                         return
                     }
                 }
@@ -822,13 +826,28 @@ class MainActivity : Activity() {
          * 走 `/?token=…`（303 + Set-Cookie），页面落到 `/` 之后由
          * onPageFinished 转去控制台。
          */
+        openConsole("#remote")
+    }
+
+    /**
+     * 进入宿主管理页，必要时先把本机会话 cookie 换到手。
+     *
+     * 为什么统一走这里：管理页从 v0.9.18 起要求 DSH 会话（`connection.admit`），
+     * 而**只有** `GET /?token=…` 能换出 cookie。之前「返回键进控制台」是直接
+     * loadUrl("/kxxy")，冷启动自动连接之后本机没有 cookie，点进去必是「未授权」
+     * 说明页 —— 用户只会觉得"控制台又坏了"。所有入口都必须先过这道门。
+     *
+     * @param anchor 落在控制台哪个锚点（`#remote` 从远程退出时用）
+     */
+    private fun openConsole(anchor: String = "") {
         val tokenUrl = engineTokenUrl
         if (!localSessionMinted && tokenUrl != null) {
+            pendingConsoleAnchor = anchor
             pendingConsole = true
             webView.loadUrl(tokenUrl)
             return
         }
-        webView.loadUrl(localOverviewUrl() + "#remote")
+        webView.loadUrl(localOverviewUrl() + anchor)
     }
 
     private fun localOverviewUrl(): String =
@@ -1178,7 +1197,9 @@ class MainActivity : Activity() {
             lastBackAt = now
             webView.loadUrl("http://127.0.0.1:${EngineConfig.DEFAULT_PORT}/")
         } else {
-            webView.loadUrl("http://127.0.0.1:${EngineConfig.DEFAULT_PORT}/kxxy")
+            // 必须走 openConsole 而不是裸 loadUrl：本机 session 还没换过时，
+            // 直接进 /kxxy 只会看到「未授权」说明页。
+            openConsole()
         }
     }
 

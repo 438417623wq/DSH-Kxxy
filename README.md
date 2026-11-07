@@ -947,11 +947,12 @@ kxxy-host 判定请求可信 → ctx.get('authorization').isTrustedRequest(req)
                           → 服务只绑回环，兜底恒真 = 门一直开着
 ```
 
-正确入口在同机的 `connection` 服务：`isAuthenticated(req, secure)` 校验的是
-**绑定 Host 的签名 cookie**（`dsh-client-connection`）。改后是三态：
-`allow` / `deny`（API 401、页面给说明）/ `unavailable`（API 503、页面提示鉴权
-服务不可用）—— 判不了就不放行。远程链路不受影响，因为连接器转发时会把 Host
-改写回 `127.0.0.1:3080` 并注入上游 cookie。
+正确入口在同机的 `connection` 服务，但**不是** `isAuthenticated`（那是内部
+`browserAuth` 的方法，服务实例上没有）：`connection.admit(req)` 一次给出
+「Host/Origin 围栏通过 + 会话 cookie 有效」，返回 `{ peer }` 或 `{ rejection }`。
+改后是三态：`allow` / `deny`（API 401、页面给说明）/ `unavailable`（API 503、
+页面提示鉴权服务不可用）—— 判不了就不放行。远程链路不受影响，因为连接器转发时
+会把 Host 改写回 `127.0.0.1:3080` 并注入上游 cookie。
 
 日志改成出口脱敏：尾部 32 KB、按行切齐、盖掉 URL 参数 / bearer / cookie /
 `sk-*` / 配对码 / 家目录。文件里仍是明文，**任何"把日志发出去"的新功能都必须
@@ -982,3 +983,47 @@ v0.9.18 的三道 CSRF 语义（JSON content-type / `sec-fetch-site` / `Origin` 
 只做诊断。想绕过 `raw.githubusercontent.com` 的 DNS 拦截，填
 `<root>/etc/net.json` 的 `rawMirror`，下次启动会把 `insteadOf` 写进 `~/.gitconfig`
 （自己那一段用注释边界标记，不碰你手改的内容）。
+
+### 判定入口写错了两次（v0.9.20）
+
+v0.9.18 修「门一直开着」时只改了服务名、没核对方法名，于是紧接着撞上同一类错误的
+另一半：`connection` 服务上**没有** `isAuthenticated`，判定一路落到 `unavailable`，
+真机上每一页都是「鉴权服务不可用」（AUTH UNAVAILABLE）。
+
+```
+HostConnectionService extends Service
+  super(ctx, 'connection')     ✓ 服务名
+  admit(req)  → { peer } | { rejection: 401 | 403 }   ✓ 真正的入口
+  requestRejection(req)      薄封装，只给拒绝码
+  isTrusted(req)             只做 Host/Origin 围栏，**不认凭证**
+  （isAuthenticated / authenticateApi 属于内部 browserAuth，服务没转发出来）
+```
+
+现在按 `admit` → `requestRejection` → `isAuthenticated` 三级降级，**只有真拿到
+Peer 才放行**；服务在但一个入口都不认得、返回形状不认识、判定抛错，全部落
+`unavailable`（宁可不放行）。同时把判定细节（`admit:401` / `admit:403` /
+`no-service` / `no-verifier` / `threw:…`）写进 `/kxxy/api/*` 的 503/401 正文和
+说明页页脚——上一次现场只有「不可用」三个字，分不清是服务没注册、接口改名还是
+抛错，白跑一轮。
+
+`admit:403` 单独一种文案（「来源不被信任」）：403 是 Host/Origin 围栏拒的，
+让人去「重新打开链接换 cookie」只会瞎折腾。
+
+**测试桩的形状必须等于真机的形状**：`tools/smoke-plugin.mjs` 的 `connection` 桩
+改成真实 `admit()`，并新增 `no-verifier`（服务在、没入口 → 503）与 `legacy`
+（只有 `isAuthenticated` 的旧实现仍走兼容分支）两条。桩也可以反着钉住优先级：
+`requestRejection` 写成抛错，`admit` 一旦不是首选就会红。
+
+**端到端复核**（本机真起引擎，`dsh --profile … --port 3199` + `--patch` 挂插件）：
+
+| 请求 | 结果 |
+| --- | --- |
+| `GET /kxxy` 无 cookie | 200 + `data-verdict="deny"`，页脚 `connection.admit:401` |
+| `GET /?token=…` → `GET /kxxy` | 200 + 真页面（71 KB，含 `kxxy-nonce`） |
+| `GET /kxxy/api/state` 无/有 cookie | 401 / 200 JSON |
+| `POST /kxxy/api/action` 带/不带 nonce | 501（未知动作）/ 403 |
+| `GET /kxxy` 带 `Host: evil.example` | 200 + `UNTRUSTED HOST`，页脚 `connection.admit:403` |
+
+配套的原生改动：**所有进控制台的入口统一走 `openConsole()`**。之前「返回键进
+控制台」是裸 `loadUrl("/kxxy")`，冷启动自动连接后本机没有会话 cookie，点进去
+必然是「未授权」说明页——用户只会觉得控制台又坏了。
