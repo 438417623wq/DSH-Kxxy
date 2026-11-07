@@ -916,3 +916,21 @@ HTTP 响应）：401 也算「活着」——那说明接下来要解决的是�
   三条都是为了让「断开」这个按钮真的有效。
 - 「同样的环境」用零权限指纹（transport + 内网地址前三段），不取 SSID（那要定位权限）；
   隧道设备不看指纹（4G 连家里电脑是正常用法）。
+
+### 已配对的电脑列表（v0.9.17 修复）
+
+真机上「连得上、但已配对的电脑一直是空的」是**透传丢了字段**，不是没保存：
+原生把设备簿写在 `kxxy-state.json` 顶层，`kxxy-host` 的 `collectEngineState()`
+用 `Object.assign` 把它摊进了 `engine.remote`，而 `/kxxy/api/state` 只回
+`{ engine, runtime }` —— 前端读的 `data.remote` 永远是 `undefined`，
+`renderRemote` 早退，列表、计数、空态一起消失。
+
+修法是两层都动：服务端把 `remote` 提回顶层（`engine` 里不留副本），前端
+`renderRemote(data.remote || engine.remote)` 并对缺失快照画空态。契约测试
+`tools/test-remote.mjs` 与冒烟测试 `tools/smoke-plugin.mjs`（[5b] 段）各钉一条，
+后者真起服务、真发请求，验的是「JSON 摊两次之后落在哪个键上」。
+
+同一版把概览页的两张长检查卡（启动与加载体检 / 运行时完整性检查）改成折叠：
+默认收起、结论留在徽章上、有红项自动展开一次、展开状态按卡记 `localStorage`
+（与设置页「系统权限」共用 `bindFold()`）。另在概览卡设备旁加了「自动连」开关，
+省掉「进管理视图再往下找」那一跳。

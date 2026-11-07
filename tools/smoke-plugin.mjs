@@ -883,6 +883,53 @@ if (!useAuth) {
   else ok('局域网 Host 亦被拒（403）')
 }
 
+console.log('\n[5b] 设备簿透传（缺陷 DV：已配对的电脑列表永远是空的）')
+{
+  /*
+   * 原生把设备簿写在 kxxy-state.json 的**顶层**，而 collectEngineState() 用
+   * `Object.assign(state, extra)` 把整份状态摊进 engine —— 所以它落到
+   * `engine.remote`。前端按契约读 `data.remote`，于是永远拿到 undefined、
+   * renderRemote 早退：手机连得上，列表却一直空着，用户以为配对没保存。
+   *
+   * 这条必须真起服务、真发请求，因为它检验的正是「JSON 经过两次摊平之后
+   * 到底落在哪个键上」—— 静态读代码看不出来，而这类错位恰好最容易被漏掉。
+   */
+  const stateFile = join(FAKE_ENGINE_ROOT, 'kxxy-state.json')
+  const device = { id: 'dev-1', label: '家里的台式机', host: '192.168.1.23:8765', trusted: true }
+  writeFileSync(
+    stateFile,
+    JSON.stringify({
+      pid: 4321,
+      remote: { devices: [device], count: 1, lastUsedId: 'dev-1', trustTip: null },
+    }),
+    'utf8',
+  )
+  process.env.KXXY_STATE_FILE = stateFile
+
+  const r = await get('/kxxy/api/state')
+  let j = null
+  try {
+    j = JSON.parse(r.text)
+  } catch (e) {
+    fail(`不是合法 JSON：${e.message}`)
+  }
+  if (j) {
+    if (Array.isArray(j.remote?.devices) && j.remote.devices.length === 1) {
+      ok(`顶层 remote.devices 透出 ${j.remote.devices.length} 台（${j.remote.devices[0].label}）`)
+    } else {
+      fail(`顶层 remote 缺失或为空：${JSON.stringify(j.remote)}`)
+    }
+    if (j.engine?.remote === undefined) ok('engine 里不留副本（同一份数据只在一处）')
+    else fail('engine.remote 仍有副本，读错键的坑还在')
+    if (j.engine?.pid === 4321) ok('状态文件其余字段照常摊平（engine.pid = 4321）')
+    else fail(`engine.pid 应为 4321，实为 ${j.engine?.pid}`)
+    if (j.remote?.trustTip === null) ok('trustTip 为 null 时原样给出（前端据此隐藏提示卡）')
+  }
+
+  delete process.env.KXXY_STATE_FILE
+  rmSync(stateFile, { force: true })
+}
+
 console.log('\n[12] 跨站来源（sec-fetch-site: cross-site）应被拒')
 if (!useAuth) {
   ok('跳过（--no-auth 已关闭来源校验）')

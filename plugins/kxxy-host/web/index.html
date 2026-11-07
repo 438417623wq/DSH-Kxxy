@@ -165,6 +165,14 @@
               <span class="remote-name" id="remote-hero-name">—</span>
               <span class="remote-meta" id="remote-hero-meta">—</span>
             </div>
+            <!--
+              「自动连」跟着最近使用的那台走。
+
+              它在这张概览卡上出现，是因为用户诉求是「已经配对成功的，让我方便
+              直接连」—— 而信任开关原先只在「管理」视图的列表里有，属于第二屏。
+              与列表里那颗按钮同一个 action，状态同样来自原生的 trusted 字段。
+            -->
+            <button class="remote-trust remote-trust-hero" id="btn-remote-trust" type="button">自动连</button>
             <button class="button button-primary button-sm" id="btn-remote-connect" type="button">连接</button>
           </div>
 
@@ -210,23 +218,42 @@
           </button>
         </div>
 
-        <!-- 检查项：逐层列出，坏的那条自己会说话 -->
-        <div class="card block-card">
-          <div class="card-title-row">
-            <div class="card-title-group">
-              <h3 class="card-title">启动与加载体检</h3>
-              <span class="card-subtitle">大部分项读配置文件（任一条坏了引擎就起不来）；最后一项「网页端入口」读本次运行的真实加载结果 —— 插件没加载起来时引擎活着、页面却进不去</span>
-            </div>
-            <span class="badge badge-subtle" id="health-count-badge">—</span>
-          </div>
-          <div class="check-list" id="health-checks">
-            <div class="check-item">
-              <div class="check-status-icon" aria-hidden="true">…</div>
-              <div class="check-content">
-                <div class="check-main"><span class="check-name">正在读取…</span></div>
+        <!--
+          检查项：逐层列出，坏的那条自己会说话。
+
+          默认折叠的理由和设置页的「系统权限」同源：11 项铺开要占一屏多，
+          而概览页的主角是上面那个结论（现在到底有没有事）。折叠后只留一行
+          「启动与加载体检 + 全部通过 / N 项待处理」，想知道细节再点开。
+
+          唯一的例外是**有事**：红项出现、而用户从没表过态时自动展开一次。
+          一个写着「3 项待处理」的收起状态，等于让用户自己去点开找是哪三项 ——
+          折叠不能把故障藏起来。用户手动收起后记进 localStorage，不再反复弹开。
+        -->
+        <div class="card block-card fold-card">
+          <details class="fold" id="health-checks-details">
+            <summary class="fold-summary">
+              <span class="fold-summary-left">
+                <span class="fold-title">启动与加载体检</span>
+                <span class="fold-sub">配置项任一条坏了引擎就起不来</span>
+              </span>
+              <span class="fold-summary-right">
+                <span class="badge badge-subtle" id="health-count-badge">—</span>
+                <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </span>
+            </summary>
+            <div class="fold-body">
+              <div class="check-list" id="health-checks">
+                <div class="check-item">
+                  <div class="check-status-icon" aria-hidden="true">…</div>
+                  <div class="check-content">
+                    <div class="check-main"><span class="check-name">正在读取…</span></div>
+                  </div>
+                </div>
               </div>
             </div>
-          </div>
+          </details>
         </div>
 
         <!-- 修复区：力度由检查结果决定，默认只给最轻的那档 -->
@@ -265,93 +292,107 @@
           </div>
         </div>
 
-        <!-- 运行时完整性检查列表 (7 项) -->
-        <div class="card block-card">
-          <div class="card-title-row">
-            <div class="card-title-group">
-              <h3 class="card-title">运行时完整性检查</h3>
-              <span class="card-subtitle">系统基础设施与 IPC 状态</span>
-            </div>
-            <span class="badge badge-success" id="runtime-all-status">7 / 7 通过</span>
-          </div>
-          <div class="check-list" id="runtime-checks-container">
-            <div class="check-item">
-              <div class="check-status-icon success" aria-hidden="true">✓</div>
-              <div class="check-content">
-                <div class="check-main">
-                  <span class="check-name">Node.js 运行时执行体</span>
-                  <span class="check-badge">ELF aarch64</span>
-                </div>
-                <div class="check-detail">/data/data/app.kxxy/files/engine/bin/node · 正常可执行</div>
-              </div>
-            </div>
+        <!--
+          运行时完整性检查列表 (7 项)。
 
-            <div class="check-item">
-              <div class="check-status-icon success" aria-hidden="true">✓</div>
-              <div class="check-content">
-                <div class="check-main">
-                  <span class="check-name">Harness Core 核心包</span>
-                  <span class="check-badge">v2.1.0-prod</span>
+          与上面那块一样默认折叠：这 7 项是「跑起来之后好不好」，正常时 7/7
+          全绿的信息量只有一行。徽章把结论留在收起状态上，点开才看逐条。
+        -->
+        <div class="card block-card fold-card">
+          <details class="fold" id="runtime-checks-details">
+            <summary class="fold-summary">
+              <span class="fold-summary-left">
+                <span class="fold-title">运行时完整性检查</span>
+                <span class="fold-sub">系统基础设施与 IPC 状态</span>
+              </span>
+              <span class="fold-summary-right">
+                <span class="badge badge-success" id="runtime-all-status">7 / 7 通过</span>
+                <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </span>
+            </summary>
+            <div class="fold-body">
+              <div class="check-list" id="runtime-checks-container">
+                <div class="check-item">
+                  <div class="check-status-icon success" aria-hidden="true">✓</div>
+                  <div class="check-content">
+                    <div class="check-main">
+                      <span class="check-name">Node.js 运行时执行体</span>
+                      <span class="check-badge">ELF aarch64</span>
+                    </div>
+                    <div class="check-detail">/data/data/app.kxxy/files/engine/bin/node · 正常可执行</div>
+                  </div>
                 </div>
-                <div class="check-detail">/files/engine/lib/node_modules/@deepseek-ai/dsh · SHA-256 签名一致</div>
-              </div>
-            </div>
 
-            <div class="check-item">
-              <div class="check-status-icon success" aria-hidden="true">✓</div>
-              <div class="check-content">
-                <div class="check-main">
-                  <span class="check-name">Android Bionic Linker 适配</span>
-                  <span class="check-badge">Linker64</span>
+                <div class="check-item">
+                  <div class="check-status-icon success" aria-hidden="true">✓</div>
+                  <div class="check-content">
+                    <div class="check-main">
+                      <span class="check-name">Harness Core 核心包</span>
+                      <span class="check-badge">v2.1.0-prod</span>
+                    </div>
+                    <div class="check-detail">/files/engine/lib/node_modules/@deepseek-ai/dsh · SHA-256 签名一致</div>
+                  </div>
                 </div>
-                <div class="check-detail">系统级 /system/bin/linker64 动态库重定向已挂载</div>
-              </div>
-            </div>
 
-            <div class="check-item">
-              <div class="check-status-icon success" aria-hidden="true">✓</div>
-              <div class="check-content">
-                <div class="check-main">
-                  <span class="check-name">UNIX IPC 命名通道</span>
-                  <span class="check-badge">Domain Socket</span>
+                <div class="check-item">
+                  <div class="check-status-icon success" aria-hidden="true">✓</div>
+                  <div class="check-content">
+                    <div class="check-main">
+                      <span class="check-name">Android Bionic Linker 适配</span>
+                      <span class="check-badge">Linker64</span>
+                    </div>
+                    <div class="check-detail">系统级 /system/bin/linker64 动态库重定向已挂载</div>
+                  </div>
                 </div>
-                <div class="check-detail">files/engine/kxxy-state.json 处于可写入监听态</div>
-              </div>
-            </div>
 
-            <div class="check-item">
-              <div class="check-status-icon success" aria-hidden="true">✓</div>
-              <div class="check-content">
-                <div class="check-main">
-                  <span class="check-name">SQLite3 原生驱动组件</span>
-                  <span class="check-badge">WAL 模式</span>
+                <div class="check-item">
+                  <div class="check-status-icon success" aria-hidden="true">✓</div>
+                  <div class="check-content">
+                    <div class="check-main">
+                      <span class="check-name">UNIX IPC 命名通道</span>
+                      <span class="check-badge">Domain Socket</span>
+                    </div>
+                    <div class="check-detail">files/engine/kxxy-state.json 处于可写入监听态</div>
+                  </div>
                 </div>
-                <div class="check-detail">better-sqlite3 模块 binding 载入无符号冲突</div>
-              </div>
-            </div>
 
-            <div class="check-item">
-              <div class="check-status-icon success" aria-hidden="true">✓</div>
-              <div class="check-content">
-                <div class="check-main">
-                  <span class="check-name">用户 Workspace 隔离沙箱</span>
-                  <span class="check-badge">POSIX Perms</span>
+                <div class="check-item">
+                  <div class="check-status-icon success" aria-hidden="true">✓</div>
+                  <div class="check-content">
+                    <div class="check-main">
+                      <span class="check-name">SQLite3 原生驱动组件</span>
+                      <span class="check-badge">WAL 模式</span>
+                    </div>
+                    <div class="check-detail">better-sqlite3 模块 binding 载入无符号冲突</div>
+                  </div>
                 </div>
-                <div class="check-detail">/sdcard/Android/data/app.kxxy/files 权限可读写 (0755)</div>
-              </div>
-            </div>
 
-            <div class="check-item">
-              <div class="check-status-icon success" aria-hidden="true">✓</div>
-              <div class="check-content">
-                <div class="check-main">
-                  <span class="check-name">Localhost 回环网络策略</span>
-                  <span class="check-badge">IPv4 Loopback</span>
+                <div class="check-item">
+                  <div class="check-status-icon success" aria-hidden="true">✓</div>
+                  <div class="check-content">
+                    <div class="check-main">
+                      <span class="check-name">用户 Workspace 隔离沙箱</span>
+                      <span class="check-badge">POSIX Perms</span>
+                    </div>
+                    <div class="check-detail">/sdcard/Android/data/app.kxxy/files 权限可读写 (0755)</div>
+                  </div>
                 </div>
-                <div class="check-detail">TCP 3080 端口无外网暴露风险，仅限本地 WebView</div>
+
+                <div class="check-item">
+                  <div class="check-status-icon success" aria-hidden="true">✓</div>
+                  <div class="check-content">
+                    <div class="check-main">
+                      <span class="check-name">Localhost 回环网络策略</span>
+                      <span class="check-badge">IPv4 Loopback</span>
+                    </div>
+                    <div class="check-detail">TCP 3080 端口无外网暴露风险，仅限本地 WebView</div>
+                  </div>
+                </div>
               </div>
             </div>
-          </div>
+          </details>
         </div>
 
         <!-- 13 项补丁状态折叠列表 -->

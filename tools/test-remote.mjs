@@ -34,6 +34,7 @@ const html = norm(read('plugins/kxxy-host/web/index.html'))
 const htmlText = html.replace(/<wbr\s*\/?>/g, '')
 const js = norm(read('plugins/kxxy-host/web/host.js'))
 const css = norm(read('plugins/kxxy-host/web/host.css'))
+const hostLib = norm(read('plugins/kxxy-host/lib/index.js'))
 const runtime = norm(read('tools/build-runtime.mjs'))
 const installer = norm(read('android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt'))
 const scan = norm(read('android/app/src/main/java/app/kxxy/remote/QrScanActivity.kt'))
@@ -184,6 +185,12 @@ ok(
 )
 ok('信任提示由原生 trustTip 驱动，前端不复述条件', has(js, 'remote.trustTip') && has(store, 'fun trustTip(ctx: Context): Device?'))
 ok('列表里能开关自动连', has(js, 'data-remote-act="${d.trusted ? \'untrust\' : \'trust\'}"'))
+/*
+ * 「已配对成功的，让我能方便直接连」的落点：概览卡上那台（最近用的）设备
+ * 旁边直接有「自动连」。只放在管理视图的列表里，用户得先想到去点「管理」。
+ */
+ok('概览卡 hero 上就有自动连开关', has(html, 'id="btn-remote-trust"') && has(js, 'dom.btnRemoteTrust?.addEventListener'))
+ok('hero 开关状态同样来自原生 trusted', has(js, "classList.toggle('is-on', hero.trusted === true)"))
 ok('二维码/连接串带机器名且做了编码', /encodeURIComponent\(os\.hostname\(\)/.test(connectorSrc))
 ok('样式齐全（扫码/信任/开关）', ['.remote-scan-button', '.remote-trust-tip', '.remote-trust'].every((c) => css.includes(c)))
 
@@ -198,10 +205,49 @@ ok('添加表单有连接串与备注两个输入', has(html, 'id="remote-url-in
 ok('列表容器与空态都在', has(html, 'id="remote-list"') && has(html, 'id="remote-list-empty"'))
 ok('说明卡讲清「同一 WiFi 不经过任何服务器」', /不经过|局域网/.test(html.slice(html.indexOf('remote-note-card'))))
 ok('前端只发 kxxy://remote/*，不直接改 location 到远端', has(js, 'kxxy://remote/${action}'))
-ok('渲染走 data.remote，不本地缓存设备清单', has(js, 'renderRemote(state.remote)') || has(js, 'renderRemote('))
+ok('渲染走 data.remote，不本地缓存设备清单', has(js, 'renderRemote('))
+/*
+ * 缺陷 DV：设备存下来了，列表却永远是空的。
+ *
+ * 原生把设备簿写在状态文件顶层，插件 `Object.assign` 把它摊进 `engine` ——
+ * 所以快照实际只在 `engine.remote`。前端只读 `data.remote` 时永远是 undefined，
+ * `renderRemote` 早退，用户看到的就是「手机连上了，已配对的电脑一直空」。
+ * 这两条钉住两端：服务端必须把 remote 提到顶层，前端两个位置都要看。
+ */
+ok('状态 API 把 remote 提到顶层（不是只埋在 engine 里）', /const remote = engine\.remote[\s\S]{0,160}sendJson\(res, 200, \{[\s\S]{0,120}remote,/.test(hostLib))
+ok('前端同时兼容 data.remote 与 engine.remote', has(js, 'renderRemote(data.remote || engine.remote)'))
+ok('快照缺失时仍画出空态，而不是一片空白', has(js, 'const snapshot = remote || {}'))
 ok('错误按 seq 去重，避免每次轮询弹一次 toast', has(js, 'seq > remoteErrorSeq'))
 ok('设备名做 HTML 转义', has(js, 'escapeHtml(d.label)'))
 ok('样式类齐全（卡片/英雄区/条目/徽章）', ['.remote-card', '.remote-hero', '.remote-item', '.remote-badge'].every((c) => css.includes(c)))
+
+// ---------------------------------------------------------------------------
+// [A] 契约：概览折叠（v0.9.17）
+// ---------------------------------------------------------------------------
+console.log('\n[A] 概览折叠')
+
+/*
+ * 概览页原先两张长列表（启动体检查 11 项、运行时完整性 7 项）铺开占一屏多，
+ * 而它们正常时的信息量只有一行结论。改成 details 折叠后：
+ *   · 默认收起，结论（全部通过 / N 项待处理 / 7-7 通过）留在 summary 徽章上，
+ *     收起不等于藏信息；
+ *   · 用户展开过一次就记住（localStorage），不逼人每次重新点开；
+ *   · 有红项时自动展开一次 —— 写着「3 项待处理」却不告诉是哪三项，
+ *     折叠就成了藏故障。
+ */
+ok('启动体检是可折叠卡', has(html, 'id="health-checks-details"') && /<details class="fold" id="health-checks-details"/.test(html))
+ok('运行时完整性是可折叠卡', /<details class="fold" id="runtime-checks-details"/.test(html))
+ok('两张卡默认收起（details 上不写 open）', !/<details class="fold"[^>]*\bopen\b/.test(html))
+ok('收起态保留结论徽章', has(html, 'id="health-count-badge"') && has(html, 'id="runtime-all-status"'))
+ok('检查项容器仍在（renderHealth / renderRuntimeChecks 不失效）', has(html, 'id="health-checks"') && has(html, 'id="runtime-checks-container"'))
+ok('折叠样式齐全', ['.fold-card', '.fold-summary', '.fold[open] .chevron-icon', '.fold-body'].every((c) => css.includes(c)))
+ok('两张卡与系统权限卡共用一套记忆逻辑', has(js, "bindFold(dom.healthChecksDetails, 'kxxy.overview.health.open.v1')")
+  && has(js, "bindFold(dom.runtimeChecksDetails, 'kxxy.overview.runtime.open.v1')")
+  && has(js, "bindFold(dom.permDetails, 'kxxy.settings.perm.open.v1')"))
+ok('展开状态记进 localStorage，且能在受限 WebView 下降级', has(js, 'localStorage.setItem(key, details.open ? \'1\' : \'0\')') && /catch \(_\) \{\}/.test(js))
+ok('有红项时自动展开一次（收起不藏故障）', has(js, 'if (bad.length) openFoldForAttention(dom.healthChecksDetails)'))
+ok('用户表过态就不再替它展开', has(js, 'if (details.dataset.foldChoice) return'))
+ok('程序化展开不写存档（不改变用户下次的默认版面）', has(js, "details.dataset.foldAuto = '1'"))
 
 // ---------------------------------------------------------------------------
 // [A] 契约：上手引导（v0.9.16）

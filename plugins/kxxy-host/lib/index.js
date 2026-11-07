@@ -1002,9 +1002,26 @@ export function apply(ctx) {
           if (path === '/kxxy/api/state' && req.method === 'GET') {
             // 主题偏好随轮询刷新：官方设置页改了主题，控制台几秒内跟随
             themeCache = readThemePreference(getSettings())
+            const engine = collectEngineState(ctx)
+            /*
+             * 远程设备簿要单独提到顶层。
+             *
+             * 原生把它写在状态文件的顶层（`"remote": {...}`），而
+             * `collectEngineState()` 用 `Object.assign(state, extra)` 把整份
+             * 状态摊平进 engine —— 于是它实际只在 `engine.remote` 里，
+             * 顶层的 `remote` 永远是 undefined。前端按契约读 `data.remote`，
+             * 结果是「手机连上了、已配对的电脑列表一直空着」（缺陷 DV）：
+             * 设备确实存下来了，只是从来没被画出来过。
+             *
+             * 这里抽到顶层并从 engine 里删掉：同一份数据出现在两个地方，
+             * 迟早有人读错那一份，而这次的 bug 就是读错的那一份。
+             */
+            const remote = engine.remote ?? null
+            delete engine.remote
             sendJson(res, 200, {
-              engine: collectEngineState(ctx),
+              engine,
               runtime: collectRuntimeState(),
+              remote,
             })
             return
           }

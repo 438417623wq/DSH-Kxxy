@@ -603,6 +603,85 @@ html, body {
   min-height: 40px;
 }
 
+/*
+ * 概览页的可折叠卡片（启动与加载体检 / 运行时完整性检查）。
+ *
+ * 与下面 `.patch-accordion` 是同一套交互、不同的排版诉求：那套的 summary 只有
+ * 「标题 + 徽章」，这两张卡还有一句副标题要跟着走，所以标题与副标题竖排，
+ * 徽章与箭头右对齐并 `flex: none`（否则窄屏上徽章会被标题挤成两行）。
+ *
+ * 卡片自身 `padding: 0`：内边距交给 summary 与 fold-body —— 折叠后只剩 summary
+ * 那 14px，卡片高度从「一屏多」缩到 48px 左右，这才是这次改动想要的结果。
+ */
+.fold-card {
+  padding: 0;
+}
+
+.fold {
+  width: 100%;
+}
+
+.fold-summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 16px;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.fold-summary::-webkit-details-marker {
+  display: none;
+}
+
+.fold-summary-left {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.fold-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* 副标题最多两行：它是解释性文字，让它把徽章挤到第二行就得不偿失了 */
+.fold-sub {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.fold-summary-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.fold[open] .chevron-icon {
+  transform: rotate(180deg);
+}
+
+/* 分隔线与标题行原有那一层一致：展开后才画，收起时不该有横线 */
+.fold-body {
+  padding: 0 16px 16px 16px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.fold-body .check-list {
+  padding-top: 12px;
+}
+
 /* 13 项补丁手风琴折叠卡片 */
 .patch-card {
   padding: 0;
@@ -3557,6 +3636,19 @@ input, textarea, select {
   border-color: rgba(34, 197, 94, 0.4);
   background: rgba(34, 197, 94, 0.16);
   color: var(--accent-green);
+}
+
+/*
+ * 概览卡 hero 里那一颗。
+ *
+ * 比列表里的矮一档：hero 一行里同时有设备名、地址、这颗开关和「连接」按钮，
+ * 390px 宽下再多 2px 高度就会把 meta 那行挤到看不见。横向也收紧 —— 它的
+ * 作用是「一眼看到现在是不是自动连」，不是主操作按钮。
+ */
+.remote-trust-hero {
+  min-height: 26px;
+  padding: 3px 8px;
+  white-space: nowrap;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -708,8 +708,14 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 折叠兜底。改动全在 `kxxy-host/web`（index.html / host.js / host.css），
  * 不升编号的话设备上仍是 @14 的旧页面 —— 而这次的问题恰好是「页面在教用户用
  * 一条连不上的路径」，比缺个按钮更糟：用户会照着做完，然后卡在那句英文 401 上。
+ *
+ * 15 → 16：已配对列表修复 + 概览折叠（2026-11-07）。两处都在 `plugins/kxxy-host`：
+ * `lib/index.js` 把设备簿提到 `/kxxy/api/state` 顶层（原先只埋在 `engine.remote`
+ * 里，前端读不到 ⇒「手机连上了，已配对的电脑一直空」）；`web/` 把两张长检查卡
+ * 改成折叠。插件树指纹（锚点 8）本来也能判出这次变化，这里照约定一起递增：
+ * 两个判据指向同一次重装，谁先命中都不影响结果。
  */
-const PATCHSET_MARKER = "kxxy-patchset@15";
+const PATCHSET_MARKER = "kxxy-patchset@16";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

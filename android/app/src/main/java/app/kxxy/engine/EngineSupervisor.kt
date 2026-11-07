@@ -829,6 +829,11 @@ class EngineSupervisor(private val ctx: Context) {
                  * SharedPreferences 里（理由见 RemoteStore 的类注释），前端
                  * 拿不到。连接串在这里**已脱敏**（token 换成圆点）：这份 JSON
                  * 会落盘成 kxxy-state.json，对插件可读，明文凭证不该出现在那儿。
+                 *
+                 * 注意它到前端的路径：kxxy-host 读这份文件后用 `Object.assign`
+                 * 把顶层字段摊进 `engine`，所以插件里它是 `engine.remote`；
+                 * `/kxxy/api/state` 再把它提回顶层给页面（前端读 `data.remote`）。
+                 * 只在一处透传的后果是「设备存下来了但列表永远空」——缺陷 DV。
                  */
                 append("  \"remote\": ${app.kxxy.remote.RemoteStore.snapshotJson(ctx)},\n")
                 append("  \"updatedAt\": ${System.currentTimeMillis()}\n")

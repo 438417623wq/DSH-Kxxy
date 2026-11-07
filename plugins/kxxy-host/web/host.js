@@ -193,6 +193,8 @@
     healthHeadline: document.getElementById('health-headline'),
     healthSubline: document.getElementById('health-subline'),
     healthChecks: document.getElementById('health-checks'),
+    healthChecksDetails: document.getElementById('health-checks-details'),
+    runtimeChecksDetails: document.getElementById('runtime-checks-details'),
     healthCountBadge: document.getElementById('health-count-badge'),
     healthRepairCard: document.getElementById('health-repair-card'),
     healthRepairHint: document.getElementById('health-repair-hint'),
@@ -217,6 +219,7 @@
     btnRemoteManage: document.getElementById('btn-remote-manage'),
     btnRemoteAdd: document.getElementById('btn-remote-add'),
     btnRemoteConnect: document.getElementById('btn-remote-connect'),
+    btnRemoteTrust: document.getElementById('btn-remote-trust'),
     btnRemoteBack: document.getElementById('btn-remote-back'),
     remoteUrlInput: document.getElementById('remote-url-input'),
     remoteLabelInput: document.getElementById('remote-label-input'),
@@ -416,11 +419,15 @@
 
   /** 概览卡 + 设备列表的统一渲染入口（由 fetchState 每轮喂一次快照）。 */
   function renderRemote(remote) {
-    if (!remote || !dom.remoteHero) return;
-    remoteSnapshot = remote;
-    const devices = Array.isArray(remote.devices) ? remote.devices : [];
+    if (!dom.remoteHero) return;
+    // 快照缺失（引擎刚起、状态文件还没写出来）按「一台都没配」画。
+    // 直接 return 的后果是列表区一片空白且「还没有配对的电脑」也不显示 ——
+    // 用户分不清是没配对还是页面坏了。
+    const snapshot = remote || {};
+    remoteSnapshot = snapshot;
+    const devices = Array.isArray(snapshot.devices) ? snapshot.devices : [];
 
-    const lastId = remote.lastUsedId;
+    const lastId = snapshot.lastUsedId;
     const hero = devices.find((d) => d.id === lastId) || devices[0] || null;
 
     // 还没有配对过任何电脑时，引导卡默认展开（那正是用户最需要它的时候）；
@@ -437,16 +444,25 @@
       dom.remoteHeroMeta.textContent = `${remoteKindLabel(hero)} · ${hero.host} · ${relativeTime(hero.lastUsedAt)}`;
       dom.remoteHeroDot.classList.toggle('is-stale', hero.ok === false);
       dom.btnRemoteConnect.dataset.id = hero.id;
+      if (dom.btnRemoteTrust) {
+        dom.btnRemoteTrust.dataset.id = hero.id;
+        dom.btnRemoteTrust.classList.toggle('is-on', hero.trusted === true);
+        dom.btnRemoteTrust.textContent = hero.trusted ? '已自动连' : '自动连';
+        dom.btnRemoteTrust.title = hero.trusted
+          ? '已开启自动连接，点击关闭'
+          : '信任这台电脑，下次打开 App 自动连接';
+      }
     } else {
       dom.remoteHero.hidden = true;
       dom.remoteEmpty.hidden = false;
       dom.btnRemoteConnect.dataset.id = '';
+      if (dom.btnRemoteTrust) dom.btnRemoteTrust.dataset.id = '';
     }
 
     renderRemoteList(devices);
-    renderTrustTip(remote);
+    renderTrustTip(snapshot);
 
-    const err = remote.error || {};
+    const err = snapshot.error || {};
     if (typeof err.seq === 'number' && err.seq > remoteErrorSeq) {
       remoteErrorSeq = err.seq;
       if (err.message) showToast(err.message, 'error');
@@ -548,6 +564,30 @@
       const id = dom.btnRemoteConnect.dataset.id;
       if (!id) return;
       postRemote('connect', { id });
+    });
+
+    /*
+     * 概览卡上的「自动连」开关。
+     *
+     * 为什么这里也要有一个，而不是只在「管理」视图里：用户的原话是「我已经
+     * 配对成功的，让我可以方便直接连接」。概览卡是他唯一会顺手看到的地方，
+     * 而「信任」这个开关藏在管理页第二屏的列表里，等于要求他为了一个自己
+     * 还不知道有什么用的按钮先多点两次。
+     *
+     * 与列表里那颗按钮发同一个 action、用同一套原生判定（trusted 字段由
+     * RemoteStore 给出），前端不自己记状态。
+     */
+    dom.btnRemoteTrust?.addEventListener('click', () => {
+      const id = dom.btnRemoteTrust.dataset.id;
+      if (!id) return;
+      const device = (remoteSnapshot?.devices || []).find((d) => d.id === id);
+      const name = device?.label || '这台电脑';
+      const next = !device?.trusted;
+      postRemote(next ? 'trust' : 'untrust', { id });
+      showToast(
+        next ? `已信任「${name}」：同一网络下打开 App 会直接连` : `已关闭「${name}」的自动连接`,
+        next ? 'success' : 'info',
+      );
     });
 
     /*
@@ -868,6 +908,51 @@
     if (btn) btn.click();
   }
 
+  /*
+   * 可折叠卡片的展开状态。
+   *
+   * 与设置页「系统权限」同一套规则：HTML 里不写 `open`（默认收起），用户展开
+   * 过一次就记进 localStorage —— 每次进来都要重新点开一遍，折叠就成了负担。
+   *
+   * `dataset.foldChoice` 是「用户表过态」的标记：'1'/'0' 表示用户自己点的，
+   * 空表示还没表态（程序化展开不算）。体检卡靠它决定要不要自动替用户打开。
+   * 存 `'1'/'0'` 而不是布尔字符串，理由同 PERM_OPEN_KEY：键名带版本语义，
+   * 以后换默认行为时改新键，老值自然失效。
+   */
+  function bindFold(details, key) {
+    if (!details) return;
+    let saved = null;
+    try {
+      saved = window.localStorage.getItem(key);
+    } catch (_) {
+      // 无痕/受限 WebView 下 localStorage 会抛，折叠本身不能因此失效
+    }
+    if (saved === '1' || saved === '0') {
+      details.dataset.foldChoice = saved;
+      details.open = saved === '1';
+    }
+    details.addEventListener('toggle', () => {
+      // 程序化展开（自动打开体检卡）不写存档：下次进来仍默认收起，
+      // 直到用户自己点一次 —— 否则一次故障会永久改变这个用户的默认版面。
+      if (details.dataset.foldAuto === '1') {
+        delete details.dataset.foldAuto;
+        return;
+      }
+      details.dataset.foldChoice = details.open ? '1' : '0';
+      try {
+        window.localStorage.setItem(key, details.open ? '1' : '0');
+      } catch (_) {}
+    });
+  }
+
+  /** 有红项时替用户展开体检卡；用户表过态（哪怕收起了）就不动。 */
+  function openFoldForAttention(details) {
+    if (!details || details.open) return;
+    if (details.dataset.foldChoice) return;
+    details.dataset.foldAuto = '1';
+    details.open = true;
+  }
+
   // ==========================================
   // 2. 状态轮询系统 (fetch('/kxxy/api/state'))
   // ==========================================
@@ -880,8 +965,13 @@
       const runtime = data.runtime || {};
       lastStateSnapshot = engine;
 
-      // 远程设备清单（原生快照，含脱敏后的连接串）
-      renderRemote(data.remote);
+      // 远程设备清单（原生快照，含脱敏后的连接串）。
+      //
+      // 两个来源都要看：原生把 `remote` 写在状态文件的顶层，而插件用
+      // `Object.assign` 把整份状态摊进 `engine` —— 于是它实际落在
+      // `engine.remote`。只读顶层的话快照永远是 undefined，页面表现就是
+      // 「手机明明连上了，已配对的电脑一直空着、也存不下来」（缺陷 DV）。
+      renderRemote(data.remote || engine.remote);
 
       // 1) 顶部 Header 状态
       if (dom.headerPulseDot && dom.headerStatusLabel) {
@@ -2382,21 +2472,15 @@
      * 存的是 `'1'/'0'` 而不是布尔字符串 `'true'`：键名带版本语义，
      * 以后要换默认行为时可以直接改成新键，老值自然失效。
      */
-    if (dom.permDetails) {
-      const PERM_OPEN_KEY = 'kxxy.settings.perm.open.v1';
-      let saved = null;
-      try {
-        saved = window.localStorage.getItem(PERM_OPEN_KEY);
-      } catch (_) {
-        // 无痕/受限 WebView 下 localStorage 会抛，折叠功能本身不能因此失效
-      }
-      if (saved === '1') dom.permDetails.open = true;
-      dom.permDetails.addEventListener('toggle', () => {
-        try {
-          window.localStorage.setItem(PERM_OPEN_KEY, dom.permDetails.open ? '1' : '0');
-        } catch (_) {}
-      });
-    }
+    /*
+     * 折叠卡片的展开状态（规则见 bindFold）。
+     *
+     * 概览页两张（启动体检 / 运行时完整性）与设置页的系统权限卡共用一套：
+     * HTML 不写 open → 默认收起；用户展开过就记住。
+     */
+    bindFold(dom.permDetails, 'kxxy.settings.perm.open.v1');
+    bindFold(dom.healthChecksDetails, 'kxxy.overview.health.open.v1');
+    bindFold(dom.runtimeChecksDetails, 'kxxy.overview.runtime.open.v1');
 
     // 开关绑定 (常驻前台 / 看门狗 / 局域网反代)
     const toggleBindings = [
@@ -2618,6 +2702,9 @@
           ? `${warn.length} 项提示`
           : (unknown.length ? `${unknown.length} 项未知` : '全部通过');
     }
+    // 有红项就替用户把这张卡展开 —— 收起状态只能写「3 项待处理」，
+    // 而用户真正想知道的是「哪 3 项」。用户手动收起过（有 foldChoice）就不干预。
+    if (bad.length) openFoldForAttention(dom.healthChecksDetails);
 
     // ── 修复区 ────────────────────────────────────────────
     // 只在「有能靠修复解决的红项」时出现。
