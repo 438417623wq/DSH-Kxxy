@@ -468,6 +468,35 @@ try {
   closeUpstream(up.server)
 }
 
+// ---------------------------------------------------------------------------
+// [C] 安全边界：会话判定与日志脱敏（缺陷 DZ / EA / EB）
+// ---------------------------------------------------------------------------
+//
+// 这一层只钉**接线**，行为由 tools/smoke-plugin.mjs 真起服务验。
+// 为什么还要静态钉一遍：这次的根因是「调用了一个不存在的方法，于是恒走兜底」，
+// 那种错行为测试也会全绿（兜底恒真），只有把"必须调哪个方法"写死才不会回去。
+console.log('\n[C] 安全边界（鉴权 / 脱敏）')
+{
+  const authSrc = norm(read('plugins/kxxy-host/lib/auth.mjs'))
+  const redactSrc = norm(read('plugins/kxxy-host/lib/redact.mjs'))
+
+  ok('判定走 connection.isAuthenticated', authSrc.includes("ctx.get('connection')") && authSrc.includes('isAuthenticated'))
+  ok('判定器缺失/抛错 → unavailable（判不了不放行）', /AUTH_UNAVAILABLE/.test(authSrc) && /return AUTH_UNAVAILABLE/.test(authSrc))
+  ok('主模块不再调用 isTrustedRequest', !/isTrustedRequest\s*\(\s*ctx\s*,/.test(hostLib))
+  ok('媒体 / API / 页面三处都过同一道判定', (hostLib.match(/authVerdict\(ctx, req\)/g) ?? []).length >= 3)
+  ok('写操作要过 CSRF 语义检查', hostLib.includes('checkWriteRequest(req)'))
+  ok('跨站来源在最外层挡掉', hostLib.includes('cross-site request rejected'))
+  ok('页面加防嵌套头', hostLib.includes("'x-frame-options': 'DENY'") && hostLib.includes('frame-ancestors'))
+  ok('日志接口走脱敏尾部', hostLib.includes('redactLogTail('))
+  ok('脱敏覆盖 token / bearer / cookie / sk-',
+    ['token|access_token', 'authorization', 'cookie:', 'sk-'].every((k) => redactSrc.includes(k)))
+  ok('日志尾部上限 32KB（原来是 64KB 原样吐）', redactSrc.includes('32 * 1024'))
+  // 管理页要 cookie 之后，冷启动自动连接（跳过 token URL 直接进远程）在
+  // 「回到本机」时会没有本机会话 —— 这两条钉住那次补换。
+  ok('退出远程前若没换过本机 cookie，先补 token URL', /!localSessionMinted && tokenUrl != null/.test(activity))
+  ok('补换完成后由 onPageFinished 转去控制台', activity.includes('pendingConsole && !remoteMode'))
+}
+
 // 生成器
 const codes = new Set()
 for (let i = 0; i < 200; i++) codes.add(generateCode())

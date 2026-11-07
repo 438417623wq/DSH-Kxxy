@@ -715,7 +715,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 改成折叠。插件树指纹（锚点 8）本来也能判出这次变化，这里照约定一起递增：
  * 两个判据指向同一次重装，谁先命中都不影响结果。
  */
-const PATCHSET_MARKER = "kxxy-patchset@16";
+const PATCHSET_MARKER = "kxxy-patchset@17";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

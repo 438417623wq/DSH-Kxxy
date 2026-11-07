@@ -570,6 +570,50 @@ try {
 		equal('extensions 目录不存在时返回空数组',
 			staleExtensions(join(workdir, 'r13-nonexistent')).length, 0);
 	}
+
+	// -----------------------------------------------------------------------
+	console.log('[EC] wrapper 按自身目录找兄弟文件（yarn 布局，缺陷 EC）');
+	// -----------------------------------------------------------------------
+	//
+	// 真机症状：`yarn --version` → Cannot find module '…/extensions/yarn/bin/yarn.js'，
+	// 而真实入口在 share/yarn/bin/yarn.js。wrapper 用 readlink -f 定位到自己
+	// 的真实目录，再找同目录的 yarn.js —— 找不到。这里复刻该布局，断言安装器
+	// 会补出那条兄弟链接，且补的是**相对**链接（扩展目录整体搬走也不悬空）。
+	{
+		const root = join(workdir, 'r-ec');
+		const ext = join(root, 'extensions', 'yarn');
+		mkdirSync(join(ext, 'bin'), { recursive: true });
+		mkdirSync(join(ext, 'share', 'yarn', 'bin'), { recursive: true });
+		writeFileSync(join(ext, 'share', 'yarn', 'bin', 'yarn.js'), 'console.log("1.22.22")\n');
+		writeFileSync(
+			join(ext, 'bin', 'yarn'),
+			'#!/bin/sh\nbasedir=$(dirname "$(readlink -f "$0")")\nexec node "$basedir/yarn.js" "$@"\n',
+			{ mode: 0o755 },
+		);
+
+		const links = buildViews(root, 'yarn', ext);
+		const bin = links.bins.find((b) => b.name === 'yarn');
+		check('<root>/bin/yarn 已接入', Boolean(bin), `bins=${JSON.stringify(links.bins.map((b) => b.name))}`);
+
+		const sibling = join(ext, 'bin', 'yarn.js');
+		check('wrapper 旁边补出了 yarn.js 兄弟链接', existsSync(sibling));
+		if (existsSync(sibling)) {
+			const target = readlinkSync(sibling);
+			check('补出的是相对链接（整包搬走不悬空）', !target.startsWith('/') && !/^[A-Za-z]:/.test(target), target);
+			check('链接指向 share/yarn/bin/yarn.js', target.includes('share') && target.endsWith('yarn.js'), target);
+		}
+
+		// 反向保护：wrapper 引用的文件在扩展内**找不到**时不能瞎建链接。
+		const ext2 = join(root, 'extensions', 'noluck');
+		mkdirSync(join(ext2, 'bin'), { recursive: true });
+		writeFileSync(
+			join(ext2, 'bin', 'noluck'),
+			'#!/bin/sh\nbasedir=$(dirname "$0")\nexec node "$basedir/ghost.js" "$@"\n',
+			{ mode: 0o755 },
+		);
+		buildViews(root, 'noluck', ext2);
+		check('扩内找不到同名文件时不建空链接', !existsSync(join(ext2, 'bin', 'ghost.js')));
+	}
 } finally {
 	rmSync(workdir, { recursive: true, force: true });
 }

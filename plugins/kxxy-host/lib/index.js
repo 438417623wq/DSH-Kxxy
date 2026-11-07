@@ -14,9 +14,14 @@
  *    dsh-host-frontend-static 用 registerFallback 等），是稳定契约。
  *
  * 2. **同 origin 复用官方鉴权，不另造一套**
- *    管理页与官方前端同在 127.0.0.1:3080，因此自动共享官方的
- *    cookie/token 鉴权。管理 API 直接用官方 authorization 服务判定浏览器信任，
- *    避免自造鉴权带来的绕过风险。
+ *    管理页与官方前端同在 127.0.0.1:3080，因此自动共享官方的会话 cookie。
+ *    判定走 `connection.isAuthenticated(req)`（`dsh-client-connection` 的公开方法，
+ *    校验的是绑定 Host 的签名 cookie），见 auth.mjs。
+ *
+ *    ⚠️ 这里曾经写成 `ctx.get('authorization').isTrustedRequest(req)` —— 那个服务
+ *    是「凭证获取流程」注册表，压根没有这个方法，于是恒走「Host 是回环就放行」的
+ *    兜底，而本机请求的 Host 天然是 127.0.0.1:3080，等于门一直开着（缺陷 DZ）。
+ *    改这条判定时请连着读 auth.mjs 的文件头，别再"退化"回去。
  *
  * 3. **动作真做，做不到就明确失败**
  *    旧版 /kxxy/api/action 恒返回 202（什么都没做），前端却弹「成功」toast。
@@ -40,6 +45,8 @@ import * as health from './health.mjs'
 import * as mirror from './mirror.mjs'
 import * as plugins from './plugins.mjs'
 import { tarGzSync } from './tar.mjs'
+import { AUTH_ALLOW, AUTH_DENY, AUTH_UNAVAILABLE, authVerdict, checkWriteRequest, deniedPageHtml } from './auth.mjs'
+import { redactLogTail } from './redact.mjs'
 
 /** 插件名。 */
 export const name = 'kxxy-host'
@@ -220,31 +227,70 @@ function injectCompat(html) {
   return `${html.slice(0, at)}${markup}${html.slice(at)}`
 }
 
-/**
- * 判定请求是否来自可信浏览器。
- *
- * 复用官方 authorization 服务的判定（若可用）；不可用时退化为
- * 「只接受回环来源」这一保守策略 —— 绝不因为判定器缺失而放行任意来源。
- */
-function isTrustedRequest(ctx, req) {
-  try {
-    const auth = ctx.get('authorization')
-    if (auth && typeof auth.isTrustedRequest === 'function') {
-      return auth.isTrustedRequest(req)
-    }
-  } catch {
-    // 服务未注册：落到保守分支
-  }
-  const host = String(req.headers?.host ?? '')
-  return host.startsWith('127.0.0.1:') || host.startsWith('localhost:')
-}
-
 /** 统一 JSON 应答。 */
-function sendJson(res, status, payload) {
+function sendJson(res, status, payload, extraHeaders = null) {
   const body = JSON.stringify(payload, null, 2)
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store',
+    ...(extraHeaders ?? {}),
+  })
+  res.end(body)
+}
+
+/**
+ * 关掉一个未认证请求，并给出**能照着做**的说明（缺陷 DZ）。
+ *
+ * 401 与 503 的区别对用户是有意义的：
+ *   · 401 —— 你这次没带凭证，去 DSH 打开一次链接就好；
+ *   · 503 —— 判定器不见了，重开链接也没用，得反馈。
+ * 两者都**不放行**，区别只在正文和状态码。
+ */
+let authWarned = null
+function denyApi(ctx, res, verdict, surface) {
+  // 只记一次：轮询页面每 3 秒一次 401，会把日志刷满而掩盖真正的病因。
+  if (authWarned !== verdict) {
+    authWarned = verdict
+    ctx?.logger?.warn?.(
+      `[kxxy-host] 拒绝未认证请求（${verdict}）：${surface}。` +
+        (verdict === AUTH_UNAVAILABLE
+          ? '找不到 connection 服务 —— 管理接口已关闭。'
+          : '缺少会话 cookie —— 从 DSH 打开的链接进入一次即可。'),
+    )
+  }
+  if (verdict === AUTH_UNAVAILABLE) {
+    sendJson(res, 503, {
+      error: 'auth-unavailable',
+      surface,
+      hint: '找不到 connection 服务，管理接口已关闭。请反馈 DSH 版本与这条信息。',
+    })
+    return
+  }
+  sendJson(
+    res,
+    401,
+    {
+      error: 'unauthorized',
+      surface,
+      hint: '缺少 DSH 会话 cookie。请从 DSH 打印的链接打开一次，或从 Kxxy App 进入。',
+    },
+    { 'www-authenticate': 'Cookie realm="dsh"' },
+  )
+}
+
+/**
+ * 页面类的拒绝：仍然回 200 + 一页静态说明。
+ *
+ * 状态码在这里不重要，重要的是**人看得懂**。给 401 白屏等于把「你没带凭证」
+ * 和「服务挂了」两件事糊成一件，用户只能理解成「又坏了」。
+ */
+function denyPage(res, verdict) {
+  const html = deniedPageHtml(verdict === AUTH_UNAVAILABLE ? AUTH_UNAVAILABLE : AUTH_DENY)
+  const body = Buffer.from(html, 'utf8')
+  res.writeHead(200, {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': body.length,
     'cache-control': 'no-store',
   })
   res.end(body)
@@ -875,16 +921,16 @@ export function apply(ctx) {
     // 按后缀给准确的 Content-Type（上游 mime 表对 .mkv/.opus 之类会退化成
     // application/octet-stream，浏览器便拒绝播放）。
     //
-    // 安全边界：仅回环可信请求（isTrustedRequest），且只接受绝对路径。
+    // 安全边界：仅已认证会话可读（authVerdict），且只接受绝对路径。
     // 引擎进程本身以 app uid 运行，能读的文件与官方 /api/file 完全一致，
     // 不额外放宽。
     const disposeMedia = ctx.webServer.register({
       kind: 'prefix',
       path: '/kxxy/media',
       handler: async (req, res) => {
-        if (!isTrustedRequest(ctx, req)) {
-          res.writeHead(403)
-          res.end('forbidden')
+        const verdict = authVerdict(ctx, req)
+        if (verdict !== AUTH_ALLOW) {
+          denyApi(ctx, res, verdict, 'media')
           return
         }
         if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -987,18 +1033,37 @@ export function apply(ctx) {
 
     // ── 管理 API：/kxxy/api/* ───────────────────────────────────────
     // 同样不能带尾斜杠，理由见上面的 assets 路由。
+    //
+    // 门在**一处**：所有子路径都先从这条 prefix 进来，判定不通过就出不去。
+    // 会话判定见 auth.mjs（缺陷 DZ：原来用错了服务，兜底判据恒真）。
     const disposeApi = ctx.webServer.register({
       kind: 'prefix',
       path: '/kxxy/api',
       handler: async (req, res) => {
-        if (!isTrustedRequest(ctx, req)) {
-          sendJson(res, 403, { error: 'forbidden' })
+        // 跨站请求在最外层先挡（缺陷 EA 的第一道）：同源页面自己发请求不会带
+        // 这个值，带了就说明是别的站点在替用户发（含 JSON 的"简单请求"侧信道）。
+        if (String(req.headers?.['sec-fetch-site'] ?? '').toLowerCase() === 'cross-site') {
+          sendJson(res, 403, { error: 'cross-site request rejected' })
+          return
+        }
+        const verdict = authVerdict(ctx, req)
+        if (verdict !== AUTH_ALLOW) {
+          denyApi(ctx, res, verdict, 'api')
           return
         }
 
         const path = String(req.url ?? '').split('?')[0]
 
         try {
+          // 写操作再验一层 CSRF 语义（缺陷 EA）：同源 JSON 才放行。
+          // 放在这里而不是各 handler 里，是因为新增端点时最容易忘的就是这一步。
+          if (req.method !== 'GET' && req.method !== 'HEAD') {
+            const check = checkWriteRequest(req)
+            if (!check.ok) {
+              sendJson(res, check.status, { error: check.error })
+              return
+            }
+          }
           if (path === '/kxxy/api/state' && req.method === 'GET') {
             // 主题偏好随轮询刷新：官方设置页改了主题，控制台几秒内跟随
             themeCache = readThemePreference(getSettings())
@@ -1451,16 +1516,35 @@ export function apply(ctx) {
           if (path === '/kxxy/api/log' && req.method === 'GET') {
             const engineRoot = extinstall.engineRoot()
             const logFile = join(engineRoot, 'engine.log')
+            /*
+             * 出口脱敏（缺陷 EB）：DSH 每次启动都会往 engine.log 打一行
+             * `dsh web: http://127.0.0.1:3080/?token=…`，那个 token 就是本次
+             * 进程的 launch token。原来这里 `slice(-64KB)` 原样返回，于是
+             * 「匿名读日志 → 拿到有效凭证」是一条直线。
+             *
+             * 规则与取舍见 redact.mjs：不删行、不截半行，宁多盖不少盖。
+             */
             let tail = ''
+            let lines = 0
+            let truncated = false
+            let error = null
             try {
               if (existsSync(logFile)) {
-                const all = readFileSync(logFile, 'utf8')
-                tail = all.slice(-64 * 1024)
+                const redacted = redactLogTail(readFileSync(logFile, 'utf8'))
+                tail = redacted.tail
+                lines = redacted.lines
+                truncated = redacted.truncated
               }
             } catch (e) {
-              tail = `log read failed: ${e.message}`
+              error = `log read failed: ${e.message}`
             }
-            sendJson(res, 200, { tail })
+            sendJson(res, 200, {
+              tail: error ? '' : tail,
+              lines,
+              truncated,
+              redacted: true,
+              error,
+            })
             return
           }
 
@@ -1492,6 +1576,17 @@ export function apply(ctx) {
     // 同时挂 "/kxxy/"：用户手输地址栏时很容易带上尾斜杠，而 exact 表是精确匹配，
     // 缺了这一条就是 404。两条都指向同一个 handler。
     const renderPage = async (req, res) => {
+      /*
+       * 页面也要判定（缺陷 DZ）。
+       *
+       * 页面本身是纯静态资源、不含状态，但它是「用户唯一能看到原因的地方」：
+       * 未认证时回一页说明（401 白屏只会让人以为又坏了），库里不放任何数据。
+       */
+      const verdict = authVerdict(ctx, req)
+      if (verdict !== AUTH_ALLOW) {
+        denyPage(res, verdict)
+        return
+      }
       if (cachedIndexHtml === null) {
         const buf = readWebAsset('index.html')
         cachedIndexHtml = buf ?? Buffer.from(
@@ -1504,6 +1599,10 @@ export function apply(ctx) {
         'content-type': 'text/html; charset=utf-8',
         'content-length': cachedIndexHtml.length,
         'cache-control': 'no-cache',
+        // 控制台不该被任何页面框住：点击劫持在这里的后果是「在你没看见的
+        // 位置上点了卸载扩展/断开设备」。
+        'x-frame-options': 'DENY',
+        'content-security-policy': "frame-ancestors 'none'",
       })
       res.end(cachedIndexHtml)
     }

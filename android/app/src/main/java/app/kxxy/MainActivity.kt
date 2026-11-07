@@ -108,6 +108,27 @@ class MainActivity : Activity() {
     @Volatile
     private var urlLoaded = false
 
+    /**
+     * 本进程拿到的引擎 token URL（`http://127.0.0.1:3080/?token=…`）。
+     *
+     * 它不只是"首个页面地址"，还是**换取会话 cookie 的唯一途径**：DSH 的
+     * webServer 对每个请求都校验一个绑定 Host 的签名 cookie，而这个 cookie
+     * 只能由 `GET /?token=<launch token>` 换出来（303 + Set-Cookie）。
+     *
+     * 冷启动自动连接会跳过这次换取（直接进远程页），于是"回到本机"时
+     * WebView 里根本没有本机 cookie —— v0.9.18 给管理页加上会话校验后，
+     * 那样一跳就会撞上「未授权」。所以这里把它存下来，需要时补一次。
+     */
+    private var engineTokenUrl: String? = null
+
+    /** 本机 origin 的会话 cookie 是否已经换到手。 */
+    @Volatile
+    private var localSessionMinted = false
+
+    /** 补换 cookie 之后要落到控制台（onPageFinished 消费）。 */
+    @Volatile
+    private var pendingConsole = false
+
     private var stateJob: Job? = null
 
     /** 当前页面路径（onPageFinished + onDoUpdateVisitedHistory 双钩子维护）。 */
@@ -441,6 +462,21 @@ class MainActivity : Activity() {
                     remoteDeviceId?.let { RemoteStore.markUsed(this@MainActivity, it, true) }
                 }
                 currentPath = pathOf(url)
+                /*
+                 * 补换 cookie 的回程：`exitRemote` 里若发现本机还没有会话，
+                 * 会先加载 token URL。它 303 到 `/`，到这里就该转去控制台了。
+                 * 判据用路径而不是完整 URL —— 303 之后地址栏是 `/`，token
+                 * 已经不在地址里（这正是我们想要的，别把它留在历史里）。
+                 */
+                if (pendingConsole && !remoteMode) {
+                    val p = pathOf(url)
+                    if (p == "/" || p.isNullOrEmpty()) {
+                        pendingConsole = false
+                        localSessionMinted = true
+                        webView.loadUrl(localOverviewUrl() + "#remote")
+                        return
+                    }
+                }
                 // 页面就绪后立刻把挂起的 attention 意图送进去（冷启动路径）。
                 flushPendingAttention()
             }
@@ -753,6 +789,7 @@ class MainActivity : Activity() {
         urlLoaded = true
         pendingAttentionId = null
         pendingSessionId = null
+        pendingConsole = false
         remoteBar?.bind(device)
         remoteBar?.show()
         Log.i(TAG, "enter remote session: ${device.label} @ ${device.origin} (auto=$auto)")
@@ -776,6 +813,21 @@ class MainActivity : Activity() {
             RemoteStore.startCooldown(this)
         }
         Log.i(TAG, "exit remote session (cooldown=$cooldown)")
+        /*
+         * 回本机时要先确保本机 origin 有会话 cookie（缺陷 DZ 的下游）。
+         *
+         * 冷启动自动连接是「token URL 还没加载就直接进远程页」，此时 WebView
+         * 的 cookie jar 里没有 127.0.0.1:3080 的会话 —— 管理页现在会校验它，
+         * 直接跳过去只会看到「未授权」。这里补一次换取：
+         * 走 `/?token=…`（303 + Set-Cookie），页面落到 `/` 之后由
+         * onPageFinished 转去控制台。
+         */
+        val tokenUrl = engineTokenUrl
+        if (!localSessionMinted && tokenUrl != null) {
+            pendingConsole = true
+            webView.loadUrl(tokenUrl)
+            return
+        }
         webView.loadUrl(localOverviewUrl() + "#remote")
     }
 
@@ -1241,6 +1293,7 @@ class MainActivity : Activity() {
      * 一次重定向，用户在界面上重新扫码/授权即可，比白屏好。
      */
     private fun loadEngineUrl(tokenUrl: String?) {
+        if (tokenUrl != null) engineTokenUrl = tokenUrl
         if (urlLoaded) return
         urlLoaded = true
 
@@ -1263,6 +1316,8 @@ class MainActivity : Activity() {
 
         val target = tokenUrl ?: "http://127.0.0.1:${EngineConfig.DEFAULT_PORT}/"
         Log.i(TAG, "loading engine url: ${target.take(64)}…")
+        // 带 token 才算"把 cookie 换到手"；裸地址那一次不算，稍后回本机要补。
+        localSessionMinted = tokenUrl != null
         webView.loadUrl(target)
     }
 

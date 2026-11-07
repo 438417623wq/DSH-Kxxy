@@ -934,3 +934,29 @@ HTTP 响应）：401 也算「活着」——那说明接下来要解决的是�
 默认收起、结论留在徽章上、有红项自动展开一次、展开状态按卡记 `localStorage`
 （与设置页「系统权限」共用 `bindFold()`）。另在概览卡设备旁加了「自动连」开关，
 省掉「进管理视图再往下找」那一跳。
+
+### 控制台的鉴权边界（v0.9.18）
+
+外部审计指出 `/kxxy`、`/kxxy/api/*` 不带凭证也返回 200，`/kxxy/api/log` 还会吐出
+带 `?token=…` 的日志。两条根因不在一起，但第一条是根本：
+
+```
+kxxy-host 判定请求可信 → ctx.get('authorization').isTrustedRequest(req)
+                          ✗ 该方法不存在（authorization 是「凭证获取流程」注册表）
+                          → 恒走兜底：Host 是 127.0.0.1 就放行
+                          → 服务只绑回环，兜底恒真 = 门一直开着
+```
+
+正确入口在同机的 `connection` 服务：`isAuthenticated(req, secure)` 校验的是
+**绑定 Host 的签名 cookie**（`dsh-client-connection`）。改后是三态：
+`allow` / `deny`（API 401、页面给说明）/ `unavailable`（API 503、页面提示鉴权
+服务不可用）—— 判不了就不放行。远程链路不受影响，因为连接器转发时会把 Host
+改写回 `127.0.0.1:3080` 并注入上游 cookie。
+
+日志改成出口脱敏：尾部 32 KB、按行切齐、盖掉 URL 参数 / bearer / cookie /
+`sk-*` / 配对码 / 家目录。文件里仍是明文，**任何"把日志发出去"的新功能都必须
+再过一遍 `redactLog`**。
+
+同一版补了四个运行时默认值：yarn 的 bin/share 分离链接、ImageMagick 的 CJK
+默认字体、`~/.gitconfig` 身份、pip 清华镜像。NDK、`/tmp`、`raw.githubusercontent.com`
+被 DNS 拦截这三条属于平台边界，只在文档与诊断里说清，不假装能修。

@@ -949,6 +949,16 @@ object EngineConfig {
             "COREPACK_NPM_REGISTRY=https://registry.npmmirror.com",
             "npm_config_registry=https://registry.npmmirror.com",
             "NPM_CONFIG_REGISTRY=https://registry.npmmirror.com",
+            // pip 镜像（缺陷 EF）：此前只做了 npm 半边，pip 直连 pypi.org/simple，
+            // 大索引十几秒都下不完。pip.conf 由 RuntimeInstaller.ensurePipConfig
+            // 写（持久），这里再给一份环境变量 —— 有些脚本用 `env -i` 清环境，
+            // 那时只剩配置文件生效，两层都到位才稳。
+            "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple",
+            "PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn",
+            "PIP_DISABLE_PIP_VERSION_CHECK=1",
+            // 有些脚本把运行时状态写进 `$XDG_RUNTIME_DIR`（gpg-agent、部分 python
+            // 工具）。Android 上没有这个目录，不指就落到不可写的 `/run`。
+            "XDG_RUNTIME_DIR=${tmp.absolutePath}",
             // Go 的临时目录（go build 往这里写中间产物）。GOTMPDIR 只解决 tmp，
             // 真正的 GOROOT 在下面按目录探测后追加（缺陷 BI）。
             "GOTMPDIR=${tmp.absolutePath}",

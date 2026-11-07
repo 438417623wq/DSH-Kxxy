@@ -46,7 +46,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { extractTarGz } from './tar.mjs'
 
@@ -462,6 +462,8 @@ export function buildViews(root, id, extDir) {
     // used 用来避免同一扩展内部展平后重名（不同子目录里同名命令）
     const used = new Set()
     collectBins(extBin, '', engineBin, used, bins, views)
+    // 命令接完之后补一次「wrapper 找不着同目录兄弟文件」的修复（缺陷 EC）
+    repairWrapperSiblings(bins, extDir)
   }
 
   const extLib = join(extDir, 'lib')
@@ -684,6 +686,130 @@ function materialise(dst, rel) {
   } catch {
     // 老清单没有 views、或清单损坏/只读：交给卸载时的归属校验兜底
   }
+}
+
+/**
+ * 修「wrapper 按自身目录找兄弟文件，而文件其实在别处」这一类布局（缺陷 EC）。
+ *
+ * ── 症状 ────────────────────────────────────────────────────────────────
+ *
+ *     $ yarn --version
+ *     Error: Cannot find module '…/extensions/yarn/bin/yarn.js'
+ *
+ * 而 `…/extensions/yarn/share/yarn/bin/yarn.js` 好好待着（手动跑能出 1.22.22）。
+ *
+ * ── 根因 ────────────────────────────────────────────────────────────────
+ *
+ * 命令入口是个 shell wrapper，它这样定位自己：
+ *
+ *     basedir=$(dirname "$(readlink -f "$0")")
+ *     exec node "$basedir/yarn.js"
+ *
+ * `readlink -f` 解析到的是**真实文件**所在的目录（`extensions/yarn/bin`），
+ * 而 Yarn 1.x 在 Termux 的包布局是 bin 与 share 分离，真正的 `yarn.js` 在
+ * `<pkg>/share/yarn/bin/` 下。安装器只负责把命令链进 `<root>/bin`，从没管过
+ * 「这个 wrapper 还缺个兄弟文件」。这不只发生在 yarn 上：任何「bin 目录里只有
+ * 启动器、主体在 share/ 下」的包都会这样，症状都是「命令在、跑起来说模块没了」。
+ *
+ * ── 做法 ────────────────────────────────────────────────────────────────
+ *
+ * 读 wrapper 文本，抽出所有 `$basedir/<相对路径>` 引用；对每个**在 wrapper
+ * 旁边不存在**的引用，在扩展目录内按文件名找唯一命中，再在引用位置上补一条
+ * 相对软链（引用是 `bin/yarn.js` 这种子路径时先补目录）。
+ *
+ * 三条保守边界，宁可不修也不猜：
+ *   · 只处理以 `#!` 开头的文本脚本（二进制/大文件直接跳过）；
+ *   · 引用数超过 4 条就不动（那多半不是"缺兄弟文件"，是别的东西）；
+ *   · 文件名在扩展内必须**唯一**，多个命中就放弃 —— 猜错会得到一个更费解的错。
+ *
+ * 补出来的链接落在扩展目录内部，随扩展卸载一起消失，不进 `.links.json`。
+ *
+ * @param {Array<{name: string, target: string, src: string}>} bins
+ * @param {string} extDir 扩展根目录
+ * @returns {number} 补出的链接数
+ */
+function repairWrapperSiblings(bins, extDir) {
+  const MAX_REFS = 4
+  let repaired = 0
+
+  for (const bin of bins) {
+    let text = ''
+    try {
+      const buf = readFileSync(bin.src)
+      // 二进制（含 NUL）或过大的文件不可能是这种 wrapper
+      if (buf.length === 0 || buf.length > 64 * 1024 || buf.includes(0)) continue
+      text = buf.toString('utf8')
+    } catch {
+      continue
+    }
+    if (!text.startsWith('#!')) continue
+
+    const refs = new Set()
+    for (const m of text.matchAll(/\$\{?basedir\}?\/([A-Za-z0-9._/-]+)/g)) {
+      const rel = m[1].replace(/\/+$/, '')
+      if (rel && !rel.includes('..')) refs.add(rel)
+    }
+    if (refs.size === 0 || refs.size > MAX_REFS) continue
+
+    const dir = dirname(bin.src)
+    for (const rel of refs) {
+      const wanted = join(dir, rel)
+      if (existsSync(wanted)) continue
+      const base = rel.split('/').pop()
+      const hit = findUniqueFile(extDir, base)
+      if (hit === null) continue
+      try {
+        mkdirSync(dirname(wanted), { recursive: true })
+        const relTarget = relative(dirname(wanted), hit)
+        symlinkSync(relTarget, wanted)
+        repaired += 1
+      } catch {
+        // 单条失败继续：修不上只是那条命令还不能跑，不该让整个安装失败
+      }
+    }
+  }
+  return repaired
+}
+
+/**
+ * 在目录树里按文件名找**唯一**命中（跳过 node_modules / .git）。
+ *
+ * @param {string} root
+ * @param {string} name
+ * @param {number} [maxDepth]
+ * @returns {string | null}
+ */
+function findUniqueFile(root, name, maxDepth = 6) {
+  /** @type {string | null} */
+  let found = null
+  let hits = 0
+
+  const walk = (dir, depth) => {
+    if (depth > maxDepth || hits > 1) return
+    let entries = []
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      // 深目录里翻 node_modules 既慢又可能撞上同名依赖，跳过
+      if (entry.isDirectory() && (entry.name === 'node_modules' || entry.name === '.git')) continue
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        walk(full, depth + 1)
+        continue
+      }
+      if (entry.name === name) {
+        hits += 1
+        if (hits === 1) found = full
+        if (hits > 1) return
+      }
+    }
+  }
+
+  walk(root, 0)
+  return hits === 1 ? found : null
 }
 
 /**

@@ -7,12 +7,12 @@
  * 服务器，把插件的 `apply(ctx)` 跑一遍，然后打真实请求验证四个端点。
  *
  * 刻意**不**引入 cordis —— 插件只用到 ctx 的三样东西：
- *   ctx.get('authorization')  → 信任判定（缺失时应退化为回环判定）
+ *   ctx.get('connection')     → 会话判定（isAuthenticated，缺失时应关掉接口）
  *   ctx.webServer.register()  → 路由注册
  *   ctx.logger.info()         → 日志
  * 这三样都在这里以最小实现替代，从而可以在没有 DSH 进程的情况下验证插件。
  *
- * 用法：node tools/smoke-plugin.mjs [--no-auth]
+ * 用法：node tools/smoke-plugin.mjs
  */
 
 import { createServer, request as httpRequest } from 'node:http'
@@ -45,8 +45,6 @@ const MARKER_PROBE_BYTES = 256
 const FAKE_ENGINE_ROOT = mkdtempSync(join(tmpdir(), 'kxxy-smoke-'))
 process.env.KXXY_ENGINE_ROOT = FAKE_ENGINE_ROOT
 delete process.env.KXXY_STATE_FILE
-
-const useAuth = !process.argv.includes('--no-auth')
 
 let failures = 0
 const ok = (m) => console.log(`  ✓ ${m}`)
@@ -93,21 +91,40 @@ const webServer = {
 
 const indexTaps = []
 
-// 信任判定：模拟官方 authorization 服务（存在时用它，缺失时插件应退化）
-const authorization = useAuth
-  ? {
-      isTrustedRequest(req) {
-        const host = String(req.headers?.host ?? '')
-        const okHost = host.startsWith('127.0.0.1:') || host.startsWith('localhost:')
-        const site = String(req.headers?.['sec-fetch-site'] ?? '')
-        return okHost && site !== 'cross-site'
-      },
-    }
-  : undefined
+/**
+ * 会话判定桩 —— 模拟官方的 `connection` 服务（`dsh-client-connection`）。
+ *
+ * 为什么不是 `authorization`：那个服务是「凭证获取流程」注册表，没有请求级
+ * 判定方法。曾经照着一个不存在的 `isTrustedRequest` 写，导致插件恒走
+ * 「Host 是回环就放行」的兜底（缺陷 DZ）。这里必须按**真实接口**建模，
+ * 否则测试会把错的形状钉成"对的"。
+ *
+ * 三种模式供断言切换：
+ *   · 'auth'    —— 请求可信（等价于浏览器带着绑定该 Host 的有效 cookie）
+ *   · 'anon'    —— 一律不可信（验 401）
+ *   · 'missing' —— 服务不存在（验 503）
+ *   · 'throw'   —— 判定器抛错（同样按"判不了"处理 → 503）
+ *
+ * 注意 `isAuthenticated` 的第二个参数（secure）与 Host 绑定语义：
+ * 真实实现把 Host 编进 cookie 的 authority，所以「Host 不对」在真实世界里
+ * 表现为「cookie 对不上」，这里照着建模，别让 [11] 那条断言变成假绿。
+ */
+let authMode = 'auth'
+const connection = {
+  isAuthenticated(req) {
+    if (authMode === 'throw') throw new Error('connection stub exploded')
+    if (authMode !== 'auth') return false
+    const host = String(req.headers?.host ?? '')
+    return host.startsWith('127.0.0.1:') || host.startsWith('localhost:')
+  },
+}
 
 const logs = []
 const ctx = {
-  get: (name) => (name === 'authorization' ? authorization : undefined),
+  get: (name) => {
+    if (name !== 'connection') return undefined
+    return authMode === 'missing' ? undefined : connection
+  },
   webServer,
   logger: { info: (m) => logs.push(m), warn: (m) => logs.push(`WARN ${m}`) },
   /**
@@ -857,7 +874,13 @@ console.log('\n[8d] 已迁移与未知动作：明确报错而非假成功')
 
 console.log('\n[9] POST /kxxy/api/action 非法 JSON')
 {
-  const res = await fetch(base + '/kxxy/api/action', { method: 'POST', body: '{oops' })
+  // 必须带 JSON 的 content-type：写操作现在先过 CSRF 语义（缺陷 EA），
+  // 不带这个头会先被 415 拦下，测不到 JSON 解析那一段。
+  const res = await fetch(base + '/kxxy/api/action', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{oops',
+  })
   if (res.status !== 400) fail(`状态码应为 400，实为 ${res.status}`)
   else ok('400 invalid json')
 }
@@ -869,18 +892,20 @@ console.log('\n[10] 未知端点 /kxxy/api/nope')
   else ok('404 unknown endpoint')
 }
 
-console.log('\n[11] 不可信来源（Host 非回环）应被拒')
-if (!useAuth) {
-  // --no-auth 用来在无引擎凭据的机器上跑通其余用例，它同时也把来源校验
-  // 关掉了。这时再断言 403 只会永远红着 —— 跳过而不是假装通过。
-  ok('跳过（--no-auth 已关闭来源校验）')
-} else {
+console.log('\n[11] authority 不匹配（Host 非回环）应被拒')
+{
+  /*
+   * 为什么不是 403 而是 401：真实实现把 Host 编进 cookie 的 authority，
+   * 「Host 不对」在协议层表现为「没有可用于该 authority 的 cookie」，
+   * 所以语义是"未认证"而不是"禁止"。这里照着真实语义断言，
+   * 别把它写成 403 —— 那会让实现为了迁就测试而扭曲。
+   */
   const r = await raw('/kxxy/api/state', { headers: { host: 'evil.example.com:3080' } })
-  if (r.status !== 403) fail(`状态码应为 403，实为 ${r.status}`)
-  else ok('403 forbidden')
+  if (r.status !== 401) fail(`状态码应为 401，实为 ${r.status}`)
+  else ok('401 unauthorized（evil Host 拿不到该 authority 的 cookie）')
   const r2 = await raw('/kxxy/api/state', { headers: { host: '192.168.1.9:3080' } })
-  if (r2.status !== 403) fail(`局域网 Host 也应被拒，实为 ${r2.status}`)
-  else ok('局域网 Host 亦被拒（403）')
+  if (r2.status !== 401) fail(`局域网 Host 也应被拒，实为 ${r2.status}`)
+  else ok('局域网 Host 亦被拒（401）')
 }
 
 console.log('\n[5b] 设备簿透传（缺陷 DV：已配对的电脑列表永远是空的）')
@@ -931,9 +956,7 @@ console.log('\n[5b] 设备簿透传（缺陷 DV：已配对的电脑列表永远
 }
 
 console.log('\n[12] 跨站来源（sec-fetch-site: cross-site）应被拒')
-if (!useAuth) {
-  ok('跳过（--no-auth 已关闭来源校验）')
-} else {
+{
   const r = await raw('/kxxy/api/state', {
     headers: { host: '127.0.0.1:3080', 'sec-fetch-site': 'cross-site' },
   })
@@ -1126,8 +1149,8 @@ console.log('\n[14] /kxxy/media（音视频流式路由）')
     r.on('error', reject)
     r.end()
   })
-  if (evilHost.status !== 403) fail(`非回环 Host 应 403，实为 ${evilHost.status}`)
-  else ok('非回环 Host → 403（与 /kxxy/api 同等严格）')
+  if (evilHost.status !== 401) fail(`非回环 Host 应 401（authority 对不上），实为 ${evilHost.status}`)
+  else ok('非回环 Host → 401（与 /kxxy/api 同一条判定）')
 }
 
 console.log('\n[14b] /kxxy/api/health（启动配置体检）')
@@ -1493,6 +1516,142 @@ console.log('\n[14b] /kxxy/api/health（启动配置体检）')
       else ok('无结果 → 200 {result:null}')
     }
   }
+}
+
+// ── 鉴权三态（缺陷 DZ）────────────────────────────────────────────
+//
+// 真机上曾经「不带 cookie 访问 /kxxy/api/* 也 200」，根因是判定器写错了对象
+// （把 authorization 当成请求鉴权服务，而它没有 isTrustedRequest），于是恒走
+// 「Host 是回环就放行」的兜底。这三段断言的形状必须与真实实现一致：
+// 判不了就是 503，判为不然就是 401 —— 两种都不放行。
+console.log('\n[13] 会话判定三态（缺陷 DZ）')
+{
+  const prev = authMode
+
+  authMode = 'anon'
+  {
+    const r = await get('/kxxy/api/state')
+    if (r.status !== 401) fail(`无会话时 API 应 401，实为 ${r.status}`)
+    else ok('无会话 → /kxxy/api/state 401')
+    const p = await get('/kxxy')
+    if (p.status !== 200) fail(`未认证时页面仍应 200（给说明页），实为 ${p.status}`)
+    else if (!p.text.includes('data-verdict="deny"')) fail('未认证页面不是「未授权」说明页')
+    else ok('未认证 → 页面 200 + 「未授权」说明页（不是白屏）')
+    const m = await get('/kxxy/media?path=/etc/hosts')
+    if (m.status !== 401) fail(`无会话时媒体路由应 401，实为 ${m.status}`)
+    else ok('无会话 → /kxxy/media 401')
+  }
+
+  authMode = 'missing'
+  {
+    const r = await get('/kxxy/api/state')
+    if (r.status !== 503) fail(`connection 缺失时 API 应 503，实为 ${r.status}`)
+    else ok('connection 缺失 → 503（判不了就不放行）')
+    const p = await get('/kxxy')
+    if (!p.text.includes('data-verdict="unavailable"')) fail('服务缺失时页面未给出「鉴权服务不可用」')
+    else ok('connection 缺失 → 页面说明「鉴权服务不可用」')
+  }
+
+  authMode = 'throw'
+  {
+    const r = await get('/kxxy/api/state')
+    if (r.status !== 503) fail(`判定器抛错时 API 应 503，实为 ${r.status}`)
+    else ok('判定器抛错 → 503（异常不得当成通过）')
+  }
+
+  authMode = prev
+  {
+    const r = await get('/kxxy/api/state')
+    if (r.status !== 200) fail(`恢复会话后 API 应 200，实为 ${r.status}`)
+    else ok('恢复会话 → 200（对照组）')
+  }
+}
+
+// ── 写操作的 CSRF 语义（缺陷 EA）──────────────────────────────────
+console.log('\n[13b] 写操作 CSRF 语义')
+{
+  const body = JSON.stringify({ action: 'make-coffee' })
+  const form = await raw('/kxxy/api/action', {
+    method: 'POST',
+    headers: { host: '127.0.0.1:3080', 'content-type': 'text/plain' },
+    body,
+  })
+  if (form.status !== 415) fail(`text/plain 写请求应 415，实为 ${form.status}`)
+  else ok('content-type: text/plain → 415（跨站表单打不进来）')
+
+  const crossOrigin = await raw('/kxxy/api/action', {
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:3080',
+      'content-type': 'application/json',
+      origin: 'http://evil.example',
+    },
+    body,
+  })
+  if (crossOrigin.status !== 403) fail(`跨源 Origin 应 403，实为 ${crossOrigin.status}`)
+  else ok('Origin 与 Host 不同源 → 403')
+
+  const sameOrigin = await raw('/kxxy/api/action', {
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:3080',
+      'content-type': 'application/json',
+      'sec-fetch-site': 'same-origin',
+      origin: 'http://127.0.0.1:3080',
+    },
+    body,
+  })
+  if (sameOrigin.status !== 501) fail(`同源未知动作应仍走到 501，实为 ${sameOrigin.status}`)
+  else ok('同源 JSON → 放行到业务层（501 未知动作，对照组）')
+}
+
+// ── 日志出口脱敏（缺陷 EB）────────────────────────────────────────
+//
+// engine.log 里必然有 `?token=…`（DSH 启动时打的），原来那个接口原样返回
+// 64KB。这里塞一份"什么脏东西都有"的假日志，逐条验它被盖掉。
+console.log('\n[13c] 日志出口脱敏（缺陷 EB）')
+{
+  const logPath = join(FAKE_ENGINE_ROOT, 'engine.log')
+  const rawLines = [
+    'dsh web: http://127.0.0.1:3080/?token=deadbeefcafe1234',
+    'Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz012345',
+    'cookie: dsh_session=abcdef0123456789abcdef',
+    '/data/user/0/app.kxxy/files/home/projects/demo',
+    'ordinary line without secrets',
+  ]
+  writeFileSync(logPath, rawLines.join('\n'), 'utf8')
+
+  const r = await get('/kxxy/api/log')
+  if (r.status !== 200) fail(`日志接口应 200，实为 ${r.status}`)
+  else {
+    let payload = null
+    try {
+      payload = JSON.parse(r.text)
+    } catch {
+      fail('日志接口返回的不是 JSON')
+    }
+    if (payload) {
+      const tail = String(payload.tail ?? '')
+      if (payload.redacted !== true) fail('响应未标记 redacted: true')
+      else ok('响应标记 redacted: true')
+      if (tail.includes('deadbeefcafe1234')) fail('token 原样泄露')
+      else ok('URL 里的 token 已盖掉')
+      if (!tail.includes('token=***')) fail('未出现 token=*** 占位')
+      else ok('保留 token=*** 占位（看得出这儿原来有值）')
+      if (tail.includes('sk-abcdefghijklmnopqrstuvwxyz012345')) fail('sk- key 原样泄露')
+      else ok('sk- 形状的 key 已盖掉')
+      if (tail.includes('abcdef0123456789abcdef')) fail('cookie 值原样泄露')
+      else ok('cookie 值已盖掉')
+      if (tail.includes('/data/user/0/app.kxxy/files/home')) fail('家目录绝对路径原样泄露')
+      else if (!tail.includes('~/projects/demo')) fail('家目录未替换成 ~')
+      else ok('家目录替换成 ~（保留相对结构）')
+      if (payload.lines !== 5) fail(`行数应保持 5，实为 ${payload.lines}`)
+      else ok('行数不变（脱敏不删行）')
+      if (!tail.includes('ordinary line without secrets')) fail('普通行被误伤')
+      else ok('普通行未被误伤')
+    }
+  }
+  rmSync(logPath, { force: true })
 }
 
 console.log('\n[15] disposer 卸载后路由消失')

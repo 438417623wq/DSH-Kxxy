@@ -123,6 +123,9 @@ class RuntimeInstaller(private val ctx: Context) {
             // 字体永远找不到。这里落一份自建配置并用 FONTCONFIG_FILE 指过去
             // （不能改 etc/fonts/fonts.conf —— 那是扩展池的软链，重装即覆盖）。
             ensureFontConfig(root)
+            // 缺陷 ED/EE/EF：IM 的 type 列表、git 身份、pip 镜像 —— 都是「装完就该好」
+            // 的默认值，每次启动校一次，扩展重装/首次开机都能自愈。
+            ensureDevEnvDefaults(root)
             // 缺陷 CW：TeX 的 `web2c/mktex*` 缺可执行位（extract 用
             // FileOutputStream 写出，忽略 zip 条目的 unix mode），于是
             // `mktextfm: 1: .../mktexnam: Permission denied`。
@@ -200,6 +203,7 @@ class RuntimeInstaller(private val ctx: Context) {
         ensureEmacsSiteLoad(root)
         ensureGuileCcacheFresh(root)
         ensureFontConfig(root)
+        ensureDevEnvDefaults(root)
         ensureTexExecBits(root)
         ensureTmpDir(ctx)
         writeStamp(root)
@@ -1570,6 +1574,22 @@ class RuntimeInstaller(private val ctx: Context) {
             append("<accept><family>Noto Sans SC</family></accept></alias>\n")
             append("  <alias binding=\"same\"><family>sans-serif</family>")
             append("<accept><family>NotoSansSC-Regular</family></accept></alias>\n")
+            // ── 默认族名（缺陷 ED）─────────────────────────────────────────────
+            //
+            // 上面那两条只覆盖 `sans-serif` **这个名字**。可真正会出事的两个
+            // 工具都不问它：ffmpeg 的 `drawtext` 默认族是 `Sans`（→ DejaVu，
+            // 缺字形时画出 `D0D00` 这种方块码），ImageMagick 走自己的 type
+            // 配置（见 ensureImageMagickTypes）。两者都**不报错**，一个出白图、
+            // 一个出乱码 —— 静默失败最难查。
+            //
+            // 这里用 `prefer` 而不是 `accept`：accept 只是"也接受"，prefer 才
+            // 改变首选。只登记**通用名**（Sans / Helvetica / Arial），不碰
+            // `DejaVu Sans` 这类真实存在的族名 —— 用户显式要 DejaVu 时就该给
+            // DejaVu，硬顶成 Noto 属于"修一个问题、造一个问题"。
+            for (generic in listOf("Sans", "sans", "Sans Serif", "Helvetica", "Arial")) {
+                append("  <alias binding=\"same\"><family>${xmlEscape(generic)}</family>")
+                append("<prefer><family>Noto Sans SC</family></prefer></alias>\n")
+            }
             append("</fontconfig>\n")
         }.toByteArray(Charsets.UTF_8)
 
@@ -1583,6 +1603,161 @@ class RuntimeInstaller(private val ctx: Context) {
             target.writeBytes(conf)
             Log.i(TAG, "ensureFontConfig: wrote ${target.path}")
         }.onFailure { Log.w(TAG, "ensureFontConfig failed: ${it.message}") }
+    }
+
+    /**
+     * 给 ImageMagick 的 type 列表补上 CJK 字体（缺陷 ED 的另一半）。
+     *
+     * ── 为什么 fontconfig 别名救不了 IM ──────────────────────────────────────
+     *
+     * ImageMagick 不查 fontconfig 的族别名，它读自己的 `type.xml`；
+     * 没给 `-font` 时解析到列表首项 —— 真机实测是 `AndroidClock`，那套字体
+     * 没有汉字字形，`magick -annotate '环境检测'` 于是输出**纯白图**
+     * （`mean=1`），全程不报错。
+     *
+     * ── 做法 ────────────────────────────────────────────────────────────────
+     *
+     * 往现成的 `etc/ImageMagick-{7,6}/type.xml` 里**插入**几条 type 条目，
+     * 而不是整份替换：原文件里的 `<include file="type-ghostscript.xml"/>` 与
+     * 几十条标准字体还要用，覆盖等于把别的字体的路一起堵死。
+     *
+     * 插入位置是 `<typemap>` 之后的第一行 —— IM 的列表顺序决定默认解析，
+     * 放首位才能让「不带 -font」的场景命中 CJK。
+     *
+     * 幂等靠注释标记 `kxxy:cjk-first`：扩展重装会把 type.xml 还原，本函数
+     * 每次启动都会再补一次（成本是读一个小 XML）。
+     */
+    private fun ensureImageMagickTypes(root: File) {
+        val font = File(EngineConfig.officeFontsDir(ctx), "NotoSansSC-Regular.ttf")
+        if (!font.isFile) return
+        val glyphs = xmlEscape(font.absolutePath)
+
+        val entries = buildString {
+            append("  <!-- kxxy:cjk-first — RuntimeInstaller 生成，扩展重装后会自动补回 -->\n")
+            // name 是 `-font` 认的名字，family 是 fontconfig 口径的族名。
+            // 通用名（Sans/Helvetica/Arial）也登记，因为脚本里最常见的就是它们。
+            val names = listOf(
+                "NotoSansSC" to "Noto Sans SC",
+                "Noto Sans SC" to "Noto Sans SC",
+                "Sans" to "Sans",
+                "Sans-Serif" to "Sans-Serif",
+                "Helvetica" to "Helvetica",
+                "Arial" to "Arial",
+            )
+            for ((name, family) in names) {
+                append("  <type name=\"${xmlEscape(name)}\" fullname=\"${xmlEscape(family)}\"")
+                append(" family=\"${xmlEscape(family)}\" style=\"Normal\" stretch=\"Normal\"")
+                append(" weight=\"400\" glyphs=\"$glyphs\" format=\"TrueType\"/>\n")
+            }
+        }
+
+        for (rel in listOf("etc/ImageMagick-7", "etc/ImageMagick-6")) {
+            val dir = File(root, rel)
+            if (!dir.isDirectory) continue
+            val target = File(dir, "type.xml")
+            val existing = runCatching { if (target.isFile) target.readText() else "" }.getOrDefault("")
+            if (existing.contains("kxxy:cjk-first")) continue
+
+            val body = if (existing.isNotEmpty()) {
+                val opener = Regex("<typemap[^>]*>").find(existing)
+                if (opener == null) existing else
+                    existing.substring(0, opener.range.last + 1) + "\n" + entries +
+                        existing.substring(opener.range.last + 1)
+            } else {
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<typemap>\n$entries</typemap>\n"
+            }
+
+            runCatching {
+                target.parentFile?.mkdirs()
+                target.writeText(body)
+                Log.i(TAG, "ensureImageMagickTypes: patched ${target.path}")
+            }.onFailure { Log.w(TAG, "ensureImageMagickTypes failed: ${it.message}") }
+        }
+    }
+
+    /**
+     * 预置 git 身份（缺陷 EE）。
+     *
+     * Termux 的 git 装完不带 `~/.gitconfig`，而 git 在缺 `user.name`/`user.email`
+     * 时**按设计拒绝提交**（不是 bug，是防止匿名历史）。真机第一次 `git commit`
+     * 就撞 `Author identity unknown`。
+     *
+     * 三条约束：
+     *   · 只在文件不存在时写 —— 用户改过就永远不碰；
+     *   · `safe.directory = *` 必须有：扩展目录与用户工程的属主/路径经常变，
+     *     缺了会一路 `dubious ownership`；
+     *   · 不生成 SSH 密钥。密钥是身份凭证，静默生成等于替用户做决定；
+     *     要用的地方（控制台）有显式按钮。
+     */
+    private fun ensureGitIdentity(ctx: Context) {
+        val home = EngineConfig.dshHome(ctx)
+        val target = File(home, ".gitconfig")
+        if (target.isFile && target.length() > 0L) return
+        runCatching {
+            target.parentFile?.mkdirs()
+            target.writeText(
+                """
+                # 由 Kxxy 生成。要改成自己的身份，直接编辑本文件即可（不会被覆盖）。
+                [user]
+                	name = Kxxy User
+                	email = kxxy@localhost
+                [init]
+                	defaultBranch = main
+                [safe]
+                	directory = *
+                [core]
+                	autocrlf = false
+                [color]
+                	ui = false
+                """.trimIndent() + "\n",
+            )
+            Log.i(TAG, "ensureGitIdentity: wrote ${target.path}")
+        }.onFailure { Log.w(TAG, "ensureGitIdentity failed: ${it.message}") }
+    }
+
+    /**
+     * 预置 pip 镜像（缺陷 EF）。
+     *
+     * 镜像此前只做了 npm 半边（`NPM_CONFIG_REGISTRY` 等，见 EngineConfig），
+     * pip 直连 `pypi.org/simple`，那个索引十几秒都下不完。
+     *
+     * 写在用户级配置里而不是环境变量里：环境变量对「shell 里手动 pip」有效，
+     * 但子进程被清空环境时（部分脚本 `env -i`）就丢了；pip.conf 是持久的。
+     * 环境变量另外在 EngineConfig 里也补一份，两层都到位。
+     *
+     * 同样只在文件不存在时写 —— 企业内网/代理环境下用户会自己换源，
+     * 硬写会把人卡死。
+     */
+    private fun ensurePipConfig(ctx: Context) {
+        val home = EngineConfig.dshHome(ctx)
+        val body = """
+            [global]
+            index-url = https://pypi.tuna.tsinghua.edu.cn/simple
+            trusted-host = pypi.tuna.tsinghua.edu.cn
+            timeout = 30
+        """.trimIndent() + "\n"
+        val targets = listOf(
+            File(home, ".config/pip/pip.conf"),
+            File(home, ".pip/pip.conf"),
+        )
+        for (target in targets) {
+            if (target.isFile && target.length() > 0L) continue
+            runCatching {
+                target.parentFile?.mkdirs()
+                target.writeText(body)
+                Log.i(TAG, "ensurePipConfig: wrote ${target.path}")
+            }.onFailure { Log.w(TAG, "ensurePipConfig failed: ${it.message}") }
+        }
+    }
+
+    /** 开发环境默认值（git 身份 / pip 镜像）——两处调用点共用这一层。 */
+    private fun ensureDevEnvDefaults(root: File) {
+        runCatching { ensureGitIdentity(ctx) }
+            .onFailure { Log.w(TAG, "ensureGitIdentity crashed: ${it.message}") }
+        runCatching { ensurePipConfig(ctx) }
+            .onFailure { Log.w(TAG, "ensurePipConfig crashed: ${it.message}") }
+        runCatching { ensureImageMagickTypes(root) }
+            .onFailure { Log.w(TAG, "ensureImageMagickTypes crashed: ${it.message}") }
     }
 
     /** 极简 XML 文本转义（路径里可能有 `&`，虽然 Android 上基本不会）。 */
@@ -2346,7 +2521,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 同理，**自有插件（kxxy-host）的前端资源有实质改动**也要 +1 —— 那些
          * 文件同样在 runtime.zip 里，标记不变就等于「新 APK 装了个旧设置页」。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@16"
+        private const val PATCHSET_MARKER = "kxxy-patchset@17"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**
