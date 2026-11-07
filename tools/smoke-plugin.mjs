@@ -936,6 +936,15 @@ console.log('\n[8d] 已迁移与未知动作：明确报错而非假成功')
   const r3 = await post({ action: 'make-coffee' })
   if (r3.status !== 501) fail(`未知动作应 501，实为 ${r3.status}`)
   else ok('未知动作 → 501 not implemented')
+
+  // heal-ext：启动时已经跑过一次，这里是「再试一次」的入口。断言两点 ——
+  // 200 且有 repaired 计数（前端靠它决定说"修了几条"还是"没发现要修的"）。
+  const r4 = await post({ action: 'heal-ext' })
+  let heal = null
+  try { heal = await r4.json() } catch { heal = null }
+  if (r4.status !== 200) fail(`heal-ext 应 200，实为 ${r4.status}`)
+  else if (typeof heal?.repaired !== 'number') fail(`heal-ext 应答缺 repaired：${JSON.stringify(heal)}`)
+  else ok(`heal-ext → 200（repaired=${heal.repaired}，scanned=${heal.scanned}）`)
 }
 
 console.log('\n[9] POST /kxxy/api/action 非法 JSON')
@@ -1015,6 +1024,13 @@ console.log('\n[5b] 设备簿透传（缺陷 DV：已配对的电脑列表永远
     if (j.engine?.pid === 4321) ok('状态文件其余字段照常摊平（engine.pid = 4321）')
     else fail(`engine.pid 应为 4321，实为 ${j.engine?.pid}`)
     if (j.remote?.trustTip === null) ok('trustTip 为 null 时原样给出（前端据此隐藏提示卡）')
+    // 扩展接入自愈的结果要跟着 /state 出来：控制台据此显示"上次修了几条"，
+    // 也是"扩展是用户态资产、代码修了碰不到它"这条的唯一可观测出口。
+    if (j.heal && typeof j.heal.scanned === 'number' && typeof j.heal.repaired === 'number') {
+      ok(`顶层 heal 快照透出（scanned=${j.heal.scanned}, repaired=${j.heal.repaired}）`)
+    } else {
+      fail(`顶层 heal 缺失或形状不对：${JSON.stringify(j.heal)}`)
+    }
   }
 
   delete process.env.KXXY_STATE_FILE

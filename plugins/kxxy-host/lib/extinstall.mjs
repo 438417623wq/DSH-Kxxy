@@ -46,7 +46,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { dirname, join, relative } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { extractTarGz } from './tar.mjs'
 
@@ -729,46 +729,206 @@ function materialise(dst, rel) {
  * @returns {number} 补出的链接数
  */
 function repairWrapperSiblings(bins, extDir) {
-  const MAX_REFS = 4
   let repaired = 0
-
   for (const bin of bins) {
-    let text = ''
+    if (repairWrapperRefs(bin.src, extDir) !== null) repaired += 1
+  }
+  return repaired
+}
+
+/**
+ * 单个 wrapper 的兄弟文件修复。
+ *
+ * @param {string} binPath wrapper 文件（真身，不是软链）
+ * @param {string} extDir 扩展根目录
+ * @returns {string | null} 补出的链接目标；无需修复或放弃时为 null
+ */
+function repairWrapperRefs(binPath, extDir) {
+  const MAX_REFS = 4
+  const MAX_BYTES = 64 * 1024
+  let firstFix = null
+
+  let text = ''
+  try {
+    // 先 stat 再读：`bin/` 里混着 go / node 这类几十 MB 的真实 ELF，
+    // 直接 readFileSync 等于每次启动把几十 MB 读进内存再丢掉。
+    const st = statSync(binPath)
+    if (st.size === 0 || st.size > MAX_BYTES) return null
+    const buf = readFileSync(binPath)
+    // 二进制（含 NUL）不可能是这种 wrapper
+    if (buf.length === 0 || buf.includes(0)) return null
+    text = buf.toString('utf8')
+  } catch {
+    return null
+  }
+  if (!text.startsWith('#!')) return null
+
+  const refs = new Set()
+  for (const m of text.matchAll(/\$\{?basedir\}?\/([A-Za-z0-9._/-]+)/g)) {
+    const rel = m[1].replace(/\/+$/, '')
+    if (rel && !rel.includes('..')) refs.add(rel)
+  }
+  if (refs.size === 0 || refs.size > MAX_REFS) return null
+
+  const dir = dirname(binPath)
+  for (const rel of refs) {
+    const wanted = join(dir, rel)
+    if (existsSync(wanted)) continue
+    const base = rel.split('/').pop()
+    const hit = findUniqueFile(extDir, base)
+    if (hit === null) continue
     try {
-      const buf = readFileSync(bin.src)
-      // 二进制（含 NUL）或过大的文件不可能是这种 wrapper
-      if (buf.length === 0 || buf.length > 64 * 1024 || buf.includes(0)) continue
-      text = buf.toString('utf8')
+      mkdirSync(dirname(wanted), { recursive: true })
+      const relTarget = relative(dirname(wanted), hit)
+      symlinkSync(relTarget, wanted)
+      if (firstFix === null) firstFix = wanted
     } catch {
-      continue
+      // 单条失败继续：修不上只是那条命令还不能跑，不该让整个安装失败
     }
-    if (!text.startsWith('#!')) continue
+  }
+  return firstFix
+}
 
-    const refs = new Set()
-    for (const m of text.matchAll(/\$\{?basedir\}?\/([A-Za-z0-9._/-]+)/g)) {
-      const rel = m[1].replace(/\/+$/, '')
-      if (rel && !rel.includes('..')) refs.add(rel)
-    }
-    if (refs.size === 0 || refs.size > MAX_REFS) continue
+/**
+ * 已装扩展的接入自愈（缺陷 EC 的另一半）。
+ *
+ * ── 为什么安装期修过还要再来一趟 ────────────────────────────────────────
+ *
+ * [repairWrapperSiblings] 只在 `buildViews` 里跑，也就是**扩展被安装的那一刻**。
+ * 而扩展是用户态资产：yarn 可能是一年前装的，`repairWrapperSiblings` 诞生于
+ * v0.9.18，那之后代码再也没碰过它 —— 真机症状就是升到新版、代码里有修复、
+ * `yarn --version` 却仍旧 `Cannot find module '…/extensions/yarn/bin/yarn.js'`。
+ *
+ * 所以修法不能只挂在安装路径上，必须能在**任意时刻**对**已存在的目录树**跑一遍。
+ *
+ * ── 这一步到底看什么 ────────────────────────────────────────────────────
+ *
+ * 遍历每个扩展的 `bin/`、`sbin/`（递归，跳过 node_modules / .git），对每个条目：
+ *
+ *   · **悬空软链** —— `bin/yarn → yarn.js`，而 `yarn.js` 不在这层。按链接目标
+ *     的文件名在扩展内找唯一命中，把链接直接改指真身（不是先补中间链：中间链
+ *     的路径形状未必是调用方期望的）。
+ *   · **文本 wrapper** —— 以 `#!` 开头、内部用 `$basedir/<相对路径>` 定位兄弟
+ *     文件而那个文件不在旁边的，见 [repairWrapperRefs]。
+ *
+ * 两条都不满足就原样放过。**宁可不修也不猜**：文件名在扩展内不唯一时直接放弃，
+ * 猜错只会得到一个更费解的报错。
+ *
+ * 幂等：修过之后再跑一遍 `repaired` 为 0，所以可以每次启动都跑。
+ *
+ * @param {string} root 引擎根
+ * @returns {{scanned: number, repaired: number, items: Array<{ext: string, entry: string, target: string}>}}
+ */
+export function healExtensions(root) {
+  const result = { scanned: 0, repaired: 0, items: [] }
+  if (!root) return result
 
-    const dir = dirname(bin.src)
-    for (const rel of refs) {
-      const wanted = join(dir, rel)
-      if (existsSync(wanted)) continue
-      const base = rel.split('/').pop()
-      const hit = findUniqueFile(extDir, base)
-      if (hit === null) continue
-      try {
-        mkdirSync(dirname(wanted), { recursive: true })
-        const relTarget = relative(dirname(wanted), hit)
-        symlinkSync(relTarget, wanted)
-        repaired += 1
-      } catch {
-        // 单条失败继续：修不上只是那条命令还不能跑，不该让整个安装失败
+  let dirs = []
+  try {
+    dirs = readdirSync(extensionsDir(root), { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.endsWith('.tmp-install'))
+      .map((e) => e.name)
+  } catch {
+    return result
+  }
+
+  for (const id of dirs) {
+    const extDir = join(extensionsDir(root), id)
+    for (const sub of ['bin', 'sbin']) {
+      const start = join(extDir, sub)
+      if (!existsSync(start)) continue
+      for (const entry of walkBinTree(start, 0)) {
+        result.scanned += 1
+        const target = healBinEntry(entry, extDir)
+        if (target === null) continue
+        result.repaired += 1
+        // 列表只留前 12 条：state 每次轮询都带出去，没有理由让它无限长
+        if (result.items.length < 12) result.items.push({ ext: id, entry: relative(extDir, entry), target })
       }
     }
   }
-  return repaired
+  return result
+}
+
+/**
+ * 递归列出 bin 树里的**条目本身**（含悬空软链 —— `existsSync` 对它们返 false，
+ * 所以这里必须用 `lstatSync` 走 `readdirSync(withFileTypes)`，不能先过滤存在性）。
+ *
+ * @param {string} dir
+ * @param {number} depth
+ * @returns {string[]}
+ */
+function walkBinTree(dir, depth) {
+  const out = []
+  if (depth > 4) return out
+  let entries = []
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    if (entry.name === 'node_modules' || entry.name === '.git') continue
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      out.push(...walkBinTree(full, depth + 1))
+      continue
+    }
+    out.push(full)
+  }
+  return out
+}
+
+/**
+ * 修一个 bin 条目。返回修好后的指向（供日志/state），无需修复返回 null。
+ *
+ * @param {string} entry
+ * @param {string} extDir
+ * @returns {string | null}
+ */
+function healBinEntry(entry, extDir) {
+  let st = null
+  try {
+    st = lstatSync(entry)
+  } catch {
+    return null
+  }
+
+  if (st.isSymbolicLink()) {
+    let raw = ''
+    try {
+      raw = readlinkSync(entry)
+    } catch {
+      return null
+    }
+    const wanted = resolve(dirname(entry), raw)
+    if (existsSync(wanted)) return null // 链接是好的
+    // 只修「指向扩展内部」的悬空链（典型是 `bin/yarn → yarn.js`）。
+    // 指向扩展**外面**的（`/data/data/com.termux/files/usr/bin/perl` 这类
+    // 回填残留）不在这里动：那是占位符回填与 relinkAll 的地盘，按文件名
+    // 在扩展里瞎猜一个同名文件反而会把坏的改成错的。
+    const inside = relative(extDir, wanted)
+    if (!inside || inside.startsWith('..') || isAbsolute(inside)) return null
+    const base = basename(wanted)
+    if (!base) return null
+    const hit = findUniqueFile(extDir, base)
+    // 命中的就是原本要指的那个路径（只是它自己不存在）时无解，交给 wrapper 分支
+    if (hit === null || resolve(hit) === wanted) return null
+    try {
+      unlinkSync(entry)
+      symlinkSync(relative(dirname(entry), hit), entry)
+      return hit
+    } catch {
+      // 摘了链却建不回去会让情况更糟：尽量还原
+      try {
+        symlinkSync(raw, entry)
+      } catch { /* 还原失败只能认了，下一次启动会再试 */ }
+      return null
+    }
+  }
+
+  if (!st.isFile()) return null
+  return repairWrapperRefs(entry, extDir)
 }
 
 /**

@@ -540,6 +540,8 @@ console.log('\n[E] 平台边界与网络诊断')
   const netSrc = norm(read('plugins/kxxy-host/lib/netdiag.mjs'))
   const healthSrc = norm(read('plugins/kxxy-host/lib/health.mjs'))
   const kotlinInstaller = norm(read('android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt'))
+  const extinstallSrc = norm(read('plugins/kxxy-host/lib/extinstall.mjs'))
+  const kotlinConfig = norm(read('android/app/src/main/java/app/kxxy/engine/EngineConfig.kt'))
 
   ok('空地址判定覆盖 0.0.0.0 与 127.x', netSrc.includes("'0.0.0.0'") && netSrc.includes("startsWith('127.')"))
   ok('有对照组主机（区分"只拦这一个"与"整体没网"）', netSrc.includes("id: 'github'") && netSrc.includes('controlOk'))
@@ -559,6 +561,21 @@ console.log('\n[E] 平台边界与网络诊断')
   ok('raw 镜像从 etc/net.json 读（默认不预置第三方地址）',
     kotlinInstaller.includes('etc/net.json') && kotlinInstaller.includes('insteadOf = https://raw.githubusercontent.com/'))
   ok('临时目录每次启动真写一次（失败会指名道姓）', kotlinInstaller.includes('.kxxy-writable'))
+
+  // 这一组钉住「装了扩展之后代码里的修复也能生效」：扩展是用户态资产，
+  // 只在安装路径上修等于对老设备完全无效（真机症状：0.9.20 上 yarn 仍旧
+  // Cannot find module …/bin/yarn.js）。
+  ok('扩展接入自愈是导出函数、可在任意时刻对已装目录跑',
+    /export function healExtensions/.test(extinstallSrc))
+  ok('启动路径真的调了自愈（不是只留了个函数）',
+    /extinstall\.healExtensions\(/.test(hostLib) && /runHeal\(root0\)/.test(hostLib))
+  ok('自愈覆盖悬空软链与 wrapper 两种形状',
+    /healBinEntry/.test(extinstallSrc) && /repairWrapperRefs/.test(extinstallSrc))
+
+  // NDK：装不进包里，但必须真的接线 —— 否则用户把 NDK 放进去也不会生效
+  ok('NDK 三处探测（引擎根两份 + home）并写进 GYP_DEFINES',
+    /android_ndk_path=/.test(kotlinConfig) && /File\(root, "ndk"\)/.test(kotlinConfig))
+  ok('PLATFORM 说明缺 NDK 时该放哪里', /<引擎根>\/ndk|引擎根>\/ndk/.test(healthSrc))
 }
 
 // 生成器

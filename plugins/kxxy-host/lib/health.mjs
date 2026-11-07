@@ -687,10 +687,19 @@ function checkNetwork() {
   const code = 'NET'
   const title = 'GitHub 直链'
   const snap = netSnapshot()
+  // 被黑洞时后台会实测几个镜像（见 netdiag.probeMirrors）。把**这台机器当前
+  // 网络下真的能通的那一个**写出来，比笼统说"换成镜像"有用得多 —— 用户照着
+  // 帖子随便挑一个镜像，很可能恰好也不通，然后以为诊断在瞎说。
+  const working = Array.isArray(snap.mirrors) ? snap.mirrors.find((m) => m.ok) : null
+  const moveText = working
+    ? `实测可用：${working.base}（写进 <引擎根>/etc/net.json 的 rawMirror，重启后 git 走它）`
+    : Array.isArray(snap.mirrors) && snap.mirrors.length
+      ? `实测的 ${snap.mirrors.length} 个镜像都不通，只能换网络或在电脑上取文件`
+      : '正在实测镜像可用性（结果在下一次刷新出现）'
   const hint =
     '这不是手机能改的：DNS 对单个域名返 0.0.0.0，系统 DNS 也换不了。' +
-    '绕过办法是把 raw.githubusercontent.com 换成镜像（jsDelivr / ghproxy），' +
-    '或在电脑上 clone 后把文件传进来。'
+    `绕过办法：${moveText}。` +
+    'git clone / api.github.com / codeload 都正常，受影响的只有 raw 直链。'
 
   if (snap.level === 'probing') {
     return check(code, title, Verdict.UNKNOWN, '正在后台探测（结果在下一次刷新出现）')
@@ -710,12 +719,19 @@ function checkNetwork() {
       code,
       title,
       Verdict.WARN,
-      `raw.githubusercontent.com 解析到空地址，而 github.com 正常${dns} —— 单域名被 DNS 拦截，不是本机配置。`,
+      `raw.githubusercontent.com 解析到空地址，而 github.com 正常${dns} —— 单域名被 DNS 拦截，不是本机配置。` +
+        (working ? `实测镜像 ${working.base} 可用。` : ''),
       hint,
     )
   }
   if (snap.level === 'blackhole') {
-    return check(code, title, Verdict.WARN, 'GitHub 相关域名全部解析到空地址（DNS 层黑洞）', hint)
+    return check(
+      code,
+      title,
+      Verdict.WARN,
+      'GitHub 相关域名全部解析到空地址（DNS 层黑洞）' + (working ? `；实测镜像 ${working.base} 可用` : ''),
+      hint,
+    )
   }
   return check(code, title, Verdict.UNKNOWN, `${snap.headline}（分不清是没网还是被拦，下次刷新再判）`)
 }
@@ -743,21 +759,42 @@ function checkPlatform(root) {
     tmpWritable = false
   }
   const tmpdir = process.env.TMPDIR || ''
-  notes.push(
-    tmpWritable
-      ? '/tmp 可写'
-      : `/tmp 不可写（Android 上属 shell:shell 771，app 不在 shell 组）；` +
-        `已用 TMPDIR=${tmpdir || '(未设置)'} 兜底，硬编码 /tmp 的脚本仍会失败`,
-  )
+  if (tmpWritable) {
+    notes.push('/tmp 可写')
+  } else {
+    // 把「凭什么不可写」摆出来：`/tmp` 在多数机型上是 `/data/local/tmp` 的软链，
+    // 属 shell:shell 0771 —— 属主和同组可写、others 没有写位，而 APP 是以
+    // u0_aXXX 跑的，既不是 shell 也不在 shell 组。只说「不可写」会让人去
+    // 重装 APK 或者怀疑是权限没给够，把 mode 与 uid 摆出来就不用猜了。
+    let why = '/tmp 不可写'
+    try {
+      const st = statSync('/tmp')
+      const mode = (st.mode & 0o7777).toString(8).padStart(4, '0')
+      const uid = typeof process.getuid === 'function' ? process.getuid() : null
+      why = `/tmp 不可写（mode ${mode}，属主 uid ${st.uid}` + (uid === null ? '）' : `，本进程 uid ${uid}）`)
+    } catch {
+      why = '/tmp 不存在'
+    }
+    notes.push(
+      `${why}；已用 TMPDIR=${tmpdir || '(未设置)'} 兜底，` +
+        '只有硬编码 /tmp、不读 TMPDIR 的程序会失败（那是应用沙箱边界，非 root 改不了）',
+    )
+  }
 
+  // NDK：`<root>/ndk`、`<root>/android-ndk`、`<home>/ndk` 三处任一有 toolchains/
+  // 就算装了 —— EngineConfig 会把它同时写进 ANDROID_NDK_* 与 GYP_DEFINES。
   const ndk =
     process.env.ANDROID_NDK_PATH ||
     process.env.ANDROID_NDK_ROOT ||
-    (root && existsSync(join(root, 'ndk')) ? join(root, 'ndk') : '')
+    [root && join(root, 'ndk'), root && join(root, 'android-ndk')].find(
+      (d) => d && existsSync(join(d, 'toolchains')),
+    ) ||
+    ''
   notes.push(
     ndk
-      ? `NDK 见 ${ndk}`
-      : '没有 NDK：需要 node-gyp 现场编译的原生模块装不上（有预编译产物的包不受影响）',
+      ? `NDK 见 ${ndk}（已接入 node-gyp 的 android_ndk_path）`
+      : '没有 NDK：node-gyp 在 android 目标下报 `Undefined variable android_ndk_path`，' +
+        '没发 arm64 预编译包的原生模块装不上；把 NDK 解压到 <引擎根>/ndk 后重启即自动接入（3~4 GB，不随安装包分发）',
   )
 
   return check(code, title, Verdict.OK, notes.join('；'))

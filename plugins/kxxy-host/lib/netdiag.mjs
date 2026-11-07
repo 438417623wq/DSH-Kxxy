@@ -50,6 +50,9 @@ export const TARGETS = [
 /** 缓存有效期：DNS 记录变化不快，但换网络（切 Wi-Fi/流量）会变，5 分钟够。 */
 const TTL_MS = 5 * 60 * 1000
 
+/** 镜像可用性的缓存：比 DNS 结论长得多，见 startProbe 里的说明。 */
+const MIRROR_TTL_MS = 30 * 60 * 1000
+
 /** 单次解析的超时。DNS 挂了的时候 getaddrinfo 能拖到十几秒。 */
 const LOOKUP_TIMEOUT_MS = 4_000
 
@@ -189,7 +192,33 @@ export function startProbe(root) {
     try {
       const results = await Promise.all(TARGETS.map(probeTarget))
       const summary = summarize(results, resolvServers(root))
-      b.result = { ...summary, at: Date.now(), targets: results }
+      const next = { ...summary, at: Date.now(), targets: results }
+      /*
+       * 只有在**确认被黑洞**时才去实测镜像。
+       *
+       * 理由：正常网络里没必要把用户请求引向第三方代理；而一旦确认 raw 被拦，
+       * 那几个候选能不能用就变成唯一有信息量的问题 —— 用户按提示手填一个
+       * 恰好也不通的镜像，等于白折腾一轮。
+       *
+       * 镜像结果单独一份缓存（30 分钟）：DNS 结论 5 分钟就过期，但"哪个镜像
+       * 能用"变化慢得多，每 5 分钟重试四个外部站点纯属浪费。
+       */
+      if (summary.level === 'selective' || summary.level === 'blackhole') {
+        const prev = b.result?.mirrors
+        const prevAt = Number(b.result?.mirrorsAt ?? 0)
+        if (Array.isArray(prev) && Date.now() - prevAt < MIRROR_TTL_MS) {
+          next.mirrors = prev
+          next.mirrorsAt = prevAt
+        } else {
+          try {
+            next.mirrors = await probeMirrors()
+            next.mirrorsAt = Date.now()
+          } catch {
+            // 探测镜像失败不影响 DNS 结论
+          }
+        }
+      }
+      b.result = next
       b.at = Date.now()
     } catch (e) {
       b.result = { level: 'unknown', headline: `探测失败：${e?.message ?? e}`, at: Date.now(), targets: [] }
@@ -219,4 +248,83 @@ export function refresh(root) {
   const b = box()
   b.at = 0
   return startProbe(root)
+}
+
+/**
+ * GitHub 直链的镜像候选（**只用于实测，不预置成默认值**）。
+ *
+ * 为什么不在代码里挑一个写死：这类代理服务存亡无常，写死一个等于埋一颗
+ * "几个月后突然不工作"的雷（`RuntimeInstaller.ensureNetConfig` 的注释里
+ * 也是同一个理由）。所以这里只在**已经确认 raw 被黑洞**时才去实测这几个
+ * 候选，挑当前网络真的能用的那个，然后由用户自己决定要不要写进配置。
+ *
+ * `base` 是「把完整 raw URL 接在后面」的形式；`prefix` 是「接在原 URL 前面」
+ * 的形式，两者只是拼接位置不同，落进 `etc/net.json` 的都是 `base`。
+ */
+export const MIRRORS = [
+  { id: 'ghproxy', base: 'https://ghproxy.net/https://raw.githubusercontent.com/' },
+  { id: 'gh-proxy', base: 'https://gh-proxy.com/https://raw.githubusercontent.com/' },
+  { id: 'ghfast', base: 'https://ghfast.top/https://raw.githubusercontent.com/' },
+  { id: 'gitmirror', base: 'https://raw.gitmirror.com/' },
+]
+
+/**
+ * 实测用的小文件：git 仓库里的一行文本，内容固定、体积小、不需要鉴权。
+ * 用 `git/git` 而不是我们自己的仓库 —— 前者在哪儿都通，不牵扯本项目。
+ */
+const MIRROR_PROBE_PATH = 'git/git/master/README.md'
+
+/**
+ * 逐个实测镜像候选，返回每个的可用性。
+ *
+ * 任何一条失败都不抛：这个函数的存在意义就是"在坏网络里挑出还能用的那个"，
+ * 它自己不能被坏网络带崩。
+ *
+ * @param {number} [timeoutMs] 单条超时
+ * @returns {Promise<Array<{id: string, base: string, ok: boolean, ms: number, status?: number, error?: string}>>}
+ */
+export async function probeMirrors(timeoutMs = 3000) {
+  const url = `https://raw.githubusercontent.com/${MIRROR_PROBE_PATH}`
+  const out = []
+  for (const m of MIRRORS) {
+    const started = Date.now()
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), timeoutMs)
+    try {
+      const res = await fetch(m.base + url, {
+        method: 'GET',
+        signal: ctl.signal,
+        // 只要头部：能拿到 2xx 就说明这条链路是通的，正文没必要下
+        headers: { range: 'bytes=0-64', 'user-agent': 'kxxy-netdiag' },
+      })
+      out.push({
+        id: m.id,
+        base: m.base,
+        ok: res.ok || res.status === 206,
+        status: res.status,
+        ms: Date.now() - started,
+      })
+    } catch (e) {
+      out.push({
+        id: m.id,
+        base: m.base,
+        ok: false,
+        ms: Date.now() - started,
+        error: e?.name === 'AbortError' ? 'timeout' : String(e?.message ?? e),
+      })
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  return out
+}
+
+/**
+ * 实测并挑出第一个可用的镜像。
+ *
+ * @returns {Promise<{ok: boolean, chosen: object | null, tried: Array<object>}>}
+ */
+export async function pickMirror(timeoutMs = 3000) {
+  const tried = await probeMirrors(timeoutMs)
+  return { ok: tried.some((t) => t.ok), chosen: tried.find((t) => t.ok) ?? null, tried }
 }

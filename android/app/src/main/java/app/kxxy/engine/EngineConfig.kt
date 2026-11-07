@@ -1135,6 +1135,38 @@ object EngineConfig {
             env += "GOFLAGS=-mod=mod"
         }
 
+        // NDK 的接线（问题清单：node-gyp 的 `android_ndk_path`）。
+        //
+        // Termux 的 node 是 `android/arm64` 构建，node-gyp 在这类目标下会去读
+        // `process.config.variables.android_ndk_path` 拿 sysroot 与交叉工具链。
+        // 这个值在 **node 编译期**就固化了，本运行时那份是 `(unset)` —— 于是任何
+        // 引用它的 `binding.gyp` 都在 configure 阶段就死：
+        //
+        //     gyp: Undefined variable android_ndk_path in binding.gyp
+        //     gyp ERR! configure error
+        //
+        // 一个 `.node` 都产不出来，凡是没发 android-arm64 预编译包的 npm 包
+        // （sqlite / pty / 图像处理）全都装不上。
+        //
+        // NDK 本体 3–4 GB，装不进安装包，所以这里只做接线，不假装有：
+        //   1. 用户把 NDK 解到 `<root>/ndk` 或 `<root>/android-ndk` 之后，把三家
+        //      约定的环境变量（ANDROID_NDK_HOME / ANDROID_NDK_ROOT / NDK_ROOT）
+        //      一并指过去；
+        //   2. 用 `GYP_DEFINES` 把 `android_ndk_path` 塞进 gyp 的变量表 —— gyp 的
+        //      `Load()` 会吸收这个环境变量，等于把 node 里缺的那条编译期常量补上，
+        //      `binding.gyp` 里的 `<(android_ndk_path)` 才有值。
+        // 没有 NDK 就一条都不设，体检里 PLATFORM 会说明缺的是什么、要放哪里。
+        val ndkDir = listOf(File(root, "ndk"), File(root, "android-ndk"), File(home, "ndk"))
+            .firstOrNull { File(it, "toolchains").isDirectory }
+        if (ndkDir != null) {
+            val ndkPath = ndkDir.absolutePath
+            env += "ANDROID_NDK_HOME=$ndkPath"
+            env += "ANDROID_NDK_ROOT=$ndkPath"
+            env += "ANDROID_NDK_PATH=$ndkPath"
+            env += "NDK_ROOT=$ndkPath"
+            env += "GYP_DEFINES=android_ndk_path=$ndkPath"
+        }
+
         // PHP 的 ini 与扩展目录（缺陷 BL）。
         //
         // Termux 的 php 编译期把 `--with-config-file-path` 钉在

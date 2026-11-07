@@ -1027,3 +1027,61 @@ Peer 才放行**；服务在但一个入口都不认得、返回形状不认识�
 配套的原生改动：**所有进控制台的入口统一走 `openConsole()`**。之前「返回键进
 控制台」是裸 `loadUrl("/kxxy")`，冷启动自动连接后本机没有会话 cookie，点进去
 必然是「未授权」说明页——用户只会觉得控制台又坏了。
+
+### 扩展接入自愈与四处「装了也好不了」（v0.9.21）
+
+上一版之后仍挂在真机上的四条，前三条是**机制问题**，第四条是**平台边界**。
+
+**① `yarn --version` 报 `Cannot find module …/extensions/yarn/bin/yarn.js`**
+
+修法 v0.9.18 就写了（wrapper 用 `readlink -f` 定位自身目录，再找同目录的
+`yarn.js`，而 Yarn 1.x 的包布局把主体放在 `share/yarn/bin/`）。真机上仍坏，
+原因不在修法：那段逻辑挂在 `buildViews()` 里，**只在扩展被安装的那一刻**跑。
+扩展是用户态资产，装完一年也不会再进安装流程——代码修好了，机器上的目录树没人动。
+
+现在多一条独立的自愈路径 `healExtensions()`，在**每次引擎启动**时对**已装的**
+扩展跑一遍，也可以在控制台「修复命令链接」里手动触发。它认两种坏形状：
+
+| 形状 | 例子 | 处理 |
+| --- | --- | --- |
+| 悬空软链 | `bin/yarn → yarn.js`，而 `yarn.js` 不在这层 | 按目标文件名在扩展内找**唯一**命中，把链接改指真身 |
+| 文本 wrapper 缺兄弟 | `exec node "$basedir/yarn.js"` | 在引用位置补一条相对软链 |
+
+保守边界照旧：只碰以 `#!` 开头、体积 ≤ 64 KB 的文本（`bin/` 里混着 go / node
+这种几十 MB 的 ELF，先 `stat` 再读）；引用数 > 4 不动；文件名在扩展内不唯一就
+放弃。**幂等**——修完再跑 `repaired` 为 0，所以挂在启动路径上不心疼。
+结果进 `/kxxy/api/state` 的顶层 `heal`。
+
+**② `node-gyp rebuild` → `gyp: Undefined variable android_ndk_path`**
+
+Termux 的 node 是 `android/arm64` 构建，node-gyp 在该目标下读
+`process.config.variables.android_ndk_path` 拿 sysroot 与交叉工具链；这个值在
+node 编译期就固化了，本地这份是 `(unset)`。NDK 本体 3–4 GB，装不进安装包。
+
+所以做的是**接线**而不是假装：`<root>/ndk`、`<root>/android-ndk`、`<home>/ndk`
+任一处有 `toolchains/` 时，`EngineConfig` 把 `ANDROID_NDK_HOME` /
+`ANDROID_NDK_ROOT` / `ANDROID_NDK_PATH` / `NDK_ROOT` 一并指过去，并用
+`GYP_DEFINES=android_ndk_path=…` 把那条编译期常量补进 gyp 的变量表（gyp 的
+`Load()` 会吸收这个环境变量）。没有 NDK 就一条都不设，体检里的
+`PLATFORM` 会说明缺的是什么、该放到哪儿。
+
+**③ `/tmp` 不可写**
+
+应用沙箱边界，非 root 改不了：`/tmp` 在多数机型上是 `/data/local/tmp` 的软链，
+属 `shell:shell` `0771`——属主与同组可写、others 没有写位，而 APP 以 `u0_aXXX`
+运行。`TMPDIR` / `TMP` / `TEMP` / `GOTMPDIR` / `XDG_RUNTIME_DIR` 都已指到
+`filesDir/tmp`（启动时真写一次探测），受影响的只有**硬编码 `/tmp` 且不读
+`TMPDIR`** 的程序。体检现在把 mode 与两个 uid 一起打出来，省得去重装 APK。
+
+**④ `raw.githubusercontent.com` → `0.0.0.0`**
+
+DNS 解析层的单域名黑洞，改不了（bin/ 里那些二进制都走 Android netd，不看
+`resolv.conf`）。能做的只有绕：以前提示"换成镜像"，但用户照着帖子挑一个，很可能
+恰好也不通。
+
+现在**当场实测**：确认被黑洞后，后台依次请求 `ghproxy` / `gh-proxy` / `ghfast` /
+`raw.gitmirror` 四个候选（只要头部、单条 3 秒超时、只测一个公开文件），把当前网络
+真能通的那个写进体检结论；控制台「实测直链镜像」按钮会把它写进
+`<root>/etc/net.json` 的 `rawMirror`，重启后由原生层落成
+`url.<mirror>.insteadOf`。**仍然不预置任何第三方地址**——这类代理存亡无常，
+写死一个等于埋一颗"几个月后突然不工作"的雷。

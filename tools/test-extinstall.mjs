@@ -30,6 +30,7 @@ import { join, dirname } from 'node:path';
 import {
 	applyPlaceholders,
 	buildViews,
+	healExtensions,
 	placeholderMap,
 	poolSignature,
 	relinkAll,
@@ -613,6 +614,64 @@ try {
 		);
 		buildViews(root, 'noluck', ext2);
 		check('扩内找不到同名文件时不建空链接', !existsSync(join(ext2, 'bin', 'ghost.js')));
+	}
+
+	// -----------------------------------------------------------------------
+	console.log('[EH] 已装扩展的接入自愈（healExtensions，缺陷 EC 的另一半）');
+	// -----------------------------------------------------------------------
+	//
+	// 真机现场：代码里 v0.9.18 就有 wrapper 修复，升到 0.9.20 之后
+	// `yarn --version` 仍是 Cannot find module '…/extensions/yarn/bin/yarn.js'。
+	// 原因不是修复写错了，而是它只挂在**安装那一刻**——那个扩是一年前装的，
+	// 之后再没被安装流程碰过。所以自愈必须能对已存在的目录树跑，且幂等。
+	//
+	// 这里不调 buildViews（模拟"老设备上已经装好的扩展"），直接摆出两种坏形状：
+	//   · 悬空软链：bin/yalc → yalc.js，而 yalc.js 在 share/ 下
+	//   · 文本 wrapper：bin/ylnk 用 $basedir/ylnk.js 找兄弟文件
+	{
+		const root = join(workdir, 'r-eh');
+		const ext = join(root, 'extensions', 'yalc');
+		mkdirSync(join(ext, 'bin'), { recursive: true });
+		mkdirSync(join(ext, 'share', 'yalc', 'bin'), { recursive: true });
+		writeFileSync(join(ext, 'share', 'yalc', 'bin', 'yalc.js'), 'console.log("ok")\n');
+		// 悬空软链（老安装器把 bin/yalc 指到了同目录的 yalc.js）
+		symlinkSync('yalc.js', join(ext, 'bin', 'yalc'));
+		// 文本 wrapper，兄弟文件缺失
+		writeFileSync(
+			join(ext, 'bin', 'ylnk'),
+			'#!/bin/sh\nbasedir=$(dirname "$(readlink -f "$0")")\nexec node "$basedir/ylnk.js" "$@"\n',
+			{ mode: 0o755 },
+		);
+		writeFileSync(join(ext, 'share', 'yalc', 'bin', 'ylnk.js'), 'console.log("ok")\n');
+
+		const first = healExtensions(root);
+		check('扫到了 bin 里的条目', first.scanned >= 2, `scanned=${first.scanned}`);
+		equal('两条坏链都被记进 repaired', first.repaired, 2);
+
+		const yalc = join(ext, 'bin', 'yalc');
+		let resolves = false;
+		try { resolves = existsSync(join(dirname(yalc), readlinkSync(yalc))); } catch { resolves = false; }
+		check('悬空软链已改指真身', resolves && existsSync(join(ext, 'bin', 'yalc')));
+		check('wrapper 的兄弟文件已补出', existsSync(join(ext, 'bin', 'ylnk.js')));
+
+		const second = healExtensions(root);
+		equal('再跑一遍没有可修的东西（幂等）', second.repaired, 0);
+		check('幂等时 scanned 仍照常统计', second.scanned >= 2, `scanned=${second.scanned}`);
+
+		// 空根 / 不存在根不能抛
+		equal('root 为空串时返回零', healExtensions('').scanned, 0);
+		equal('extensions 不存在时返回零', healExtensions(join(workdir, 'r-eh-none')).repaired, 0);
+
+		// 反向保护：指向**扩展外面**的悬空链不碰。
+		// 那是占位符回填 / relinkAll 的地盘（`/data/data/com.termux/...` 这类
+		// 回填残留），按文件名在扩展里瞎猜一个同名文件只会把坏的改成错的。
+		const outLink = join(ext, 'bin', 'youtside');
+		symlinkSync('/data/data/com.termux/files/usr/bin/yalc.js', outLink);
+		// Windows 会把绝对目标规范化成带盘符的形式，所以比较"改没改"而不是字面值
+		const before = readlinkSync(outLink);
+		const third = healExtensions(root);
+		equal('指向扩展外的悬空链不计入修复', third.repaired, 0);
+		check('也不改动它（原样留着交给占位符回填）', readlinkSync(outLink) === before, `now=${readlinkSync(outLink)}`);
 	}
 } finally {
 	rmSync(workdir, { recursive: true, force: true });

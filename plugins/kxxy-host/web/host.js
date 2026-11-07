@@ -213,6 +213,8 @@
     btnAboutDismiss: document.getElementById('btn-about-dismiss'),
     btnRestartEngine: document.getElementById('btn-restart-engine'),
     btnExportLogs: document.getElementById('btn-export-logs'),
+    btnHealExt: document.getElementById('btn-heal-ext'),
+    btnRawMirror: document.getElementById('btn-raw-mirror'),
 
     // 插件视图（对话页白屏时的停用入口）
     pluginList: document.getElementById('plugin-list'),
@@ -2472,6 +2474,63 @@
           }
         } finally {
           dom.btnExportLogs.disabled = false;
+        }
+      });
+    }
+
+    // 修复命令链接（扩展接入自愈：悬空软链 / wrapper 缺兄弟文件）
+    //
+    // 真机症状是 `yarn --version` 报 Cannot find module '…/bin/yarn.js'：
+    // 命令在 PATH 上，wrapper 却找不到同目录的兄弟文件。启动时已经自动跑过一次，
+    // 这个按钮是「我刚装的扩展还是坏的，再试一次」，并如实报修了几条 ——
+    // 没修到就直接说没修到，不给假成功的 toast。
+    if (dom.btnHealExt) {
+      dom.btnHealExt.addEventListener('click', async () => {
+        dom.btnHealExt.disabled = true;
+        showToast('正在检查命令链接...', 'info');
+        try {
+          const res = await apiPost('/kxxy/api/action', { action: 'heal-ext' });
+          if (res && res.repaired > 0) {
+            const names = (res.items || []).map((i) => `${i.ext}/${i.entry}`).join('、');
+            showToast(`修复 ${res.repaired} 条：${names}`, 'success');
+          } else {
+            showToast('没有发现需要修复的命令链接', 'info');
+          }
+        } finally {
+          dom.btnHealExt.disabled = false;
+        }
+      });
+    }
+
+    // 实测直链镜像（raw.githubusercontent.com 被 DNS 黑洞时的一键绕行）
+    //
+    // 为什么不给「填个镜像地址」的输入框：这类代理存亡无常，用户照着帖子挑一个
+    // 很可能恰好也不通，然后以为诊断在瞎说。这里当场把几个候选都打一遍，只把
+    // **真能通的那个**写进配置；一个都不通就明说，让人去换网络。
+    if (dom.btnRawMirror) {
+      dom.btnRawMirror.addEventListener('click', async () => {
+        const ok = await confirmDialog({
+          title: '实测并启用直链镜像',
+          desc:
+            '会依次请求几个公共 GitHub 代理（每个最多 3 秒），挑当前网络能通的那个写进配置。' +
+            '只测一个公开文件，不发送任何本机信息。启用后需要重启引擎才生效。',
+          okText: '开始实测',
+        });
+        if (!ok) {
+          return;
+        }
+        dom.btnRawMirror.disabled = true;
+        showToast('正在实测镜像（最多约 15 秒）...', 'info');
+        try {
+          const res = await apiPost('/kxxy/api/action', { action: 'apply-raw-mirror' });
+          if (res && res.ok) {
+            showToast(res.note || '镜像已写入，重启引擎后生效', 'success');
+          }
+        } catch {
+          // apiPost 已经把 HTTP 状态弹过一次；这里补上"那现在能干什么"
+          showToast('实测的镜像都不通：换网络，或在电脑上 clone 后把文件传进来', 'warning');
+        } finally {
+          dom.btnRawMirror.disabled = false;
         }
       });
     }

@@ -2659,7 +2659,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 同理，**自有插件（kxxy-host）的前端资源有实质改动**也要 +1 —— 那些
          * 文件同样在 runtime.zip 里，标记不变就等于「新 APK 装了个旧设置页」。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@18"
+        private const val PATCHSET_MARKER = "kxxy-patchset@19"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**

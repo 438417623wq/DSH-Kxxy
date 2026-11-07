@@ -32,6 +32,8 @@
  *      export-logs    → 真打包 tar.gz，A+B 双写落盘（§7-3）
  *      set-priv-mode / set-toggle → 写 kxxy-prefs.json
  *      term-key       → 写 stdin.request，原生层写进引擎 PTY
+ *      heal-ext       → 重跑扩展接入自愈（悬空链 / wrapper 缺兄弟文件）
+ *      apply-raw-mirror → 实测镜像并写进 etc/net.json（重启后 git 生效）
  *      install-ext / switch-mirror → 已迁往专用端点，此处明确 400
  *      未知动作       → 501，让前端抛错回滚按钮而不是假成功
  *
@@ -783,8 +785,8 @@ function exportLogs(root) {
   }
 }
 
-/** 分派表。返回 {status, body}。 */
-function dispatchAction(payload) {
+/** 分派表。返回 {status, body}（个别动作要实测网络，是异步的）。 */
+async function dispatchAction(payload) {
   const root = extinstall.engineRoot()
   const action = payload?.action
 
@@ -842,6 +844,70 @@ function dispatchAction(payload) {
       return { status: 200, body: { ok: true } }
     }
 
+    // ── 换用 GitHub 直链镜像（缺陷 EH 的绕行：实测挑一个，不预置品牌）────
+    case 'apply-raw-mirror': {
+      if (!root) return { status: 503, body: { error: 'engine root unknown' } }
+      const picked = await netdiag.pickMirror()
+      if (!picked.chosen) {
+        return {
+          status: 409,
+          body: {
+            error: 'no working mirror',
+            tried: picked.tried,
+            note:
+              '实测的镜像当前都不通（raw 被 DNS 拦截时这些代理也常被同一层拦）。' +
+              '换网络，或在电脑上 clone 后把文件传进来。',
+          },
+        }
+      }
+      const cfgFile = join(root, 'etc/net.json')
+      let cfg = {}
+      try {
+        if (existsSync(cfgFile)) cfg = JSON.parse(readFileSync(cfgFile, 'utf8')) || {}
+      } catch {
+        // 用户手改坏了就按空配置写回去，别让一个坏 JSON 卡死这个按钮
+        cfg = {}
+      }
+      cfg.rawMirror = picked.chosen.base
+      try {
+        mkdirSync(dirname(cfgFile), { recursive: true })
+        writeFileSync(cfgFile, JSON.stringify(cfg, null, 2) + '\n')
+      } catch (e) {
+        return { status: 500, body: { error: `写 etc/net.json 失败：${e?.message ?? e}` } }
+      }
+      // 为什么是「重启后生效」而不是立刻生效：insteadOf 是原生层在启动时
+      // 写进 ~/.gitconfig 的（RuntimeInstaller.ensureNetConfig），插件这一侧
+      // 不去抢着改用户那份可能手改过的文件。如实告知，不给假成功。
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          requiresRestart: true,
+          mirror: picked.chosen.base,
+          tried: picked.tried,
+          note: `已把 ${picked.chosen.id} 写进 etc/net.json，重启引擎后 git 的 raw 直链自动走它`,
+        },
+      }
+    }
+
+    // ── 扩展接入自愈：手动重跑一次（启动时已经跑过，这里是「再试一次」）──
+    case 'heal-ext': {
+      if (!root) return { status: 503, body: { error: 'engine root unknown' } }
+      const healed = runHeal(root)
+      if (healed.error) return { status: 500, body: { error: healed.error } }
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          ...healed,
+          note:
+            healed.repaired > 0
+              ? `修复 ${healed.repaired} 条命令链接，重新打开终端即可生效（已开着的 shell 要重开）`
+              : '没有需要修复的命令链接',
+        },
+      }
+    }
+
     // ── 已迁往专用端点的旧动作：明确报错并指引，绝不假成功 ──────────
     case 'install-ext':
       return {
@@ -862,6 +928,36 @@ function dispatchAction(payload) {
 // ---------------------------------------------------------------------------
 // 插件主体
 // ---------------------------------------------------------------------------
+
+/** 最近一次扩展接入自愈的结果（写进 /state 供控制台展示）。 */
+let lastHeal = null
+
+/**
+ * 跑一次扩展接入自愈，并把结果记进 [lastHeal]。
+ *
+ * 与 `relinkAll` 的区别：那个按 `.links.json` 重建**引擎侧**的接入点，只在
+ * runtime 升级后跑；这个修的是**扩展自己目录里**的悬空链接与缺兄弟文件，
+ * 任何时候都能跑，而且幂等（修好后再跑 repaired 为 0）。
+ *
+ * @param {string} root
+ * @returns {{scanned: number, repaired: number, items: Array<object>}}
+ */
+function runHeal(root) {
+  let result = { scanned: 0, repaired: 0, items: [] }
+  try {
+    result = extinstall.healExtensions(root)
+  } catch (e) {
+    lastHeal = { at: Date.now(), scanned: 0, repaired: 0, items: [], error: String(e?.message ?? e) }
+    return lastHeal
+  }
+  // 只在有修复时更新 at，否则每次启动都会把「上次修复时间」刷成现在
+  if (result.repaired > 0 || !lastHeal) {
+    lastHeal = { at: Date.now(), ...result }
+  } else {
+    lastHeal = { ...lastHeal, scanned: result.scanned }
+  }
+  return lastHeal
+}
 
 /**
  * 插件主体。
@@ -886,6 +982,24 @@ export function apply(ctx) {
     const rebuilt = extinstall.relinkAll(root0)
     if (rebuilt > 0) {
       ctx.logger?.info?.(`[kxxy-host] relinkAll: ${rebuilt} extension(s) relinked after runtime upgrade`)
+    }
+
+    // ── 扩展接入自愈：修「命令在、跑起来说模块没了」这一类 ──────────────
+    //
+    // 必须在**每次启动**跑，不能只挂在安装路径上：扩展是用户态资产，装进去
+    // 之后代码再改也碰不到它。真机症状是升到 0.9.20（代码里早有修复）、
+    // `yarn --version` 仍旧 `Cannot find module '…/extensions/yarn/bin/yarn.js'`
+    // —— 那个扩展是 0.9.18 之前装的，安装期的修复对它从未生效过。
+    //
+    // 代价：每个扩展的 bin/ 走一遍 stat（TeX Live 1600 多个条目），几十毫秒，
+    // 且幂等。修完的结果进 /state，控制台能看到到底修了哪几条。
+    const healed = runHeal(root0)
+    if (healed.repaired > 0) {
+      ctx.logger?.info?.(
+        `[kxxy-host] 扩展接入自愈：修复 ${healed.repaired} 条（${healed.items
+          .map((i) => `${i.ext}/${i.entry}`)
+          .join(', ')}）`,
+      )
     }
 
     // ── 布局迁移：把旧代码装的扩展重新装配一遍 ────────────────────────
@@ -1154,6 +1268,8 @@ export function apply(ctx) {
               // DNS 黑洞诊断（缺陷 EH）：同步取缓存，后台由 startProbe 刷新。
               // 放开在顶层而不是 engine 里 —— 它跟引擎毫无关系，是网络环境的读数。
               net: netdiag.netSnapshot(),
+              // 扩展接入自愈的最近一次结果（启动时跑，也可由 heal-ext 动作重跑）
+              heal: lastHeal,
             })
             return
           }
@@ -1624,7 +1740,7 @@ export function apply(ctx) {
               sendJson(res, 400, { error: 'invalid json' })
               return
             }
-            const result = dispatchAction(payload)
+            const result = await dispatchAction(payload)
             ctx.logger?.info?.(
               `[kxxy-host] action=${payload.action ?? '?'} -> ${result.status}`,
             )
