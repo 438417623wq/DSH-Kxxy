@@ -378,9 +378,9 @@ function lookupHost(host) {
 /**
  * 目录是否在 PATH 上（按平台的分隔符，容忍 `\` 与结尾 `/`）。
  *
- * 拿到构建机上跑时 `join()` 产出的是 `C:\…`，而 PATH 里写的是 `C:\…`，
- * 直接字符串比较会因为大小写/结尾斜杠而假阴性 —— 真机上不会，但一条
- * 只在真机上成立的判定等于没测过。
+ * 拿到构建机上跑时 `join()` 产出的是反斜杠路径，而 PATH 可能写正斜杠、
+ * 可能多一个结尾斜杠，分隔符也从 `:` 变成 `;` —— 直接字符串比较会假阴性。
+ * 真机上真阴性的概率很低，但一条「只在真机上成立」的判定等于没测过。
  *
  * @param {string} pathEnv
  * @param {string} dir
@@ -398,7 +398,8 @@ export function pathHasDir(pathEnv, dir, platform = process.platform) {
 }
 
 /** 探一次可写：写完就删，不留垃圾。 */
-function probeWritable(file) {  try {
+function probeWritable(file) {
+  try {
     writeFileSync(file, 'kxxy-probe\n')
     try {
       unlinkSync(file)
