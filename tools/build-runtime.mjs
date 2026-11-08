@@ -720,7 +720,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 新页面配旧插件 = 多带一个被忽略的头（无害），旧页面配新插件 = 所有写操作 403。
  * 正因为这种组合会"静默变砖"，补丁集必须涨 —— 它是唯一能保证两边一起换的锚点。
  */
-const PATCHSET_MARKER = "kxxy-patchset@21";
+const PATCHSET_MARKER = "kxxy-patchset@22";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

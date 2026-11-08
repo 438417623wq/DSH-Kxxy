@@ -326,12 +326,14 @@ export const POOL_ITEMS = [
   // ── L 组：编辑器与 shell（缺陷 CN，问题清单 P18 里体积大的那几个）───────
   //
   // 报告点的 man/libtool/zsh/vim 已进预装（G10），这里只放「功能和已有东西
-  // 重叠 / 单个体积不小」的三个：neovim 16 个依赖含全套 tree-sitter 语法、
+  // 重叠 / 单个体积不小」的三个：neovim 16 个依赖、runtime 里带全套 vim 语法
+  // （`share/nvim/runtime/syntax/*.vim`；注意 **不含** treesitter 的 parser
+  // `.so` —— 那是上游 neovim 包就没带的，打开 .md 会提示 E5113，不影响读写）、
   // fish 自带 6.8 MiB 的 function 库、gh 是老版本 git 之外的 GitHub 客户端。
   {
     id: "shells", seeds: ["fish", "neovim", "gh"], category: "devtools",
     name: "fish / Neovim / GitHub CLI",
-    description: "交互式 shell（fish）、现代编辑器（nvim + tree-sitter 语法）、GitHub 命令行客户端。",
+    description: "交互式 shell（fish）、现代编辑器（nvim，语法高亮齐全）、GitHub 命令行客户端。",
     bins: ["fish", "nvim", "gh"],
   },
 ];

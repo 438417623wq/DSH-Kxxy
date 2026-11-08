@@ -625,13 +625,14 @@ console.log('\n[E] 平台边界与网络诊断')
 // 哪一步动的。所以既要有入口，也要能证明它不写文件。
 {
   const selfSrc = norm(read('plugins/kxxy-host/lib/selftest.mjs'))
-  ok('自检模块存在且六项判定可单测',
+  ok('自检模块存在且七项判定可单测',
     /export function judgeAuth/.test(selfSrc) &&
       /export function judgeYarn/.test(selfSrc) &&
       /export function judgeNdk/.test(selfSrc) &&
       /export function judgeTmp/.test(selfSrc) &&
       /export function judgeHelpers/.test(selfSrc) &&
-      /export function judgeRaw/.test(selfSrc))
+      /export function judgeRaw/.test(selfSrc) &&
+      /export function judgeNvim/.test(selfSrc))
   // 「只读」的准确含义：除了临时目录里那个写完就删的探针，不碰任何东西
   ok('自检只读：除临时探针外不写盘、不建目录、不改权限',
     !/mkdirSync/.test(selfSrc) &&
@@ -640,6 +641,30 @@ console.log('\n[E] 平台边界与网络诊断')
   ok('动作入口挂在分派表上', /case 'selftest'/.test(hostLib))
   ok('控制台有一键验收按钮', /btn-selftest/.test(norm(read('plugins/kxxy-host/web/index.html'))))
   ok('/state 顶层带最近一次验收结果', /selftest: lastSelftest/.test(hostLib))
+}
+
+// ── 扩展的 libexec 视图与 nvim 的两层（缺陷 EI）──────────────────────
+//
+// 真机现场：`nvim --version` → `…/engine/bin/nvim: 13: exec:
+// …/engine/libexec/nvim/nvim: not found`，而载荷本身是好的。三层根因里
+// 前两层是代码能修的，这里把它们钉住 —— 尤其「已装扩展也要能就地补」，
+// 那是上一轮 healExtensions 的同一条教训（修法挂在安装路径上 = 只对新装生效）。
+{
+  const extSrc = norm(read('plugins/kxxy-host/lib/extinstall.mjs'))
+  ok('buildViews 把 libexec 也摊进引擎根',
+    /for \(const sub of \['etc', 'share', 'opt', 'sbin', 'var', 'libexec'\]\)/.test(extSrc))
+  ok('有给已装扩展就地补链接的入口', /export function ensureLibexecView/.test(extSrc))
+  ok('启动路径会调它（不是只挂在安装那一刻）', /ensureLibexecView\(root0\)|ensureLibexecView\(root\)/.test(hostLib))
+  ok('补出来的条目写回清单（卸载能回收、relink 能重建）', /links\.views = views/.test(extSrc))
+
+  const kotlin = norm(read('android/app/src/main/java/app/kxxy/engine/EngineConfig.kt'))
+  ok('buildEnv 设 VIMRUNTIME（E484 的那一层）',
+    /VIMRUNTIME=\$\{nvimRuntime\.absolutePath\}/.test(kotlin) &&
+      /share\/nvim\/runtime/.test(kotlin))
+  ok('~/.bashrc 升到 kxxy-shell@5 并兜一层 VIMRUNTIME',
+    /# kxxy-shell@5/.test(kotlin) &&
+      /VIMRUNTIME:-/.test(kotlin) &&
+      /export VIMRUNTIME=/.test(kotlin))
 }
 
 // 生成器

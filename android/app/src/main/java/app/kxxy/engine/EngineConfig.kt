@@ -1202,6 +1202,26 @@ object EngineConfig {
         // 且 `php.ini` 完全不生效。`PHPRC` 指向引擎根下合并视图的 `etc/php`。
         val phpEtc = File(root, "etc/php")
         if (phpEtc.isDirectory) env += "PHPRC=${phpEtc.absolutePath}"
+
+        // Neovim 的运行时目录（缺陷 EI 的第二层）。
+        //
+        // `bin/nvim` 是个 sh wrapper，补上 `libexec/nvim` 之后 nvim 能启动，但
+        // 它会去读**编译期**的 prefix：
+        //   E484: Can't open file
+        //   /data/data/com.termux/files/usr/share/nvim/syntax/syntax.vim
+        // Termux 那边 `$PREFIX/share/nvim/runtime` 就是运行时目录，而我们的
+        // 引擎根是 `<filesDir>/engine` —— 两者毫无关系，那个路径在设备上不存在。
+        //
+        // extinstall 的 mergeViews 会把 shells 扩展的 `share/` 摊到 `<root>/share`，
+        // 所以正常位置就是 `<root>/share/nvim/runtime`。`$VIMRUNTIME` 是 nvim
+        // 认的官方覆盖点（`:h $VIMRUNTIME`），比改二进制里的字符串干净得多。
+        //
+        // 只在目录**确实存在**时才设：没装 shells 扩展的设备上这个路径不存在，
+        // 挂一条死路径只会让下次排查多一个误导项。也没必要判断用户是否已设 ——
+        // 引擎进程的来源是 Java，读不到 shell 的 profile；而用户若在 ~/.bashrc
+        // 里自己 export，那是 shell 启动后才生效，优先级天然高于这里。
+        val nvimRuntime = File(root, "share/nvim/runtime")
+        if (nvimRuntime.isDirectory) env += "VIMRUNTIME=${nvimRuntime.absolutePath}"
         // Maven 的本地仓库落在 HOME 下，避免往只读的引擎根写
         env += "MAVEN_OPTS=-Dmaven.repo.local=${File(home, ".m2/repository").absolutePath}"
 
@@ -1690,10 +1710,16 @@ object EngineConfig {
      * key**，而不是看整串是否为空），并把 `$HOME/.kxxy/bin` 挂进 PATH：上一版
      * 只判空串，用户自己设了别的定义时一条都不补；外部 shell 也拿不到 ghraw。
      *
+     * `# kxxy-shell@5` 补 `VIMRUNTIME` 的兜底（缺陷 EI 的第二层）：nvim 的
+     * prefix 编译期写死在 Termux 路径上，运行时不指路就是
+     * `E484: Can't open file …/com.termux/files/usr/share/nvim/syntax/syntax.vim`。
+     * 引擎拉起的终端本来就有这条（见 [buildEnv]），这里兜的是"shell 不是引擎
+     * 拉起"以及用户 unset 之后的情况；判据同 GYP_DEFINES —— 已有就不覆盖。
+     *
      * @see buildEnv
      */
     private fun userShellInitContent(): String = """
-        # kxxy-shell@4
+        # kxxy-shell@5
         # [dsh-kxxy] 官方终端在 Android 上的默认交互式 shell 初始化。
         #
         # 上游以 `bash --rcfile <临时文件> -i` 启动终端，那个临时 rcfile 的第一行是
@@ -1759,6 +1785,20 @@ object EngineConfig {
                 ;;
         esac
         unset _ndkstub
+
+        # ── Neovim 的运行时目录（缺陷 EI 的第二层）─────────────────────────
+        # nvim 的 prefix 是**编译期**写死的 Termux 路径：
+        #     /data/data/com.termux/files/usr/share/nvim
+        # 而我们的运行时在 <engine>/share/nvim/runtime（extinstall 把 shells
+        # 扩展的 share/ 摊到了引擎根），不指路就是启动即报：
+        #     E484: Can't open file
+        #     /data/data/com.termux/files/usr/share/nvim/syntax/syntax.vim
+        # ${'$'}VIMRUNTIME 是 nvim 认的官方覆盖点（:h ${'$'}VIMRUNTIME）。
+        # 只在目录真实存在时设（没装 shells 扩展的设备不该多出一条死路径），
+        # 也不覆盖用户自己设的值 —— 判据与上面 GYP_DEFINES 同一条原则。
+        if [ -z "${'$'}{VIMRUNTIME:-}" ] && [ -d "${'$'}{KXXY_ENGINE_ROOT:-}/share/nvim/runtime" ]; then
+            export VIMRUNTIME="${'$'}{KXXY_ENGINE_ROOT:-}/share/nvim/runtime"
+        fi
 
         # ── GitHub 直链助手（ghraw / raw2api）在 PATH 上 ────────────────────
         # 引擎拉起的终端本来就有这条（buildEnv 注入），这里兜的是「shell 不是

@@ -1142,9 +1142,9 @@ echo <raw-url> | raw2api           # 只转 URL，交给别的工具
 
 ### 一键验收（控制台「维护区」→ 一键验收）
 
-前面这些修完之后要验的东西散在四五条手敲命令里（`yarn --version`、`echo $GYP_DEFINES`、
-`ghraw …`、探 `/tmp`），以前是「敲一条、截图、贴回来、再问下一条」。现在一次点完，
-跑的就是**引擎进程自己**的环境 —— 与你终端里拿到的 env / PATH 是同一套：
+前面这些修完之后要验的东西散在六七条手敲命令里（`yarn --version`、`echo $GYP_DEFINES`、
+`ghraw …`、探 `/tmp`、`nvim --version`），以前是「敲一条、截图、贴回来、再问下一条」。
+现在一次点完，跑的就是**引擎进程自己**的环境 —— 与你终端里拿到的 env / PATH 是同一套：
 
 | 项 | 看什么 | 红了怎么办 |
 |---|---|---|
@@ -1154,6 +1154,7 @@ echo <raw-url> | raw2api           # 只转 URL，交给别的工具
 | `TMP` | `TMPDIR` 能否写入（`/tmp` 写不进去属沙箱边界，只当证据） | 检查清理工具是否接管了应用私有目录 |
 | `HELPERS` | `ghraw` / `raw2api` 在不在、有没有执行位、在不在 PATH | 点「装 GitHub 直链助手」 |
 | `RAW` | `raw.githubusercontent.com` 的 DNS 现状 | 黑洞时用 `ghraw` 走 API，域名层面改不了 |
+| `NVIM` | `bin/nvim` 的 wrapper 能否找到 `libexec/nvim/nvim`、`VIMRUNTIME` 对不对、有没有 treesitter parser | 缺链接点「修复命令链接」；缺 `VIMRUNTIME` 重启引擎；缺 parser 不用管（不影响读写） |
 
 它**只诊断、不修**（修各有各的按钮，一个按钮顺手改四处，出问题没人说得清是哪步动的），
 面板右上「复制结果」可直接把整份结论贴出来。

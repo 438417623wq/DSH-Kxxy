@@ -30,6 +30,7 @@ import { join, dirname } from 'node:path';
 import {
 	applyPlaceholders,
 	buildViews,
+	ensureLibexecView,
 	healExtensions,
 	placeholderMap,
 	poolSignature,
@@ -672,6 +673,119 @@ try {
 		const third = healExtensions(root);
 		equal('指向扩展外的悬空链不计入修复', third.repaired, 0);
 		check('也不改动它（原样留着交给占位符回填）', readlinkSync(outLink) === before, `now=${readlinkSync(outLink)}`);
+	}
+	// -----------------------------------------------------------------------
+	console.log('[EI] 已装扩展的 libexec 视图（ensureLibexecView，nvim 那条 not found）');
+	// -----------------------------------------------------------------------
+	//
+	// 真机现场：
+	//   $ nvim --version
+	//   …/engine/bin/nvim: 13: exec: …/engine/libexec/nvim/nvim: not found
+	// 而 `extensions/shells/libexec/nvim/nvim --version` 能出 NVIM v0.12.6 ——
+	// 载荷是好的，缺的是 `<root>/libexec/nvim` 这条链接（安装期只摊了
+	// etc/share/opt/sbin/var，漏了 libexec）。
+	//
+	// 为什么不能只靠 buildViews：那要用户把扩展**重装**一遍，rust 250 MB、
+	// texlive 1600 个文件，为了几条软链不值得 —— 已装扩展要能就地补。
+	{
+		const root = join(workdir, 'r-ei');
+		const ext = makeExt(root, 'shells', {
+			'bin/nvim': '#!/system/bin/sh\nexec "<root>/libexec/nvim/nvim" "$@"\n',
+			'libexec/nvim/nvim': 'ELF-NVIM',
+			'libexec/nvim/vimdiff': 'ELF-VIMDIFF',
+			'share/nvim/runtime/syntax/syntax.vim': '" syntax\n',
+		});
+		// 模拟「v0.9.23 之前装的」：清单里没有 libexec 条目
+		writeFileSync(
+			join(ext, '.links.json'),
+			JSON.stringify({ extId: 'shells', bins: [], libs: [], views: [], layout: 3 }),
+		);
+
+		const first = ensureLibexecView(root);
+		equal('补出 1 条（libexec/nvim 整目录）', first.added, 1);
+		checkLink(
+			'<root>/libexec/nvim 指向扩展里的真身',
+			join(root, 'libexec', 'nvim'),
+			join(ext, 'libexec', 'nvim'),
+		);
+		check(
+			'wrapper 的 exec 目标现在真的存在',
+			existsSync(join(root, 'libexec', 'nvim', 'nvim')),
+		);
+
+		const manifest = JSON.parse(readFileSync(join(ext, '.links.json'), 'utf8'));
+		const view = (manifest.views ?? []).find((v) => v.target === join(root, 'libexec', 'nvim'));
+		check('补出的条目写回了清单（卸载能回收、relink 能重建）', Boolean(view), JSON.stringify(manifest.views));
+		equal('清单里的名字带 libexec/ 前缀', view?.name, 'libexec/nvim');
+
+		const second = ensureLibexecView(root);
+		equal('再跑一遍不重复添加（幂等）', second.added, 0);
+		equal('清单也没被写重复', JSON.parse(readFileSync(join(ext, '.links.json'), 'utf8')).views.length, 1);
+
+		// runtime 升级会把 <root>/libexec 里的视图清掉，靠 relinkAll 按清单重建
+		rmSync(join(root, 'libexec', 'nvim'), { recursive: true, force: true });
+		writeFileSync(join(root, 'extensions', '.relink'), '');
+		const rebuilt = relinkAll(root);
+		check('relinkAll 能按清单把它重建回来', rebuilt >= 1, `rebuilt=${rebuilt}`);
+		check('<root>/libexec/nvim/nvim 又在了', existsSync(join(root, 'libexec', 'nvim', 'nvim')));
+
+		// 新装扩展走 buildViews 时也应该直接摊出来（不需要等自愈）
+		{
+			const r2 = join(workdir, 'r-ei-new');
+			const ext2 = makeExt(r2, 'shells', {
+				'bin/nvim': '#!/system/bin/sh\n',
+				'libexec/nvim/nvim': 'ELF',
+			});
+			const links = buildViews(r2, 'shells', ext2);
+			check('buildViews 直接摊出 libexec', existsSync(join(r2, 'libexec', 'nvim', 'nvim')));
+			check(
+				'并登记进 .links.json 的 views',
+				(links.views ?? []).some((v) => v.target === join(r2, 'libexec', 'nvim')),
+			);
+		}
+
+		// 反向保护 1：没有清单 = 不是我们装的（用户自己放的），不动它
+		{
+			const r3 = join(workdir, 'r-ei-foreign');
+			const ext3 = makeExt(r3, 'mytool', { 'libexec/mytool/mytool': 'X' });
+			const res = ensureLibexecView(r3);
+			equal('没有 .links.json 的扩展不碰', res.added, 0);
+			check('也不会替它建链接', !existsSync(join(r3, 'libexec', 'mytool')));
+			check('没写清单', !existsSync(join(ext3, '.links.json')));
+		}
+
+		// 反向保护 2：同名 libexec 由先到者占，后来者不覆盖
+		{
+			const r4 = join(workdir, 'r-ei-dup');
+			const a = makeExt(r4, 'aa', { 'libexec/tool/tool': 'A' });
+			const b = makeExt(r4, 'bb', { 'libexec/tool/tool': 'B' });
+			for (const [id, dir] of [['aa', a], ['bb', b]]) {
+				writeFileSync(
+					join(dir, '.links.json'),
+					JSON.stringify({ extId: id, bins: [], libs: [], views: [], layout: 3 }),
+				);
+			}
+			mkdirSync(join(r4, 'libexec'), { recursive: true });
+			const ra = ensureLibexecView(r4);
+			check('先到者接上了', existsSync(join(r4, 'libexec', 'tool', 'tool')));
+			equal('只有一个扩展真正建了链接', ra.added, 1);
+			// readdirSync 的顺序不保证（Windows 上是字母序，别的平台不一定），
+			// 所以不假设 aa 先到 —— 只看叶子指向这两个里的哪一个。
+			//
+			// 注意 `root/libexec/tool` 此时可能是**真目录**：第二个扩展进来时
+			// mergeEntry 会把前者的整目录软链「物化」再合并（否则写进去的其实是
+			// 前一个扩展的目录）。所以判据落在叶子 `tool/tool` 上。
+			const owner = readlinkSync(join(r4, 'libexec', 'tool', 'tool'));
+			const cands = [join(a, 'libexec', 'tool', 'tool'), join(b, 'libexec', 'tool', 'tool')];
+			check('占位者就是其中一个扩展', cands.includes(owner), `owner=${owner}`);
+			const loser = owner === cands[0] ? b : a;
+			// 后到者**必须**在清单里留下 shadowed 记录 —— 否则占位者卸载后
+			// 它的贡献就永久丢了（与 mergeViews 同一条规则）
+			const mfLose = JSON.parse(readFileSync(join(loser, '.links.json'), 'utf8'));
+			check('后来者在清单里留下 shadowed 记录', (mfLose.views ?? []).some((v) => v.shadowed), JSON.stringify(mfLose.views));
+			const second2 = ensureLibexecView(r4);
+			equal('再跑一遍谁都不重复添加', second2.added, 0);
+		}
 	}
 } finally {
 	rmSync(workdir, { recursive: true, force: true });

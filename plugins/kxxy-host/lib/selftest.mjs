@@ -31,7 +31,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants, existsSync, unlinkSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, existsSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { promises as dnsPromises } from 'node:dns'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -330,6 +330,72 @@ export function judgeRaw(r) {
   )
 }
 
+/**
+ * nvim 能不能真的跑起来（缺陷 EI 的三层）。
+ *
+ * 真机症状是**命令在、一执行就说文件不存在**：
+ *
+ *     $ nvim --version
+ *     /data/user/0/app.kxxy/files/engine/bin/nvim: 13: exec:
+ *     /data/user/0/app.kxxy/files/engine/libexec/nvim/nvim: not found
+ *
+ * 三层坏法，**修法完全不同**，所以必须分开报：
+ *
+ *   ① `<root>/libexec/nvim` 不存在 —— `bin/nvim` 是个 sh wrapper，最后一行
+ *      `exec <root>/libexec/nvim/nvim`，而安装期漏摊了 `libexec/`。
+ *      ⇒ 点「修复命令链接」（引擎每次启动也会自动补）。
+ *   ② `VIMRUNTIME` 没设或指错 —— 能启动，但一开文件就
+ *      `E484: Can't open file …/com.termux/files/usr/share/nvim/syntax/syntax.vim`
+ *      （prefix 是编译期写死的 Termux 路径）。⇒ 重启引擎，`buildEnv` 会补。
+ *   ③ 载荷没带 treesitter parser —— 打开 .md 报 `E5113`，**不影响读写**，
+ *      只是噪音。这一条插件侧无解，如实说明比让用户以为是坏的强。
+ *
+ * @param {{installed?: boolean, execPath?: string|null, execOk?: boolean,
+ *          runtime?: string|null, runtimeOk?: boolean, parserCount?: number}} r
+ * @returns {Item}
+ */
+export function judgeNvim(r) {
+  if (!r?.installed) {
+    return item('NVIM', '编辑器命令（nvim）', Level.SKIP, '没有安装 nvim（shells 扩展未装）')
+  }
+  if (!r?.execOk) {
+    return item(
+      'NVIM',
+      '编辑器命令（nvim）',
+      Level.FAIL,
+      `wrapper 的 exec 目标不存在：${r?.execPath || '(未知)'}`,
+      '点下面的「修复命令链接」补这条链接（引擎每次启动也会自动补）。' +
+        '修完要**重开终端** —— 已开着的 shell 不会自己刷新。',
+    )
+  }
+  if (!r?.runtimeOk) {
+    return item(
+      'NVIM',
+      '编辑器命令（nvim）',
+      Level.WARN,
+      r?.runtime ? `VIMRUNTIME=${r.runtime}，但那里没有 syntax/syntax.vim` : '没有 VIMRUNTIME',
+      'nvim 能启动，但打开文件会报 `E484: Can\'t open file …/share/nvim/syntax/syntax.vim`。' +
+        '重启一次引擎（`buildEnv` 会设好）；外部 shell 重开终端即可（~/.bashrc 有兜底）。',
+    )
+  }
+  if (!(Number(r?.parserCount) > 0)) {
+    return item(
+      'NVIM',
+      '编辑器命令（nvim）',
+      Level.WARN,
+      '可运行、运行时目录正常；但载荷没带 treesitter parser',
+      '打开 .md / .lua 等文件会提示 `E5113: Parser could not be created`。' +
+        '**不影响编辑与保存**，只是噪音：parser 是扩展载荷里就没有的，插件侧补不了。',
+    )
+  }
+  return item(
+    'NVIM',
+    '编辑器命令（nvim）',
+    Level.PASS,
+    `NVIM 可运行、运行时目录正常（${r.parserCount} 个 parser）`,
+  )
+}
+
 // ---------------------------------------------------------------------------
 // 采集（真机上才跑得动的那一半）
 // ---------------------------------------------------------------------------
@@ -419,13 +485,37 @@ function probeWritable(file) {
 }
 
 /**
+ * 采集 nvim 的三层证据。
+ *
+ * `runtimeOk` 只看**环境变量那一份**：`<root>/share/nvim/runtime` 里有文件
+ * 不等于 nvim 找得到 —— 它认的是 `$VIMRUNTIME`，没设就仍然去读编译期写死的
+ * Termux 路径。用回落目录去判「运行时正常」会把这个缺陷报成通过。
+ */
+function collectNvim(root, deps, exists, countParsers) {
+  const wrapper = join(root, 'libexec/nvim/nvim')
+  const installed = exists(join(root, 'bin/nvim')) || exists(wrapper)
+  const runtimeEnv = String(deps.vimruntime ?? process.env.VIMRUNTIME ?? '').trim()
+  const runtimeDir = runtimeEnv || join(root, 'share/nvim/runtime')
+  const runtimeOk = Boolean(runtimeEnv) && exists(join(runtimeEnv, 'syntax/syntax.vim'))
+  return judgeNvim({
+    installed,
+    execPath: wrapper,
+    execOk: exists(wrapper),
+    runtime: runtimeEnv || null,
+    runtimeOk,
+    parserCount: countParsers(join(runtimeDir, 'parser')),
+  })
+}
+
+/**
  * 跑一遍自检。
  *
  * 依赖全部可注入（`deps`），这样构建机上能验判定逻辑，真机上才走真命令 ——
  * 与 `healExtensions` / `installHelpers` 的做法一致。
  *
  * @param {{home?: string, pathEnv?: string, exec?: Function, lookup?: Function,
- *          exists?: Function, canExec?: Function, probe?: Function, now?: Function}} [deps]
+ *          exists?: Function, canExec?: Function, probe?: Function, now?: Function,
+ *          root?: string, vimruntime?: string, countParsers?: Function}} [deps]
  * @returns {Promise<{at: number, ok: boolean, verdict: string, counts: object, items: Item[], note: string}>}
  */
 export async function runSelftest(deps = {}) {
@@ -443,6 +533,14 @@ export async function runSelftest(deps = {}) {
   const probe = deps.probe ?? probeWritable
   const lookup = deps.lookup ?? lookupHost
   const exec = deps.exec ?? runShell
+  const countParsers = deps.countParsers ?? ((dir) => {
+    try {
+      return readdirSync(dir).filter((n) => n.endsWith('.so')).length
+    } catch {
+      // parser 目录不存在 —— 载荷没带，见 judgeNvim 的第三层
+      return -1
+    }
+  })
   const now = deps.now ?? Date.now
   const platform = deps.platform ?? process.platform
   const isWin = platform === 'win32'
@@ -507,6 +605,16 @@ export async function runSelftest(deps = {}) {
   // ⑥ raw 直链的 DNS 现状
   const raw = await lookup('raw.githubusercontent.com')
   items.push(judgeRaw({ host: 'raw.githubusercontent.com', ...raw }))
+
+  // ⑦ nvim（缺陷 EI）：wrapper 的 exec 目标、VIMRUNTIME、treesitter parser 三层。
+  // 追加在最后而不是插在 YARN 后面 —— 前六项的顺序在文档与截图里都用过，
+  // 打乱会让人对不上号；新项放末尾，老的读法不变。
+  const root = deps.root ?? process.env.KXXY_ENGINE_ROOT ?? process.env.PREFIX ?? ''
+  if (!root) {
+    items.push(item('NVIM', '编辑器命令（nvim）', Level.SKIP, '拿不到引擎根（KXXY_ENGINE_ROOT），无法判定'))
+  } else {
+    items.push(collectNvim(root, deps, exists, countParsers))
+  }
 
   const counts = { pass: 0, warn: 0, fail: 0, skip: 0 }
   for (const it of items) {

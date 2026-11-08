@@ -8,7 +8,7 @@
  *   → 回填路径占位符（回填清单在包内 .pool-manifest.json）  ← 问题.txt【1】
  *   → 原子 rename 成 extensions/<id>/             （断电不会留半个扩展）
  *   → bin/** 软链进 <engineRoot>/bin、lib/*.so* 复制进 <engineRoot>/lib，
- *     并把各扩展的 etc/ share/ opt/ 递归合并进引擎根的同名位置
+ *     并把各扩展的 etc/ share/ opt/ sbin/ var/ libexec/ 递归合并进引擎根的同名位置
  *     （递归合并而非整目录覆盖的理由见 mergeViews 的注释）
  *
  * 为什么要回填占位符（问题.txt【1】）：
@@ -528,7 +528,12 @@ export function buildViews(root, id, extDir) {
   }
 
   // ③ etc / share / opt / sbin / var 合并视图
-  for (const sub of ['etc', 'share', 'opt', 'sbin', 'var']) {
+  //
+  // `libexec` 是后加的（v0.9.24），漏它的后果见 [ensureLibexecView] 的注释：
+  // 扩展的 `bin/<cmd>` 是个 wrapper，最后一行 `exec <root>/libexec/<name>/<name>`
+  // —— 而这个 `<root>/libexec/<name>` 从来没人建，命令一跑就是
+  // `…/libexec/nvim/nvim: not found`。
+  for (const sub of ['etc', 'share', 'opt', 'sbin', 'var', 'libexec']) {
     const from = join(extDir, sub)
     if (!existsSync(from)) continue
     mergeViews(from, join(root, sub), sub, views)
@@ -846,6 +851,96 @@ export function healExtensions(root) {
         if (result.items.length < 12) result.items.push({ ext: id, entry: relative(extDir, entry), target })
       }
     }
+  }
+  return result
+}
+
+/**
+ * 给**已装**扩展补 `libexec/` 视图（缺陷 EI）。
+ *
+ * ── 症状 ────────────────────────────────────────────────────────────────
+ *
+ *     $ nvim --version
+ *     /data/user/0/app.kxxy/files/engine/bin/nvim: 13: exec:
+ *     /data/user/0/app.kxxy/files/engine/libexec/nvim/nvim: not found
+ *
+ * 而载荷是好的：`extensions/shells/libexec/nvim/nvim --version` 正常输出
+ * `NVIM v0.12.6`。
+ *
+ * ── 根因 ────────────────────────────────────────────────────────────────
+ *
+ * shells 扩展的 `bin/nvim` 不是 ELF，是个 sh wrapper，最后一行写死
+ *
+ *     LD_PRELOAD="<root>/lib/libluajit.so" exec "<root>/libexec/nvim/nvim" "$@"
+ *
+ * 也就是说，「真身」按 `<root>/libexec/<name>/` 找 —— 这是 Termux 的包布局
+ * （`$PREFIX/libexec/nvim/nvim` 是 deb 里的实际位置）。[buildViews] 早先把
+ * `bin` 接进 `<root>/bin`、把 `lib`/`etc`/`share`/`opt`/`sbin`/`var` 摊到引擎根，
+ * **唯独漏了 `libexec`**，于是这条 wrapper 的 exec 目标从来不存在。
+ *
+ * 为什么只有 nvim 中招：emacs / gnuplot 虽然同样缺这条链接，但它们的
+ * `bin/<cmd>` 是**真 ELF**，不经过 wrapper，也就不会去读 `libexec`。
+ *
+ * ── 为什么不能只改 buildViews ────────────────────────────────────────────
+ *
+ * 那只会对**以后新装**的扩展生效（与 [healExtensions] 是同一课）。已装机型的
+ * 修法要么把全部扩展重装一遍（rust 250 MB、texlive 1600 个文件，启动路径上
+ * 不可接受），要么就地补几条链接 —— 这个函数选后者：只读扩展目录、只往
+ * `<root>/libexec` 里加软链，几十毫秒，幂等。
+ *
+ * 目录归属沿用 [mergeEntry] 的规则（先到者胜、目标就是自己时记成自有条目），
+ * 补出来的条目**写回 `.links.json`**：卸载时要能回收、[relinkAll] 要能重建。
+ *
+ * @param {string} root 引擎根
+ * @returns {{added: number, items: Array<{ext: string, entry: string, target: string}>}}
+ */
+export function ensureLibexecView(root) {
+  const result = { added: 0, items: [] }
+  if (!root) return result
+
+  const dstRoot = join(root, 'libexec')
+  let dirs = []
+  try {
+    dirs = readdirSync(extensionsDir(root), { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.endsWith('.tmp-install'))
+      .map((e) => e.name)
+  } catch {
+    return result
+  }
+
+  for (const id of dirs) {
+    const extDir = join(extensionsDir(root), id)
+    const from = join(extDir, 'libexec')
+    if (!existsSync(from)) continue
+
+    // 没有清单 = 不是我们装的（用户自己放进去的），不动它
+    const linksFile = join(extDir, '.links.json')
+    let links = null
+    try { links = JSON.parse(readFileSync(linksFile, 'utf8')) } catch { continue }
+    const views = Array.isArray(links.views) ? links.views : []
+    const known = new Set(views.map((v) => v.target))
+
+    // 目标根可能还不存在（runtime 侧本来一定有，但被删过就得补）
+    try { mkdirSync(dstRoot, { recursive: true }) } catch { continue }
+
+    const collected = []
+    mergeViews(from, dstRoot, 'libexec', collected)
+    // 两类都要写回清单：真正建出来的（以后要能重建），以及**被别人占了位**
+    // 的 shadowed 记录（占位者卸载后要靠它补位）。只写前者的话，「卸一个扩展，
+    // 另一个扩展的 libexec 跟着消失」—— 与 mergeViews 当初那个坑同型。
+    const fresh = collected.filter((v) => !known.has(v.target))
+    if (fresh.length === 0) continue
+    const created = fresh.filter((v) => !v.shadowed)
+
+    views.push(...fresh)
+    try {
+      links.views = views
+      writeFileSync(linksFile, JSON.stringify(links, null, 2) + '\n')
+    } catch {
+      // 清单只读：链接已经建出来了，能跑；下次启动会重复补一次（幂等）
+    }
+    result.added += created.length
+    for (const v of created) if (result.items.length < 12) result.items.push({ ext: id, entry: v.name, target: v.target })
   }
   return result
 }

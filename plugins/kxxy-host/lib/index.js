@@ -35,7 +35,7 @@
  *      heal-ext       → 重跑扩展接入自愈（悬空链 / wrapper 缺兄弟文件）
  *      apply-raw-mirror → 实测镜像并写进 etc/net.json（重启后 git 生效）
  *      install-ghraw  → 重装 $HOME/.kxxy/bin/{ghraw,raw2api}（走 API 取 raw）
- *      selftest       → 六项真机验收（鉴权/ yarn / NDK / 临时目录 / 助手 / raw），只读
+ *      selftest       → 七项真机验收（鉴权 / yarn / NDK / 临时目录 / 助手 / raw / nvim），只读
  *      install-ext / switch-mirror → 已迁往专用端点，此处明确 400
  *      未知动作       → 501，让前端抛错回滚按钮而不是假成功
  *
@@ -931,7 +931,7 @@ async function dispatchAction(payload) {
       }
     }
 
-    // ── 真机验收：六项一次跑完（只读，不改盘）──────────────────────────
+    // ── 真机验收：七项一次跑完（只读，不改盘）──────────────────────────
     //
     // 之前每条验收都是让人在终端里手敲再截图：敲错引号、用错 shell、只看
     // 一条就回来问，来回好几轮。这些检查在引擎进程里跑一遍等价于在同一套
@@ -980,24 +980,39 @@ let lastSelftest = null
 /**
  * 跑一次扩展接入自愈，并把结果记进 [lastHeal]。
  *
+ * 两件事，都是「装完了链接不全」这一类：
+ *   · [extinstall.healExtensions] 修扩展目录**内部**的悬空链接与缺兄弟文件；
+ *   · [extinstall.ensureLibexecView] 补 `<root>/libexec/<name>` —— 扩展的
+ *     `bin/<cmd>` 是个 sh wrapper，最后一行 exec 那个路径，而安装期漏摊了
+ *     `libexec/`（缺陷 EI，真机症状 `…/libexec/nvim/nvim: not found`）。
+ *
  * 与 `relinkAll` 的区别：那个按 `.links.json` 重建**引擎侧**的接入点，只在
- * runtime 升级后跑；这个修的是**扩展自己目录里**的悬空链接与缺兄弟文件，
- * 任何时候都能跑，而且幂等（修好后再跑 repaired 为 0）。
+ * runtime 升级后跑；这个修的是扩展自己目录里/清单外的缺口，任何时候都能跑，
+ * 而且幂等（修好后再跑 repaired 为 0）。
  *
  * @param {string} root
- * @returns {{scanned: number, repaired: number, items: Array<object>}}
+ * @returns {{scanned: number, repaired: number, items: Array<object>, libexec?: object}}
  */
 function runHeal(root) {
   let result = { scanned: 0, repaired: 0, items: [] }
+  let libexec = { added: 0, items: [] }
   try {
     result = extinstall.healExtensions(root)
+    // libexec 视图与上一条同属「装完了链接不全」，一起跑、一起报 ——
+    // 用户点一次「修复命令链接」就该把 nvim 这类 wrapper 一起修好。
+    libexec = extinstall.ensureLibexecView(root)
+    if (libexec.added > 0) {
+      result.repaired += libexec.added
+      const room = Math.max(0, 12 - result.items.length)
+      result.items.push(...libexec.items.slice(0, room))
+    }
   } catch (e) {
     lastHeal = { at: Date.now(), scanned: 0, repaired: 0, items: [], error: String(e?.message ?? e) }
     return lastHeal
   }
   // 只在有修复时更新 at，否则每次启动都会把「上次修复时间」刷成现在
   if (result.repaired > 0 || !lastHeal) {
-    lastHeal = { at: Date.now(), ...result }
+    lastHeal = { at: Date.now(), ...result, libexec }
   } else {
     lastHeal = { ...lastHeal, scanned: result.scanned }
   }
@@ -1052,15 +1067,20 @@ export function apply(ctx) {
       ctx.logger?.info?.(`[kxxy-host] relinkAll: ${rebuilt} extension(s) relinked after runtime upgrade`)
     }
 
-    // ── 扩展接入自愈：修「命令在、跑起来说模块没了」这一类 ──────────────
+    // ── 扩展接入自愈（含 libexec 视图，缺陷 EC / EI）────────────────────
     //
-    // 必须在**每次启动**跑，不能只挂在安装路径上：扩展是用户态资产，装进去
-    // 之后代码再改也碰不到它。真机症状是升到 0.9.20（代码里早有修复）、
-    // `yarn --version` 仍旧 `Cannot find module '…/extensions/yarn/bin/yarn.js'`
-    // —— 那个扩展是 0.9.18 之前装的，安装期的修复对它从未生效过。
+    // 每次启动都要跑，不能只挂在安装路径上 —— 扩展是用户态资产，装进去之后
+    // 代码再改也碰不到它：
+    //   · `bin/<cmd>` 的 wrapper 找不到兄弟文件（yarn 的
+    //     `Cannot find module '…/extensions/yarn/bin/yarn.js'`）；
+    //   · `bin/<cmd>` 最后一行 exec `<root>/libexec/<name>/<name>`，而早先
+    //     buildViews 只摊了 etc / share / opt / sbin / var，**漏了 libexec**
+    //     ⇒ `…/engine/libexec/nvim/nvim: not found`（载荷本身是好的）。
+    // 两件事都只补链接、不重装（rust 250 MB、texlive 1600 个文件，为几条软链
+    // 重解一遍不可接受），都幂等，几十毫秒。
     //
-    // 代价：每个扩展的 bin/ 走一遍 stat（TeX Live 1600 多个条目），几十毫秒，
-    // 且幂等。修完的结果进 /state，控制台能看到到底修了哪几条。
+    // 代价：每个扩展的 bin/ 走一遍 stat（TeX Live 1600 多个条目）。修完的结果
+    // 进 /state，控制台能看到到底修了哪几条。
     const healed = runHeal(root0)
     if (healed.repaired > 0) {
       ctx.logger?.info?.(

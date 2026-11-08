@@ -20,6 +20,7 @@ import {
   judgeAuth,
   judgeHelpers,
   judgeNdk,
+  judgeNvim,
   judgeRaw,
   judgeTmp,
   judgeYarn,
@@ -52,11 +53,20 @@ function greenDeps(over = {}) {
     platform: 'android',
     authDetail: 'admit:peer',
     gyp: 'android_ndk_path=/data/user/0/app.kxxy/files/kxxy-home/.cache/kxxy-ndk-stub',
-    exists: (p) => /cpufeatures$|\.kxxy\/bin$|ghraw$|raw2api$|ndk-stub$/.test(p),
+    // 路径分隔符两组都写：构建机是 `\`，真机是 `/`，而这条 exists 是正则
+    exists: (p) =>
+      /cpufeatures$|[\\/]\.kxxy[\\/]bin$|ghraw$|raw2api$|ndk-stub$|[\\/]bin[\\/]nvim$|libexec[\\/]nvim[\\/]nvim$|syntax\.vim$/.test(
+        p,
+      ),
     canExec: () => true,
     probe: () => null,
     lookup: async () => ({ addresses: ['185.199.109.133'], error: null }),
     exec: () => ({ code: 0, out: '1.22.22\n', err: '', error: null }),
+    // nvim 那一项：引擎根 + VIMRUNTIME + parser 个数（真机上 parser 目录在
+    // <runtime>/parser 下，构建机没有，所以计数必须可注入）
+    root: '/data/user/0/app.kxxy/files/engine',
+    vimruntime: '/data/user/0/app.kxxy/files/engine/share/nvim/runtime',
+    countParsers: () => 12,
     now: () => 1762500000000,
     ...over,
   }
@@ -235,7 +245,7 @@ console.log('\n[7] runSelftest 汇总（注入依赖）')
   const all = await runSelftest(greenDeps())
   equal('全绿 → ok', all.ok, true)
   equal('全绿 → verdict=pass', all.verdict, 'pass')
-  equal('六条都在', all.items.length, 6)
+  equal('七条都在', all.items.length, 7)
   equal('计数与条目数自洽', all.counts.pass + all.counts.warn + all.counts.fail + all.counts.skip, all.items.length)
   equal('没有失败', all.counts.fail, 0)
   check('note 说的是「全部通过」', all.note.includes('全部通过'))
@@ -243,7 +253,7 @@ console.log('\n[7] runSelftest 汇总（注入依赖）')
   check('每条都有 id / title / status / detail', all.items.every((i) => i.id && i.title && i.status && 'detail' in i))
 
   const idOrder = all.items.map((i) => i.id).join(',')
-  equal('顺序固定（鉴权在最前）', idOrder, 'AUTH,YARN,NDK,TMP,HELPERS,RAW')
+  equal('顺序固定（鉴权在最前，nvim 追加在末尾）', idOrder, 'AUTH,YARN,NDK,TMP,HELPERS,RAW,NVIM')
 
   const broken = await runSelftest(
     greenDeps({
@@ -286,6 +296,87 @@ console.log('\n[8] 目录是否在 PATH 上')
   equal('空目录 → false', pathHasDir('/system/bin', '', 'linux'), false)
   equal('反斜杠也认（构建机）', pathHasDir('C:\\a\\bin;D:\\b', 'D:\\b', 'win32'), true)
   equal('windows 用 ; 分隔（不会把盘符当分隔）', pathHasDir('C:\\a;C:\\b', 'C:\\a', 'win32'), true)
+}
+
+// ── 9. nvim 的三层 ─────────────────────────────────────────────────────
+console.log('\n[9] nvim（缺陷 EI：wrapper / VIMRUNTIME / treesitter）')
+{
+  const ok = judgeNvim({
+    installed: true,
+    execPath: '/e/libexec/nvim/nvim',
+    execOk: true,
+    runtime: '/e/share/nvim/runtime',
+    runtimeOk: true,
+    parserCount: 12,
+  })
+  equal('三层都正常 → 通过', ok.status, Level.PASS)
+  check('parser 个数进 detail', ok.detail.includes('12'))
+
+  equal('没装 → 跳过（不是失败）', judgeNvim({ installed: false }).status, Level.SKIP)
+
+  // 第一层：真机原文 `…/engine/bin/nvim: 13: exec: …/libexec/nvim/nvim: not found`
+  const noLink = judgeNvim({
+    installed: true,
+    execPath: '/e/libexec/nvim/nvim',
+    execOk: false,
+    runtime: '/e/share/nvim/runtime',
+    runtimeOk: true,
+    parserCount: 12,
+  })
+  equal('缺 libexec 链接 → 失败', noLink.status, Level.FAIL)
+  check('detail 带出 exec 目标', noLink.detail.includes('libexec/nvim/nvim'))
+  check('提示指向「修复命令链接」', noLink.hint.includes('修复命令链接'))
+  check('提示要求重开终端', noLink.hint.includes('重开终端'))
+
+  // 第二层：E484
+  const noRuntime = judgeNvim({
+    installed: true,
+    execPath: '/e/libexec/nvim/nvim',
+    execOk: true,
+    runtime: null,
+    runtimeOk: false,
+    parserCount: -1,
+  })
+  equal('没有 VIMRUNTIME → 留意（不是失败）', noRuntime.status, Level.WARN)
+  check('detail 说清是没设', noRuntime.detail.includes('没有 VIMRUNTIME'))
+  check('提示给出 E484 原文（用户能对上号）', noRuntime.hint.includes('E484'))
+  check('提示提到重启引擎', noRuntime.hint.includes('重启'))
+
+  const badRuntime = judgeNvim({
+    installed: true,
+    execPath: '/e/libexec/nvim/nvim',
+    execOk: true,
+    runtime: '/e/share/nvim/runtime',
+    runtimeOk: false,
+    parserCount: 12,
+  })
+  equal('VIMRUNTIME 指错也算留意', badRuntime.status, Level.WARN)
+  check('并带上实际指向', badRuntime.detail.includes('/e/share/nvim/runtime'))
+
+  // 第三层：E5113 —— 本轮唯一补不了的（载荷里就没有）
+  const noParser = judgeNvim({
+    installed: true,
+    execPath: '/e/libexec/nvim/nvim',
+    execOk: true,
+    runtime: '/e/share/nvim/runtime',
+    runtimeOk: true,
+    parserCount: 0,
+  })
+  equal('载荷没带 parser → 留意', noParser.status, Level.WARN)
+  check('说清不影响编辑保存', noParser.hint.includes('不影响'))
+  check('并说明插件侧补不了', noParser.hint.includes('补不了'))
+  equal(
+    'parser 目录都不存在（-1）也当没带',
+    judgeNvim({
+      installed: true,
+      execPath: '/e/libexec/nvim/nvim',
+      execOk: true,
+      runtime: '/e/r',
+      runtimeOk: true,
+      parserCount: -1,
+    }).status,
+    Level.WARN,
+  )
 }
 
 console.log(`\n真机验收自检测试：${passed} 通过 / ${failed} 失败`)
