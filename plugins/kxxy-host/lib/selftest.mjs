@@ -123,9 +123,16 @@ export function judgeAuth(detail) {
 /**
  * `yarn --version` 的实际输出判定。
  *
- * 坏形状（缺陷 EB）：`Cannot find module '…/extensions/…/bin/yarn.js'` ——
- * 命令在 PATH 上，wrapper 却找不到同目录的兄弟文件。修法是 `healExtensions`，
- * 而它只在**扩展目录**上生效，所以这里要给出"点哪个按钮"。
+ * 三种坏形状必须分开说，因为动作完全不同：
+ *
+ *   · `Cannot find module '…/extensions/…/bin/yarn.js'`（缺陷 EB）—— 命令在
+ *     PATH 上，wrapper 却找不到同目录的兄弟文件 ⇒ 点「修复命令链接」；
+ *   · `yarn: not found`（退出码 127）—— PATH 里压根没有这个命令 ⇒ 是扩展
+ *     没装/没接入，点修复按钮白费；
+ *   · 其它（被权限挡、被 selinux 挡、超时）⇒ 只能看诊断日志定位到具体文件。
+ *
+ * 一条提示指错按钮比没有提示更糟：用户会照着点，点完还是坏的，然后以为
+ * 整个修复链都没用。
  *
  * @param {{code?: number|null, out?: string, err?: string, error?: Error|null}} r
  * @returns {Item}
@@ -140,16 +147,15 @@ export function judgeYarn(r) {
   }
   const firstLine = (err || out || String(r?.error?.message ?? '没有输出')).split('\n')[0]
   const missingSibling = /Cannot find module/i.test(blob)
-  return item(
-    'YARN',
-    '包管理器命令（yarn）',
-    Level.FAIL,
-    `yarn --version 失败：${firstLine}`,
-    missingSibling
-      ? '这是「wrapper 找不到兄弟文件」：点下面的「修复命令链接」（或重启引擎，启动时也会自动修）。' +
-        '修完要**重开终端**，已开着的 shell 里 PATH 与命令缓存不会自己刷新。'
-      : '点「修复命令链接」试一次；仍失败就导出诊断日志，看这条命令到底解析到了哪个文件。',
-  )
+  const notFound = !missingSibling && (r?.code === 127 || /:\s*not found\b/i.test(blob))
+  const hint = missingSibling
+    ? '这是「wrapper 找不到兄弟文件」：点下面的「修复命令链接」（或重启引擎，启动时也会自动修）。' +
+      '修完要**重开终端**，已开着的 shell 里 PATH 与命令缓存不会自己刷新。'
+    : notFound
+      ? 'PATH 里没有 yarn 这个命令，不是链接坏了：多半是 yarn 扩展没装或没接入。' +
+        '去控制台「扩展」页确认它在列表里且是启用状态；装完要重启引擎，再重开终端。'
+      : '点「修复命令链接」试一次；仍失败就导出诊断日志，看这条命令到底解析到了哪个文件。'
+  return item('YARN', '包管理器命令（yarn）', Level.FAIL, `yarn --version 失败：${firstLine}`, hint)
 }
 
 /**

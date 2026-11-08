@@ -105,7 +105,7 @@ console.log('\n[2] yarn --version')
 
   const other = judgeYarn({ code: 127, out: '', err: 'sh: yarn: not found', error: null })
   equal('找不到命令 → 失败', other.status, Level.FAIL)
-  check('非兄弟文件缺失时不乱指修复按钮', !other.hint.includes('wrapper'))
+  check('127 的提示指向「扩展没装」，不是修复按钮', other.hint.includes('扩展') && !other.hint.includes('修复命令链接'))
 
   const timedOut = judgeYarn({ code: null, out: '', err: '', error: { code: 'ETIMEDOUT' } })
   equal('超时 → 失败而不是通过', timedOut.status, Level.FAIL)
