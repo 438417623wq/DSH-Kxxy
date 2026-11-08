@@ -583,7 +583,17 @@ console.log('\n[E] 平台边界与网络诊断')
   ok('GYP_DEFINES 已设时不整条覆盖（追加 android_ndk_path）',
     /inheritedGyp/.test(kotlinConfig) && /contains\("android_ndk_path="\)/.test(kotlinConfig))
   ok('~/.bashrc 兜一层 GYP_DEFINES（shell 不是引擎拉起时）',
-    /kxxy-shell@3/.test(kotlinConfig) && /android_ndk_path=\$\{'\$'\}_ndkstub/.test(kotlinConfig))
+    /kxxy-shell@4/.test(kotlinConfig) && /android_ndk_path=\$\{'\$'\}_ndkstub/.test(kotlinConfig))
+  // 判据必须与 buildEnv 同形：看有没有那一条 key，而不是看整串是否为空。
+  // 上一版只判空串 —— 用户设了别的 GYP_DEFINES 时一条都不补，同一个变量在
+  // 两处有两套判据，这种不对称迟早咬人。
+  ok('~/.bashrc 的判据与 buildEnv 一致（按 key 判，不是按空串判）',
+    /case " \$\{'\$'\}\{GYP_DEFINES:-\} " in/.test(kotlinConfig) &&
+      /\*" android_ndk_path="\*\)/.test(kotlinConfig) &&
+      /GYP_DEFINES="\$\{'\$'\}GYP_DEFINES android_ndk_path=/.test(kotlinConfig))
+  ok('~/.bashrc 也把 $HOME/.kxxy/bin 挂进 PATH（外部 shell 拿得到 ghraw）',
+    /case ":\$\{'\$'\}PATH:" in/.test(kotlinConfig) &&
+      /export PATH="\$\{'\$'\}PATH:\$\{'\$'\}HOME\/\.kxxy\/bin"/.test(kotlinConfig))
   ok('NATIVE 体检项解释原生编译链（含 npm 12 的安装脚本闸门）',
     /code = 'NATIVE'/.test(healthSrc) && /install-scripts approve/.test(healthSrc))
 
@@ -607,6 +617,29 @@ console.log('\n[E] 平台边界与网络诊断')
     /probeApiRoute/.test(netSrc) && /next\.api = api/.test(netSrc))
   ok('体检在黑洞时优先报 API 路线', /ghraw <raw-url>/.test(healthSrc))
   ok('PLATFORM 不再声称"没有 NDK 就装不上"', !/没有 NDK：node-gyp/.test(healthSrc))
+}
+
+// ── 一键验收：只诊断，不修 ──────────────────────────────────────────
+//
+// 这层断言的意义是钉住**边界**：验收如果顺手改了盘，出问题时没人说得清是
+// 哪一步动的。所以既要有入口，也要能证明它不写文件。
+{
+  const selfSrc = norm(read('plugins/kxxy-host/lib/selftest.mjs'))
+  ok('自检模块存在且六项判定可单测',
+    /export function judgeAuth/.test(selfSrc) &&
+      /export function judgeYarn/.test(selfSrc) &&
+      /export function judgeNdk/.test(selfSrc) &&
+      /export function judgeTmp/.test(selfSrc) &&
+      /export function judgeHelpers/.test(selfSrc) &&
+      /export function judgeRaw/.test(selfSrc))
+  // 「只读」的准确含义：除了临时目录里那个写完就删的探针，不碰任何东西
+  ok('自检只读：除临时探针外不写盘、不建目录、不改权限',
+    !/mkdirSync/.test(selfSrc) &&
+      !/chmodSync/.test(selfSrc) &&
+      (selfSrc.match(/writeFileSync\(/g) || []).length === 1)
+  ok('动作入口挂在分派表上', /case 'selftest'/.test(hostLib))
+  ok('控制台有一键验收按钮', /btn-selftest/.test(norm(read('plugins/kxxy-host/web/index.html'))))
+  ok('/state 顶层带最近一次验收结果', /selftest: lastSelftest/.test(hostLib))
 }
 
 // 生成器

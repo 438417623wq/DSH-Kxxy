@@ -1020,6 +1020,17 @@
               <span>装 GitHub 直链助手</span>
             </button>
 
+            <!-- 一键验收：把「装完要手敲的四五条命令」收成一次点击。
+                 这些检查在引擎进程里跑，等于在真机同一套 env / PATH 下敲 ——
+                 只诊断，不修（修各有各的按钮） -->
+            <button class="button button-subtle button-block" id="btn-selftest">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 11l3 3L22 4"/>
+                <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+              </svg>
+              <span>一键验收（六项）</span>
+            </button>
+
             <!-- 直达插件页：对话页白屏时用户第一反应是「把刚装的插件关掉」，
                  从概览的维护区进来比在底栏五个页签里找更直觉 -->
             <button class="button button-subtle button-block" id="btn-open-plugins">
@@ -1031,6 +1042,16 @@
               </svg>
               <span>插件管理</span>
             </button>
+          </div>
+
+          <!-- 验收结果：每条一行（状态点 + 标题 + 证据 + 该点哪个按钮）。
+               刻意放在按钮下方同一个卡片里 —— 用户点完按钮眼睛不用移动 -->
+          <div class="selftest-panel" id="selftest-panel" hidden>
+            <div class="selftest-head">
+              <span class="selftest-verdict" id="selftest-verdict">—</span>
+              <button class="button button-subtle" id="btn-selftest-copy">复制结果</button>
+            </div>
+            <ul class="selftest-list" id="selftest-list"></ul>
           </div>
         </div>
       </section>

@@ -390,8 +390,8 @@ else
 fi | sed -E 's#^https?://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/([^/]+)/(.*)\$#https://api.github.com/repos/\\1/\\2/contents/\\4?ref=\\3#'
 `
 
-/** 助手脚本的真值表：文件名 → 内容。 */
-const HELPERS = [
+/** 助手脚本的真值表：文件名 → 内容。自检（selftest）也用它列名单。 */
+export const HELPERS = [
   { name: 'ghraw', body: GHRAW_SH },
   { name: 'raw2api', body: RAW2API_SH },
 ]

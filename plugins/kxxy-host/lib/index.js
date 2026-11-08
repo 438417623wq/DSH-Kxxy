@@ -35,6 +35,7 @@
  *      heal-ext       → 重跑扩展接入自愈（悬空链 / wrapper 缺兄弟文件）
  *      apply-raw-mirror → 实测镜像并写进 etc/net.json（重启后 git 生效）
  *      install-ghraw  → 重装 $HOME/.kxxy/bin/{ghraw,raw2api}（走 API 取 raw）
+ *      selftest       → 六项真机验收（鉴权/ yarn / NDK / 临时目录 / 助手 / raw），只读
  *      install-ext / switch-mirror → 已迁往专用端点，此处明确 400
  *      未知动作       → 501，让前端抛错回滚按钮而不是假成功
  *
@@ -52,6 +53,7 @@ import * as health from './health.mjs'
 import * as mirror from './mirror.mjs'
 import * as netdiag from './netdiag.mjs'
 import * as plugins from './plugins.mjs'
+import * as selftest from './selftest.mjs'
 import { tarGzSync } from './tar.mjs'
 import { AUTH_ALLOW, AUTH_DENY, AUTH_UNAVAILABLE, authVerdict, authDetail, checkNonce, checkWriteRequest, acceptedNonces, rotateNonce, deniedPageHtml } from './auth.mjs'
 import { redactLogTail } from './redact.mjs'
@@ -929,6 +931,17 @@ async function dispatchAction(payload) {
       }
     }
 
+    // ── 真机验收：六项一次跑完（只读，不改盘）──────────────────────────
+    //
+    // 之前每条验收都是让人在终端里手敲再截图：敲错引号、用错 shell、只看
+    // 一条就回来问，来回好几轮。这些检查在引擎进程里跑一遍等价于在同一套
+    // env / PATH 下敲命令，所以把入口收到这里。**它不修任何东西** ——
+    // 修各有各的按钮（heal-ext / install-ghraw / apply-raw-mirror）。
+    case 'selftest': {
+      lastSelftest = await selftest.runSelftest()
+      return { status: 200, body: lastSelftest }
+    }
+
     // ── 已迁往专用端点的旧动作：明确报错并指引，绝不假成功 ──────────
     case 'install-ext':
       return {
@@ -955,6 +968,14 @@ let lastHeal = null
 
 /** 最近一次 ghraw 助手安装的结果（同上）。 */
 let lastHelpers = null
+
+/**
+ * 最近一次真机验收的结果（同上）。
+ *
+ * 只在用户点「一键验收」时更新：这套检查要起子进程、要查 DNS，放进
+ * `/state` 的三秒轮询里会把控制台拖慢，而它的结论本来也不会自己变。
+ */
+let lastSelftest = null
 
 /**
  * 跑一次扩展接入自愈，并把结果记进 [lastHeal]。
@@ -1333,6 +1354,8 @@ export function apply(ctx) {
               heal: lastHeal,
               // raw 直链绕行助手的安装结果（ghraw / raw2api 在 PATH 上）
               helpers: lastHelpers,
+              // 最近一次「一键验收」的结果（不自动跑，见 lastSelftest 注释）
+              selftest: lastSelftest,
             })
             return
           }

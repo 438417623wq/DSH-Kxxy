@@ -1139,3 +1139,21 @@ echo <raw-url> | raw2api           # 只转 URL，交给别的工具
 未认证 `api.github.com` 限流 60 次/小时（按 IP），批量取请设 `GH_TOKEN`；整仓下载用
 `codeload.github.com/<owner>/<repo>/tar.gz/refs/heads/<ref>`。体检 `NET` 现在会先报
 这条路线是否实测可用，镜像降为第二选择。
+
+### 一键验收（控制台「维护区」→ 一键验收）
+
+前面这些修完之后要验的东西散在四五条手敲命令里（`yarn --version`、`echo $GYP_DEFINES`、
+`ghraw …`、探 `/tmp`），以前是「敲一条、截图、贴回来、再问下一条」。现在一次点完，
+跑的就是**引擎进程自己**的环境 —— 与你终端里拿到的 env / PATH 是同一套：
+
+| 项 | 看什么 | 红了怎么办 |
+|---|---|---|
+| `AUTH` | `connection.admit` 这条判定链是否活着（报 `admit:peer` / `admit:401`） | 说明接口又变了，是「鉴权服务不可用」的成因 |
+| `YARN` | `yarn --version` 实际输出 | 点「修复命令链接」，然后重开终端 |
+| `NDK` | `GYP_DEFINES` 里 `android_ndk_path` 指向的目录在不在 | 重启引擎会自动建桩目录（不需要真 NDK） |
+| `TMP` | `TMPDIR` 能否写入（`/tmp` 写不进去属沙箱边界，只当证据） | 检查清理工具是否接管了应用私有目录 |
+| `HELPERS` | `ghraw` / `raw2api` 在不在、有没有执行位、在不在 PATH | 点「装 GitHub 直链助手」 |
+| `RAW` | `raw.githubusercontent.com` 的 DNS 现状 | 黑洞时用 `ghraw` 走 API，域名层面改不了 |
+
+它**只诊断、不修**（修各有各的按钮，一个按钮顺手改四处，出问题没人说得清是哪步动的），
+面板右上「复制结果」可直接把整份结论贴出来。

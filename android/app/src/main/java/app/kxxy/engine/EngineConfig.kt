@@ -1683,14 +1683,17 @@ object EngineConfig {
      * 扩展树里那份 ccache 是持久资产（`runtime` 重装从不碰 `extensions/`），
      * 所以在这里补一道判断即可。
      *
-     * `# kxxy-shell@3` 再追加一段 `GYP_DEFINES` 兜底：`android_ndk_path` 是
-     * node-gyp 在 android 目标下必读的变量（`common.gypi` 无条件引用它拼
-     * include 路径），缺了就在 configure 阶段死。它只需要一个桩目录，不需要
-     * 真 NDK（见 [buildEnv] 里的长注释）。引擎进程本身已经带着这条，这里补的是
-     * "shell 不是引擎拉起的"场景。
+     * `# kxxy-shell@3` 补了 `GYP_DEFINES` 的兜底（node-gyp 在 android 目标下
+     * 必读 `android_ndk_path`，缺了 configure 就死；它只需要一个桩目录）。
+     *
+     * `# kxxy-shell@4` 把 `GYP_DEFINES` 的判据对齐 `buildEnv`（**看有没有那一条
+     * key**，而不是看整串是否为空），并把 `$HOME/.kxxy/bin` 挂进 PATH：上一版
+     * 只判空串，用户自己设了别的定义时一条都不补；外部 shell 也拿不到 ghraw。
+     *
+     * @see buildEnv
      */
     private fun userShellInitContent(): String = """
-        # kxxy-shell@3
+        # kxxy-shell@4
         # [dsh-kxxy] 官方终端在 Android 上的默认交互式 shell 初始化。
         #
         # 上游以 `bash --rcfile <临时文件> -i` 启动终端，那个临时 rcfile 的第一行是
@@ -1737,14 +1740,34 @@ object EngineConfig {
         # 真 NDK（官方 NDK 的 host 工具链是 linux-x86_64，arm64 手机跑不了）。
         # 引擎进程启动时已经带着这条变量，这里补的是「shell 不是引擎拉起的」
         # 那种情况，以及用户手动 unset 之后的兜底。
-        if [ -z "${'$'}{GYP_DEFINES:-}" ]; then
-            _ndkstub="${'$'}HOME/.cache/kxxy-ndk-stub"
-            if [ ! -d "${'$'}_ndkstub/sources/android/cpufeatures" ]; then
-                mkdir -p "${'$'}_ndkstub/sources/android/cpufeatures" 2>/dev/null
-            fi
-            export GYP_DEFINES="android_ndk_path=${'$'}_ndkstub"
-            unset _ndkstub
-        fi
+        #
+        # 判定方式与 buildEnv **一致**：看有没有这一条 key，而不是看整串是否为空。
+        # 上一版只判空，于是用户自己设了别的 GYP_DEFINES（比如 `foo=1`）时
+        # 我们一条都不补 —— 同一个变量在两处有两套判据，这种不对称迟早咬人。
+        _ndkstub="${'$'}HOME/.cache/kxxy-ndk-stub"
+        case " ${'$'}{GYP_DEFINES:-} " in
+            *" android_ndk_path="*) : ;;
+            *)
+                if [ ! -d "${'$'}_ndkstub/sources/android/cpufeatures" ]; then
+                    mkdir -p "${'$'}_ndkstub/sources/android/cpufeatures" 2>/dev/null
+                fi
+                if [ -z "${'$'}{GYP_DEFINES:-}" ]; then
+                    export GYP_DEFINES="android_ndk_path=${'$'}_ndkstub"
+                else
+                    export GYP_DEFINES="${'$'}GYP_DEFINES android_ndk_path=${'$'}_ndkstub"
+                fi
+                ;;
+        esac
+        unset _ndkstub
+
+        # ── GitHub 直链助手（ghraw / raw2api）在 PATH 上 ────────────────────
+        # 引擎拉起的终端本来就有这条（buildEnv 注入），这里兜的是「shell 不是
+        # 引擎拉起的」以及用户自己覆盖过 PATH 的情况。目录可能还不存在 ——
+        # PATH 里挂一个不存在的目录无害，助手由插件启动时幂等写入。
+        case ":${'$'}PATH:" in
+            *":${'$'}HOME/.kxxy/bin:"*) : ;;
+            *) export PATH="${'$'}PATH:${'$'}HOME/.kxxy/bin" ;;
+        esac
     """.trimIndent() + "\n"
 
     /** 首行标记前缀，用于识别「这个 .bashrc 是我们写的」，避免覆盖用户自定义。 */

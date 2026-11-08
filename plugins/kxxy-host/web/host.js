@@ -216,6 +216,11 @@
     btnHealExt: document.getElementById('btn-heal-ext'),
     btnRawMirror: document.getElementById('btn-raw-mirror'),
     btnGhraw: document.getElementById('btn-ghraw'),
+    btnSelftest: document.getElementById('btn-selftest'),
+    selftestPanel: document.getElementById('selftest-panel'),
+    selftestList: document.getElementById('selftest-list'),
+    selftestVerdict: document.getElementById('selftest-verdict'),
+    btnSelftestCopy: document.getElementById('btn-selftest-copy'),
 
     // 插件视图（对话页白屏时的停用入口）
     pluginList: document.getElementById('plugin-list'),
@@ -324,6 +329,14 @@
 
   /** 最近一次拿到的快照，供热路径（连接按钮）读 id 用。 */
   let remoteSnapshot = null;
+
+  /**
+   * 最近一次「一键验收」的可复制文本。
+   *
+   * 存成文本而不是从 DOM 反推：面板里的 hint 是给人看的，复制出去要的是
+   * 「标题 — 证据 — 建议」三行列齐，两者结构不一样。
+   */
+  let lastSelftestText = '';
 
   /**
    * 引导卡的展开状态是否已经「按设备情况定过一次」。
@@ -2557,6 +2570,89 @@
           dom.btnGhraw.disabled = false;
         }
       });
+    }
+
+    // 一键验收（六项真机自检）
+    //
+    // 结果不能只弹 toast：六条结论要同时在场才能对照（哪条红、证据是什么、
+    // 该点哪个按钮），而 toast 会一条顶一条。这里渲染成一行一条，并把
+    // 「复制结果」留在面板右上 —— 用户要贴回来给我看时不用手抄。
+    if (dom.btnSelftest) {
+      dom.btnSelftest.addEventListener('click', async () => {
+        dom.btnSelftest.disabled = true;
+        showToast('正在验收（最多约 10 秒）...', 'info');
+        try {
+          const res = await apiPost('/kxxy/api/action', { action: 'selftest' });
+          renderSelftest(res);
+        } finally {
+          dom.btnSelftest.disabled = false;
+        }
+      });
+    }
+
+    if (dom.btnSelftestCopy) {
+      dom.btnSelftestCopy.addEventListener('click', async () => {
+        const text = lastSelftestText;
+        if (!text) {
+          showToast('还没有验收结果', 'info');
+          return;
+        }
+        const ok = await copyText(text);
+        showToast(ok ? '已复制验收结果' : '复制失败，请手动长按选中', ok ? 'success' : 'error');
+      });
+    }
+
+    /**
+     * 渲染一键验收的结果。
+     *
+     * 每条固定三行：标题（是什么）/ 证据（看到的原始事实）/ 建议（该做什么）。
+     * 三条分开是有原因的 —— 之前排障时最难的就是「现象」与「推断」混在一句话里，
+     * 用户照着一句混话去改，改完还是坏的。
+     *
+     * @param {{verdict?: string, note?: string, at?: number, items?: Array<object>}} res
+     */
+    function renderSelftest(res) {
+      if (!res || !Array.isArray(res.items)) {
+        showToast('验收没有返回结果', 'error');
+        return;
+      }
+      const labels = { pass: '通过', warn: '留意', fail: '失败', skip: '跳过' };
+      if (dom.selftestVerdict) {
+        dom.selftestVerdict.textContent = `${res.note || '验收完成'}（${labels[res.verdict] || res.verdict || '未知'}）`;
+        dom.selftestVerdict.setAttribute('data-verdict', res.verdict || '');
+      }
+      if (dom.selftestList) {
+        dom.selftestList.innerHTML = res.items
+          .map(
+            (it) => `
+          <li class="selftest-row" data-status="${escapeHtml(it.status)}">
+            <span class="selftest-dot" aria-hidden="true"></span>
+            <div>
+              <div class="selftest-title">${escapeHtml(it.title)}</div>
+              <div class="selftest-detail">${escapeHtml(it.detail || '')}</div>
+              ${it.hint ? `<div class="selftest-hint">${escapeHtml(it.hint)}</div>` : ''}
+            </div>
+          </li>`,
+          )
+          .join('');
+      }
+      if (dom.selftestPanel) {
+        dom.selftestPanel.hidden = false;
+      }
+      // 复制用的文本：一行一条，标出状态，便于直接贴回来
+      const when = res.at ? new Date(res.at).toLocaleString() : '';
+      lastSelftestText = [
+        `kxxy 验收${when ? `（${when}）` : ''}：${res.note || ''}`,
+        ...res.items.map(
+          (it) => `[${labels[it.status] || it.status}] ${it.title} — ${it.detail || ''}${it.hint ? `\n    建议：${it.hint}` : ''}`,
+        ),
+      ].join('\n');
+
+      if (res.ok) {
+        showToast(res.verdict === 'warn' ? '验收通过，有几条要留意' : '全部通过', res.verdict === 'warn' ? 'warning' : 'success');
+      } else {
+        showToast(res.note || '有项目没通过，逐条看下方结果', 'error');
+      }
     }
 
     // 权限等级：模式卡选中后「应用并重启引擎」

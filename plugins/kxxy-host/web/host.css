@@ -2373,6 +2373,120 @@ html, body {
   margin-top: 12px;
 }
 
+/* ── 一键验收的结果面板 ──────────────────────────────────────────────────
+   为什么不用 toast：一次六条，toast 会互相顶掉，而用户真正要看的是
+   「哪条红了、它的证据是什么、该点哪个按钮」—— 三样东西得同时在场。
+   颜色只做点缀（状态点 + 左边框），正文一律用主题文字色，
+   避免在浅色主题下出现读不清的绿字。 */
+.selftest-panel {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.selftest-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.selftest-head .button {
+  width: auto;
+  min-width: 0;
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+.selftest-verdict {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.selftest-verdict[data-verdict='pass'] {
+  color: var(--accent-green);
+}
+
+.selftest-verdict[data-verdict='warn'] {
+  color: var(--accent-orange);
+}
+
+.selftest-verdict[data-verdict='fail'] {
+  color: var(--accent-red);
+}
+
+.selftest-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.selftest-row {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border-left: 3px solid var(--border-strong);
+}
+
+.selftest-row[data-status='pass'] {
+  border-left-color: var(--accent-green);
+}
+
+.selftest-row[data-status='warn'] {
+  border-left-color: var(--accent-orange);
+}
+
+.selftest-row[data-status='fail'] {
+  border-left-color: var(--accent-red);
+}
+
+.selftest-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.selftest-row[data-status='pass'] .selftest-dot {
+  background: var(--accent-green);
+}
+
+.selftest-row[data-status='warn'] .selftest-dot {
+  background: var(--accent-orange);
+}
+
+.selftest-row[data-status='fail'] .selftest-dot {
+  background: var(--accent-red);
+}
+
+.selftest-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.selftest-detail {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  margin-top: 2px;
+  word-break: break-word;
+}
+
+.selftest-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
 /* 底部 Tab 导航栏 */
 .app-tabbar {
   position: fixed;

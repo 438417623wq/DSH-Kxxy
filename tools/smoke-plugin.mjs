@@ -964,6 +964,28 @@ console.log('\n[8d] 已迁移与未知动作：明确报错而非假成功')
   } else if ((gh.written ?? []).length !== 0) {
     fail(`第二次补装应无写入，实为 ${(gh.written ?? []).join(',')}`)
   } else ok(`install-ghraw → 200（内容已是最新，dir=${gh.dir}）`)
+
+  // selftest：一键验收。构建机上 yarn / 临时目录两项按「跳过」处理（PATH 与
+  // 真机不同），所以这里不假设全绿，只钉三件事：形状对、条目齐、计数自洽。
+  const r6 = await post({ action: 'selftest' })
+  let st = null
+  try { st = await r6.json() } catch { st = null }
+  const ids = (st?.items ?? []).map((i) => i.id).join(',')
+  const counted = st ? st.counts.pass + st.counts.warn + st.counts.fail + st.counts.skip : -1
+  if (r6.status !== 200) fail(`selftest 应 200，实为 ${r6.status}（${JSON.stringify(st)}）`)
+  else if (!Array.isArray(st?.items) || st.items.length !== 6) {
+    fail(`selftest 应返回 6 条，实为 ${st?.items?.length}`)
+  } else if (ids !== 'AUTH,YARN,NDK,TMP,HELPERS,RAW') {
+    fail(`selftest 条目顺序不对：${ids}`)
+  } else if (!st.items.every((i) => i.id && i.title && i.status && typeof i.detail === 'string')) {
+    fail(`selftest 有条目缺字段：${JSON.stringify(st.items)}`)
+  } else if (counted !== st.items.length) {
+    fail(`selftest 计数与条目数不一致：${JSON.stringify(st.counts)} vs ${st.items.length}`)
+  } else if (st.ok !== (st.counts.fail === 0)) {
+    fail(`selftest 的 ok 与失败数矛盾：ok=${st.ok} fail=${st.counts.fail}`)
+  } else {
+    ok(`selftest → 200（${st.counts.pass} 通过 / ${st.counts.warn} 留意 / ${st.counts.fail} 失败 / ${st.counts.skip} 跳过）`)
+  }
 }
 
 console.log('\n[9] POST /kxxy/api/action 非法 JSON')
@@ -1055,6 +1077,12 @@ console.log('\n[5b] 设备簿透传（缺陷 DV：已配对的电脑列表永远
       ok(`顶层 helpers 快照透出（dir=${j.helpers.dir}）`)
     } else {
       fail(`顶层 helpers 缺失或形状不对：${JSON.stringify(j.helpers)}`)
+    }
+    // 验收结果同理：用户贴回来的是这份快照，形状错一个字段就没法对照。
+    if (j.selftest && Array.isArray(j.selftest.items) && j.selftest.items.length === 6) {
+      ok(`顶层 selftest 快照透出（${j.selftest.verdict}）`)
+    } else {
+      fail(`顶层 selftest 缺失或形状不对：${JSON.stringify(j.selftest)}`)
     }
   }
 
