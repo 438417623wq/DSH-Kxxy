@@ -132,6 +132,33 @@ class MainActivity : Activity() {
         exitRemote()
     }
 
+    /**
+     * 本轮自动连接允许的时间（毫秒），由 [autoConnectTimeoutMs] 在进入远程时定下。
+     *
+     * 单独存字段而不是每次现算：主框架在推进时看门狗要**续期**（见
+     * `onProgressChanged`），续期必须用与首次排程同一个期限，否则公网隧道
+     * 会在第 4.5 秒被自己排的旧定时器砍掉。
+     */
+    @Volatile
+    private var remoteWatchdogMs = AUTO_CONNECT_TIMEOUT_MS
+
+    /**
+     * 自动连接该给多久。
+     *
+     * 4.5 秒这个数只在局域网成立。公网隧道是另一回事：DNS → TLS → Cloudflare
+     * 边缘 → 回源 → 前端整包下载，实测首屏 5–13 秒（2026-11-16 trycloudflare
+     * 真机），拿局域网的阈值去量它，结果就是每次冷启动都「自动连接超时 →
+     * 静默退回本机」，用户看到的永远是本地那个空工作区。
+     *
+     * 判据用 `kind == tunnel` 或「主机不是私网地址」，两者任一成立就按广域网算。
+     */
+    private fun autoConnectTimeoutMs(device: RemoteStore.Device): Long =
+        if (device.kind == "tunnel" || !RemoteLink.isPrivateHost(device.host)) {
+            AUTO_CONNECT_WAN_TIMEOUT_MS
+        } else {
+            AUTO_CONNECT_TIMEOUT_MS
+        }
+
     @Volatile
     private var urlLoaded = false
 
@@ -453,6 +480,22 @@ class MainActivity : Activity() {
                 // plugins，引擎本身活着）。这里把那条错误落盘，体检才可能报出来。
                 WebBootLog.record(this@MainActivity, msg.message(), msg.sourceId(), msg.lineNumber())
                 return true
+            }
+
+            /**
+             * 主框架还在推进，就给自动连接的看门狗续期。
+             *
+             * 看门狗要抓的是「连得上但对方不回包」——那种情况进度条会**卡死**
+             * 不动。而公网隧道是「慢但在动」：每来一次进度回调就把期限往后滑
+             * 一个 [remoteWatchdogMs]，于是慢速链路不会被误杀，真卡死仍然会
+             * 在期限内落回本机。这是把「超时」从绝对时间改成「无进展时间」。
+             */
+            override fun onProgressChanged(view: WebView, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                if (!remoteMode || remotePageLoaded) return
+                if (newProgress >= 100) return
+                webView.removeCallbacks(remoteWatchdog)
+                webView.postDelayed(remoteWatchdog, remoteWatchdogMs)
             }
 
             /**
@@ -1137,7 +1180,10 @@ class MainActivity : Activity() {
         Log.i(TAG, "enter remote session: ${device.label} @ ${device.origin} (auto=$auto)")
         webView.loadUrl(device.url)
         webView.removeCallbacks(remoteWatchdog)
-        if (auto) webView.postDelayed(remoteWatchdog, AUTO_CONNECT_TIMEOUT_MS)
+        if (auto) {
+            remoteWatchdogMs = autoConnectTimeoutMs(device)
+            webView.postDelayed(remoteWatchdog, remoteWatchdogMs)
+        }
     }
 
     /** 断开远程，回到本机宿主页的「远程控制」视图。 */
@@ -1902,6 +1948,19 @@ class MainActivity : Activity() {
          * 自动连接的初衷 —— 用户宁可手动点一次，也不愿意盯一个白屏。
          */
         private const val AUTO_CONNECT_TIMEOUT_MS = 4_500L
+
+        /**
+         * 广域网（公网隧道 / 非私网主机）自动连接的无进展等待上限。
+         *
+         * 为什么不复用 4.5 秒：那一档是照局域网定的（本地 HTTP，200ms 就回）。
+         * 公网隧道要过 DNS、TLS、Cloudflare 边缘、回源、整包前端，实测首屏
+         * 5–13 秒。用局域网阈值去量它只会得到「每次自动连接都超时」。
+         *
+         * 20 秒不是「等 20 秒才放弃」——`onProgressChanged` 每来一次进度就
+         * 续期一次，所以这只是**无进展**容忍时间：只要还在动就一直等，真卡死
+         * 20 秒后照样落回本机。
+         */
+        private const val AUTO_CONNECT_WAN_TIMEOUT_MS = 20_000L
 
         /** 设置页里「相机」「麦克风」「媒体」「短信」等单项授权共用的回执码。 */
         private const val REQ_PERM_MEDIA = 4204
