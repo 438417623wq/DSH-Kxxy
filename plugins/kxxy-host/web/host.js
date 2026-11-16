@@ -1765,6 +1765,15 @@
    */
   const expandedGroups = new Set();
 
+  /**
+   * 用户**显式折叠**过的分组。
+   *
+   * 只有 {@link expandedGroups} 是不够的：默认态本身会随数据变化（见下方
+   * `defaultExpanded`），没有「我就是要折叠」的记录时，用户手动收起的分组
+   * 会在下一次 5 秒轮询里被默认态重新展开。
+   */
+  const collapsedGroups = new Set();
+
   function renderExtensions(data) {
     if (!dom.extensionsList) return;
     const items = Array.isArray(data.items) ? data.items : [];
@@ -1790,6 +1799,9 @@
 
     // 分组：已激活排最前（默认折叠），其余按类目；未知类目归入开发工具
     const pending = items.filter(i => !i.installed);
+    // 还有东西可装时，「已激活」折叠起来给「获取」让位；全都装完了就展开它，
+    // 否则整页只剩一行组标题（见下方 defaultExpanded）。
+    const hasPending = pending.length > 0;
     const groups = [
       { key: 'installed', label: `已激活`, items: items.filter(i => i.installed), collapsible: true },
       { key: 'toolchain', label: CATEGORY_LABELS.toolchain, items: pending.filter(i => i.category === 'toolchain') },
@@ -1812,14 +1824,31 @@
       body.className = 'ext-group-body';
       // 已激活组：默认折叠，但恢复用户上次的展开态（见 expandedGroups 注释）
       if (group.collapsible) {
-        if (!expandedGroups.has(group.key)) body.classList.add('collapsed');
+        /*
+         * 展开态优先级：用户显式点过 > 默认值。
+         *
+         * 默认值取决于「这一页还有没有别的分组」：0.9.60 的真机验收发现，24 项
+         * 全部已激活的设备上唯一的分组就是「已激活」，而它默认折叠 —— 打开扩展页
+         * 只看到一行「已激活 24」，下面整片空白，看起来像加载失败。所以只有还存在
+         * 可安装分组时，才把已激活折叠起来给「获取」让位。
+         */
+        const defaultExpanded = !hasPending;
+        const expanded = expandedGroups.has(group.key)
+          ? true
+          : collapsedGroups.has(group.key) ? false : defaultExpanded;
+        if (!expanded) body.classList.add('collapsed');
         title.classList.add('clickable');
-        if (!body.classList.contains('collapsed')) title.classList.add('expanded');
+        title.classList.toggle('expanded', expanded);
         title.addEventListener('click', () => {
-          body.classList.toggle('collapsed');
-          const nowExpanded = !body.classList.contains('collapsed');
-          if (nowExpanded) expandedGroups.add(group.key);
-          else expandedGroups.delete(group.key);
+          const nowExpanded = body.classList.contains('collapsed');
+          body.classList.toggle('collapsed', !nowExpanded);
+          if (nowExpanded) {
+            expandedGroups.add(group.key);
+            collapsedGroups.delete(group.key);
+          } else {
+            expandedGroups.delete(group.key);
+            collapsedGroups.add(group.key);
+          }
           title.classList.toggle('expanded', nowExpanded);
         });
       }
@@ -1883,9 +1912,16 @@
     if (installing) {
       action.appendChild(progressButton(installing));
     } else if (ext.installed) {
-      // 已激活不再用「禁用按钮」表达 —— 灰色不可点的按钮既占掉 76px 宽度，
-      // 又把行高撑成两行（两个 30px 按钮竖排）。状态用小胶囊，动作只留一个按钮。
-      action.appendChild(el('<span class="ext-chip-ok">已激活</span>'));
+      /*
+       * 已激活行**不再挂绿色胶囊**。第 4 次真机验收（0.9.60）发现：
+       * 胶囊 + 卸载按钮并排要吃掉 124px，正文只剩 129px，
+       * 「FFmpeg 多媒体工具链」正好被挤成「FFmpeg 多媒体工 / 具链」两行，
+       * 同一张列表里出现两种行高。
+       *
+       * 而且这枚胶囊是纯冗余：已激活的条目只会落在「已激活 N」这一组里，
+       * 组标题已经说了状态，行尾的「卸载」也表示了状态 —— 再写一遍只是噪音。
+       * 按全站规则「卡片只分组，状态归组标题」，动作区只留一个按钮。
+       */
       const un = el('<button class="button button-subtle button-sm ext-remove">卸载</button>');
       un.addEventListener('click', () => removeExtension(ext.id, name));
       action.appendChild(un);

@@ -4720,15 +4720,24 @@ body {
   order: 1;
   margin-bottom: 0;
   gap: 6px;
+  align-items: center;
+  min-width: 0;
 }
 
+/* 名称单行截断：真机数据里「FFmpeg 多媒体工具链」比设计稿的「FFmpeg 6.1.1」
+   长一倍，不截断就会在末尾那个字上折行（0.9.60 实测）。 */
 .ext-name {
   font-size: var(--dsl-fs-row);
   font-weight: 600;
   color: var(--dsl-t1);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ext-version {
+  flex: none;
   font-size: var(--dsl-fs-mini);
   color: var(--dsl-t3);
 }
@@ -4738,6 +4747,9 @@ body {
   font-size: var(--dsl-fs-mini);
   color: var(--dsl-t3);
   margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ext-desc {
@@ -4778,20 +4790,9 @@ body {
   flex-direction: row;
   align-items: center;
   justify-content: flex-end;
-  min-width: 76px;
-}
-
-.ext-chip-ok {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  height: 22px;
-  padding: 0 7px;
-  border-radius: 999px;
-  font-size: var(--dsl-fs-mini);
-  font-weight: 600;
-  color: var(--dsl-ok);
-  background-color: var(--dsl-ok-soft);
+  /* 不再预留 76px：那是给「状态胶囊 + 动作」两件套留的，现在每行只有一个动作，
+     固定宽度只会白占正文空间。宽度交给按钮自己的 min-width。 */
+  min-width: 0;
 }
 
 .ext-action .button {
