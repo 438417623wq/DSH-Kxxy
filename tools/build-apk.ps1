@@ -395,9 +395,8 @@ try {
     Write-Host ""
     Write-Host ("同一份包也在：{0}" -f $signed) -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "安装到真机（patchset 版本未变时必须 pm clear，否则 isComplete() 判真不重装）：" -ForegroundColor Yellow
+    Write-Host "覆盖安装到真机（保留应用数据；启动异常使用原生诊断/救援）：" -ForegroundColor Yellow
     Write-Host "  adb install -r `"$distApk`""
-    Write-Host "  adb shell pm clear app.kxxy"
     Write-Host "  adb shell monkey -p app.kxxy -c android.intent.category.LAUNCHER 1"
     Write-Host ""
     Write-Host "签名是仓库内固定密钥（android/keystore/），此后换机器/换用户都不用再卸载。" -ForegroundColor DarkGray

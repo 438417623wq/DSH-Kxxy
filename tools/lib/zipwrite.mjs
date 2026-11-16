@@ -6,7 +6,9 @@
  * 而我们必须精确控制：
  *   - external_attr 里的 Unix mode（0755/0644），让安装器能直接照抄权限位；
  *   - 每个条目的存储方式（大二进制用 deflate，已是压缩格式的用 store）；
- *   - 不产生 Zip64 记录（总大小 < 4 GiB，用不到，且 Android 端解析更简单）。
+ *   - 默认只产 ZIP32；完整 runtime 可显式启用仅条目计数的有界 ZIP64。
+ *     文件长度、压缩长度、偏移和总归档仍小于 4 GiB，不产生逐文件 ZIP64 extra。
+ *     APK 外层与增量补包不隐式启用 ZIP64。
  *
  * 格式参考 PKWARE APPNOTE 4.3.16：
  *   本地文件头 30 字节 + 文件名 + 数据
@@ -15,6 +17,44 @@
  */
 import { closeSync, openSync, readFileSync, readSync } from "node:fs";
 import zlib, { deflateRawSync } from "node:zlib";
+
+// 计数扩展不是无限制 ZIP64：保持原有 ZIP32 长度/偏移边界，且限制目录内存。
+export const MAX_ZIP_ENTRIES = 200_000;
+export const MAX_ZIP_CENTRAL_BYTES = 64 * 1024 * 1024;
+export const ZIP32_SENTINEL = 0xffffffff;
+
+/** 仅支持单卷、32 位大小/偏移；只有条目数 >=65535 时写 ZIP64 EOCD+locator。 */
+export function zipEndRecords(count, cdSize, cdOffset, { allowZip64Count = false } = {}) {
+  for (const [name, value] of Object.entries({ count, cdSize, cdOffset })) {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`非法 ZIP ${name}：${value}`);
+  }
+  if (count > MAX_ZIP_ENTRIES || cdSize > MAX_ZIP_CENTRAL_BYTES || cdSize < count * 46 ||
+      cdSize >= ZIP32_SENTINEL || cdOffset >= ZIP32_SENTINEL) throw new Error("ZIP 目录超过有界格式上限");
+  const zip64 = count >= 0xffff;
+  if (zip64 && !allowZip64Count) throw new Error("ZIP32 条目数超过上限；仅完整 runtime 可显式启用 ZIP64 计数");
+  const prefix = zip64 ? 76 : 0;
+  if (cdOffset + cdSize + prefix + 22 >= ZIP32_SENTINEL) throw new Error("ZIP 归档超过 32 位大小/偏移上限");
+  const bytes = Buffer.alloc(prefix + 22);
+  if (zip64) {
+    bytes.writeUInt32LE(0x06064b50, 0);
+    bytes.writeBigUInt64LE(44n, 4);
+    bytes.writeUInt16LE(0x032d, 12); // Unix, ZIP 4.5
+    bytes.writeUInt16LE(45, 14);
+    bytes.writeBigUInt64LE(BigInt(count), 24);
+    bytes.writeBigUInt64LE(BigInt(count), 32);
+    bytes.writeBigUInt64LE(BigInt(cdSize), 40);
+    bytes.writeBigUInt64LE(BigInt(cdOffset), 48);
+    bytes.writeUInt32LE(0x07064b50, 56);
+    bytes.writeBigUInt64LE(BigInt(cdOffset + cdSize), 64);
+    bytes.writeUInt32LE(1, 72); // total disks
+  }
+  bytes.writeUInt32LE(0x06054b50, prefix);
+  bytes.writeUInt16LE(zip64 ? 0xffff : count, prefix + 8);
+  bytes.writeUInt16LE(zip64 ? 0xffff : count, prefix + 10);
+  bytes.writeUInt32LE(cdSize, prefix + 12);
+  bytes.writeUInt32LE(cdOffset, prefix + 16);
+  return bytes;
+}
 
 const CRC_TABLE = (() => {
   const table = new Int32Array(256);
@@ -212,13 +252,16 @@ function dosDateTime(date) {
  * 全程只保留「已完成条目的元数据」与「中央目录缓冲」，不把整个 zip 放内存。
  */
 export class ZipWriter {
-  constructor(sink) {
+  constructor(sink, { allowZip64Count = false } = {}) {
     this.sink = sink; // (Buffer) => void
     this.offset = 0;
     this.entries = [];
+    this.allowZip64Count = allowZip64Count;
+    this.finished = false;
   }
 
   #emit(buf) {
+    if (this.offset + buf.length >= ZIP32_SENTINEL) throw new Error("ZIP 归档超过 32 位大小/偏移上限");
     this.sink(buf);
     this.offset += buf.length;
   }
@@ -271,6 +314,9 @@ export class ZipWriter {
   }
 
   async #addInternal(name, data, file, opts) {
+    if (this.finished) throw new Error("ZIP 已结束，不能继续添加条目");
+    const limit = this.allowZip64Count ? MAX_ZIP_ENTRIES : 0xfffe;
+    if (this.entries.length >= limit) throw new Error("ZIP 条目数超过上限");
     const { mode = 0o644, level = 6, comment = "", date = new Date("2026-01-01T00:00:00Z") } = opts;
     /*
      * ⚠️ 这两个 Buffer 会**长期**留在 `this.entries` 里（中央目录最后才写），
@@ -311,6 +357,10 @@ export class ZipWriter {
     const commentBuf = ownBuffer(comment);
 
     const totalSize = data !== null ? data.length : file.size;
+    if (!nameBuf.length || nameBuf.length > 0xffff || commentBuf.length > 0xffff ||
+        !Number.isSafeInteger(totalSize) || totalSize < 0 || totalSize >= ZIP32_SENTINEL) {
+      throw new Error(`ZIP 条目名称、注释或长度超过格式上限：${name}`);
+    }
     const ext = name.slice(name.lastIndexOf(".")).toLowerCase();
     const wantDeflate = level >= 0 && totalSize > 0 && !ALREADY_COMPRESSED.has(ext);
 
@@ -420,7 +470,10 @@ export class ZipWriter {
 
   /** 写中央目录与结束记录。返回总字节数与条目数。 */
   finish() {
+    if (this.finished) throw new Error("ZIP 不能重复结束");
     const cdStart = this.offset;
+    const plannedSize = this.entries.reduce((sum, e) => sum + 46 + e.name.length + e.comment.length, 0);
+    const end = zipEndRecords(this.entries.length, plannedSize, cdStart, { allowZip64Count: this.allowZip64Count });
     for (const e of this.entries) {
       const head = Buffer.alloc(46);
       head.writeUInt32LE(0x02014b50, 0);
@@ -444,19 +497,10 @@ export class ZipWriter {
       this.#emit(e.name);
       if (e.comment.length) this.#emit(e.comment);
     }
-    const cdSize = this.offset - cdStart;
-
-    const end = Buffer.alloc(22);
-    end.writeUInt32LE(0x06054b50, 0);
-    end.writeUInt16LE(0, 4);
-    end.writeUInt16LE(0, 6);
-    end.writeUInt16LE(this.entries.length, 8);
-    end.writeUInt16LE(this.entries.length, 10);
-    end.writeUInt32LE(cdSize, 12);
-    end.writeUInt32LE(cdStart, 16);
-    end.writeUInt16LE(0, 20);
+    if (this.offset - cdStart !== plannedSize) throw new Error("ZIP 中央目录写入长度不一致");
     this.#emit(end);
+    this.finished = true;
 
-    return { bytes: this.offset, entries: this.entries.length };
+    return { bytes: this.offset, entries: this.entries.length, zip64Count: this.entries.length >= 0xffff };
   }
 }

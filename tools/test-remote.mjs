@@ -102,6 +102,14 @@ ok('快照含 devices / lastUsedId / count / error', ['"devices"', '"lastUsedId"
 ok('每个设备含 id/label/host/origin/kind/secure/ok', ['"id"', '"label"', '"host"', '"origin"', '"kind"', '"secure"', '"ok"'].every((k) => store.includes(k)))
 ok('错误带自增序号（前端靠它决定弹不弹 toast）', has(store, 'KEY_ERROR_SEQ') && has(store, 'noteError'))
 ok('noteError 递增序号并落盘', has(store, 'putLong(KEY_ERROR_SEQ'))
+/*
+ * 这两个字段此前只在读取侧存在、写入侧漏了 —— 表现是「以后再说」重启后
+ * 失效、证书指纹存不住（于是每次都算首次信任，TOFU 等于没有）。
+ */
+ok('trustPromptSkipped 真的落盘', has(store, 'put("trustPromptSkipped", d.trustPromptSkipped)'))
+ok('证书指纹落盘且可清除', has(store, 'put("certSha256"') && has(store, 'fun clearCertificatePin'))
+ok('快照只报「是否固定过」，不下发指纹本身', has(store, 'put("certPinned",'))
+ok('重新配对时继承证书固定（换码不该让固定失效）', has(store, 'certSha256 = existing?.certSha256'))
 
 // ---------------------------------------------------------------------------
 // [A] 契约：安全边界（这一段最重要）
@@ -115,12 +123,22 @@ ok(
   '否则远端页面能调起本机的系统权限申请',
 )
 ok('先立标记再 loadUrl（顺序是安全语义，不是时序优化）', has(activity, 'remoteMode = true') && /remoteMode = true[\s\S]{0,400}loadUrl/.test(activity))
-ok('远程 origin 之外不放行应用内导航', /isPairedOrigin|paired/i.test(activity))
+ok('远程 origin 之外不放行应用内导航', has(activity, 'RemoteStore.isTrustedUrl(this@MainActivity, url)'))
+/*
+ * SSL 边界（v0.9.54 改写）。
+ *
+ * 旧规则是「host 在设备簿里就 proceed」—— 配对一次就永久放弃服务端身份
+ * 校验。这里钉住新规则的四条，缺一条都会退回「可以被冒充」的状态。
+ */
+ok('SSL 错误默认拒绝（cancel 是唯一兜底）', has(activity, 'handler.cancel()'))
 ok(
-  'SSL 只对已配对 host 放行，其余 cancel',
-  has(activity, 'handler.proceed()') && has(activity, 'handler.cancel()') &&
-    /RemoteStore\.devices\([\s\S]{0,160}it\.host == host/.test(activity),
+  '证书指纹固定（TOFU）：首次记录、之后必须一致才放行',
+  has(activity, 'RemoteStore.pinCertificate(') && has(activity, 'pinned.equals(fingerprint, ignoreCase = true)'),
 )
+ok('证书变了就拒绝，而不是「配对过就放行」', has(activity, 'certificate changed for'))
+ok('主机名不匹配直接拒绝（固定指纹也救不了）', has(activity, 'SslError.SSL_IDMISMATCH'))
+ok('拿不到证书指纹时按拒绝处理（判不了 ≠ 放行）', has(activity, 'fingerprint != null && !hostnameMismatch'))
+ok('SSL 判定仍在远程模式内（本机回环不经过这条）', /override fun onReceivedSslError[\s\S]{0,900}remoteMode/.test(activity))
 ok('远程 URL 只允许 http/https', has(activity, 'scheme != "http" && scheme != "https"'))
 ok('断开远程回到本机宿主页并落到 #remote', has(activity, '#remote'))
 
@@ -171,7 +189,21 @@ ok('连续失败降级为手动', has(store, 'MAX_AUTO_FAILS'))
 ok('自动失败后有退避窗口（避免本机页重载即重试）', has(store, 'AUTO_RETRY_BACKOFF_MS'))
 ok('隧道设备不受网络指纹限制（外网连本来就是正常用法）', has(store, 'if (device.kind == "tunnel") return true'))
 ok('网络指纹不依赖定位权限（不取 SSID）', !/getConnectionInfo|\.ssid|ACCESS_FINE_LOCATION/.test(codeOnly(netPrint)))
-ok('成功判据是 onPageFinished，不是「点了连接」', /if \(remoteMode\)[\s\S]{0,200}markUsed\(this@MainActivity, it, true\)/.test(activity))
+ok(
+  '成功判据是 onPageFinished，不是「点了连接」',
+  has(activity, 'RemoteStore.markUsed(this@MainActivity, id, true)'),
+)
+/*
+ * 「加载结束」≠「可用」。
+ *
+ * 配对失效页、401、上游 502 都会走 onPageFinished。不把主框架错误码带进
+ * 判定的话，一台其实进不去的电脑会被记成「可用」、失败计数清零，自动连接
+ * 下次继续往里撞 —— 用户看到的是「每次启动都白等几秒」。
+ */
+ok('远程主框架错误码被记录', has(activity, 'remoteMainFrameError = errorResponse.statusCode'))
+ok('错误页记为失败，不记为成功', /failure >= 400[\s\S]{0,400}markUsed\(this@MainActivity, id, false\)/.test(activity))
+ok('每次导航重置错误码（上次的错不污染这次）', /onPageStarted[\s\S]{0,600}remoteMainFrameError = 0/.test(activity))
+ok('自动连接碰到错误页会退回本机', has(activity, '可能配对已失效') && has(activity, 'HTTP $failure'))
 ok('自动连接有看门狗（连得上但不回包时不会一直白屏）', has(activity, 'AUTO_CONNECT_TIMEOUT_MS') && has(activity, 'remoteWatchdog'))
 ok('自动失败静默回本机并给一句提示', has(activity, '已回到本机'))
 ok(
@@ -220,6 +252,22 @@ ok('快照缺失时仍画出空态，而不是一片空白', has(js, 'const snap
 ok('错误按 seq 去重，避免每次轮询弹一次 toast', has(js, 'seq > remoteErrorSeq'))
 ok('设备名做 HTML 转义', has(js, 'escapeHtml(d.label)'))
 ok('样式类齐全（卡片/英雄区/条目/徽章）', ['.remote-card', '.remote-hero', '.remote-item', '.remote-badge'].every((c) => css.includes(c)))
+
+/*
+ * 状态诚实性（v0.9.54）。
+ *
+ * `ok` 是「上一次连接的结果」，不是心跳。旧界面把它画成绿点 + 「3 分钟前」，
+ * 读起来就是「现在在线」—— 一台关机的电脑也会显示成绿的。这三条钉住
+ * 「历史结果」与「实时在线」的区分不被改回去。
+ */
+ok('状态文案只说上次结果，不写「在线」', has(js, '上次成功 ·') && has(js, '上次连接失败'))
+ok('从未连过的设备是灰色未知态，不是绿色', has(js, 'is-unknown') && css.includes('.remote-dot.is-unknown'))
+ok('hero 的状态独立成行（不与地址挤在一起被读成在线）', has(html, 'id="remote-hero-status"') && css.includes('.remote-status'))
+ok('接入方式三种分开表述（局域网 / 私有组网 / 公网）',
+  has(html, '私有组网') && has(html, '公网 HTTPS') && has(html, '同一个 Wi-Fi'))
+ok('移除的说明区分「删本地记录」与「撤销授权」', has(js, '电脑侧对这台手机的授权仍然有效'))
+ok('证书已固定是可见状态', has(js, 'certPinned') && css.includes('.remote-badge.is-pinned'))
+ok('移除按钮有独立图标且不小于触控安全区', has(js, 'aria-label="删除') && /\.remote-delete[\s\S]{0,400}width: var\(--touch-min\)/.test(css))
 
 // ---------------------------------------------------------------------------
 // [A] 契约：概览折叠（v0.9.17）
@@ -293,11 +341,16 @@ console.log('\n[B] 连接器（真起服务）')
 
 const seen = []
 
-/** 假上游：记录收到的 Host 与路径，模拟 DSH 的 token 换 cookie 行为。 */
+/** 假上游：记录收到的 Host / Origin / 路径，模拟 DSH 的 token 换 cookie 行为。 */
 function startUpstream() {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
-      seen.push({ host: req.headers.host, url: req.url, cookie: req.headers.cookie || '' })
+      seen.push({
+        host: req.headers.host,
+        origin: req.headers.origin,
+        url: req.url,
+        cookie: req.headers.cookie || '',
+      })
       if (req.url.startsWith('/?token=') || req.url.startsWith('/?token=')) {
         res.writeHead(302, { 'set-cookie': 'dsh_sid=abc; Path=/; HttpOnly', location: '/' })
         res.end()
@@ -388,12 +441,24 @@ const PORT = 18781
 const CODE = 'a1b2c3d4'
 const conn = createConnector({ port: PORT, target: `http://127.0.0.1:${up.port}/?token=tok-xyz`, code: CODE })
 
+/** 从 Set-Cookie 里取出会话票据（`kxxy_pair` 现在的值是票据，不再是配对码）。 */
+function sessionFrom(res) {
+  const raw = res.headers['set-cookie']
+  const list = Array.isArray(raw) ? raw : raw ? [raw] : []
+  for (const item of list) {
+    const m = /kxxy_pair=([^;]+)/.exec(item)
+    if (m) return m[1]
+  }
+  return ''
+}
+
 try {
   await conn.listen()
 
   let r = await request(PORT, { path: '/' })
   ok('无配对码 → 401', r.status === 401, `实际 ${r.status}`)
   ok('401 页面是中文引导，不是英文栈', r.body.includes('需要配对码'))
+  ok('401 带 Referrer-Policy: no-referrer（token 不进第三方日志）', r.headers['referrer-policy'] === 'no-referrer')
 
   r = await request(PORT, { path: '/__kxxy_pair?code=wrong' })
   ok('配对页错误码 → 401', r.status === 401)
@@ -401,11 +466,21 @@ try {
 
   r = await request(PORT, { path: `/__kxxy_pair?code=${CODE}` })
   ok('配对页正确码 → 302', r.status === 302, `实际 ${r.status}`)
-  ok('下发 HttpOnly 配对 cookie', /kxxy_pair=.*HttpOnly/.test(String(r.headers['set-cookie'] || '')))
+  ok('下发 HttpOnly 会话 cookie', /kxxy_pair=.*HttpOnly/.test(String(r.headers['set-cookie'] || '')))
   ok('SameSite=Lax（隧道域名跨站直连也要带上）', /SameSite=Lax/.test(String(r.headers['set-cookie'] || '')))
   ok('配对后回首页', r.headers.location === '/')
 
-  const cookie = `kxxy_pair=${CODE}`
+  const session = sessionFrom(r)
+  /*
+   * 凭证分层是这一版的核心改动：配对码只用来换票，长期凭证是随机会话。
+   * 若 cookie 里仍是那 8 位配对码，等于把「一次性引导凭证」升级成了
+   * 挂在门上一整年的长期密码 —— 这正是不该回去的状态。
+   */
+  ok('cookie 里是随机会话票据，不是配对码本身', session.length >= 40 && session !== CODE, `长度 ${session.length}`)
+  ok('会话票据是 base64url（无需要转义的字符）', /^[A-Za-z0-9_-]+$/.test(session))
+  ok('两次配对得到不同的票据（不是全局共享密钥）', sessionFrom(await request(PORT, { path: `/__kxxy_pair?code=${CODE}` })) !== session)
+
+  const cookie = `kxxy_pair=${session}`
 
   r = await request(PORT, { path: '/__kxxy_pair?code=' + CODE + '&x=1' })
   ok('配对页保留其它 query（x=1 不丢）', r.status === 302)
@@ -414,6 +489,18 @@ try {
   r = await request(PORT, { path: `/?code=${CODE}&foo=bar` })
   ok('连接串直带 code → 302 并下发 cookie', r.status === 302 && /kxxy_pair=/.test(String(r.headers['set-cookie'] || '')))
   ok('跳转后从 URL 里抹掉 code（避免留在历史/日志）', !String(r.headers.location || '').includes('code=') && String(r.headers.location || '').includes('foo=bar'))
+
+  /*
+   * 畸形 Cookie：旧实现直接 `decodeURIComponent()`，一个 `%` 就抛异常，
+   * 而那条路径在认证之前执行 —— 公网可达时等于一个「发坏包就打崩进程」的按钮。
+   * 现在解不出来只当没有 cookie，服务必须还活着。
+   */
+  r = await request(PORT, { path: '/', headers: { cookie: 'kxxy_pair=%E0%A4%A' } })
+  ok('畸形 Cookie 不崩、按未认证处理', r.status === 401, `实际 ${r.status}`)
+  r = await request(PORT, { path: '/', headers: { cookie: 'kxxy_pair' } })
+  ok('无等号的 Cookie 段同样不崩', r.status === 401, `实际 ${r.status}`)
+  r = await request(PORT, { path: '/', headers: { cookie } })
+  ok('畸形 Cookie 之后正常会话仍可用（进程没死）', r.status !== 401, `实际 ${r.status}`)
 
   // 首次文档请求：没有上游 cookie → 补 token
   seen.length = 0
@@ -440,9 +527,38 @@ try {
   ok('XHR 不被重定向到 token 页', r.status === 200)
   ok('XHR 正常打到上游并带原路径', seen[0]?.url === '/api/state')
 
+  /*
+   * 同源 Origin 要跟 Host 一起改写。
+   *
+   * 只改 Host 不改 Origin 的现场表现是「页面能打开，但一发消息就断」：
+   * 上游做 Origin/Host 同源校验时，POST 与 WebSocket 全被拒。这里同时钉住
+   * 「本站来源被归一」与「陌生来源不被洗白」两件事。
+   */
+  seen.length = 0
+  await request(PORT, {
+    path: '/api/state',
+    method: 'POST',
+    headers: { cookie, origin: `http://127.0.0.1:${PORT}`, 'content-type': 'application/json' },
+  })
+  ok('本站 Origin 被归一成上游口径（否则写请求会被上游拒）',
+    seen[0]?.origin === `http://127.0.0.1:${up.port}`, `实际 ${seen[0]?.origin}`)
+
+  seen.length = 0
+  r = await request(PORT, {
+    path: '/api/state',
+    method: 'POST',
+    headers: { cookie, origin: 'https://evil.example', 'content-type': 'application/json' },
+  })
+  ok('跨站 Origin 的写请求被拒', r.status === 403, `实际 ${r.status}`)
+  ok('被拒的请求不会打到上游', seen.length === 0, `上游收到 ${seen.length} 次`)
+
   // WebSocket 透传 —— 漏了它，界面能开、一发消息就断
   let u = await upgrade(PORT, {})
   ok('未配对的 upgrade → 401', /401/.test(u.statusLine), u.statusLine)
+
+  // 坏 Cookie 的 upgrade 同样不能打崩进程
+  u = await upgrade(PORT, { Cookie: 'kxxy_pair=%ZZ' })
+  ok('畸形 Cookie 的 upgrade → 401 而不是崩溃', /401/.test(u.statusLine), u.statusLine)
 
   u = await upgrade(PORT, { Cookie: cookie })
   ok('已配对的 upgrade → 101', /101/.test(u.statusLine), u.statusLine)
@@ -456,16 +572,131 @@ try {
   const dead = createConnector({ port: PORT + 1, target: 'http://127.0.0.1:1/', code: CODE })
   await dead.listen()
   try {
-    r = await request(PORT + 1, { path: '/', headers: { cookie, 'sec-fetch-dest': 'document' } })
+    // 会话是**每个连接器实例各存一份**的内存凭证 —— 这本身就是一层隔离：
+    // 重启或换一台机器就是换一套凭证，旧的票据在那里不成立。
+    const deadPair = await request(PORT + 1, { path: `/__kxxy_pair?code=${CODE}` })
+    const deadCookie = `kxxy_pair=${sessionFrom(deadPair)}`
+    r = await request(PORT + 1, { path: '/', headers: { cookie: deadCookie, 'sec-fetch-dest': 'document' } })
     ok('上游不可达 → 502 且给出可读原因', r.status === 502 && r.body.includes('连不上'), `实际 ${r.status}`)
+    r = await request(PORT + 1, { path: '/', headers: { cookie, 'sec-fetch-dest': 'document' } })
+    ok('另一个实例的会话票据在这里无效（凭证不跨实例）', r.status === 401, `实际 ${r.status}`)
   } finally {
     await dead.close()
+  }
+
+  // ---- 本机管理面：撤销设备授权 ----
+  const admin = conn.adminKey
+  r = await request(PORT, { path: '/__kxxy_status' })
+  ok('状态接口无密钥 → 401', r.status === 401, `实际 ${r.status}`)
+  r = await request(PORT, { path: '/__kxxy_status', headers: { 'x-kxxy-admin': 'nope' } })
+  ok('状态接口错密钥 → 401', r.status === 401, `实际 ${r.status}`)
+  r = await request(PORT, { path: '/__kxxy_status', headers: { 'x-kxxy-admin': admin } })
+  ok('状态接口正确密钥 → 200 JSON', r.status === 200 && String(r.headers['content-type']).includes('json'))
+  ok('状态接口不下发任何凭证', !r.body.includes(CODE) && !r.body.includes(session))
+  ok('状态接口报出当前会话数', /"sessions":\d+/.test(r.body))
+
+  // 隧道进来时 Host 已被改写成公网域名 —— 管理面必须在这层就挡住。
+  // 源地址判断在这里是无效的（隧道回源也是 127.0.0.1），只能靠 Host。
+  r = await request(PORT, {
+    path: '/__kxxy_status',
+    headers: { 'x-kxxy-admin': admin, host: 'kxxy.example.com' },
+  })
+  ok('公网域名进来的管理请求 → 404（源地址判不了，只能判 Host）', r.status === 404, `实际 ${r.status}`)
+
+  r = await request(PORT, { path: '/__kxxy_sessions', headers: { 'x-kxxy-admin': admin } })
+  const listed = JSON.parse(r.body)
+  ok('会话列表只回票据前缀，不回完整票据', r.body.includes('…') && !r.body.includes(session))
+  const victimId = listed.sessions.find((s) => s.label === '未命名设备')?.id
+  ok('会话列表带可撤销 id', Boolean(victimId))
+
+  r = await request(PORT, { path: `/__kxxy_sessions?id=${victimId}`, method: 'DELETE', headers: { 'x-kxxy-admin': admin } })
+  ok('按 id 撤销会话 → 撤销 1 条', r.status === 200 && JSON.parse(r.body).revoked >= 1, r.body)
+  r = await request(PORT, { path: '/', headers: { cookie } })
+  ok('被撤销的会话立刻失效', r.status === 401, `实际 ${r.status}`)
+  u = await upgrade(PORT, { Cookie: cookie })
+  ok('被撤销的会话 upgrade 也失效（不是只挡页面）', /401/.test(u.statusLine), u.statusLine)
+
+  // ---- 配对暴力破解限流 ----
+  // 单独起一个连接器：限流是「按来源计数」的，跑在共享实例上会把后面的用例一起锁死。
+  const brute = createConnector({ port: PORT + 2, target: `http://127.0.0.1:${up.port}/`, code: CODE })
+  await brute.listen()
+  try {
+    const statuses = []
+    for (let i = 0; i < 7; i++) {
+      statuses.push((await request(PORT + 2, { path: '/__kxxy_pair?code=bad' + i })).status)
+    }
+    ok('连续错码最终被限流（429）', statuses.includes(429), statuses.join(','))
+    ok('限流发生在 5 次左右，不是无限重试', statuses.lastIndexOf(429) >= 4, statuses.join(','))
+    const blocked = await request(PORT + 2, { path: `/__kxxy_pair?code=${CODE}` })
+    ok('被限流后连正确码也挡住（锁的是来源，不是那次尝试）', blocked.status === 429, `实际 ${blocked.status}`)
+  } finally {
+    await brute.close()
+  }
+
+  // ---- 配对码过期 ----
+  const expiring = createConnector({
+    port: PORT + 4,
+    target: `http://127.0.0.1:${up.port}/`,
+    code: CODE,
+    codeTtlMs: 1,
+  })
+  await expiring.listen()
+  try {
+    await new Promise((r2) => setTimeout(r2, 20))
+    r = await request(PORT + 4, { path: `/__kxxy_pair?code=${CODE}` })
+    ok('配对码过期后 → 401 且提示重启换码', r.status === 401 && r.body.includes('已过期'), `实际 ${r.status}`)
+  } finally {
+    await expiring.close()
   }
 } finally {
   await conn.close()
   // 不 await：假上游可能还挂着 upgrade 留下的 socket，等它等于等一个
   // 永不到来的回调；脚本最后会 process.exit，句柄自然回收。
   closeUpstream(up.server)
+}
+
+// ---------------------------------------------------------------------------
+// [B2] 公网模式：只认声明的入口
+// ---------------------------------------------------------------------------
+//
+// 隧道被扫到、DNS 被指错、或者有人把 Host 改成别的域名来复用这条隧道 ——
+// 这几种情况在公网部署里都会真实发生。`--public-origin` 的作用就是让
+// 「不是那条域名的请求」在认证之前就被挡掉，连配对码对错都不回答。
+console.log('\n[B2] 公网入口（--public-origin）')
+{
+  const up2 = await startUpstream()
+  const PUB = 'https://kxxy.example.com'
+  const pub = createConnector({
+    port: PORT + 3,
+    target: `http://127.0.0.1:${up2.port}/`,
+    code: CODE,
+    publicOrigin: PUB,
+  })
+  try {
+    await pub.listen()
+
+    ok('给了公网入口后默认只监听回环', pub.host === '127.0.0.1', `实际 ${pub.host}`)
+
+    let r = await request(PORT + 3, { path: '/__kxxy_pair?code=' + CODE, headers: { host: 'evil.example' } })
+    ok('错误 Host → 421（不给配对码对错当预言机）', r.status === 421, `实际 ${r.status}`)
+
+    r = await request(PORT + 3, { path: '/__kxxy_pair?code=' + CODE, headers: { host: 'kxxy.example.com' } })
+    ok('正确公网 Host → 配对成功', r.status === 302, `实际 ${r.status}`)
+    const pubSession = sessionFrom(r)
+    ok('公网模式的会话 cookie 带 Secure', /Secure/.test(String(r.headers['set-cookie'] || '')))
+
+    r = await request(PORT + 3, {
+      path: '/__kxxy_status',
+      headers: { 'x-kxxy-admin': pub.adminKey, host: 'kxxy.example.com' },
+    })
+    ok('公网 Host 下管理面不可达（即使密钥正确）', r.status === 404, `实际 ${r.status}`)
+
+    r = await request(PORT + 3, { path: '/', headers: { cookie: `kxxy_pair=${pubSession}`, host: 'kxxy.example.com' } })
+    ok('公网会话正常转发', r.status === 200, `实际 ${r.status}`)
+  } finally {
+    await pub.close()
+    closeUpstream(up2.server)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +904,28 @@ for (let i = 0; i < 200; i++) codes.add(generateCode())
 ok('配对码 8 位十六进制', /^[0-9a-f]{8}$/.test(generateCode()))
 ok('200 次生成无重复（足够熵避免撞码）', codes.size === 200, `实际 ${codes.size}`)
 ok('局域网地址探测返回数组', Array.isArray(listLanAddresses()))
+
+// ---------------------------------------------------------------------------
+// [F] 公网验收脚本（只钉住「它是分层的」这件事）
+// ---------------------------------------------------------------------------
+//
+// 这个脚本的价值全在「分层」：把「连不上」拆成 DNS / 证书 / 配对 / 上游 /
+// 实时通道五段。合并成一句「不通」就等于又回到了白屏排查。
+console.log('\n[F] 公网验收脚本')
+{
+  const checker = norm(read('tools/check-public-remote.mjs'))
+  ok('验收脚本存在且可解析', checker.length > 2000)
+  for (const layer of ['DNS 解析', 'TLS 证书', '配对与来源校验', '页面与鉴权', '实时通道']) {
+    ok(`验收分层含「${layer}」`, checker.includes(`'${layer}'`) || checker.includes(`\`${layer}\``))
+  }
+  ok('每层都给出下一步动作（不只是一句失败）', (checker.match(/→ /g) || []).length >= 4 || checker.includes('hint'))
+  ok('支持 --json 供脚本消费', checker.includes('--json') && checker.includes('JSON.stringify'))
+  ok('公网默认拒绝明文 http（本机需显式 --allow-http）',
+    checker.includes('--allow-http') && checker.includes('公网入口必须是 https://'))
+  ok('证书层会报「还有几天到期」', checker.includes('daysLeft'))
+  ok('手工做 WebSocket 握手（不用封装，才看得出隧道有没有吞 Upgrade）',
+    checker.includes('Sec-WebSocket-Key') && checker.includes('Upgrade: websocket'))
+}
 
 // 用 writeSync 写结论：stdout 是管道时 console.log 是异步的，紧跟 process.exit
 // 会把最后几行截掉（表现成「跑完了但看不到结论」）。

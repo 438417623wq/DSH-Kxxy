@@ -18,12 +18,14 @@
  */
 
 import { existsSync, mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { join, dirname, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const root = process.argv[2] ?? join(tmpdir(), 'kxxy-sim-install')
+// 传相对路径时 dsh-app-boot 会把它原样交给 `module.createRequire()`，报
+// ERR_INVALID_ARG_VALUE。这里统一转绝对路径，避免误判成产品缺陷。
+const root = resolve(process.argv[2] ?? join(tmpdir(), 'kxxy-sim-install'))
 
 let failures = 0
 const ok = (m) => console.log(`  ✓ ${m}`)
@@ -58,9 +60,25 @@ try {
   fail(`加载失败：${e.message}`)
   process.exit(1)
 }
-for (const fn of ['resolveBundleDir', 'loadProfileDirectory', 'readProfileManifest', 'evaluatePluginCompatibility', 'bundlePatchPaths', 'PROFILE_TEMPLATES']) {
+for (const fn of ['resolveBundleDir', 'loadProfileDirectory', 'readProfileManifest', 'evaluatePluginCompatibility', 'bundlePatchPaths']) {
   if (typeof appBoot[fn] === 'undefined') fail(`缺少导出 ${fn}`)
   else ok(`导出 ${fn}`)
+}
+// 0.2.2-rc.2 起 `PROFILE_TEMPLATES` 不再由 dsh-app-boot 转出，改为从
+// `@deepseek-ai/dsh-official-bundles` 直接 import（见 dsh-app-boot/lib/index.js:15）。
+// 项目自身不直接消费该表，所以只在任一入口可用时放行，缺失才算真问题。
+if (typeof appBoot.PROFILE_TEMPLATES !== 'undefined') {
+  ok('导出 PROFILE_TEMPLATES（dsh-app-boot 转出）')
+} else {
+  const bundlesEntry = join(root, 'lib', 'node_modules', '@deepseek-ai', 'dsh-official-bundles', 'lib', 'index.js')
+  let templates
+  try {
+    templates = (await import(pathToFileURL(bundlesEntry).href)).PROFILE_TEMPLATES
+  } catch (e) {
+    fail(`PROFILE_TEMPLATES 不可用：dsh-app-boot 未转出，且 dsh-official-bundles 加载失败（${e.message}）`)
+  }
+  if (templates !== undefined) ok('PROFILE_TEMPLATES 由 @deepseek-ai/dsh-official-bundles 提供')
+  else if (failures === 0) fail('PROFILE_TEMPLATES 在两个入口都缺失')
 }
 
 // ── 3. 直接验证 kxxy-host 可被 resolveBundleDir 解析 ───────────────
@@ -70,7 +88,7 @@ console.log('\n[3] resolveBundleDir("kxxy-host")')
   const profileDir = mkdtempSync(join(tmpdir(), 'kxxy-profile-'))
   writeFileSync(
     join(profileDir, 'package.json'),
-    JSON.stringify({ name: 'dsh-profile-web', private: true, dependencies: {}, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'kxxy-host'] } } }, null, 2),
+    JSON.stringify({ name: 'dsh-profile-web', private: true, dependencies: {}, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'kxxy-host', 'dsh-codex-sidebar'] } } }, null, 2),
   )
   writeFileSync(join(profileDir, 'cordis.yml'), '[]\n')
   writeFileSync(join(profileDir, 'cordis.patch.yml'), '[]\n')
@@ -120,7 +138,7 @@ console.log('\n[3] resolveBundleDir("kxxy-host")')
   }
 
   // ── 6. loadProfileDirectory 端到端 ────────────────────────────
-  console.log('\n[6] loadProfileDirectory（端到端，含 3 个 bundle）')
+  console.log('\n[6] loadProfileDirectory（端到端，含 4 个 bundle）')
   try {
     const profile = appBoot.loadProfileDirectory('dsh', profileDir, installAnchor)
     // 返回形状：{ name, dir, layers, patchPath, patches, skippedBundles }
@@ -141,6 +159,18 @@ console.log('\n[3] resolveBundleDir("kxxy-host")')
       if (skipped.some((s) => JSON.stringify(s).includes('kxxy-host'))) fail('kxxy-host 被跳过')
       else ok('kxxy-host 未被跳过')
     } else ok('无跳过项')
+    const codexLayer = (profile.layers ?? []).find((layer) => layer.packageName === 'dsh-codex-sidebar')
+    if (!codexLayer?.patches?.length) fail('dsh-codex-sidebar 缺少有效的 profile 补丁层')
+    else {
+      ok(`dsh-codex-sidebar 补丁层已解析（${codexLayer.patches.length} 条 patch）`)
+      const codexManifest = appBoot.readProfileManifest('dsh', codexLayer.packageDir)
+      if (codexManifest.dsh?.client?.platform !== 'web' || codexManifest.exports?.['./client'] !== './lib/client.js') fail('Codex 客户端安装合同不匹配')
+      else ok('Codex 客户端声明与 installation-scope 解析一致')
+      for (const path of ['lib/client.js', 'lib/service.mjs', 'lib/provider-config.mjs', 'lib/provider-http.mjs', 'lib/provider-protocols.mjs', 'lib/responses-bridge.mjs', 'lib/responses-bridge-codec.mjs', 'lib/access-policy.mjs', 'lib/file-changes.mjs', 'lib/thread-actions.mjs']) {
+        if (!existsSync(join(codexLayer.packageDir, path))) fail(`Codex 运行文件缺失：${path}`)
+      }
+    }
+    if (skipped.some((entry) => JSON.stringify(entry).includes('dsh-codex-sidebar'))) fail('dsh-codex-sidebar 被兼容性判定跳过')
   } catch (e) {
     fail(`loadProfileDirectory 抛错：${e.message}`)
   }

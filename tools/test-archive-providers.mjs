@@ -222,7 +222,7 @@ class KxxyFakeDOMParser {
  */
 function loadFragment() {
 	const source = readFileSync(FRAGMENT, "utf8");
-	const names = ["kxxyReadZip", "kxxyLooksText", "kxxyFormatSize", "kxxyResolvePath", "kxxyDirOf", "kxxyParseOpf", "kxxyBodyInner", "kxxySuffixOf"];
+	const names = ["kxxyReadZip", "kxxyLooksText", "kxxyFormatSize", "kxxyResolvePath", "kxxyDirOf", "kxxyParseOpf", "kxxyBodyInner", "kxxySuffixOf", "kxxyArchiveApply"];
 	const reactStub = {
 		useState: () => [void 0, () => {}],
 		useEffect: () => {},
@@ -376,6 +376,44 @@ equal(
 );
 equal("body 内的 script 被剔除", api.kxxyBodyInner("<body>a<script>evil()</script>b</body>"), "ab");
 equal("没有 body 标签时退回整段", api.kxxyBodyInner("<p>x</p>").trim(), "<p>x</p>");
+
+//#endregion
+
+//#region kxxyArchiveApply 注册契约
+
+{
+	const registered = [];
+	const slots = [];
+	const locales = [];
+	const effects = [];
+	api.kxxyArchiveApply({
+		locale: {
+			bind: (ns) => (key) => `${ns}.${key}`,
+			register: (ns, dictionaries) => locales.push([ns, dictionaries]),
+		},
+		documentPreviews: { register: (definition) => registered.push(definition) },
+		slots: { inject: (_name, fn) => fn(), register: (options, body) => slots.push([options, body]) },
+		effect: (fn, label) => { effects.push(label); fn(); },
+	});
+	equal("归档入口注册两个 provider", registered.length, 2);
+	equal("归档入口注册两个 body", slots.length, 2);
+	equal("归档入口包含五个 effect", effects.length, 5);
+	equal("归档入口只注册一份共享字典", locales.length, 1);
+	check("归档字典含 zh 与 en", locales[0][1].zh !== void 0 && locales[0][1].en !== void 0);
+	const ids = registered.map((definition) => definition.id);
+	equal("归档 provider ID 唯一", new Set(ids).size, 2);
+	equal("ZIP 后缀只归 archive", registered[0].extensions.join(","), "zip");
+	equal("EPUB 后缀只归 epub", registered[1].extensions.join(","), "epub");
+	for (const definition of registered) {
+		equal(`${definition.id} 保留 bytes-complete`, definition.loading, "bytes-complete");
+		check(`${definition.id} 的二进制后缀都是可预览后缀`, definition.binaryExtensions.every((ext) => definition.extensions.includes(ext)));
+		equal(`${definition.id} 保留 builtin 优先级`, definition.priority, "builtin");
+		check(`${definition.id} 有且仅有一个同 ID 的 body`, slots.filter(([options]) => options.key === definition.id).length === 1);
+	}
+	check("归档 title 随 locale 惰性求值", registered.every((definition) => typeof definition.title === "function" && typeof definition.title() === "string"));
+	check("归档 body 不同且可调用", slots.every(([, body]) => typeof body === "function") && slots[0][1] !== slots[1][1]);
+	check("归档 body 都使用标准 document 槽位", slots.every(([options]) => options.name === "sidebar.right.tab.document"));
+}
 
 //#endregion
 

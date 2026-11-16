@@ -47,6 +47,10 @@ export const SEED_PACKAGES = [
   // 装这三个只多 7.1 MiB（numpy 5.93 含 libopenblas / psutil 0.08 / crypto 1.08），
   // 却把「数据分析、进程监控、加密」三条最常走的 Python 路打通。
   "python-numpy", "python-psutil", "python-cryptography",
+  // cryptography deb 的 postinst 会再用 pip 装 cffi；离线解包不运行维护脚本。
+  // cffi>=2 + pycparser 由 build-python-deps.py 的 Android 构件显式补齐，
+  // build-runtime 默认使用已验证构件（可用 --python-deps 指定）并核对 ABI/摘要，
+  // 不能只依赖 apt 闭包。
   "jq", "yq", "fd", "fzf", "bat", "eza",
   "tree", "sd", "sqlite", "bc", "lua54",
 
@@ -326,9 +330,9 @@ export const POOL_ITEMS = [
   // ── L 组：编辑器与 shell（缺陷 CN，问题清单 P18 里体积大的那几个）───────
   //
   // 报告点的 man/libtool/zsh/vim 已进预装（G10），这里只放「功能和已有东西
-  // 重叠 / 单个体积不小」的三个：neovim 16 个依赖、runtime 里带全套 vim 语法
-  // （`share/nvim/runtime/syntax/*.vim`；注意 **不含** treesitter 的 parser
-  // `.so` —— 那是上游 neovim 包就没带的，打开 .md 会提示 E5113，不影响读写）、
+  // 重叠 / 单个体积不小」的三个：neovim 的 runtime 带全套 vim 语法；
+  // treesitter parser 由依赖包放在 lib/tree_sitter，runtime/parser 的目录
+  // 链接必须在打包时物化，否则 .md / .lua / :help / query 会报 E5113。
   // fish 自带 6.8 MiB 的 function 库、gh 是老版本 git 之外的 GitHub 客户端。
   {
     id: "shells", seeds: ["fish", "neovim", "gh"], category: "devtools",

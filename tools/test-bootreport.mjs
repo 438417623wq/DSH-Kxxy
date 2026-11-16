@@ -17,6 +17,8 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { createContext, runInContext } from 'node:vm'
 
 import { parseEngineLog, pluginNamesFrom, collectBootReport } from '../plugins/kxxy-host/lib/bootreport.mjs'
 import { runHealthCheck } from '../plugins/kxxy-host/lib/health.mjs'
@@ -61,10 +63,10 @@ function fixture(name, { log = '', bundles = [], webBoot = null } = {}) {
   const engine = join(root, `${name}-engine`)
   mkdirSync(engine, { recursive: true })
   if (log) writeFileSync(join(engine, 'engine.log'), log)
-  // 造出「运行时完整」的最小形态：否则 RUNTIME 一项会是 BAD/L3，
+  // 造出「运行时完整」的最小形态：否则 RUNTIME 一项会是 BAD/L1，
   // 把 level 断言淹掉，测不出 WEB_BOOT 是否被排除在修复之外。
   mkdirSync(join(engine, 'bin'), { recursive: true })
-  writeFileSync(join(engine, 'bin', 'node'), 'x')
+  writeFileSync(join(engine, 'bin', 'node'), 'x', { mode: 0o755 })
   const dshLib = join(engine, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'lib')
   mkdirSync(dshLib, { recursive: true })
   writeFileSync(join(dshLib, 'bin.js'), 'x')
@@ -205,6 +207,96 @@ try {
   process.env.DSH_HOME = stale.home
   health = runHealthCheck(stale.engine)
   ok('上一轮的浏览器记录被忽略', health.checks.find((c) => c.code === 'WEB_BOOT').verdict === 'OK')
+
+  console.log('[4b] 定向救援证据')
+  ok('网页失败不推荐变更配置', health.target === 'UNKNOWN' && health.level === 'NONE')
+  const rescue = fixture('rescue', { bundles: [...CORE] })
+  process.env.DSH_HOME = rescue.home
+  rmSync(join(rescue.engine, 'bin', 'node'))
+  health = runHealthCheck(rescue.engine)
+  ok('runtime 故障推荐 L1/RUNTIME 而不是 L3', health.level === 'L1' && health.target === 'RUNTIME')
+  ok('runtime 提示独立离线入口', /离线重解/.test(health.checks.find(c => c.code === 'RUNTIME').fixHint))
+  writeFileSync(join(rescue.engine, 'bin', 'node'), 'x', { mode: 0o755 })
+  writeFileSync(join(rescue.profile, 'cordis.patch.yml'), ' ')
+  health = runHealthCheck(rescue.engine)
+  ok('坏 profile 补丁只推荐 PROFILE_PATCH', health.target === 'PROFILE_PATCH')
+  rmSync(join(rescue.profile, 'cordis.patch.yml'))
+  writeFileSync(join(rescue.profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: [] } } }))
+  health = runHealthCheck(rescue.engine)
+  ok('合法清单缺 bundle 推荐 BUNDLES 而非 MANIFEST', health.target === 'BUNDLES')
+  writeFileSync(join(rescue.profile, 'package.json'), '{bad')
+  health = runHealthCheck(rescue.engine)
+  ok('坏 JSON 推荐 MANIFEST', health.target === 'MANIFEST')
+  writeFileSync(join(rescue.profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: CORE } } }))
+  health = runHealthCheck('')
+  ok('运行时位置不确定时不推荐变更', health.target === 'UNKNOWN' && health.level === 'NONE')
+  const ext = join(rescue.engine, 'extensions', 'broken')
+  mkdirSync(ext, { recursive: true })
+  writeFileSync(join(ext, '.links.json'), '{bad')
+  health = runHealthCheck(rescue.engine)
+  ok('仅扩展接入点损坏不推荐启动配置修复', health.target === 'UNKNOWN' && health.level === 'NONE')
+
+  // 从现有宿主脚本提取实际函数做行为回归，无需浏览器或新增测试文件。
+  console.log('[4c] 本次救援确认/关联/超时')
+  const hostSource = readFileSync(fileURLToPath(new URL('../plugins/kxxy-host/web/host.js', import.meta.url)), 'utf8')
+  const metaSource = hostSource.slice(hostSource.indexOf('  const LEVEL_META ='), hostSource.indexOf('  async function fetchHealth'))
+  const rescueSource = hostSource.slice(hostSource.indexOf('  const TARGET_META ='), hostSource.indexOf('  function setHealthBusy'))
+  async function browserCase({ result, healthy = true, confirm = true, target = 'RUNTIME', level = 'L1', acceptedAt = 1000, advanceTo } = {}) {
+    let now = 0
+    const timers = []
+    const posts = []
+    const toasts = []
+    const reads = []
+    const ctx = createContext({
+      Date: { now: () => now }, lastHealth: null, recoveryPending: false,
+      document: { createElement: () => ({ addEventListener() {} }) },
+      dom: { healthLevels: { appendChild() {} } }, escapeHtml: s => s,
+      confirmDialog: async opts => { reads.push(['confirm', opts]); return confirm },
+      apiPost: async (url, body) => { posts.push(body); return { accepted: true, requestedAt: acceptedAt } },
+      showToast: (message, tone) => toasts.push({ message, tone }),
+      setHealthBusy() {}, renderHealth() {},
+      setTimeout: (fn, delay) => { const t = { fn, delay }; timers.push(t); return t },
+      clearTimeout: t => { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1) },
+      fetch: async url => { reads.push(url); return { ok: true, json: async () => url.endsWith('/result') ? { result } : { ok: healthy } } },
+    })
+    runInContext(metaSource + rescueSource, ctx)
+    await ctx.requestRecovery(level, target)
+    const firstDelay = timers[0]?.delay
+    async function tick() {
+      const timer = timers.shift()
+      if (timer) { now += timer.delay; await timer.fn() }
+    }
+    await tick()
+    const earlySuccess = toasts.some(t => t.tone === 'success')
+    // 默认快进 deadline；传 advanceTo 时验证长启动尚在正常等待预算内。
+    if (timers.length) { now = advanceTo ?? 700_000; await tick() }
+    return { posts, toasts, reads, firstDelay, earlySuccess, pending: runInContext('recoveryPending', ctx) }
+  }
+  const staleRes = await browserCase({ result: { ok: true, requestedAt: 999 } })
+  ok('旧成功结果不能当本次成功', !staleRes.earlySuccess && !staleRes.toasts.some(t => t.tone === 'success'))
+  ok('旧结果未触发成功体检捷径', !staleRes.reads.includes('/kxxy/api/health'))
+  ok('受理不是成功，超时明确原生入口', staleRes.toasts.some(t => /尚未成功/.test(t.message)) && staleRes.toasts.some(t => /原生救援入口/.test(t.message)))
+  ok('offline runtime 精确提交 L1/RUNTIME', staleRes.posts[0]?.level === 'L1' && staleRes.posts[0]?.target === 'RUNTIME')
+  const matched = await browserCase({ result: { ok: true, requestedAt: 1000 } })
+  ok('本次成功结果 + 成功体检才成功', matched.earlySuccess && !matched.pending)
+  const badHealth = await browserCase({ result: { ok: true, requestedAt: 1000 }, healthy: false })
+  ok('本次 ok=true 但体检失败不报成功', !badHealth.earlySuccess)
+  const failure = await browserCase({ result: { ok: false, requestedAt: 1000, detail: '实际执行失败' } })
+  ok('本次失败 detail 原样报告', failure.toasts.some(t => t.tone === 'error' && /实际执行失败/.test(t.message)))
+  const missing = await browserCase({ result: null })
+  ok('缺执行结果不报成功', !missing.earlySuccess)
+  const noId = await browserCase({ acceptedAt: null, result: { ok: true } })
+  ok('受理缺 requestedAt 不轮询历史结果', noId.firstDelay === undefined && !noId.earlySuccess)
+  const normalStart = await browserCase({ result: null, target: null, advanceTo: 121_000 })
+  ok('120 秒启动预算之后仍留合理余量', normalStart.pending)
+  const unpacking = await browserCase({ result: null, advanceTo: 300_000 })
+  ok('运行时解包数分钟仍等待，不误判成功或超时', unpacking.pending && !unpacking.earlySuccess)
+  for (const level of ['L1', 'L2', 'L3', 'UNDO']) {
+    const cancelled = await browserCase({ level, target: null, confirm: false })
+    ok(`${level} 取消确认不发 POST`, cancelled.posts.length === 0 && /重启引擎/.test(cancelled.reads[0]?.[1]?.desc || ''))
+  }
+  const undo = await browserCase({ level: 'UNDO', target: undefined, result: { ok: true, requestedAt: 999 } })
+  ok('UNDO 同样使用本次关联且不报受理成功', undo.posts[0]?.level === 'UNDO' && !undo.earlySuccess && !undo.pending)
 
   // ── [5][6] 插件启停 ────────────────────────────────────────────────
   console.log('[5] 插件启停')

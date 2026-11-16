@@ -90,6 +90,7 @@ const KXXY_MEDIA_ZH = {
 	failed: "播放失败（错误码 {code}），文件可能已损坏。",
 	noPath: "无法解析该文件的绝对路径。",
 	unavailable: "文件资源服务不可用。",
+	noVersion: "无法获取文件版本，请刷新文件资源后重试。",
 	retry: "重试",
 	hint: "mkv / avi / wmv / flv / mpg 等容器通常需要先转成 mp4 或 webm 才能播放。",
 	download: "可用系统播放器打开",
@@ -103,6 +104,7 @@ const KXXY_MEDIA_EN = {
 	failed: "Playback failed (error {code}); the file may be damaged.",
 	noPath: "The file's absolute path could not be resolved.",
 	unavailable: "The file resource service is unavailable.",
+	noVersion: "The file version is unavailable. Refresh the file resource and retry.",
 	retry: "Retry",
 	hint: "Containers such as mkv, avi, wmv, flv and mpg usually need converting to mp4 or webm first.",
 	download: "Open in a system player",
@@ -170,12 +172,15 @@ function kxxyMakeMediaBody(kind) {
 		const meta = typeof props.useResource === "function" ? props.useResource(resourceAddress) : void 0;
 		const absolutePath = meta?.value?.absolutePath;
 		const version = meta?.value?.version;
+		const hasVersion = typeof version === "string" && version.length > 0;
+		const invalidVersion = meta?.status === "live" && meta.value !== void 0 && !hasVersion;
 		const [status, setStatus] = react.useState({ phase: "waiting" });
 		const [attempt, setAttempt] = react.useState(0);
 		// 已上报过的 revision：`request.loaded` 会写 store，store 变化又会让
 		// `content` 换一个新对象、effect 重跑。store 的 `rendered` 只认 revision，
 		// 重复调用虽然大概率被 immer 的结构共享挡掉，但这里显式只报一次更稳。
 		const reported = react.useRef();
+		const rejectedVersion = react.useRef();
 
 		const url = react.useMemo(() => {
 			if (typeof absolutePath !== "string" || absolutePath === "") return void 0;
@@ -193,15 +198,22 @@ function kxxyMakeMediaBody(kind) {
 			}
 		}, [absolutePath]);
 
-		// 元数据到手才算「渲染完成」：宿主据此把 hasContent 置真、清掉 loading。
-		// 不调它的话标签页会永远停在加载中，刷新工具条也不工作。
+		// loaded 必须携带真实 stat 字符串版本。资源仍在加载时等待；已解析却缺版本
+		// 则明确失败并清掉宿主 loading，不伪造版本，也不占用后续成功上报的 revision。
 		react.useEffect(() => {
 			if (request === void 0) return;
-			if (status.phase !== "ready") return;
+			if (invalidVersion) {
+				if (rejectedVersion.current !== request.revision) {
+					rejectedVersion.current = request.revision;
+					request.failed();
+				}
+				return;
+			}
+			if (status.phase !== "ready" || !hasVersion) return;
 			if (reported.current === request.revision) return;
 			reported.current = request.revision;
-			request.loaded(version === void 0 ? 1 : version);
-		}, [request, status.phase, version]);
+			request.loaded(version);
+		}, [request, status.phase, version, hasVersion, invalidVersion]);
 
 		const retry = (0, react.useCallback)(() => {
 			setStatus({ phase: "waiting" });
@@ -239,6 +251,8 @@ function kxxyMakeMediaBody(kind) {
 				t("loading"),
 			);
 		}
+
+		if (invalidVersion) return notice(t("noVersion"), void 0);
 
 		if (status.phase === "failed") {
 			const ext = kxxyMediaExtOf(absolutePath);

@@ -8,9 +8,14 @@
  * `.cache/apk-assets-hold/runtime.zip`（打完包后资源被移走，见下方说明）。
  */
 import { existsSync, createReadStream, readdirSync, readFileSync, openSync, readSync, closeSync, fstatSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { createGunzip, gunzipSync, inflateRawSync } from "node:zlib";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CODEX_PIN } from "./lib/codex.mjs";
+import { verifyPythonRuntime } from "./lib/python-runtime.mjs";
+import { readZipDirectory } from "./lib/zipread.mjs";
+import { verifyOfficeAssets, OFFICE_LAYER_MARKER } from "./lib/office-assets.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -185,20 +190,9 @@ function readAt(offset, len) {
   return out;
 }
 
-// ---------------------------------------------------------------- 找 EOCD
-// EOCD 在最尾部，最多回看 66,000 字节（22 字节固定头 + 64 KiB 注释上限）。
-const tailLen = Math.min(zipSize, 66_000);
-const tailStart = zipSize - tailLen;
-const tail = readAt(tailStart, tailLen);
-let eocd = -1;
-for (let i = tail.length - 22; i >= 0; i -= 1) {
-  if (tail.readUInt32LE(i) === 0x06054b50) { eocd = tailStart + i; break; }
-}
-if (eocd < 0) throw new Error("找不到 EOCD");
-const count = tail.readUInt16LE(eocd - tailStart + 10);
-const cdSize = tail.readUInt32LE(eocd - tailStart + 12);
-const cdStart = tail.readUInt32LE(eocd - tailStart + 16);
-console.log(`EOCD @${eocd}  条目 ${count}  中央目录 ${cdStart}..${cdStart + cdSize}  文件 ${zipSize}`);
+// ---------------------------------------------------------------- 读取有界 ZIP32 / ZIP64 计数目录
+const { count, cdSize, cdOffset: cdStart, eocdOffset: eocd, zip64Count } = readZipDirectory(readAt, zipSize);
+console.log(`EOCD @${eocd}  条目 ${count}  ZIP64计数 ${zip64Count}  中央目录 ${cdStart}..${cdStart + cdSize}  文件 ${zipSize}`);
 
 // ---------------------------------------------------------------- 遍历中央目录
 // `buf` 只装中央目录（几 MB），不是整个 zip —— 下面的偏移都是相对它的。
@@ -279,12 +273,9 @@ const NEED = [
   "lib/node_modules/dsh-web-mobile/lib/index.js",
   "lib/node_modules/dsh-web-mobile/cordis.patch.yml",
   "lib/node_modules/dsh-web-mobile/plugin.version",
-  // office 预览链（锚点 9）：LibreOffice wasm 引擎 + 单文件 CJK 字体。
-  // 两者都是「新增资产」而 RUNTIME_VERSION 从未变过 —— 缺了它们老设备
-  // 前面的锚点全过、跳过重装，Office 预览永远报「Office 预览不可用」。
-  "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.wasm",
-  "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.data",
-  "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.cjs",
+  // Office 引擎文件名由精确版本的完整 manifest 决定，下方逐项校验内容。
+  "lib/node_modules/@deepseek-ai/libreoffice-kit/package.json",
+  "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/package.json",
   "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/prebuilds.json",
   "lib/node_modules/kxxy-host/fonts/office-assets.version",
   "lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf",
@@ -404,48 +395,51 @@ for (const [suffix, label] of NEED_ANY) {
   }
 }
 
-// ---------------------------------------------------------------- office 资产版本标记
-// 锚点 10：LibreOffice wasm 引擎与单文件 CJK 字体是随 runtime 发的「新增资产」，
-// 而 RUNTIME_VERSION 从未变过 —— 老设备前九锚点全过、跳过重装，设备上永远没有
-// 这两份文件，Office 预览一直报「Office 预览不可用」。断言标记文件内容与
-// RuntimeInstaller.OFFICE_LAYER_MARKER 一致，并校验两份字体的 sfnt 魔数
-// （0x00010000 或 "true"/"OTTO"），防止把空文件或占位文本写进 zip。
+// ---------------------------------------------------------------- Office 完整资产合同
+// 归档阶段对 manifest 中的所有引擎、源码、许可证及字体做全量 SHA256；不解析 LINK。
 {
-  const markerNeed = /OFFICE_LAYER_MARKER\s*=\s*"([^"]+)"/.exec(
-    readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
-  );
-  const entry = byName.get("lib/node_modules/kxxy-host/fonts/office-assets.version");
-  if (!entry) {
-    console.log("office 资产版本标记：✗ 条目缺失");
+  try {
+    const marker = /private const val OFFICE_LAYER_MARKER\s*=\s*"([^"]+)"/.exec(
+      readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8"),
+    );
+    if (marker?.[1] !== OFFICE_LAYER_MARKER) throw new Error("Office 合同与 RuntimeInstaller 标记不同步");
+    const counts = new Map();
+    for (const entry of entries) counts.set(entry.name, (counts.get(entry.name) ?? 0) + 1);
+    const officeFile = (name) => {
+      const entry = byName.get(name);
+      if (!entry || counts.get(name) !== 1 || entry.comment.startsWith("LINK:") || name.endsWith("/") ||
+          ![0, 0o100000].includes((entry.externalAttr >>> 16) & 0o170000) || (entry.externalAttr & 0x10)) {
+        throw new Error(`Office 条目缺失、重复或不是普通文件：${name}`);
+      }
+      const parts = name.split("/");
+      for (let i = 1; i < parts.length; i += 1) {
+        const parent = parts.slice(0, i).join("/");
+        for (const key of [parent, `${parent}/`]) {
+          const dir = byName.get(key);
+          if (!dir) continue;
+          const kind = (dir.externalAttr >>> 16) & 0o170000;
+          if (counts.get(key) !== 1 || dir.comment.startsWith("LINK:") || dir.usize !== 0 ||
+              ![0, 0o040000].includes(kind) || (!key.endsWith("/") && kind !== 0o040000 && !(dir.externalAttr & 0x10))) {
+            throw new Error(`Office 父路径不是原位目录：${key}`);
+          }
+        }
+      }
+      return entry;
+    };
+    const office = verifyOfficeAssets({
+      has: (name) => byName.has(name) || entries.some((entry) => entry.name.startsWith(`${name}/`)),
+      size: (name) => officeFile(name).usize,
+      read: (name, limit) => {
+        const entry = officeFile(name);
+        const data = readLocal(entry);
+        if (data.length !== entry.usize) throw new Error(`Office ZIP 条目长度不符：${name}`);
+        return data.subarray(0, limit);
+      },
+    }, { full: true, runtime: true });
+    console.log(`Office 资产合同通过：kit/wasm ${office.version}，${office.files.length} 项完整资源及两份字体，${OFFICE_LAYER_MARKER}`);
+  } catch (error) {
+    console.log(`Office 资产合同失败：${error.message}`);
     missing += 1;
-  } else if (markerNeed === null) {
-    console.log("office 资产版本标记：✗ RuntimeInstaller.kt 未定义 OFFICE_LAYER_MARKER");
-    missing += 1;
-  } else {
-    const head = readLocal(entry).toString("utf8").slice(0, 256);
-    if (!head.includes(markerNeed[1])) {
-      console.log(`office 资产版本标记：✗ 标记文件不含 ${markerNeed[1]}`);
-      missing += 1;
-    } else {
-      console.log(`office 资产版本标记：✓ ${markerNeed[1]}（与 RuntimeInstaller 一致）`);
-    }
-  }
-
-  for (const name of [
-    "lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf",
-    "lib/node_modules/kxxy-host/fonts/NotoSansSC-Bold.ttf",
-  ]) {
-    const font = byName.get(name);
-    if (!font) continue;   // 缺失已由 NEED 循环报过
-    const buf = readLocal(font);
-    const tag = buf.length >= 4 ? buf.readUInt32BE(0) : 0;
-    const isSfnt = tag === 0x00010000 || tag === 0x74727565 /* true */ || tag === 0x4f54544f /* OTTO */;
-    if (!isSfnt) {
-      console.log(`office 字体：✗ ${name.split("/").pop()} 不是 sfnt（首 4 字节 0x${tag.toString(16)}）`);
-      missing += 1;
-    } else {
-      console.log(`office 字体：✓ ${name.split("/").pop()} sfnt，${buf.length} B`);
-    }
   }
 }
 
@@ -789,6 +783,76 @@ for (const [suffix, label] of NEED_ANY) {
       missing += 1;
     } else {
       console.log(`移动端插件注册：✓ dsh-web-mobile@${deps["dsh-web-mobile"]}`);
+    }
+  }
+}
+
+// Codex client/host assets must agree with installation-scope discovery.
+{
+  const base = "lib/node_modules/dsh-codex-sidebar/";
+  const required = ["package.json", "cordis.patch.yml", "lib/index.js", "lib/client.js", "lib/transport.mjs", "lib/security.mjs", "lib/service.mjs", "lib/custom-models.mjs", "lib/custom-chat.mjs", "lib/native-models.mjs", "lib/provider-api.mjs", "lib/provider-config.mjs", "lib/provider-http.mjs", "lib/provider-protocols.mjs", "lib/responses-bridge.mjs", "lib/responses-bridge-codec.mjs", "lib/workspace-tools.mjs", "lib/access-policy.mjs", "lib/file-changes.mjs", "lib/thread-actions.mjs", "web/codex.css", "plugin.fingerprint"];
+  for (const path of required) {
+    if (!byName.has(base + path)) {
+      console.log(`Codex plugin: ✗ missing ${path}`);
+      missing += 1;
+    }
+  }
+  const entry = byName.get(base + "package.json");
+  if (entry) {
+    const pkg = JSON.parse(readLocal(entry).toString("utf8"));
+    if (pkg.dsh?.client?.platform !== "web" || pkg.exports?.["./client"] !== "./lib/client.js") {
+      console.log("Codex plugin: ✗ client entry declaration mismatch");
+      missing += 1;
+    }
+  }
+  const host = byName.get("lib/node_modules/@deepseek-ai/dsh/package.json");
+  if (host && !JSON.parse(readLocal(host).toString("utf8")).dependencies?.["dsh-codex-sidebar"]) {
+    console.log("Codex plugin: ✗ missing installation-scope dependency");
+    missing += 1;
+  }
+}
+
+// ---------------------------------------------------------------- 原生 Codex 运行时（app-process 合同）
+// bin/codex 与 lib/codex/runtime.json 必须同时出现（不允许半装配状态）；
+// manifest 必须逐字匹配固定官方 app-process 合同，二进制必须是 ARM64 ELF
+// 且摘要等于固定官方值。app 模式只带 codex，不允许 bwrap 进入包内。
+{
+  const codex = byName.get("bin/codex");
+  const runtimeManifest = byName.get("lib/codex/runtime.json");
+  const bwrap = byName.get("bin/bwrap");
+  if (!codex && !runtimeManifest) {
+    console.log("Codex 原生运行时：— 未装配（不含可执行文件，与 0.9.36 相同）");
+  } else if (!codex || !runtimeManifest) {
+    console.log(`Codex 原生运行时：✗ 半装配状态（bin/codex=${!!codex} lib/codex/runtime.json=${!!runtimeManifest}）`);
+    missing += 1;
+  } else {
+    let nativeJson;
+    try {
+      nativeJson = JSON.parse(readLocal(runtimeManifest).toString("utf8"));
+      const contract = [
+        ["version", CODEX_PIN.version],
+        ["target", CODEX_PIN.target],
+        ["archiveSha256", CODEX_PIN.archiveSha256],
+        ["executionMode", "app-process"],
+        ["appServerVerified", true],
+        ["sandboxVerified", false],
+      ];
+      for (const [field, expected] of contract) {
+        if (nativeJson[field] !== expected) throw new Error(`manifest.${field}=${JSON.stringify(nativeJson[field])} ≠ ${JSON.stringify(expected)}`);
+      }
+      if (nativeJson.files?.codex !== CODEX_PIN.binarySha256) throw new Error("manifest.files.codex 与固定官方二进制摘要不符");
+      const data = readLocal(codex);
+      if (data.length < 20 || data.subarray(0, 4).toString("hex") !== "7f454c46") throw new Error("bin/codex 不是 ELF");
+      if (data.readUInt16LE(18) !== 183) throw new Error("bin/codex 不是 ARM64 ELF");
+      const digest = createHash("sha256").update(data).digest("hex");
+      if (digest !== CODEX_PIN.binarySha256) throw new Error(`bin/codex SHA256=${digest} ≠ 固定官方值`);
+      const mode = (codex.externalAttr >>> 16) & 0o7777;
+      if ((mode & 0o111) !== 0o111) throw new Error(`bin/codex 缺少可执行位（mode=${mode.toString(8)}）`);
+      if (bwrap) throw new Error("app-process 模式不允许打包 bin/bwrap");
+      console.log(`Codex 原生运行时：✓ app-process manifest 与官方二进制摘要一致（${(data.length / 1024 / 1024).toFixed(1)} MiB, mode=${mode.toString(8)}）`);
+    } catch (error) {
+      console.log(`Codex 原生运行时：✗ ${error.message}`);
+      missing += 1;
     }
   }
 }
@@ -1660,9 +1724,13 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
       problems2.push("RuntimeInstaller.kt 缺 healPackagingWrappers（corepack disable 删入口会触发全量重装）");
     } else {
       const healAt = kt.indexOf("healPackagingWrappers(root)");
-      const probeAt = kt.indexOf("if (isComplete(root))");
+      // 判据只关心「存在一条以 isComplete(root) 为准的快路径」，而不是守卫的**个数**：
+      // 0.9.52 把守卫从 `!force` 扩成 `!force && !freshRoot`（全新根不走快路径，
+      // 否则首次安装会跳过 extract），旧正则只容得下一个 `!xxx &&`，于是把正确的
+      // 代码判成「找不到快路径」。这里放宽成任意多个 `!标识符 &&` 前缀。
+      const probeAt = kt.search(/if\s*\(\s*(?:!\s*[A-Za-z_][\w.]*\s*&&\s*)*isComplete\(root\)\s*\)/);
       if (healAt < 0) problems2.push("healPackagingWrappers 定义了却没有调用点");
-      else if (probeAt < 0) problems2.push("RuntimeInstaller.kt 找不到 `if (isComplete(root))`");
+      else if (probeAt < 0) problems2.push("RuntimeInstaller.kt 找不到正常安装的 isComplete(root) 快路径");
       else if (healAt > probeAt) problems2.push("healPackagingWrappers 必须在 isComplete() 之前调用（否则快路径直接返回，自愈跑不到）");
     }
   }
@@ -1714,7 +1782,29 @@ for (const e of files) {
 console.log(`\n残留扫描：检查 ${scanned} 个候选（跳过 ELF ${elfSkipped}），文本里仍含 com.termux 的 ${leftover.length} 个`);
 for (const r of leftover) console.log(`  ! ${r.path}\n      ${r.line}`);
 
+// Python 专项：安装包和声明完整还不够，须核对原生后端、RECORD 与动态库闭包。
+try {
+  const readPython = (name, seen = new Set()) => {
+    if (seen.has(name) || seen.size > 16) throw new Error(`Python LINK 循环：${name}`);
+    seen.add(name);
+    const entry = byName.get(name);
+    if (!entry) return null;
+    return entry.comment.startsWith("LINK:") ? readPython(entry.comment.slice(5), seen) : readLocal(entry);
+  };
+  const python = verifyPythonRuntime(entries.map((entry) => entry.name), readPython);
+  for (const path of ["selftest.mjs", "python-selftest.mjs", "python-probe.py"]) {
+    if (!byName.has(`lib/node_modules/kxxy-host/lib/${path}`)) throw new Error(`Python 应用内自检缺少 ${path}`);
+  }
+  console.log(`\nPython：${python.managedFiles} 个受管文件、CFFI 原生后端、编译输入和依赖闭包通过`);
+  for (const warning of python.warnings) console.log(`  ! ${warning}`);
+  console.log("  Android 功能执行：需应用内自检；构建机结构验证不代表真机通过");
+} catch (error) {
+  missing += 1;
+  console.log(`\nPython：✗ ${error.message}`);
+}
+
 console.log(`\n结论：${missing === 0 ? "全部关键条目齐备" : `${missing} 个关键条目缺失`}`);
+if (missing > 0) process.exitCode = 1;
 
 function readLocal(e) {
   const lp = e.localOffset;

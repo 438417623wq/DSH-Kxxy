@@ -695,8 +695,10 @@ console.log('\n[3] GET /kxxy/assets/host.js')
       fail('入口卡没绑 click，点了不会弹窗')
     } else if (!/dom\.aboutDialog\.setAttribute\('data-open', 'true'\)/.test(r.text)) {
       fail('openAboutDialog 没写 data-open')
-    } else if (!/initAboutDialog\(\)/.test(r.text.replace(/function initAboutDialog\(\)/, ''))) {
-      fail('init() 里没有调用 initAboutDialog，弹窗永远不会绑定')
+    } else if (!/initAboutDialog\(\)/.test(r.text.replace(/function initAboutDialog\(\)/, ''))
+      && !(/\['about-dialog',\s*initAboutDialog\]/.test(r.text)
+        && /for \(const \[label, fn\] of initSteps\)[\s\S]{0,80}fn\(\)/.test(r.text))) {
+      fail('init() 里没有调用或调度 initAboutDialog，弹窗永远不会绑定')
     } else ok('关于弹窗交互已绑定（入口点击 / 关闭按钮 / 遮罩 / Esc）')
 
     // 页面报错过的老坑：删了 DOM 却留着 JS 引用，getElementById 返回 null
@@ -704,6 +706,13 @@ console.log('\n[3] GET /kxxy/assets/host.js')
     if (/function initMirrorActions|function fetchMirror|function renderMirrorResults|function applyMirror/.test(r.text)) {
       fail('host.js 仍残留镜像源逻辑（DOM 已删除，引用会是 null）')
     } else ok('镜像源 JS 逻辑已随 UI 一并移除')
+
+    // 安装弹层必须在 main / view-pane 外，避免页签动画的 transform 改变 fixed 定位。
+    const html = (await get('/kxxy')).text
+    const installSheetAt = html.indexOf('id="plugin-install-sheet"')
+    if (installSheetAt < 0 || installSheetAt < html.indexOf('</main>')) {
+      fail('安装弹层仍在视图内，快速打开会被页签 transform 约束到长列表底部')
+    } else ok('安装弹层在视图动画之外，固定定位参照视口')
 
     // ── 应用内确认弹窗（替代原生 confirm）──────────────────────────────
     // Android WebView 的原生 confirm 会在顶部加一行「网址为 http://127.0.0.1
@@ -1638,7 +1647,67 @@ console.log('\n[14b] /kxxy/api/health（启动配置体检）')
       const payload = JSON.parse(readFileSync(reqFile, 'utf8'))
       if (payload.level !== 'L1') fail(`level 应为 L1，实为 ${payload.level}`)
       else ok('recovery.request 已落盘且 level 正确')
+      const accepted = await res.json()
+      if (!Number.isSafeInteger(accepted.requestedAt) || accepted.requestedAt !== payload.requestedAt) fail('受理 response 必须返回落盘的同一个 requestedAt')
+      else ok('受理返回同一个 requestedAt（202 不是执行成功）')
+      if ('target' in payload) fail('旧调用省略 target 应保持兼容')
+      else ok('省略 target 保持旧调用兼容')
     }
+  }
+
+  // 独立离线运行时通道：不把 RUNTIME 映射为 L3/profile modules。
+  {
+    const res = await fetch(base + '/kxxy/api/recovery', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ level: 'L1', target: 'RUNTIME' }),
+    })
+    const accepted = await res.json()
+    const payload = JSON.parse(readFileSync(join(FAKE_ENGINE_ROOT, 'recovery.request'), 'utf8'))
+    if (res.status !== 202 || payload.level !== 'L1' || payload.target !== 'RUNTIME'
+      || accepted.requestedAt !== payload.requestedAt || accepted.target !== 'RUNTIME') fail('L1/RUNTIME 受理或落盘契约不符')
+    else ok('L1/RUNTIME → 202，target/requestedAt 原样落盘并回传')
+  }
+  {
+    const reqFile = join(FAKE_ENGINE_ROOT, 'recovery.request')
+    const before = readFileSync(reqFile, 'utf8')
+    for (const target of ['runtime', ' RUNTIME', 'L3', '', null, 1, true, {}, ['RUNTIME']]) {
+      const res = await fetch(base + '/kxxy/api/recovery', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ level: 'L1', target }),
+      })
+      if (res.status !== 400 || readFileSync(reqFile, 'utf8') !== before) fail(`非法 target 应 400 且不改请求文件：${JSON.stringify(target)}`)
+      else ok(`非法 target → 400 且不落盘：${JSON.stringify(target)}`)
+    }
+    for (const payload of [null, [], 'RUNTIME']) {
+      const res = await fetch(base + '/kxxy/api/recovery', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+      })
+      if (res.status !== 400) fail(`非法 payload 应 400：${JSON.stringify(payload)}`)
+      else ok(`非法 payload → 400：${JSON.stringify(payload)}`)
+    }
+    for (const target of ['PROFILE_PATCH', 'HOME_PATCH', 'OVERLAY', 'MANIFEST', 'BUNDLES', 'RETRY', 'ENVIRONMENT', 'UNKNOWN']) {
+      const res = await fetch(base + '/kxxy/api/recovery', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ level: 'L1', target }),
+      })
+      if (res.status !== 202 || JSON.parse(readFileSync(reqFile, 'utf8')).target !== target) fail(`合法 target 未原样落盘：${target}`)
+      else ok(`合法 target 原样落盘：${target}`)
+    }
+    const authBefore = readFileSync(reqFile, 'utf8')
+    const prev = authMode
+    authMode = 'anon'
+    const denied = await raw('/kxxy/api/recovery', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ level: 'L1', target: 'RUNTIME' }),
+    })
+    authMode = prev
+    if (denied.status !== 401 || readFileSync(reqFile, 'utf8') !== authBefore) fail('RUNTIME 必须仍要求 connection 会话鉴权')
+    else ok('RUNTIME 无 connection 会话 → 401 且不落盘')
+    const noNonce = await raw('/kxxy/api/recovery', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, nonce: null,
+      body: JSON.stringify({ level: 'L1', target: 'RUNTIME' }),
+    })
+    if (noNonce.status !== 403 || readFileSync(reqFile, 'utf8') !== authBefore) fail('RUNTIME 必须仍要求页面 nonce')
+    else ok('RUNTIME 无 nonce → 403 且不落盘')
   }
 
   // ⑫ 非法 level 必须 400（否则原生层会拿到无法解析的载荷）。

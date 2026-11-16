@@ -249,21 +249,23 @@ const BASE = "http://127.0.0.1:3080/chat";
 /** 构造一次 body props。`__loaded` 收集 `request.loaded()` 的实参。 */
 function makeProps(overrides = {}) {
 	const loaded = [];
+	const failures = [];
 	const props = {
 		content: {
 			kind: "renderer",
 			revision: 7,
 			reload: () => {},
-			failed: () => {},
+			failed: () => failures.push(true),
 			loaded: (v) => loaded.push(v),
 		},
 		resourceAddress: ADDRESS,
-		useResource: () => ({ status: "live", value: { absolutePath: PATH, version: 3 } }),
+		useResource: () => ({ status: "live", value: { absolutePath: PATH, version: "stat-v3" } }),
 		useTabInfo: () => ({ tab: { id: "t1", signal: new AbortController().signal } }),
 		scrollportRef: () => {},
 		t: (key, params) => (params === void 0 ? key : `${key}:${JSON.stringify(params)}`),
 		...overrides,
 		__loaded: loaded,
+		__failed: failures,
 	};
 	return props;
 }
@@ -374,11 +376,63 @@ function mountBody(body, props, base = BASE) {
 	find(tree, "video").props.onLoadedMetadata();
 	flush();
 	equal("loadedmetadata 后向宿主报告一次", props.__loaded.length, 1);
-	equal("报告的 version 取自 stat 结果", props.__loaded[0], 3);
+	equal("报告的 version 是 stat 的真实字符串", props.__loaded[0], "stat-v3");
 
-	// 重渲染（同一 revision）不应重复上报。
+	// content 换对象但 revision 不变，仍然不能重复写 store。
+	props.content = { ...props.content };
 	flush();
 	equal("同一 revision 不重复上报", props.__loaded.length, 1);
+	equal("正常字符串版本没有误报失败", props.__failed.length, 0);
+	props.content = { ...props.content, revision: 8 };
+	flush();
+	equal("新 revision 可以重新上报", props.__loaded.length, 2);
+}
+
+for (const [label, version] of [
+	["缺失", void 0], ["数字", 3], ["null", null], ["空字符串", ""],
+	["对象", { version: "v3" }], ["数组", ["v3"]],
+]) {
+	const props = makeProps({ useResource: () => ({ status: "live", value: { absolutePath: PATH, version } }) });
+	const { tree, flush } = mountBody(api.kxxyMediaVideoBody, props);
+	check(`${label}版本给出明确提示`, textOf(tree).includes("noVersion"));
+	check(`${label}版本不渲染未验证的播放器`, find(tree, "video") === void 0);
+	equal(`${label}版本不伪造 loaded`, props.__loaded.length, 0);
+	equal(`${label}版本调用 failed 清除宿主 loading`, props.__failed.length, 1);
+	props.content = { ...props.content };
+	flush();
+	equal(`${label}版本同 revision 失败只报一次`, props.__failed.length, 1);
+}
+
+{
+	// 带旧 value 的资源仍在加载：媒体元数据可以先到，但不能替文件版本造值。
+	let meta = { status: "loading", value: { absolutePath: PATH } };
+	const props = makeProps({ useResource: () => meta });
+	const { tree, flush } = mountBody(api.kxxyMediaVideoBody, props);
+	find(tree, "video").props.onLoadedMetadata();
+	flush();
+	equal("版本未到时不提前 loaded", props.__loaded.length, 0);
+	equal("资源加载中的缺版本不是确定性失败", props.__failed.length, 0);
+	meta = { status: "live", value: { absolutePath: PATH, version: "late-stat-version" } };
+	flush();
+	equal("版本迟到后补报一次 loaded", props.__loaded.length, 1);
+	equal("迟到版本保持原字符串", props.__loaded[0], "late-stat-version");
+	meta = { ...meta, value: { ...meta.value, version: "changed-stat-version" } };
+	flush();
+	equal("同 revision 的 stat 更新不会重复 loaded", props.__loaded.length, 1);
+}
+
+{
+	let meta = { status: "live", value: { absolutePath: PATH } };
+	const props = makeProps({ useResource: () => meta });
+	const { flush } = mountBody(api.kxxyMediaVideoBody, props);
+	meta = { status: "live", value: { absolutePath: PATH, version: "recovered-version" } };
+	const ready = flush();
+	check("缺版本恢复后同 revision 能重新渲染播放器", find(ready, "video") !== void 0);
+	find(ready, "video").props.onLoadedMetadata();
+	flush();
+	equal("缺版本失败不占用成功上报的 revision", props.__loaded[0], "recovered-version");
+	equal("版本恢复后成功只报一次", props.__loaded.length, 1);
+	equal("版本恢复不追加失败通知", props.__failed.length, 1);
 }
 
 {
@@ -390,7 +444,7 @@ function mountBody(body, props, base = BASE) {
 
 {
 	// stat 成功但没有 absolutePath：不能渲染 src=undefined 的播放器。
-	const props = makeProps({ useResource: () => ({ status: "live", value: { version: 1 } }) });
+	const props = makeProps({ useResource: () => ({ status: "live", value: { version: "stat-v1" } }) });
 	const { tree } = mountBody(api.kxxyMediaVideoBody, props);
 	check("缺 absolutePath 时报「无法解析路径」", textOf(tree).includes("noPath"));
 	check("缺 absolutePath 时不渲染播放器", find(tree, "video") === void 0);

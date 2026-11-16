@@ -44,8 +44,8 @@ async function main() {
   console.log(`[2/3] 求解依赖闭包（${SEED_PACKAGES.length} 个种子）...`);
   const { ordered, missing } = resolveClosure(index, SEED_PACKAGES);
   if (missing.length) {
-    // 缺包不直接失败：先列出来，让用户判断是不是包名变更
-    console.warn(`      ⚠️  索引中不存在: ${missing.join(", ")}`);
+    // 关键运行依赖缺失时不再产出看似完整的离线清单。
+    throw new Error(`Termux 依赖闭包不完整，索引中不存在: ${missing.join(", ")}`);
   }
   const pkgs = ordered.filter((n) => index.has(n));
   const totalBytes = pkgs.reduce((s, n) => s + index.get(n).size, 0);
@@ -116,6 +116,10 @@ async function main() {
     }
   }
 
+  if (manifest.length !== pkgs.length) {
+    throw new Error(`Termux 包下载不完整（${manifest.length}/${pkgs.length}），保留原 manifest，不发布残缺依赖清单`);
+  }
+  process.exitCode = 0;
   const manifestPath = join(cacheDir, "manifest.json");
   writeFileSync(manifestPath, JSON.stringify({
     repo: TERMUX_REPO,

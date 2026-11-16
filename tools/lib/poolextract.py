@@ -31,6 +31,8 @@ LZMA2 解码器（与 debextract.py 同一约束）；Python 的 lzma + tarfile 
       --stage <stage目录> --out <输出目录> --report <report.json>
 """
 import argparse
+from bisect import bisect_left
+from collections import deque
 import io
 import json
 import os
@@ -227,7 +229,11 @@ def load_stage(stage_dir):
         return {}, None
     with open(entries_path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
-    by_path = {e["path"]: e for e in data.get("entries", []) if e.get("type") == "file"}
+    by_path = {
+        e["path"]: e for e in data.get("entries", [])
+        if e.get("type") in ("file", "dir", "directory")
+        and is_safe_path(e.get("path", ""))
+    }
     return by_path, os.path.join(stage_dir, "blobs")
 
 
@@ -237,17 +243,179 @@ def stage_blob(blob_root, sha256):
         return fh.read()
 
 
-def normalize_target(link_path, target):
-    """把链接目标归一为相对 usr 的路径；指向 usr 之外返回 None。"""
-    if target.startswith(TERMUX_PREFIX):
-        return target[len(TERMUX_PREFIX):]
-    if target.startswith("/data/data/com.termux/files/usr"):
-        stripped = target[len("/data/data/com.termux/files/usr/"):]
-        return stripped
-    if target.startswith("/"):
-        return None
-    return posixpath.normpath(posixpath.join(posixpath.dirname(link_path), target))
+def is_safe_path(path):
+    """Only canonical, nonempty POSIX paths below usr can enter a pool."""
+    return (isinstance(path, str) and bool(path) and "\\" not in path
+            and "\x00" not in path and ":" not in path
+            and all(part not in ("", ".", "..") for part in path.split("/")))
 
+
+def normalize_target(link_path, target):
+    """Normalize a link within usr; reject external paths and root escapes."""
+    if (not is_safe_path(link_path) or not isinstance(target, str)
+            or not target or "\\" in target or "\x00" in target or ":" in target):
+        return None
+    absolute_prefix = TERMUX_PREFIX[1:-1]
+    if target.startswith(TERMUX_PREFIX):
+        raw = target[len(TERMUX_PREFIX):]
+    elif target.startswith(absolute_prefix + "/"):
+        raw = target[len(absolute_prefix) + 1:]
+    elif target.startswith("/"):
+        return None
+    else:
+        raw = posixpath.join(posixpath.dirname(link_path), target)
+    parts = []
+    for part in raw.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(part)
+    normalized = "/".join(parts)
+    return normalized if is_safe_path(normalized) else None
+
+
+def materialize_links(merged, symlinks, stage_entries=None, blob_root=None,
+                      *, max_files=1000000):
+    """Materialize file and directory links in-place, returning unresolved links.
+
+    Dependencies include links *inside* a directory target, so directory copies
+    see fully resolved aliases rather than a partial snapshot. Each link is
+    attempted once, after its dependencies; cyclic/failed dependencies remain
+    pending until the graph is exhausted. Existing destination files always win.
+    A file-count bound additionally limits expansion of nested directory aliases.
+    Stage directories are inferred from file paths (or explicit directory entries).
+    """
+    if max_files < len(merged):
+        raise ValueError("max_files is smaller than the existing file count")
+    if any(not is_safe_path(path) for path in merged):
+        raise ValueError("unsafe path in merged files")
+    stage_entries = {
+        path: entry for path, entry in (stage_entries or {}).items()
+        if is_safe_path(path) and entry.get("type") in ("file", "dir", "directory")
+    }
+    targets = {}
+    unresolved = {}
+    for path, raw_target in symlinks.items():
+        target = normalize_target(path, raw_target)
+        if target is None:
+            unresolved[path] = raw_target
+        elif path in merged:
+            continue
+        elif (path == target or path.startswith(target + "/")
+              or target.startswith(path + "/")):
+            # Never copy an ancestor into itself, or a descendant over its parent.
+            unresolved[path] = raw_target
+        else:
+            targets[path] = target
+
+    link_paths = sorted(path for path in symlinks if is_safe_path(path))
+    dependencies = {}
+    dependents = {}
+    for path, target in targets.items():
+        # A target may traverse an alias, or refer to a directory with aliases.
+        deps = set()
+        parent = target
+        while parent:
+            if parent in symlinks and parent not in merged:
+                deps.add(parent)
+            parent = posixpath.dirname(parent)
+        prefix = target + "/"
+        index = bisect_left(link_paths, prefix)
+        while index < len(link_paths) and link_paths[index].startswith(prefix):
+            candidate = link_paths[index]
+            if candidate not in merged:
+                deps.add(candidate)
+            index += 1
+        dependencies[path] = deps
+        for dependency in deps:
+            dependents.setdefault(dependency, []).append(path)
+
+    def ancestors(path):
+        parent = posixpath.dirname(path)
+        while parent:
+            yield parent
+            parent = posixpath.dirname(parent)
+
+    directories = {parent for path in merged for parent in ancestors(path)}
+    for path, entry in stage_entries.items():
+        directories.update(ancestors(path))
+        if entry["type"] in ("dir", "directory"):
+            directories.add(path)
+
+    def stage_file(entry):
+        if not blob_root:
+            return None
+        digest = entry.get("sha256", "")
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdefABCDEF" for c in digest)):
+            return None
+        try:
+            return stage_blob(blob_root, digest), entry.get("mode", 0o644)
+        except OSError:
+            return None
+
+    def can_add_file(path):
+        if path in merged:
+            return True
+        return (is_safe_path(path) and path not in directories
+                and not any(parent in merged for parent in ancestors(path)))
+
+    ready = deque(path for path in targets if not dependencies[path])
+    resolved = set()
+    while ready:
+        path = ready.popleft()
+        target = targets[path]
+        additions = {}
+        file_value = merged.get(target)
+        entry = stage_entries.get(target)
+        if file_value is None and entry and entry["type"] == "file":
+            file_value = stage_file(entry)
+        if file_value is not None:
+            additions[path] = file_value
+        elif target in directories:
+            prefix = target + "/"
+            if any(parent in merged for parent in ancestors(path)):
+                continue
+            failed = False
+            # Snapshot: newly copied destinations never become their own sources.
+            sources = {name: value for name, value in merged.items()
+                       if name.startswith(prefix)}
+            for name, source_entry in stage_entries.items():
+                if name.startswith(prefix) and source_entry["type"] == "file":
+                    destination = path + "/" + name[len(prefix):]
+                    if name not in sources and destination not in merged:
+                        value = stage_file(source_entry)
+                        if value is None:
+                            failed = True
+                            break
+                        sources[name] = value
+            if failed:
+                continue
+            additions = {path + "/" + name[len(prefix):]: value
+                         for name, value in sources.items()}
+        else:
+            continue
+        new_paths = set(additions).difference(merged)
+        if (len(merged) + len(new_paths) > max_files
+                or any(not can_add_file(name) for name in additions)):
+            continue
+        for name, value in additions.items():
+            merged.setdefault(name, value)
+            directories.update(ancestors(name))
+        if file_value is None:
+            directories.add(path)
+        resolved.add(path)
+        for dependent in dependents.get(path, ()):
+            dependencies[dependent].discard(path)
+            if not dependencies[dependent]:
+                ready.append(dependent)
+
+    unresolved.update({path: symlinks[path] for path in targets if path not in resolved})
+    return unresolved
 
 def main():
     ap = argparse.ArgumentParser()
@@ -299,7 +467,7 @@ def main():
                         skipped += 1
                         continue
                     path = rel[len(TERMUX_PREFIX):]
-                    if not path or is_pruned(path):
+                    if not is_safe_path(path) or is_pruned(path):
                         skipped += 1
                         continue
 
@@ -325,40 +493,12 @@ def main():
                         continue
                     merged[path] = (fh.read(), member.mode)
 
-        # 物化符号链接（迭代两轮：链接也可能指向另一条链接）
-        pending = dict(symlinks)
-        for _round in range(4):
-            if not pending:
-                break
-            progressed = False
-            for path, raw_target in list(pending.items()):
-                target = normalize_target(path, raw_target)
-                if target is None:
-                    del pending[path]
-                    skipped += 1
-                    continue
-                if target in merged:
-                    data, mode = merged[target]
-                    merged[path] = (data, mode)
-                    del pending[path]
-                    progressed = True
-                elif target in stage_entries and blob_root:
-                    entry = stage_entries[target]
-                    merged[path] = (stage_blob(blob_root, entry["sha256"]), entry.get("mode", 0o644))
-                    del pending[path]
-                    progressed = True
-                elif target in pending:
-                    continue  # 下一轮再说
-                else:
-                    del pending[path]
-                    skipped += 1
-                    print(f"      · {ext_id}: 链接无法解析 {path} -> {raw_target}，跳过",
-                          file=sys.stderr)
-            if not progressed:
-                break
-        for path in pending:
+        # Directory aliases wait for all file/directory dependencies to resolve.
+        pending = materialize_links(merged, symlinks, stage_entries, blob_root)
+        for path, raw_target in pending.items():
             skipped += 1
-            print(f"      · {ext_id}: 链接环/未解析 {path}，跳过", file=sys.stderr)
+            print(f"      · {ext_id}: 链接环/未解析/不安全 {path} -> {raw_target}，跳过",
+                  file=sys.stderr)
 
         out_path = os.path.join(args.out, f"{ext_id}.pool")
         total_bytes = 0

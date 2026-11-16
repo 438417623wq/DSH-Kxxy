@@ -8,8 +8,10 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Script } from "node:vm";
 
 /** 仓库里自带的预编译产物目录（见各 prebuilt 子目录的 README）。 */
 const PREBUILT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "prebuilt");
@@ -411,50 +413,57 @@ function patchRipgrep(ctx, termuxRead) {
 }
 
 /**
- * dsh-fs-local 的原子发布：`linkFile(tempPath, absolutePath)` 在 Android 上
- * 因 SELinux 禁 link 而失败，且失败后的 throwGuardedCreateFailure 在
- * 「目标不存在」时会静默返回 —— 结果是**文件根本没被写入**（不是报错）。
- * 因此必须显式改成 rename 路径。
+ * dsh-fs-local 的原子发布：Android 的 SELinux 禁止 link，新建改用 COPYFILE_EXCL。
+ * 不能先检查再 rename：并发创建者会被覆盖。默认替换仍保留上游 rename / Win32 DACL。
+ * 独占 copy 只保证不覆盖，不宣称原子可见性；两个真实版本的失败守卫均会抛错。
  */
-function patchFsLocal(ctx) {
+export function patchFsLocal(ctx) {
   const rel = "@deepseek-ai/dsh-fs-local/lib/index.js";
   if (!ctx.exists(rel)) return "跳过（依赖树无 dsh-fs-local）";
   const src = ctx.read(rel);
-  const out = replaceOnce(
-    src,
-    `\t\tif (createIfAbsent !== void 0) try {
+  const modern = src.includes('async function writeFileAtomic(absolutePath, content, mode, signal, internals = {}, options = {}) {');
+  const label = `dsh-fs-local ${modern ? "0.2.2-rc.2" : "0.2.1-rc.5"}`;
+  const marker = "KXXY_FS_LOCAL_EXCLUSIVE_CREATE";
+  const from = `\t\tif (${modern ? "options.createIfAbsent" : "createIfAbsent !== void 0"}) try {
 \t\t\tawait linkFile(tempPath, absolutePath);
 \t\t} catch (error) {
-\t\t\tawait throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
-\t\t}`,
-    `\t\tif (createIfAbsent !== void 0) {
-\t\t\tif (platform === "android") {
-\t\t\t\t/* Android：SELinux 在 app 域禁 link()，而 link 失败后的
-\t\t\t\t   throwGuardedCreateFailure 在「目标不存在」时会静默返回 ——
-\t\t\t\t   文件不会被写入。这里直接走 rename（同目录，具备同样的
-\t\t\t\t   原子发布语义），但保留原有的「不得覆盖未读过的文件」守卫。 */
-\t\t\t\tlet existing;
-\t\t\t\ttry {
-\t\t\t\t\texisting = await inspectPublicationTarget(absolutePath);
-\t\t\t\t} catch (metadataError) {
-\t\t\t\t\tif (!isENOENT(metadataError) && !isENOTDIR(metadataError)) throw new FsError(\`cannot write "\${createIfAbsent.displayPath}": \${errorMessage(metadataError)}\`, "FS_IO_ERROR", { cause: metadataError });
-\t\t\t\t}
-\t\t\t\tif (existing !== void 0) {
-\t\t\t\t\tif (!existing.isFile()) throw new FsError(\`cannot write "\${createIfAbsent.displayPath}": not a regular file\`, "FS_NOT_REGULAR_FILE");
-\t\t\t\t\tthrow new FsError(\`cannot overwrite existing "\${createIfAbsent.displayPath}" without reading it first\`, "FS_NOT_OBSERVED");
-\t\t\t\t}
-\t\t\t\tawait rename(tempPath, absolutePath);
-\t\t\t} else try {
-\t\t\t\tawait linkFile(tempPath, absolutePath);
-\t\t\t} catch (error) {
-\t\t\t\tawait throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
-\t\t\t}
-\t\t}`,
-    "dsh-fs-local 的 linkFile 发布点",
-  );
-  must(out.includes("await rename(tempPath, absolutePath);"), "fs-local 补丁未生效");
+\t\t\tawait throwGuardedCreateFailure(error, absolutePath, ${modern ? "displayPath" : "createIfAbsent.displayPath"}, inspectPublicationTarget);
+\t\t}`;
+  const to = from.replace('\t\t\tawait linkFile(tempPath, absolutePath);',
+    `\t\t\t/* ${marker} */
+\t\t\tif (platform === "android") await copyFile(tempPath, absolutePath, fsConstants.COPYFILE_EXCL);
+\t\t\telse await linkFile(tempPath, absolutePath);`);
+  const imports = [
+    ['import { createReadStream, realpath } from "node:fs";',
+      'import { constants as fsConstants, createReadStream, realpath } from "node:fs";'],
+    ['import { chmod, link, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";',
+      'import { chmod, copyFile, link, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";'],
+  ];
+  const already = src.includes(marker);
+  let original = src;
+  if (already) {
+    clientAnchor(src, marker, `${label} 独占创建标记`);
+    original = replaceOnce(original, to, from, `${label} 已打补丁发布点`);
+    for (const [before, after] of imports) original = replaceOnce(original, after, before, `${label} 已打补丁 import`);
+  }
+  // 对真实 ASAR 的完整失败守卫、写入函数（含默认覆盖、取消和错误传播）做逐字契约校验。
+  // 幂等路径先精确逆变换，再做同样校验，标记或部分补丁不能掩盖漂移。
+  const start = clientAnchor(original, 'async function throwGuardedCreateFailure(', `${label} 失败守卫`);
+  const write = clientAnchor(original, 'async function writeFileAtomic(', `${label} 写入函数`);
+  const end = clientAnchor(original, modern ? '/**\n* Remove one resolved file' : '/**\n* Collapse CRLF to LF', `${label} 写入边界`);
+  must(start < write && write < end, `${label} —— 写入函数边界漂移`);
+  const digest = createHash("sha256").update(original.slice(start, end)).digest("hex");
+  must(digest === (modern
+    ? "7f32a437b99cf959af636053cfe6c4d9e2fc065c654f429c0ddd7922b28368c1"
+    : "8784ae8cfcb276ca307adfd83fd6a7347421c1a2bc1972833519c67ad207572e"), `${label} —— 写入或失败守卫契约漂移（${digest}）`);
+  let out = replaceOnce(original, from, to, `${label} 独占创建发布点`);
+  for (const [before, after] of imports) out = replaceOnce(out, before, after, `${label} 独占创建 import`);
+  if (already) {
+    must(out === src, `${label} —— 已打补丁内容不完整`);
+    return `${label} → 已打过 Android 独占创建补丁（重新验证通过）`;
+  }
   ctx.write(rel, out);
-  return "dsh-fs-local → Android 走 rename 发布";
+  return `${label} → Android 独占创建，保留原有替换和冲突守卫`;
 }
 
 /**
@@ -584,34 +593,95 @@ function patchDocumentPreviewUnicodeSets(ctx) {
 // ------------------------------------------------------- office（文档 → PDF）链路
 
 /**
- * libreoffice-kit 的宿主平台门禁：Android 上必须放行 wasm 后端。
- *
- * 上游把「非 linux」一律当不支持的宿主，代码里三处硬编码：
- *   1. `platformTarget()` 尾部 `if (platform !== "linux") return void 0;`
- *   2. `resolveEngine()` 里原生包缺失时 `if (platform !== "linux") throw …Required…missing`
- *   3. `resolveEngine()` 尾部 `if (platform !== "linux") throw …Unsupported LibreOfficeKit host`
- * 第 3 处是决定性的：Android 上 `platformTarget()` 本就返回 `void 0`（`details` 为空、
- * 取不到 `glibcVersionRuntime`），流程必然走到第 3 处抛错，永远到不了紧随其后的
- * `readEngine(resolvePackage('@deepseek-ai/libreoffice-kit-wasm'), "wasm", "wasm")`。
- *
- * 为什么必须放行 wasm 而不是补原生包：Android 上没有 linux-glibc 预编译产物，
- * 而 `@deepseek-ai/libreoffice-kit-wasm` 是纯 wasm 引擎（soffice.wasm + soffice.data），
- * 与宿主 ABI 无关，实测在 arm64 Android 上可完成 docx/pptx → PDF（约 4.5 s）。
- *
- * 安全性依据：三处判据只影响「要不要用 wasm 后端」这一条路径选择。Android 上
- * 原生包本来就解析不到，放行后行为等同于「原生缺失 → 落到 wasm」，与桌面
- * Linux 上原生缺失时的行为一致。
+ * Office 服务的 Android 缺省字体：不通过 overlay 整体替换用户 config。
+ * 沿用旧 officeFontsDir 的单文件 TTF 目录，不混入有 TTC 渲染问题的 /system/fonts。
+ * 只补 this.options；显式 []、用户路径、配置校验及非 Android 行为全部保留。
+ * 全源码签名覆盖真实构造器到 createConverter 链；幂等先逐字逆变换再验签。
  */
-function patchLibreOfficeKitPlatform(ctx) {
+export function patchOfficeDefaultFonts(ctx) {
+  const marker = "KXXY_OFFICE_DEFAULT_FONTS";
+  const inject = `\t\t\t/* ${marker}：仅补 Android 缺省值，不回写用户 config。 */
+\t\t\tif (process.platform === "android" && fontDirectories === void 0) {
+\t\t\t\tconst kxxyRoot = process.env.KXXY_ENGINE_ROOT;
+\t\t\t\tif (typeof kxxyRoot !== "string" || !isAbsolute(kxxyRoot) || kxxyRoot.includes("\\0")) throw new Error("Android Office 默认字体需要非空、无 NUL 的绝对路径 KXXY_ENGINE_ROOT。");
+\t\t\t\tthis.options.fontDirectories = [join(kxxyRoot, "lib/node_modules/kxxy-host/fonts")];
+\t\t\t}
+`;
+  const forms = [
+    {
+      pkg: "@deepseek-ai/dsh-office-kit",
+      hashes: ["88f0697ec0507ba25732f3a359ddca277e1890f215fbe1babf7b98f6c4c40e97"],
+      fontHash: "04f8bac43c0ced64a478059435ab8b9ceedeacd6b11790bfd70a97c7fffb2278",
+      queue: "\t\t\tthis.queue = new ConversionQueue(config, this.generation, (bytes, request, signal) => this.runOperation(bytes, request, signal));",
+    },
+    {
+      pkg: "@deepseek-ai/dsh-office-to-pdf",
+      // 第二个指纹仅接受本文件已有的 odt/ods/odp 格式补丁，允许补丁组合后复验。
+      hashes: ["74cf9df9ab605a7675797ee1304d7af7059e97e90c3728ce4e40fbd2333fd7b8",
+        "597215530f11d493126a4ce0b5ef4d8dda394082861ff6f5886f968c258cfd2f"],
+      fontHash: "e85c76f603af39038aaafcc5bc829fc760c3889b879078890ccbb910cd54beea",
+      queue: "\t\t\tthis.queue = new ConversionQueue(config, this.generation, (bytes, extension, signal) => this.convertBytes(bytes, extension, signal));",
+    },
+  ];
+  const edits = [];
+  for (const { pkg, hashes, fontHash, queue } of forms) {
+    if (!ctx.exists(pkg)) continue;
+    const rel = `${pkg}/lib/index.js`;
+    const label = `${pkg} Android 缺省字体`;
+    must(ctx.exists(rel), `${label} —— 包存在但入口缺失`);
+    const src = ctx.read(rel);
+    const already = src.includes(marker);
+    const original = already ? replaceOnce(src, inject, "", `${label} 完整补丁逆变换`) : src;
+    const digest = createHash("sha256").update(original).digest("hex");
+    must(hashes.includes(digest), `${label} —— 未知或漂移的源码签名（${digest}）`);
+    const start = clientAnchor(original, "\t\tconstructor(ctx, config) {\n", `${label} 构造器`);
+    const end = clientAnchor(original, queue, `${label} 转换队列`);
+    must(start < end && createHash("sha256").update(original.slice(start, end)).digest("hex") === fontHash,
+      `${label} —— 字体构造块契约漂移`);
+    const out = replaceOnce(original, queue, inject + queue, `${label} 默认值注入点`);
+    if (already) must(out === src, `${label} —— 补丁位置或内容不完整`);
+    edits.push({ rel, out, already, label });
+  }
+  // 两个入口同时存在时也先全部验签，任一漂移都不写入半份补丁。
+  for (const { rel, out, already } of edits) if (!already) ctx.write(rel, out);
+  return edits.length ? edits.map(({ label, already }) => `${label} → ${already ? "已打过（逆变换复验通过）" : "仅注入宿主字体目录"}`).join("；")
+    : "跳过（依赖树无 Office 服务）";
+}
+
+/**
+ * libreoffice-kit 的宿主平台门禁：Android 只使用 WASM，不冒充 Linux glibc ABI。
+ * 0.1.5 只需放行 resolveEngine 尾部拒绝；platformTarget 和桌面原生包门禁不变。
+ * 0.2.3 已统一 WASM fallback，必须验证整个 engine 区段后原样保留，而非机械改次数。
+ */
+export function patchLibreOfficeKitPlatform(ctx) {
   const rel = "@deepseek-ai/libreoffice-kit/lib/index.js";
   if (!ctx.exists(rel)) return "跳过（依赖树无 libreoffice-kit）";
   const src = ctx.read(rel);
-  const from = 'if (platform !== "linux")';
-  const to = 'if (platform !== "linux" && platform !== "android")';
-  const hits = src.split(from).length - 1;
-  must(hits === 3, `libreoffice-kit 平台门禁 —— 期望 3 处，实际 ${hits} 处`);
-  ctx.write(rel, src.split(from).join(to));
-  return "libreoffice-kit → 平台门禁放行 android（启用 wasm 后端）";
+  const label = "libreoffice-kit 平台选择";
+  const from = '\tif (platform !== "linux") throw new Error(`Unsupported LibreOfficeKit host: ${platform}-${arch}`);';
+  const to = '\tif (platform !== "linux" && platform !== "android") throw new Error(`Unsupported LibreOfficeKit host: ${platform}-${arch}`);';
+  const already = src.includes(to);
+  const original = already ? replaceOnce(src, to, from, `${label} 已打补丁门禁`) : src;
+  const start = clientAnchor(original, '//#region lib/types/engine.js\n', `${label} engine 起点`);
+  const end = clientAnchor(original, '//#endregion\n//#region lib/types/operations.js', `${label} engine 终点`);
+  for (const anchor of ['function platformTarget(', 'async function resolveEngine(', 'async function readEngine(']) {
+    const at = clientAnchor(original, anchor, `${label} ${anchor}`);
+    must(start < at && at < end, `${label} —— 函数移出 engine 区段`);
+  }
+  // 指纹来自两版真实 ASAR，覆盖 ABI、glibc 下限、包缺失/损坏区分、路径和 manifest 验证。
+  const digest = createHash("sha256").update(original.slice(start, end)).digest("hex");
+  if (digest === "e678c368c926de84b1499528998b53d26571a6831805ac89c35fadba7866cf5e") {
+    must(!already, `${label} —— 新版混入旧门禁补丁`);
+    return "libreoffice-kit 0.2.3 → 已验证上游 Android WASM fallback，保留 native 与完整性门禁（零改写）";
+  }
+  must(digest === "8053aa88a4f1bebfdb284e28cb7abd06b528f9f639225d8a61ddda763fc8ccc2", `${label} —— 未知或漂移的 engine 契约（${digest}）`);
+  const out = replaceOnce(original, from, to, `${label} 0.1.5 的 WASM 宿主门禁`);
+  if (already) {
+    must(out === src, `${label} —— 已打补丁内容不完整`);
+    return "libreoffice-kit 0.1.5 → 已打过 Android WASM 补丁（重新验证通过）";
+  }
+  ctx.write(rel, out);
+  return "libreoffice-kit 0.1.5 → 仅放行 Android WASM，保留 Linux/桌面 native 选择";
 }
 
 /**
@@ -695,6 +765,84 @@ function patchOfficeToPdfFormats(ctx) {
   return "dsh-office-to-pdf → 扩展名白名单补 odt / ods / odp";
 }
 
+// 客户端补丁只识别已核实的 rc.5 / rc.2 形态，不依赖构建机上的第三方解析器。
+function clientAnchor(text, anchor, label) {
+  const at = text.indexOf(anchor);
+  must(at >= 0, `${label} —— 未找到锚点`);
+  must(text.indexOf(anchor, at + 1) < 0, `${label} —— 锚点出现多次，替换不安全`);
+  return at;
+}
+
+function clientSyntax(text, label) {
+  try { new Script(text); }
+  catch (error) { must(false, `${label} —— 语法或作用域边界已改变：${error.message}`); }
+}
+
+function clientFactory(text, id) {
+  const forms = [
+    {
+      compact: false,
+      head: `window.__ModuleLoader__.load({\n\tid: "${id}",\n\tfactory: (require) => {\n\t\tvar module = { exports: {} };\n\t\tvar exports = module.exports;\n\t\tObject.defineProperty(exports, Symbol.toStringTag, { value: "Module" });\n`,
+      tail: '\t\treturn module.exports;\n\t}\n});\n\n//# sourceMappingURL=client.js.map',
+    },
+    {
+      compact: true,
+      head: `\nwindow.__ModuleLoader__.load({id:\`${id}\`,factory:require=>{var module={exports:{}};var exports=module.exports;Object.defineProperty(exports,Symbol.toStringTag,{value:\`Module\`});`,
+      tail: 'return module.exports}});\n//# sourceMappingURL=client.js.map',
+    },
+  ];
+  const matches = forms.filter(({ head, tail }) => text.startsWith(head) && text.endsWith(tail));
+  must(matches.length === 1, `${id} —— 未知的模块 factory 包装`);
+  const form = matches[0];
+  clientAnchor(text, form.head, `${id} factory`);
+  clientSyntax(text, `${id} 完整 bundle`);
+  return { ...form, body: text.slice(form.head.length, -form.tail.length) };
+}
+
+function clientScopedFunction(body, head, end, label) {
+  const start = clientAnchor(body, head, label);
+  must(start < end, `${label} —— 函数与导出顺序已改变`);
+  // 只编译、不执行上游：前缀必须是完整的 factory 语句，切片必须恰好是一个函数。
+  // 若锚点跑进字符串、嵌套回调或另一函数，这两次编译至少有一次会失败。
+  clientSyntax(`(function(require){${body.slice(0, start)}\n})`, `${label} factory 层级`);
+  const code = body.slice(start, end);
+  clientSyntax(`(${code}\n)`, `${label} 函数边界`);
+  return { start, code };
+}
+
+function documentPreviewLayout(text, fragments = [], extraCalls = []) {
+  const factory = clientFactory(text, '@deepseek-ai/dsh-client-ui-sidebar-documentpreview');
+  const { compact, body } = factory;
+  clientAnchor(body, compact ? 'let react=require("react");' : 'let react = require("react");', '文档预览 react 绑定');
+  const tail = compact
+    ? 'exports.apply=apply;exports.inject=inject;'
+    : '\t\t//#endregion\n\t\texports.apply = apply;\n\t\texports.inject = inject;\n';
+  const exportAt = clientAnchor(body, tail, '文档预览导出的 apply');
+  must(exportAt + tail.length === body.length, '文档预览导出不在 factory 末尾');
+  const injected = fragments.map(fragment => `\n${fragment}\n`).join('');
+  const end = exportAt - injected.length;
+  must(body.slice(end, exportAt) === injected, '文档预览片段缺失、改变或不在 factory 导出之前');
+  for (const fragment of fragments) clientAnchor(body, fragment, '文档预览已注入片段');
+  const apply = clientScopedFunction(body, compact ? 'function apply(ctx){' : 'function apply(ctx) {', end, '文档预览 apply');
+  const setup = compact
+    ? 'function apply(ctx){const config=Config(globalThis.__DSH_DOCUMENT_PREVIEW_CONFIG__??{});const previews=new DocumentPreviewRegistry;const disposePreviews=ctx.reflect.provide(`documentPreviews`,previews);'
+    : 'function apply(ctx) {\n\t\t\tconst config = Config(globalThis.__DSH_DOCUMENT_PREVIEW_CONFIG__ ?? {});\n\t\t\tconst previews = new DocumentPreviewRegistry();\n\t\t\tconst disposePreviews = ctx.reflect.provide("documentPreviews", previews);';
+  must(apply.code.startsWith(setup), '文档预览 apply 的配置或注册表契约已改变');
+  const calls = compact
+    ? 'apply$9(ctx);apply$8(ctx);apply$6(ctx);apply$5(ctx);apply$4(ctx);apply$2(ctx,config.office);apply$1(ctx,config.excel);apply$3(ctx)'
+    : 'apply$9(ctx);\n\t\t\tapply$8(ctx);\n\t\t\tapply$6(ctx);\n\t\t\tapply$5(ctx);\n\t\t\tapply$4(ctx);\n\t\t\tapply$2(ctx, config.office);\n\t\t\tapply$1(ctx, config.excel);\n\t\t\tapply$3(ctx);';
+  const closing = compact ? '}' : '\n\t\t}\n';
+  const addedCalls = extraCalls.map(name => `${compact ? '' : '\n\t\t\t'};${name}(ctx);`).join('');
+  const callTail = calls + addedCalls + closing;
+  clientAnchor(apply.code, callTail, '文档预览内置及本地 provider 注册顺序');
+  must(apply.code.endsWith(callTail), '文档预览 provider 调用不在导出 apply 末尾');
+  return {
+    ...factory,
+    exportAt: factory.head.length + exportAt,
+    callAt: factory.head.length + end - closing.length,
+  };
+}
+
 /**
  * 客户端 office 预览器的扩展名清单：补 odt / ods / odp。
  *
@@ -712,13 +860,30 @@ function patchOfficeToPdfFormats(ctx) {
  * 「二进制后缀」—— 这正是我们要的：`binaryDocumentPath` 为真 ⇒ 只留 office
  * 一个候选，不会追加纯文本兜底、不会出现「打开方式」菜单。
  */
-function patchDocumentPreviewOfficeExtensions(ctx) {
+export function patchDocumentPreviewOfficeExtensions(ctx) {
   const rel = "@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.js";
   if (!ctx.exists(rel)) return "跳过（依赖树无文档预览客户端）";
-  const from = 'const extensions = [\n\t\t\t\t"doc",\n\t\t\t\t"docx",\n\t\t\t\t"ppt",\n\t\t\t\t"pptx"\n\t\t\t];';
-  const to =
-    'const extensions = [\n\t\t\t\t"doc",\n\t\t\t\t"docx",\n\t\t\t\t"odt",\n\t\t\t\t"ppt",\n\t\t\t\t"pptx",\n\t\t\t\t"odp",\n\t\t\t\t"ods"\n\t\t\t];';
-  const patched = replaceOnce(ctx.read(rel), from, to, "文档预览 office provider 的扩展名清单");
+  const text = ctx.read(rel);
+  const { compact, body } = documentPreviewLayout(text);
+  const end = clientAnchor(body, 'function conversionErrorKey(code)', 'office 后继函数');
+  const office = clientScopedFunction(body, compact ? 'function apply$2(ctx,config){' : 'function apply$2(ctx, config) {', end, 'office provider');
+  const head = compact
+    ? 'function apply$2(ctx,config){const id=`@deepseek-ai/dsh-client-ui-sidebar-documentpreview/office`;'
+    : 'function apply$2(ctx, config) {\n\t\t\tconst id = "@deepseek-ai/dsh-client-ui-sidebar-documentpreview/office";';
+  must(office.code.startsWith(head), 'office provider 的 ID 或函数绑定已改变');
+  const registration = compact
+    ? 'ctx.effect(()=>ctx.documentPreviews.register({id,extensions,binaryExtensions:extensions,priority:`builtin`,title:()=>t(`title`),loading:`renderer`,wrap:false}));'
+    : 'ctx.effect(() => ctx.documentPreviews.register({\n\t\t\t\tid,\n\t\t\t\textensions,\n\t\t\t\tbinaryExtensions: extensions,\n\t\t\t\tpriority: "builtin",\n\t\t\t\ttitle: () => t("title"),\n\t\t\t\tloading: "renderer",\n\t\t\t\twrap: false\n\t\t\t}));';
+  clientAnchor(office.code, registration, 'office 共享扩展名与 renderer 契约');
+  const from = compact
+    ? 'const extensions=[`doc`,`docx`,`ppt`,`pptx`];'
+    : 'const extensions = [\n\t\t\t\t"doc",\n\t\t\t\t"docx",\n\t\t\t\t"ppt",\n\t\t\t\t"pptx"\n\t\t\t];';
+  const to = compact
+    ? 'const extensions=[`doc`,`docx`,`odt`,`ppt`,`pptx`,`odp`,`ods`];'
+    : 'const extensions = [\n\t\t\t\t"doc",\n\t\t\t\t"docx",\n\t\t\t\t"odt",\n\t\t\t\t"ppt",\n\t\t\t\t"pptx",\n\t\t\t\t"odp",\n\t\t\t\t"ods"\n\t\t\t];';
+  const replacement = replaceOnce(office.code, from, to, 'office 扩展名清单');
+  const patched = replaceOnce(text, office.code, replacement, 'office provider 函数');
+  documentPreviewLayout(patched);
   ctx.write(rel, patched);
   return "文档预览 office provider → 扩展名补 odt / ods / odp";
 }
@@ -743,23 +908,20 @@ function patchDocumentPreviewOfficeExtensions(ctx) {
  * 片段内所有标识符带 `kxxy` / `KXXY_` 前缀 —— 这是个 26 万字符的扁平作用域，
  * 不加前缀极易与上游局部变量撞名。
  */
-function patchDocumentPreviewArchiveProviders(ctx) {
+export function patchDocumentPreviewArchiveProviders(ctx) {
   const rel = "@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.js";
   if (!ctx.exists(rel)) return "跳过（依赖树无文档预览客户端）";
   const fragment = prebuilt("documentpreview-archive/providers.js").toString("utf8").trimEnd();
-  must(
-    fragment.includes("function kxxyArchiveApply("),
-    "文档预览归档 provider —— 片段缺少 kxxyArchiveApply 入口",
-  );
-  must(
-    !fragment.includes("</script"),
-    "文档预览归档 provider —— 片段含 </script，内联进 bundle 会截断脚本",
-  );
-
-  const tail = "\t\t//#endregion\n\t\texports.apply = apply;";
-  const call = "\t\t\tapply$3(ctx);\n";
-  let patched = replaceOnce(ctx.read(rel), tail, `${fragment}\n${tail}`, "文档预览客户端模块尾部");
-  patched = replaceOnce(patched, call, `${call}\t\t\tkxxyArchiveApply(ctx);\n`, "文档预览 apply() 的收尾调用");
+  clientAnchor(fragment, 'function kxxyArchiveApply(', '文档预览归档片段入口');
+  must(!fragment.includes('</script'), '文档预览归档片段含 </script');
+  const text = ctx.read(rel);
+  must(!text.includes('kxxyArchiveApply') && !text.includes('kxxyMediaApply'), '归档补丁重复、部分应用或注册顺序已改变');
+  const { compact, exportAt, callAt } = documentPreviewLayout(text);
+  let patched = text.slice(0, exportAt) + `\n${fragment}\n` + text.slice(exportAt);
+  // rc.2 最后一个内置调用没有分号；必须显式断开，不能依赖 ASI。
+  const call = `${compact ? '' : '\n\t\t\t'};kxxyArchiveApply(ctx);`;
+  patched = patched.slice(0, callAt) + call + patched.slice(callAt);
+  documentPreviewLayout(patched, [fragment], ['kxxyArchiveApply']);
   ctx.write(rel, patched);
   return "文档预览客户端 → 新增 zip / epub 两个归档 provider";
 }
@@ -794,20 +956,17 @@ function patchDocumentPreviewArchiveProviders(ctx) {
 export function patchDocumentPreviewMediaProviders(ctx) {
   const rel = "@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.js";
   if (!ctx.exists(rel)) return "跳过（依赖树无文档预览客户端）";
+  const archive = prebuilt("documentpreview-archive/providers.js").toString("utf8").trimEnd();
   const fragment = prebuilt("documentpreview-media/providers.js").toString("utf8").trimEnd();
-  must(
-    fragment.includes("function kxxyMediaApply("),
-    "文档预览音视频 provider —— 片段缺少 kxxyMediaApply 入口",
-  );
-  must(
-    !fragment.includes("</script"),
-    "文档预览音视频 provider —— 片段含 </script，内联进 bundle 会截断脚本",
-  );
-
-  const tail = "\t\t//#endregion\n\t\texports.apply = apply;";
-  const call = "\t\t\tkxxyArchiveApply(ctx);\n";
-  let patched = replaceOnce(ctx.read(rel), tail, `${fragment}\n${tail}`, "文档预览客户端模块尾部（音视频）");
-  patched = replaceOnce(patched, call, `${call}\t\t\tkxxyMediaApply(ctx);\n`, "文档预览 apply() 的音视频收尾调用");
+  clientAnchor(fragment, 'function kxxyMediaApply(', '文档预览音视频片段入口');
+  must(!fragment.includes('</script'), '文档预览音视频片段含 </script');
+  const text = ctx.read(rel);
+  must(!text.includes('kxxyMediaApply'), '音视频补丁重复或部分应用');
+  const { compact, exportAt, callAt } = documentPreviewLayout(text, [archive], ['kxxyArchiveApply']);
+  let patched = text.slice(0, exportAt) + `\n${fragment}\n` + text.slice(exportAt);
+  const call = `${compact ? '' : '\n\t\t\t'};kxxyMediaApply(ctx);`;
+  patched = patched.slice(0, callAt) + call + patched.slice(callAt);
+  documentPreviewLayout(patched, [archive, fragment], ['kxxyArchiveApply', 'kxxyMediaApply']);
   ctx.write(rel, patched);
   return "文档预览客户端 → 新增 video / audio 两个媒体 provider";
 }
@@ -841,9 +1000,10 @@ export function assertEngineFlags(engineProcessSource) {
  * 客户端半区不激活 ⇒ 手机上仍是官方桌面布局，且 logcat 里一行线索都没有。
  *
  * 声明版本用各自 package.json 里的真实版本（kxxy-host 0.1.0、
- * dsh-web-mobile 3.1.0）。这个字段不参与 npm 安装（运行时树是离线装配的），
+ * dsh-web-mobile 3.3.5）。这个字段不参与 npm 安装（运行时树是离线装配的），
  * 只被 `profileDependencyNames` 读键名，但写真实版本号可让 `dsh plugin` 的
- * pnpm 操作在人工介入时不至于困惑。
+ * pnpm 操作在人工介入时不至于困惑。版本必须与 build-runtime.mjs 的
+ * `MOBILE_PLUGIN_PKG`、`EngineConfig.MOBILE_PLUGIN_VERSION` 三处一致。
  */
 export function patchDshManifest(ctx) {
   const rel = "@deepseek-ai/dsh/package.json";
@@ -852,7 +1012,8 @@ export function patchDshManifest(ctx) {
 
   const wanted = [
     ["kxxy-host", "0.1.0"],
-    ["dsh-web-mobile", "3.1.0"],
+    ["dsh-web-mobile", "3.3.5"],
+    ["dsh-codex-sidebar", "0.1.0"],
   ];
   const added = [];
   for (const [name, version] of wanted) {
@@ -1279,21 +1440,15 @@ function patchDeveloperRoleCompat(ctx) {
  * 而种子表是**由前端传进来**的参数，加载器 `dsh-client-modules/lib/client.js`
  * 是普通打包产物 —— 路径稳定、代码可读。在加载器里补别名，前端换版不用跟着改。
  *
- * 幂等：靠 `KXXY_CLIENT_RUNTIME_ALIAS` 记号判断。
+ * 幂等：记号、完整补丁字节及构造函数插入位置必须同时吻合，伪标记不跳过。
  */
 export function patchClientRuntimeAlias(ctx) {
   const rel = "@deepseek-ai/dsh-client-modules/lib/client.js";
   if (!ctx.exists(rel)) return "跳过（依赖树无 dsh-client-modules）";
   const src = ctx.read(rel);
-  if (src.includes("KXXY_CLIENT_RUNTIME_ALIAS")) return "已打过（客户端运行时总包别名），跳过";
-
-  const ANCHOR = "this.seed = new Map(Object.entries(options.staticModules));";
-  must(src.includes(ANCHOR), `dsh-client-modules 的种子表构造点变了：找不到锚点 "${ANCHOR}"`);
-
-  const indent = /^([\t ]*)this\.seed = new Map\(Object\.entries\(options\.staticModules\)\);/m.exec(src)[1];
-  // 只有 `/client` 这一个子路径做别名。裸包名不做：插件对它的期待是整个运行
-  // 时 API，用 store 顶上会在别处变成「undefined is not a function」，比现在
-  // 这条明确的 import 失败更难查。而这批插件的 client bundle 只 require 子路径。
+  const { compact } = clientFactory(src, '@deepseek-ai/dsh-client-modules');
+  const indent = compact ? '' : '\t\t\t\t';
+  // 裸包名代表整个旧运行时，不能错误地用 store 顶替。
   const ALIASES = [["@deepseek-ai/dsh-client-runtime/client", "@deepseek-ai/dsh-client-store"]];
   const body = [
     "",
@@ -1305,10 +1460,44 @@ export function patchClientRuntimeAlias(ctx) {
     `${indent}\tif (!this.seed.has(kxxyAlias) && this.seed.has(kxxyTarget)) this.seed.set(kxxyAlias, this.seed.get(kxxyTarget));`,
     `${indent}}`,
   ].join("\n");
-
-  const at = src.indexOf(ANCHOR);
-  must(src.indexOf(ANCHOR, at + 1) < 0, "dsh-client-modules 的种子表构造行出现多次，插入不安全");
-  ctx.write(rel, src.slice(0, at + ANCHOR.length) + body + src.slice(at + ANCHOR.length));
+  const already = src.includes('KXXY_CLIENT_RUNTIME_ALIAS');
+  if (already) clientAnchor(src, 'KXXY_CLIENT_RUNTIME_ALIAS', '客户端别名标记');
+  const raw = already ? replaceOnce(src, body, '', '客户端别名完整补丁') : src;
+  const factory = clientFactory(raw, '@deepseek-ai/dsh-client-modules');
+  const classHead = compact ? 'var ClientModuleSystem=class{' : 'var ClientModuleSystem = class {';
+  const classAt = clientAnchor(factory.body, classHead, 'ClientModuleSystem 类');
+  const constructorHead = compact ? 'constructor(options){' : 'constructor(options) {';
+  const constructorAt = clientAnchor(factory.body, constructorHead, 'ClientModuleSystem 构造函数');
+  const end = clientAnchor(factory.body, compact ? 'register(registration){' : 'register(registration) {', 'ClientModuleSystem 后继方法');
+  must(classAt < constructorAt && constructorAt < end, 'ClientModuleSystem 构造函数层级已改变');
+  clientSyntax(`(function(require){${factory.body.slice(0, classAt)}\n})`, 'ClientModuleSystem factory 层级');
+  clientSyntax(`class KxxyBoundary{${factory.body.slice(classAt + classHead.length, constructorAt)}\n}`, 'ClientModuleSystem 字段边界');
+  const constructor = factory.body.slice(constructorAt, end);
+  clientSyntax(`class KxxyBoundary{${constructor}\n}`, 'ClientModuleSystem 构造函数边界');
+  const setup = compact
+    ? 'constructor(options){this.manifest=options.manifest;this.entries=new ClientEntries(this,{'
+    : 'constructor(options) {\n\t\t\t\tthis.manifest = options.manifest;\n\t\t\t\tthis.entries = new ClientEntries(this, {';
+  must(constructor.startsWith(setup), 'ClientModuleSystem manifest / entries 初始化已改变');
+  const anchor = compact ? 'this.seed=new Map(Object.entries(options.staticModules));' : 'this.seed = new Map(Object.entries(options.staticModules));';
+  const seedAt = clientAnchor(constructor, anchor, 'ClientModuleSystem seed 构造点');
+  clientAnchor(factory.body, anchor, '客户端模块唯一 seed 构造点');
+  const beforeSeed = compact ? 'prune:roots=>{this.prune(roots)}});' : 'prune: (roots) => {\n\t\t\t\t\t\tthis.prune(roots);\n\t\t\t\t\t}\n\t\t\t\t});\n\t\t\t\t';
+  must(constructor.slice(0, seedAt).endsWith(beforeSeed), 'seed 不紧邻 ClientEntries 初始化');
+  const seedEnd = seedAt + anchor.length;
+  clientSyntax(`class KxxyBoundary{${constructor.slice(0, seedEnd)}\n}}`, 'seed 必须是构造函数顶层语句');
+  const next = compact
+    ? 'this.loadBundle=options.loadBundle??defaultLoadBundle;this.resolveAsset=options.resolveAsset??(reference=>reference);'
+    : '\n\t\t\t\tthis.loadBundle = options.loadBundle ?? defaultLoadBundle;';
+  must(constructor.slice(seedEnd).startsWith(next), 'seed 后的加载器初始化已改变');
+  clientAnchor(factory.body, compact ? 'exports.ClientModuleSystem=ClientModuleSystem;' : 'exports.ClientModuleSystem = ClientModuleSystem;', '客户端模块类导出');
+  const at = factory.head.length + constructorAt + seedEnd;
+  const out = raw.slice(0, at) + body + raw.slice(at);
+  clientSyntax(out, '客户端别名完整产物');
+  if (already) {
+    must(out === src, '客户端别名不在唯一 seed 构造点之后');
+    return '已打过（客户端运行时总包别名），跳过';
+  }
+  ctx.write(rel, out);
   return "客户端运行时总包别名 → @deepseek-ai/dsh-client-runtime/client 指向 store 种子（老插件可加载）";
 }
 
@@ -1319,10 +1508,9 @@ export function patchClientRuntimeAlias(ctx) {
  * `HARNESS / Failed to load plugins` —— 引擎活着、会话完好、控制台也进得去，
  * 唯独对话页进不去。用户的原话是「哪怕不兼容也不应该崩溃」。
  *
- * 机制：前端 boot 结束后会跑一次汇总（产物里的 `IZ`），把每个 entry 的
- * 最终状态一次性列出，只要有一条不是 `active` 就 `throw`，上层 `catch` 里
- * 直接 `page.fail(...)` 把整页换成错误卡。也就是说：**report 阶段的诊断**
- * 具备了「杀页面」的权力，哪怕真正的挂载（`uiRenderer`）完全没问题。
+ * rc.5 的同步审计 `IZ` 会因任意 entry 失败而 throw。rc.2 的异步审计 `VJ`
+ * 已能跳过非核心 entry，但固定七项之外的官方包也只告警，且告警文案不再满足
+ * 本地体检契约。两版都只改最终的来源分类与报告，不改 entry 生命周期。
  *
  * 判定改成按来源分档：
  *   · 官方包（`@deepseek-ai/*`）失败 —— 仍然硬失败。它们与运行时是同一套
@@ -1341,9 +1529,9 @@ export function patchClientRuntimeAlias(ctx) {
  *   · 体检 WEB_BOOT 按同一特征串把它判成 WARN 而不是 BAD
  *     （页面能用 ≠ 页面进不去，两者不能共用一档）。
  *
- * 锚点用正则而不是字面串：这段是压缩产物的单行代码，局部变量名（当前是 `r`）
- * 每次发版都可能变，命中失败必须让构建失败 —— 宁可打包失败，也不要产出一个
- * 「补丁没打上、用户装完还是白屏」的包。
+ * 双版本锚点锁定完整收集器、状态映射和调用等待顺序；rc.2 继续 await 激活
+ * 失败原因，并按对象的 name 而非 reason 判定来源。结构漂移必须让构建失败，
+ * 幂等也要验证完整改写结果，不能仅凭一段告警措辞跳过。
  */
 export function patchFrontendLenientBoot(ctx) {
   const PREFIX = "lib/node_modules/@deepseek-ai/dsh-web-frontend/dist/assets/";
@@ -1351,58 +1539,93 @@ export function patchFrontendLenientBoot(ctx) {
   must(mains.length === 1, `前端主 chunk 定位失败：命中 ${mains.length} 个（期望 1 个 index-<hash>.js）`);
   const key = mains[0];
   const text = ctx.files.get(key).data.toString("utf8");
-  if (text.includes("failed and were skipped")) return "已打过（第三方插件加载失败降级），跳过";
-
-  // 目标语句（压缩后）：if(r.length>0)throw new Error(`web boot: ${String(r.length)} entr${...} did not activate\n${r.join(`\n`)}`)}
-  //
-  // 注意 `\n` 是**真的换行**：上游那份压缩产物的模板字符串里直接断了一行，
-  // 不是 `\n` 这两个字符。写成 `\\n` 会静默失配（第一版就是这样，靠本测试抓出来）。
-  const RE =
-    /if\((\w+)\.length>0\)throw new Error\(`web boot: \$\{String\(\1\.length\)\} entr\$\{\1\.length===1\?"y":"ies"\} did not activate\n\$\{\1\.join\(`\n`\)\}`\)\}/;
-  const m = RE.exec(text);
-  must(m !== null, "前端 boot 的未激活汇总结构变了：找不到 IZ 的 throw 语句（压缩变量名或措辞已改）");
-  must(RE.exec(text.slice(m.index + m[0].length)) === null, "前端 boot 的未激活汇总语句出现多次，替换不安全");
-
-  const id = m[1];
-  const BODY = [
-    `const kxxyFatal=${id}.filter(function(kxxyLine){return /^@deepseek-ai\\//.test(kxxyLine)});`,
-    `if(kxxyFatal.length>0)throw new Error("web boot: "+String(kxxyFatal.length)+" entr"+(kxxyFatal.length===1?"y":"ies")+" did not activate\\n"+kxxyFatal.join("\\n"));`,
-    `if(${id}.length>0)console.warn("web boot: "+String(${id}.length)+" entr"+(${id}.length===1?"y":"ies")+" from third-party plugins failed and were skipped (their UI stays absent; details below)\\n"+${id}.join("\\n"));`,
-    "}",
-  ].join("");
-
-  const out = text.slice(0, m.index) + BODY + text.slice(m.index + m[0].length);
-  ctx.files.set(key, { data: Buffer.from(out, "utf8"), mode: ctx.files.get(key).mode ?? 0o644 });
-  return `前端 boot 降级 → 第三方插件加载失败只跳过（官方包仍硬失败）：${key.split("/").pop()}`;
+  // 两版收集器完整锁定，尤其不重写 rc.2 的 importError / await 激活失败原因。
+  const legacyCollect = 'function IZ(e,t){const r=[];for(const i of e.loader.entries()){const n=i.options.name;if(i.fiber===void 0){const l=t.importError(n);r.push(l===void 0?`${n}: import failed (see console for the import error)`:`${n}: import failed: ${l.message}`);continue}const s=yx[i.fiber.state];if(s!=="active")if(s==="pending"){const l=Object.keys(i.fiber.inject).filter(u=>e.get(u)===void 0);r.push(`${n}: pending (waiting for service${l.length===1?"":"s"}: ${l.join(", ")||"unknown"})`)}else r.push(`${n}: ${s}`)}';
+  const modernCollect = 'async function VJ(e,t,r=i=>{console.warn(i)}){const i=[];for(const c of e.loader.entries()){const d=c.options.name;if(c.fiber===void 0){const h=t.importError(d);i.push({name:d,reason:h===void 0?"import failed (see console for the import error)":`import failed: ${h.message}`});continue}const f=o$[c.fiber.state];if(f!=="active")if(f==="pending"){const h=Object.keys(c.fiber.inject).filter(v=>e.get(v)===void 0);i.push({name:d,reason:`pending (waiting for service${h.length===1?"":"s"}: ${h.join(", ")||"unknown"})`})}else f==="failed"?i.push({name:d,reason:await HJ(c.fiber)}):i.push({name:d,reason:f})}';
+  // rc.3 只换了三个压缩标识符（收集器 VJ→ZJ、核心集合 UJ→VJ、激活原因 HJ→BJ），
+  // 函数体与调用顺序逐字未变 —— 所以按「同形态换名」派生，而不是再抄一份长字面量。
+  const modernCollectRc3 = modernCollect
+    .replace('async function VJ(', 'async function ZJ(')
+    .replace('await HJ(c.fiber)', 'await BJ(c.fiber)');
+  const modernTail = 'if(i.length===0)return;const n=c=>UJ.has(c),o=i.filter(({name:c})=>n(c)).length;if(o>0){const c=i.map(({name:d,reason:f})=>`${d}${n(d)?" (required)":""}: ${f}`);throw new Error(`web boot: ${String(o)} required ${a9(o)} did not activate\n${c.join(`\n`)}`)}const l=i.map(({name:c,reason:d})=>`${c}: ${d}`);r(`web boot: warning: ${String(i.length)} ${a9(i.length)} did not activate\n${l.join(`\n`)}`)}';
+  const forms = [
+    {
+      collect: legacyCollect, id: 'r', warn: 'console.warn', structured: false,
+      audit: 'IZ', required: null, reason: null,
+      tail: 'if(r.length>0)throw new Error(`web boot: ${String(r.length)} entr${r.length===1?"y":"ies"} did not activate\n${r.join(`\n`)}`)}',
+    },
+    {
+      collect: modernCollect, id: 'i', warn: 'r', structured: true,
+      audit: 'VJ', required: 'UJ', reason: 'HJ', label: 'rc.2',
+      tail: modernTail,
+    },
+    {
+      collect: modernCollectRc3, id: 'i', warn: 'r', structured: true,
+      audit: 'ZJ', required: 'VJ', reason: 'BJ', label: 'rc.3',
+      tail: modernTail.replace('const n=c=>UJ.has(c)', 'const n=c=>VJ.has(c)'),
+    },
+  ];
+  const matches = [];
+  for (const form of forms) {
+    const { id, warn, structured } = form;
+    const lines = name => structured
+      ? `${name}.map(function(kxxyEntry){return kxxyEntry.name+": "+kxxyEntry.reason})`
+      : name;
+    const body = [
+      structured ? `if(${id}.length===0)return;` : '',
+      `const kxxyFatal=${id}.filter(function(kxxyLine){return /^@deepseek-ai\\//.test(${structured ? 'kxxyLine.name' : 'kxxyLine'})});`,
+      `if(kxxyFatal.length>0)throw new Error("web boot: "+String(kxxyFatal.length)+" entr"+(kxxyFatal.length===1?"y":"ies")+" did not activate\\n"+${lines('kxxyFatal')}.join("\\n"));`,
+      `if(${id}.length>0)${warn}("web boot: "+String(${id}.length)+" entr"+(${id}.length===1?"y":"ies")+" from third-party plugins failed and were skipped (their UI stays absent; details below)\\n"+${lines(id)}.join("\\n"));`,
+      '}',
+    ].join('');
+    const patched = form.collect + body;
+    for (const [code, already] of [[form.collect + form.tail, false], [patched, true]]) {
+      if (text.includes(code)) matches.push({ ...form, code, patched, already });
+    }
+  }
+  must(matches.length === 1, `前端 boot 审计结构未知或不唯一：命中 ${matches.length} 种形态`);
+  const form = matches[0];
+  clientAnchor(text, form.collect, '前端 boot 唯一收集器');
+  clientAnchor(text, form.structured ? `async function ${form.audit}(e,t,r=` : 'function IZ(e,t){', '前端 boot 审计函数');
+  const state = form.structured ? 'No' : 'Vi';
+  const labels = form.structured ? 'o$' : 'yx';
+  clientAnchor(text, `${state}={PENDING:0,LOADING:1,ACTIVE:2,FAILED:3,DISPOSED:4,UNLOADING:5}`, '前端 boot 状态枚举');
+  clientAnchor(text, `${labels}={[${state}.PENDING]:"pending",[${state}.LOADING]:"loading",[${state}.ACTIVE]:"active",[${state}.FAILED]:"failed",[${state}.DISPOSED]:"disposed",[${state}.UNLOADING]:"unloading"}`, '前端 boot 状态映射');
+  clientAnchor(text, `await n.await(),await ${form.audit}(t,e.modules)`, '前端 boot 审计调用与等待顺序');
+  if (form.structured) {
+    clientAnchor(text, `async function ${form.reason}(e){try{await e.await()}catch(t){return\`failed: \${String(t)}\`}return"failed"}`, '前端 boot 异步激活失败原因');
+    const required = ['dsh-client-modules', 'dsh-api-session-controller', 'dsh-client-ui-renderer', 'dsh-client-ui-layout', 'dsh-client-ui-session', 'dsh-client-ui-chat', 'dsh-client-ui-sidebar'].map(name => `@deepseek-ai/${name}`);
+    clientAnchor(text, `${form.required}=new Set(${JSON.stringify(required)})`, '前端 boot 上游核心入口集合');
+  }
+  clientSyntax(`(${form.code})`, '前端 boot 原审计函数');
+  clientSyntax(`(${form.patched})`, '前端 boot 新审计函数');
+  if (form.already) {
+    clientAnchor(text, 'failed and were skipped', '前端 boot 降级标记');
+    return '已打过（第三方插件加载失败降级），跳过';
+  }
+  must(!text.includes('failed and were skipped') && !text.includes('kxxyFatal'), '前端 boot 补丁部分应用或标记冲突');
+  const out = replaceOnce(text, form.code, form.patched, '前端 boot 审计函数');
+  ctx.files.set(key, { data: Buffer.from(out, 'utf8'), mode: ctx.files.get(key).mode ?? 0o644 });
+  return `前端 boot 降级 → 第三方插件加载失败只跳过（官方包仍硬失败）：${key.split('/').pop()}`;
 }
 
 export function applyAllPatches(root, termuxRead) {
   const ctx = createPatchContext(root);
-  const results = [
-    patchKoffi(ctx),
-    patchSharp(ctx),
-    patchNodePty(ctx),
-    patchSubprocessInspector(ctx),
-    patchFlock(ctx),
-    patchRequireBuiltin(ctx),
-    patchSandboxLocal(ctx),
-    patchSessionJsonl(ctx),
-    patchSessionJsonlWorker(ctx),
-    patchRipgrep(ctx, termuxRead),
-    patchFsLocal(ctx),
-    patchAttachmentLocal(ctx),
-    patchNativeCommandAndroid(ctx),
-    patchDocumentPreviewUnicodeSets(ctx),
-    patchLibreOfficeKitPlatform(ctx),
-    patchLibreOfficeKitFontFallbacks(ctx),
-    patchOfficeToPdfFormats(ctx),
-    patchDocumentPreviewOfficeExtensions(ctx),
-    patchDocumentPreviewArchiveProviders(ctx),
-    patchDocumentPreviewMediaProviders(ctx),
-    patchDeveloperRoleCompat(ctx),
-    patchClientRuntimeAlias(ctx),
-    patchFrontendLenientBoot(ctx),
-    patchDshManifest(ctx),
+  const steps = [
+    patchKoffi, patchSharp, patchNodePty, patchSubprocessInspector, patchFlock,
+    patchRequireBuiltin, patchSandboxLocal, patchSessionJsonl, patchSessionJsonlWorker,
+    patchRipgrep, patchFsLocal, patchAttachmentLocal, patchNativeCommandAndroid,
+    patchDocumentPreviewUnicodeSets, patchLibreOfficeKitPlatform, patchLibreOfficeKitFontFallbacks,
+    patchOfficeDefaultFonts, patchOfficeToPdfFormats, patchDocumentPreviewOfficeExtensions, patchDocumentPreviewArchiveProviders,
+    patchDocumentPreviewMediaProviders, patchDeveloperRoleCompat, patchClientRuntimeAlias,
+    patchFrontendLenientBoot, patchDshManifest,
   ];
+  const results = [], errors = [];
+  for (const step of steps) {
+    try { results.push(step(ctx, termuxRead)); }
+    catch (error) { errors.push(new Error(`${step.name}: ${error.message}`, { cause: error })); }
+  }
+  // 一次报告所有上游锚点变化，但任意失败仍禁止生成运行时，不把失败当成跳过。
+  if (errors.length) throw new AggregateError(errors, `${errors.length} 个 Android 补丁失败：\n${errors.map(e => e.message).join('\n')}`);
   return results;
 }

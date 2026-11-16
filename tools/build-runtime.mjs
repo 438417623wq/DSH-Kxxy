@@ -53,8 +53,12 @@ import { applyAllPatches, assertEngineFlags } from "./lib/patches.mjs";
 import { downloadTo, openAsar, sha256Hex } from "./lib/registry.mjs";
 import { TERMUX_PREFIX, isPruned } from "./lib/stage.mjs";
 import { untarGz } from "./lib/targz.mjs";
+import { ensureOfficeWasm, officeMapReader, verifyOfficeFonts, OFFICE_LAYER_MARKER, OFFICE_WASM_ROOT } from "./lib/office-assets.mjs";
 import { readZipEntries } from "./lib/zipread.mjs";
 import { ZipWriter } from "./lib/zipwrite.mjs";
+import { stampCodexPlugin, attachCodexRuntime } from "./lib/codex.mjs";
+import { stampHostPluginFingerprint } from "./lib/host-fingerprint.mjs";
+import { PYTHON_REVISION, PYTHON_HOST_FILES, loadPythonDependencies, verifyPythonInputs, verifyPythonRuntime, createPythonRepairAssets } from "./lib/python-runtime.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PROJECT = resolve(HERE, "..");
@@ -298,6 +302,10 @@ function parseArgs(argv) {
     out: join(PROJECT, "android", "app", "src", "main", "assets", "runtime.zip"),
     manifest: null,
     plugins: join(PROJECT, "plugins"),
+    pythonDeps: process.env.KXXY_PYTHON_DEPS
+      ? resolve(process.env.KXXY_PYTHON_DEPS)
+      : join(PROJECT, "tools", "prebuilt", "python-android-cp314", "manifest.json"),
+    pythonRepairAssets: join(PROJECT, "android", "app", "src", "main", "assets", "python-repair"),
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -306,8 +314,10 @@ function parseArgs(argv) {
     else if (a === "--out") opts.out = resolve(argv[++i]);
     else if (a === "--manifest") opts.manifest = resolve(argv[++i]);
     else if (a === "--plugins") opts.plugins = resolve(argv[++i]);
+    else if (a === "--python-deps") opts.pythonDeps = resolve(argv[++i]);
+    else if (a === "--python-repair-assets") opts.pythonRepairAssets = resolve(argv[++i]);
     else if (a === "--help" || a === "-h") {
-      console.log("用法：node tools/build-runtime.mjs [--stage <dir>] [--asar <app.asar>] [--out <zip>]");
+      console.log("用法：node tools/build-runtime.mjs [--stage <dir>] [--asar <app.asar>] [--out <zip>] --python-deps <manifest.json>");
       process.exit(0);
     } else throw new Error(`未知参数：${a}`);
   }
@@ -582,31 +592,14 @@ function extractOfficialTheme(asarFiles) {
  */
 const OFFICE_CACHE = join(PROJECT, ".cache", "office");
 
-/*
- * ⚠️ 版本号不是随手挑的，必须与 `@deepseek-ai/libreoffice-kit` 的
- * `ENGINE_VERSIONS.wasm` **逐字相等**（缺陷 CL，问题清单 R3 / P7）。
- *
- * 真机症状：Office→PDF 全断，报
- *   Installed LibreOfficeKit wasm package has an incompatible or incomplete manifest.
- * 判定在 `libreoffice-kit/lib/index.js:1579`：
- *   if (pkg.name !== `${ENGINE_PREFIX}-${target}` ||
- *       pkg.version !== ENGINE_VERSIONS[target] ||
- *       manifest.version !== pkg.version ||
- *       manifest.schemaVersion !== 1 || manifest.status !== "built" || …)
- *       throw new Error(`Installed LibreOfficeKit ${backend} package has an
- *                        incompatible or incomplete manifest.`);
- * 而设备上 kit 是 0.1.5，它的 `ENGINE_VERSIONS` 是
- *   { darwin-arm64: "0.1.5", linux-arm64-glibc: "0.1.1", …, wasm: "0.1.5" }
- * —— **wasm 要 0.1.5**，我们却一直打包 0.1.1。上一版报「schemaVersion 2」是
- * 误判：0.1.1 的 prebuilds.json 里 schemaVersion 其实是 1，真正对不上的是
- * `manifest.version`（0.1.1 ≠ 期望的 0.1.5）。
- *
- * 为什么可以升：kit 对**非 wasm** 平台仍要求 0.1.1（`linux-*-glibc`），但我们
- * 在安卓上只用 wasm 后端（原生 LOK 没有 android 目标），所以只要 wasm 这一栏
- * 对齐即可。kit 侧的 `ENGINE_VERSIONS` 是打包在 kit 里的常量，升级 wasm 包
- * 不需要动 kit；反之若将来升级 kit，必须回来重核这张表。
- */
-const WASM_PKG = {
+// 仅当所选上游闭包**整包**不带 wasm 时，才按 kit 的精确版本注入官方 tarball。
+// 版本、源码常量和完整 manifest 合同由 office-assets.mjs 核验，损坏的现有包不得补旧文件。
+//
+// 为什么 0.2.3 也在表里：上游桌面版把 wasm 放在 optionalDependencies，桌面
+// 发行物按平台裁剪后整包缺席；kit 一升到 0.2.3，沿用「只补 0.1.5」的老规则
+// 就会让 Android 构建直接卡死。注入的 0.2.3 与官方 ASAR 内容逐字节一致
+// （prebuilds.json 与全资源长度指纹两条都在 office-assets.mjs 里钉死）。
+const LEGACY_WASM_PKG = {
   url: "https://registry.npmmirror.com/@deepseek-ai/libreoffice-kit-wasm/-/libreoffice-kit-wasm-0.1.5.tgz",
   // 缺陷 DH：构建机到 registry.npmmirror.com 的 TLS 直接断连，npmjs 可达且字节相同
   // （sha256 断言保证）。保留主地址，只是加一条备用。
@@ -616,8 +609,23 @@ const WASM_PKG = {
   file: "libreoffice-kit-wasm-0.1.5.tgz",
   sha256: "4d5dda19a257d75fd09776d37a4f37708d7c2e163defede64b3377cb411ed406",
   version: "0.1.5",
-  zipBase: "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/",
 };
+
+const WASM_0_2_3_PKG = {
+  url: "https://registry.npmmirror.com/@deepseek-ai/libreoffice-kit-wasm/-/libreoffice-kit-wasm-0.2.3.tgz",
+  fallbacks: [
+    "https://registry.npmjs.org/@deepseek-ai/libreoffice-kit-wasm/-/libreoffice-kit-wasm-0.2.3.tgz",
+  ],
+  file: "libreoffice-kit-wasm-0.2.3.tgz",
+  sha256: "fc5ff6fe5ac9d19af91a8b5d090a766ed679717cb936cc1bd7f29ec4ab44e262",
+  version: "0.2.3",
+};
+
+/** kit 版本 → 官方 wasm tarball 来源。表里没有的版本一律硬失败。 */
+const PINNED_WASM_PKGS = new Map([
+  [LEGACY_WASM_PKG.version, LEGACY_WASM_PKG],
+  [WASM_0_2_3_PKG.version, WASM_0_2_3_PKG],
+]);
 
 const FONT_PKG = {
   url: "https://registry.npmmirror.com/@expo-google-fonts/noto-sans-sc/-/noto-sans-sc-0.4.4.tgz",
@@ -643,7 +651,7 @@ const FONT_PKG = {
  * 新资产永远不落地。改字体字重、换字体包版本、或 wasm 引擎包版本时，
  * **这个编号必须一起递增**，否则设备上跑的仍是旧字体/旧引擎。
  */
-const OFFICE_FONTS_MARKER = "kxxy-office@2";
+const OFFICE_FONTS_MARKER = OFFICE_LAYER_MARKER;
 const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
 
 /**
@@ -720,7 +728,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 新页面配旧插件 = 多带一个被忽略的头（无害），旧页面配新插件 = 所有写操作 403。
  * 正因为这种组合会"静默变砖"，补丁集必须涨 —— 它是唯一能保证两边一起换的锚点。
  */
-const PATCHSET_MARKER = "kxxy-patchset@22";
+const PATCHSET_MARKER = "kxxy-patchset@25";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**
@@ -731,16 +739,23 @@ const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
  * profile 的 `package.json` 里 `dependencies` 是空对象。内置 = 构建期把它塞进
  * `lib/node_modules/`，与 kxxy-host 同一条路。
  *
- * 版本锁 3.1.0：客户端半区是按 dsh 0.2.0-rc.2 的插槽契约写的，升级宿主或升级
- * 插件都必须重跑真机验收（它的 `dsh.client.inject` 名单里有 8 个官方客户端包，
- * 任何一个改名都会让整条 entry 激活失败 ⇒ 白屏）。
+ * 版本锁 3.3.5（2026-11-15 升级，原 3.1.0）：
+ *
+ * 3.1.0 的抽屉锚点是 `[data-mobile-nav="frame"] > :first-child`。宿主 0.2.2-rc.2
+ * 在抽屉模式下把**空的 drawerMask 排在 sidebarCol 前面**，于是 3.1.0 的抽屉皮肤
+ * （position/width 280/z-index 1300/近白底色）全落在遮罩上，真侧栏被整块盖住 ⇒
+ * 真机竖屏「侧栏打开是纯白一片」。3.3.5 的代码注释里已写明这次宿主变更，改用
+ * `[class*="_sidebarCol"]` 定位、并 `[class*="_drawerMask"]{display:none}`。
+ *
+ * 升级插件仍必须重跑真机验收：它的 `dsh.client.inject` 名单里有 8 个官方客户端包，
+ * 任何一个改名都会让整条 entry 激活失败 ⇒ 整页白屏。3.3.5 的 inject 名单与 3.1.0 逐项相同。
  */
 const MOBILE_PLUGIN_PKG = {
-  url: "https://registry.npmmirror.com/dsh-web-mobile/-/dsh-web-mobile-3.1.0.tgz",
+  url: "https://registry.npmmirror.com/dsh-web-mobile/-/dsh-web-mobile-3.3.5.tgz",
   // 缺陷 DH：同上。
-  fallbacks: ["https://registry.npmjs.org/dsh-web-mobile/-/dsh-web-mobile-3.1.0.tgz"],
-  file: "dsh-web-mobile-3.1.0.tgz",
-  sha256: "6881c6d0d806606765c4700b8c1797211f1522be17372ea07182799363a640fb",
+  fallbacks: ["https://registry.npmjs.org/dsh-web-mobile/-/dsh-web-mobile-3.3.5.tgz"],
+  file: "dsh-web-mobile-3.3.5.tgz",
+  sha256: "877c9ea37c993d88289c14e80b5b4ba75f8a0e7f9b205b92926fe30e3bbc7438",
   zipBase: "lib/node_modules/dsh-web-mobile/",
 };
 
@@ -748,11 +763,14 @@ const MOBILE_PLUGIN_PKG = {
  * 移动端插件的版本标记（锚点 10 的判据），与
  * `RuntimeInstaller.MOBILE_PLUGIN_MARKER` 逐字一致。
  *
- * 为什么不直接探 package.json 里的 `"version": "3.1.0"`：那样标记就与包版本
+ * 为什么不直接探 package.json 里的 `"version": "3.3.5"`：那样标记就与包版本
  * 绑死了，而我们需要的是「构建脚本认为的插件资产变了」这个信号 —— 换包版本、
  * 改裁剪清单、甚至只换 tarball 来源都该让设备重装一次。
+ *
+ * @2（2026-11-15）：插件 3.1.0 → 3.3.5。设备上的 @1 必须重装一次才能拿到修好的
+ * 抽屉锚点，否则白屏照旧。
  */
-const MOBILE_PLUGIN_MARKER = "kxxy-mobile-plugin@1";
+const MOBILE_PLUGIN_MARKER = "kxxy-mobile-plugin@2";
 const MOBILE_PLUGIN_MARKER_FILE = "plugin.version";
 
 /**
@@ -1106,50 +1124,17 @@ async function fetchTgz(pkg) {
   return untarGz(buf);
 }
 
-/**
- * 把 LibreOffice wasm 引擎与单文件 CJK 字体塞进 asarPart。
- *
- * 为什么不能走 `readPluginFiles` / 依赖树：wasm 包的 `package.json` 声明了
- * `"os": ["linux"]`，会被 assemble.mjs 的 isPlatformSpecific 直接排除；
- * 而它恰恰是安卓上唯一可用的 office 后端（原生 LOK 没有 android 目标）。
- */
+/** 按 kit 的真实精确版本保留/注入 wasm，完整核验后再附带单文件 CJK 字体。 */
 async function bundleOfficeAssets(asarPart) {
   console.log("[6.5/8] 打包 LibreOffice wasm 引擎与 CJK 字体");
 
-  const wasm = await fetchTgz(WASM_PKG);
-  let wasmCount = 0;
-  for (const e of wasm) {
-    if (e.type !== "0") continue;
-    if (!e.path.startsWith("package/")) continue;
-    const rel = e.path.slice("package/".length);
-    if (rel === "package.json") continue; // 由下面的改写版覆盖
-    const zipPath = WASM_PKG.zipBase + rel;
-    if (asarPart.has(zipPath)) throw new Error(`wasm 引擎条目与既有条目冲突：${zipPath}`);
-    asarPart.set(zipPath, { data: e.data, mode: 0o644 });
-    wasmCount += 1;
-  }
-
-  /*
-   * `package.json` 必须**改写**：上游声明 `"os": ["linux"]`，而 libreoffice-kit
-   * 在 resolveEngine 里读它做 `pkg.name` / `pkg.version` 校验。os 字段对
-   * Node 的 require.resolve 有实际影响（不是纯元数据），安卓上会抛
-   * EBADPLATFORM，所以只保留校验真正需要的字段。
-   */
-  const pkgEntry = wasm.find((e) => e.path === "package/package.json");
-  if (!pkgEntry) throw new Error("wasm 引擎包里找不到 package.json");
-  const pkgJson = JSON.parse(pkgEntry.data.toString("utf8"));
-  if (pkgJson.name !== "@deepseek-ai/libreoffice-kit-wasm" || pkgJson.version !== WASM_PKG.version) {
-    throw new Error(`wasm 引擎包版本漂移：${pkgJson.name}@${pkgJson.version}，补丁与常量按 ${WASM_PKG.version} 写死`);
-  }
-  delete pkgJson.os;
-  delete pkgJson.cpu;
-  delete pkgJson.libc;
-  asarPart.set(
-    `${WASM_PKG.zipBase}package.json`,
-    { data: Buffer.from(`${JSON.stringify(pkgJson, null, "\t")}\n`, "utf8"), mode: 0o644 },
-  );
-  wasmCount += 1;
-  console.log(`      + ${WASM_PKG.zipBase}（${wasmCount} 文件，os 字段已剥离）`);
+  const office = await ensureOfficeWasm(asarPart, async (version) => {
+    const pkg = PINNED_WASM_PKGS.get(version);
+    if (!pkg) throw new Error(`kit ${version} 没有已钉住的 wasm 包来源，拒绝构建`);
+    return fetchTgz(pkg);
+  });
+  const wasmCount = office.added;
+  console.log(`      ${wasmCount ? "注入" : "保留"} ${OFFICE_WASM_ROOT}@${office.version}（${office.files.length} 项资源及源码/许可证全校验）`);
 
   const fonts = await fetchTgz(FONT_PKG);
   let fontCount = 0;
@@ -1163,8 +1148,10 @@ async function bundleOfficeAssets(asarPart) {
     console.log(`      + ${zipPath}（${human(e.data.length)}）`);
   }
 
+  verifyOfficeFonts(officeMapReader(asarPart));
+
   /*
-   * 版本标记文件（锚点 10 的判据）。
+   * 版本标记文件（锚点 9 的判据）。
    *
    * 字体与 wasm 包都是「新增资产」：老设备升级 APK 时 runtime 版本戳不变，
    * 九锚点全通过 ⇒ isComplete() 为真 ⇒ 新资产永远不落地。所以必须像
@@ -1486,75 +1473,7 @@ async function bundleTexliveMacros(asarPart) {
 //   ② `lib/index.js` 首行那行标记注释（算之前先剥掉，写的时候再放回去）。
 // 否则「算出的指纹改变标记、标记又改变指纹」，每次构建的指纹都不一样，
 // 设备上永远重装（700 MiB 全量解压，比 bug 本身更糟）。
-const HOST_PLUGIN_NAME = "kxxy-host";
-const HOST_PLUGIN_BASE = `lib/node_modules/${HOST_PLUGIN_NAME}/`;
-const HOST_PLUGIN_ENTRY_REL = "lib/index.js";
-const HOST_PLUGIN_FP_REL = "lib/.fingerprint";
-
-/**
- * 入口首行的分界标记行。
- *
- * 允许标记里出现中文与任意非星号字符，以「星号 + 斜杠」结束（这里刻意不把
- * 那两个字符连写出来 —— 在块注释里连写会提前结束本注释，本文件已经踩过一次）。
- */
-const HOST_MARK_LINE_RE = /^\/\* kxxy-host@[^\n]*?\*\/\r?\n/;
-
-const sha256Of = (buf) => createHash("sha256").update(buf).digest("hex");
-
-/**
- * 计算并写入宿主插件指纹，返回完整 sha256（64 hex）。
- *
- * 条目按**路径排序**后逐条 `路径\0内容sha256` 拼接再整体求一次 sha256：
- * 排序保证与 readdir 顺序无关（Windows/NTFS 与 ext4 的目录顺序不同）；
- * 两层哈希保证大文件不占内存、且单文件改动只影响它自己那一行。
- */
-function stampHostPluginFingerprint(asarPart) {
-  const rows = [];
-  let bytes = 0;
-  for (const [path, value] of asarPart) {
-    if (!path.startsWith(HOST_PLUGIN_BASE)) continue;
-    if (path === `${HOST_PLUGIN_BASE}${HOST_PLUGIN_FP_REL}`) continue;
-    const data = value.data ?? Buffer.alloc(0);
-    const rel = path.slice(HOST_PLUGIN_BASE.length);
-    const normalised =
-      rel === HOST_PLUGIN_ENTRY_REL
-        ? Buffer.from(data.toString("utf8").replace(HOST_MARK_LINE_RE, ""), "utf8")
-        : data;
-    rows.push(`${rel}\u0000${sha256Of(normalised)}`);
-    bytes += normalised.length;
-  }
-  if (rows.length === 0) throw new Error(`插件树为空，无法计算指纹：${HOST_PLUGIN_BASE}`);
-  rows.sort();
-  const fingerprint = sha256Of(Buffer.from(rows.join("\n"), "utf8"));
-  const short = fingerprint.slice(0, 12);
-
-  // 入口首行标记：先是给人看的（`head -1 lib/index.js` 就知道设备上是哪一版），
-  // 其次是给 smoke-plugin.mjs 的格式断言盯的。真正生效的判据是 .fingerprint。
-  const entryPath = `${HOST_PLUGIN_BASE}${HOST_PLUGIN_ENTRY_REL}`;
-  const entry = asarPart.get(entryPath);
-  if (!entry) throw new Error(`插件入口不存在：${entryPath}`);
-  const body = entry.data.toString("utf8").replace(HOST_MARK_LINE_RE, "");
-  asarPart.set(entryPath, {
-    ...entry,
-    data: Buffer.from(`/* kxxy-host@${short} */\n${body}`, "utf8"),
-  });
-
-  // 指纹文件：三行 key:value，纯 ASCII，Native 侧按行前缀解析（不引 JSON 库，
-  // 也不为它开一个 700 MiB 的 zip 读；设备上直接 readText 即可）。
-  asarPart.set(`${HOST_PLUGIN_BASE}${HOST_PLUGIN_FP_REL}`, {
-    data: Buffer.from(
-      `algorithm:sha256\nfingerprint:${fingerprint}\nfiles:${rows.length}\nmarker:kxxy-host@${short}\n`,
-      "utf8",
-    ),
-    mode: 0o644,
-  });
-
-  console.log(
-    `      指纹 ${HOST_PLUGIN_NAME}: ${fingerprint.slice(0, 16)}…（${rows.length} 文件 / ${human(bytes)}）`,
-  );
-  console.log(`      入口标记 → kxxy-host@${short}`);
-  return fingerprint;
-}
+// 宿主指纹算法由全量装配与 Python 增量修复共用（lib/host-fingerprint.mjs）。
 
 /**
  * 从 git remote 取仓库地址，规范化成**能点开**的 https 形式。
@@ -1598,6 +1517,10 @@ function readRepoUrl() {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (!opts.pythonDeps || !existsSync(opts.pythonDeps)) {
+    throw new Error("缺少已验证的 Python 依赖构件：先运行 tools/build-python-deps.py 并传 --python-deps <manifest.json>，不能再产出缺 CFFI 的离线 Python");
+  }
+  const pythonDependencies = loadPythonDependencies(opts.pythonDeps);
 
   if (!existsSync(join(opts.stage, "entries.json"))) {
     throw new Error(`stage 不存在或不完整：${opts.stage}（缺 entries.json）`);
@@ -1627,6 +1550,27 @@ async function main() {
   // ---------------------------------------------------------------- stage 侧
   console.log(`[1/8] 读 stage ${opts.stage}`);
   const part = collectStage(opts.stage);
+  const pythonStageEntries = new Map(part.files.map((entry) => [entry.path, entry]));
+  const pythonStageLinks = new Map(part.links.map((entry) => [entry.path, entry.target]));
+  const readPythonStage = (path, seen = new Set()) => {
+    if (seen.has(path)) throw new Error(`Python stage LINK 循环：${path}`);
+    seen.add(path);
+    if (pythonStageLinks.has(path)) return readPythonStage(pythonStageLinks.get(path), seen);
+    const entry = pythonStageEntries.get(path);
+    if (!entry) return null;
+    const data = entry.data ?? readFileSync(join(part.stage.blobRoot, entry.blob.slice(0, 2), entry.blob));
+    // 构件来自已归一化的 runtime，sysconfig 也须用相同占位符比对。
+    if (!isElf(data) && SCRIPT_TOP_DIRS.some((dir) => path.startsWith(dir)) && data.length <= MAX_SCRIPT_BYTES) {
+      let text = data.toString("latin1");
+      for (const [needle, replacement] of PATH_REWRITES) text = text.split(needle).join(replacement);
+      return Buffer.from(text, "latin1");
+    }
+    return data;
+  };
+  verifyPythonInputs(pythonDependencies.ledger, readPythonStage);
+  for (const path of pythonDependencies.files.keys()) {
+    if (pythonStageEntries.has(path) || pythonStageLinks.has(path)) throw new Error(`Python 受管依赖与 stage 冲突，需核对版本：${path}`);
+  }
   console.log(
     `      stage：实体 ${part.files.length}，符号链接 ${part.links.length}，` +
       `丢弃 ${part.dropped.length}`,
@@ -1751,6 +1695,8 @@ async function main() {
   // 连 4 MiB 的分块缓冲都分配不出来。`asarFiles` 在此之后再无读者。
   const asarPart = new Map(asarFiles);
   asarFiles.clear();
+  for (const [path, file] of pythonDependencies.files) asarPart.set(path, file);
+  console.log(`      + Python 离线依赖 ${pythonDependencies.files.size} 文件（CFFI + pycparser）`);
   for (const w of corepackWrappers()) {
     // 同名 stage 条目必须让位：`bin/corepack` 在 stage 里是一条符号链接
     // （`→ ../lib/node_modules/corepack/dist/corepack.js`），它会以 LINK 条目
@@ -1788,6 +1734,10 @@ async function main() {
       console.log(`      + lib/node_modules/${name}/ （${count} 文件）`);
     }
   }
+
+  const codexPluginFingerprint = stampCodexPlugin(asarPart);
+  const codexRuntime = attachCodexRuntime(asarPart, process.env.KXXY_CODEX_RUNTIME_DIR);
+  if (!codexRuntime.included) console.warn(`      ! Codex: ${codexRuntime.reason}`);
 
   const merged = mergeEntries(
     { files: deduped.files, links: deduped.links },
@@ -1928,7 +1878,17 @@ async function main() {
    * `lib/.fingerprint` 这个新条目不会进 zip。
    */
   const hostPluginFingerprint = stampHostPluginFingerprint(asarPart);
-
+  const pythonRepairFiles = new Map(pythonDependencies.files);
+  for (const name of PYTHON_HOST_FILES) {
+    const path = `lib/node_modules/kxxy-host/${name}`;
+    const file = asarPart.get(path);
+    if (!file) throw new Error(`Python 自检文件缺失：${path}`);
+    pythonRepairFiles.set(path, file);
+  }
+  verifyPythonRuntime(
+    [...new Set([...pythonStageEntries.keys(), ...pythonStageLinks.keys(), ...pythonDependencies.files.keys()])],
+    (path) => pythonDependencies.files.get(path)?.data ?? readPythonStage(path),
+  );
 
   /*
    * 悬空 LINK 清扫。
@@ -2064,7 +2024,7 @@ async function main() {
   const zip = new ZipWriter((buf) => {
     zipDigest.update(buf);
     writeSync(fd, buf);
-  });
+  }, { allowZip64Count: true });
 
   /*
    * 写出循环里的周期性 GC（缺陷 CT 连带修复）。
@@ -2167,6 +2127,7 @@ async function main() {
     rootPlaceholder: ROOT_PLACEHOLDER,
     termuxPrefix: TERMUX_PREFIX,
     arch: "aarch64",
+    pythonRuntimeRevision: PYTHON_REVISION,
     node: "24.18.0",
     entries: written + 1,
     directories: dirs.length,
@@ -2185,9 +2146,13 @@ async function main() {
       hostFingerprint: hostPluginFingerprint,
       hostMarker: `kxxy-host@${hostPluginFingerprint.slice(0, 12)}`,
       mobileMarker: MOBILE_PLUGIN_MARKER,
+      codexFingerprint: codexPluginFingerprint,
+      codexRuntime,
     },
   };
-  await zip.add("kxxy-runtime.json", Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8"), { mode: 0o644 });
+  const runtimeManifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  await zip.add("kxxy-runtime.json", runtimeManifestBytes, { mode: 0o644 });
+  pythonRepairFiles.set("kxxy-runtime.json", { data: runtimeManifestBytes, mode: 0o644 });
   written += 1;
 
   // 别名清单（缺陷 DD）：`<别名>\t<本体>` 每行一条，单独一份小资产。
@@ -2233,8 +2198,13 @@ async function main() {
    * 键名保持**扁平**：gradle 侧用一条 `"key": "value"` 正则取值，不引 JSON 解析
    * （build.gradle.kts 里没有 JSON 库，且配置阶段不该为了 6 个字段去加依赖）。
    */
+  const pythonRepair = await createPythonRepairAssets(opts.pythonRepairAssets, pythonRepairFiles, {
+    baseHostFingerprint: hostPluginFingerprint, hostFingerprint: hostPluginFingerprint,
+  });
   const buildMeta = {
     schema: 1,
+    pythonRuntimeRevision: PYTHON_REVISION,
+    pythonRepairManifestSha256: pythonRepair.manifestSha256,
     generatedAt: new Date().toISOString(),
     runtimeSha256,
     runtimeSize: stats.size,
@@ -2243,6 +2213,11 @@ async function main() {
     kxxyHostFingerprint: hostPluginFingerprint,
     kxxyHostMarker: `kxxy-host@${hostPluginFingerprint.slice(0, 12)}`,
     dshWebMobileMarker: MOBILE_PLUGIN_MARKER,
+    codexPluginFingerprint,
+    codexRuntimeIncluded: codexRuntime.included,
+    codexRuntimeVersion: codexRuntime.version,
+    codexRuntimeExecutionMode: codexRuntime.executionMode ?? null,
+    codexRuntimeAppServerVerified: codexRuntime.appServerVerified === true,
     nodeVersion: manifest.node,
     repoUrl: readRepoUrl(),
   };

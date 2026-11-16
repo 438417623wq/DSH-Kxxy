@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>插件安装入口布局回归</title></head>
+<body>
+  <h1>插件安装入口布局回归</h1>
+  <p>真实页面与模拟 API；不执行安装、文件上传或联网操作。</p>
+  <pre id="results" role="status">正在检查…</pre>
+  <script>
+    (async () => {
+      const results = [];
+      const output = document.getElementById('results');
+      const check = (condition, message, actual) => {
+        results.push({ pass: !!condition, message, actual });
+        output.textContent = JSON.stringify(results, null, 2);
+      };
+      const frame = document.createElement('iframe');
+      frame.title = '真实插件页';
+      frame.style.cssText = 'width:390px;height:844px;border:1px solid #ccc';
+      document.body.appendChild(frame);
+      for (const count of [0, 40]) {
+        const loaded = new Promise(resolve => frame.onload = resolve);
+        frame.src = `/kxxy?count=${count}`;
+        await loaded;
+        const win = frame.contentWindow;
+        const doc = frame.contentDocument;
+        const el = id => doc.getElementById(id);
+        for (let i = 0; i < 60; i++) {
+          if (el('plugin-list-meta').textContent.includes(`共 ${count} 个插件`)) break;
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        doc.querySelector('.tab-item[data-target="plugins"]').click();
+        check((win.__kxxyInitErrors || []).length === 0, `${count} 项：初始化无异常`, win.__kxxyInitErrors);
+        const mask = el('plugin-install-sheet');
+        const sheet = mask.querySelector('[role="dialog"]');
+        const inspect = method => {
+          const style = win.getComputedStyle(mask);
+          const rect = sheet.getBoundingClientRect();
+          const maskRect = mask.getBoundingClientRect();
+          const geometry = { position: style.position, display: style.display, zIndex: style.zIndex,
+            top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right, width: rect.width };
+          check(!mask.hidden && style.position === 'fixed' && style.display === 'flex' && Number(style.zIndex) >= 200,
+            `${count} 项：${method} 遮罩固定定位`, geometry);
+          check(Math.abs(maskRect.top) < 1 && Math.abs(maskRect.left) < 1
+            && Math.abs(maskRect.width - win.innerWidth) < 1 && Math.abs(maskRect.height - win.innerHeight) < 1,
+            `${count} 项：${method} 遮罩覆盖整个视口`, { top: maskRect.top, left: maskRect.left, width: maskRect.width, height: maskRect.height });
+          check(rect.width > 0 && rect.top >= 0 && rect.bottom <= win.innerHeight + 1 && rect.left >= 0 && rect.right <= win.innerWidth + 1,
+            `${count} 项：${method} 面板完整位于手机视口`, geometry);
+          check(el(method === 'local' ? 'pi-step-select' : 'pi-step-online').hidden === false,
+            `${count} 项：${method} 对应步骤显示`);
+          check(el(`pi-tab-${method}`).getAttribute('aria-selected') === 'true', `${count} 项：${method} 来源选中`);
+          check(doc.body.style.overflow === 'hidden', `${count} 项：弹层打开锁定滚动`);
+        };
+        el('btn-plugin-local-install').click();
+        inspect('local');
+        el('pi-tab-online').click();
+        inspect('online');
+        check(el('pi-step-online').querySelector('a').getAttribute('href') === '/', `${count} 项：在线入口仍指向官方对话页`);
+        el('pi-close').click();
+        check(mask.hidden && win.getComputedStyle(mask).display === 'none' && doc.body.style.overflow === '', `${count} 项：关闭并恢复滚动`);
+        el('btn-plugin-online-add').click();
+        inspect('online');
+        el('pi-tab-local').click();
+        inspect('local');
+        sheet.click();
+        check(!mask.hidden, `${count} 项：点击面板内容不会关闭`);
+        mask.click();
+        check(mask.hidden && doc.body.style.overflow === '', `${count} 项：遮罩关闭并恢复滚动`);
+        el('btn-plugin-local-install').click();
+        inspect('local');
+        el('pi-close').click();
+        check(win.getComputedStyle(doc.querySelector('.plugin-toolbar')).paddingBottom === '14px', `${count} 项：注释后的工具栏规则可解析`);
+      }
+      window.__pluginInstallResults = results;
+      window.__pluginInstallDone = true;
+      output.textContent = `${results.filter(r => r.pass).length}/${results.length} PASS\n` + JSON.stringify(results, null, 2);
+    })().catch(error => {
+      document.getElementById('results').textContent = `ERROR: ${error.stack || error}`;
+      window.__pluginInstallDone = true;
+      window.__pluginInstallError = String(error);
+    });
+  </script>
+</body>
+</html>

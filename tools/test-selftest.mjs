@@ -27,6 +27,8 @@ import {
   pathHasDir,
   runSelftest,
 } from '../plugins/kxxy-host/lib/selftest.mjs'
+import { PYTHON_ITEM_IDS } from '../plugins/kxxy-host/lib/python-selftest.mjs'
+import { pythonSpawnFixture } from './test-python-selftest.mjs'
 
 let passed = 0
 let failed = 0
@@ -55,7 +57,7 @@ function greenDeps(over = {}) {
     gyp: 'android_ndk_path=/data/user/0/app.kxxy/files/kxxy-home/.cache/kxxy-ndk-stub',
     // 路径分隔符两组都写：构建机是 `\`，真机是 `/`，而这条 exists 是正则
     exists: (p) =>
-      /cpufeatures$|[\\/]\.kxxy[\\/]bin$|ghraw$|raw2api$|ndk-stub$|[\\/]bin[\\/]nvim$|libexec[\\/]nvim[\\/]nvim$|syntax\.vim$/.test(
+      /cpufeatures$|[\\/]\.kxxy[\\/]bin$|ghraw$|raw2api$|ndk-stub$|[\\/]bin[\\/](?:nvim|python3)$|libexec[\\/]nvim[\\/]nvim$|syntax\.vim$/.test(
         p,
       ),
     canExec: () => true,
@@ -67,6 +69,10 @@ function greenDeps(over = {}) {
     root: '/data/user/0/app.kxxy/files/engine',
     vimruntime: '/data/user/0/app.kxxy/files/engine/share/nvim/runtime',
     countParsers: () => 12,
+    // Python 只用固定协议夹具；不能在构建机上启动宿主解释器冒充真机。
+    pythonSpawn: pythonSpawnFixture,
+    pythonNow: () => 0,
+    env: { KXXY_ENGINE_ROOT: '/data/user/0/app.kxxy/files/engine' },
     now: () => 1762500000000,
     ...over,
   }
@@ -245,7 +251,7 @@ console.log('\n[7] runSelftest 汇总（注入依赖）')
   const all = await runSelftest(greenDeps())
   equal('全绿 → ok', all.ok, true)
   equal('全绿 → verdict=pass', all.verdict, 'pass')
-  equal('七条都在', all.items.length, 7)
+  equal('原七条与七条 Python 功能检查都在', all.items.length, 7 + PYTHON_ITEM_IDS.length)
   equal('计数与条目数自洽', all.counts.pass + all.counts.warn + all.counts.fail + all.counts.skip, all.items.length)
   equal('没有失败', all.counts.fail, 0)
   check('note 说的是「全部通过」', all.note.includes('全部通过'))
@@ -253,7 +259,7 @@ console.log('\n[7] runSelftest 汇总（注入依赖）')
   check('每条都有 id / title / status / detail', all.items.every((i) => i.id && i.title && i.status && 'detail' in i))
 
   const idOrder = all.items.map((i) => i.id).join(',')
-  equal('顺序固定（鉴权在最前，nvim 追加在末尾）', idOrder, 'AUTH,YARN,NDK,TMP,HELPERS,RAW,NVIM')
+  equal('旧七项顺序不变，Python 追加在末尾', idOrder, ['AUTH', 'YARN', 'NDK', 'TMP', 'HELPERS', 'RAW', 'NVIM', ...PYTHON_ITEM_IDS].join(','))
 
   const broken = await runSelftest(
     greenDeps({
@@ -276,7 +282,17 @@ console.log('\n[7] runSelftest 汇总（注入依赖）')
   const skipped = await runSelftest(greenDeps({ platform: 'win32' }))
   equal('构建机上 yarn 跳过', skipped.items.find((i) => i.id === 'YARN').status, Level.SKIP)
   equal('构建机上临时目录跳过', skipped.items.find((i) => i.id === 'TMP').status, Level.SKIP)
+  check('构建机上全部 Python 项明确跳过', skipped.items.filter((i) => PYTHON_ITEM_IDS.includes(i.id)).every((i) => i.status === Level.SKIP))
   equal('跳过不算失败', skipped.counts.fail, 0)
+
+  const noRoot = await runSelftest(greenDeps({ root: '', pythonSpawn: () => { throw new Error('无根不能启动 Python') } }))
+  check('无引擎根时 Python 项全跳过', noRoot.items.filter((i) => PYTHON_ITEM_IDS.includes(i.id)).every((i) => i.status === Level.SKIP))
+
+  const pythonBroken = await runSelftest(greenDeps({ pythonSpawn: () => ({ status: 0, stdout: 'broken protocol', stderr: '' }) }))
+  equal('Python 乱输出影响总 verdict', pythonBroken.verdict, 'fail')
+  equal('Python 乱输出只使解释器项失败', pythonBroken.counts.fail, 1)
+  check('Python 乱输出不影响原七项', pythonBroken.items.slice(0, 7).every((i) => i.status === Level.PASS))
+  check('汇总说明点名 Python 解释器', pythonBroken.note.includes('Python 解释器'))
 
   // 没有 DSH_HOME 时不能去猜路径（猜错会把用户引到别人的目录上）
   const noHome = await runSelftest(greenDeps({ home: '' }))
@@ -311,6 +327,7 @@ console.log('\n[9] nvim（缺陷 EI：wrapper / VIMRUNTIME / treesitter）')
   })
   equal('三层都正常 → 通过', ok.status, Level.PASS)
   check('parser 个数进 detail', ok.detail.includes('12'))
+  check('通过也不声称已验证加载或 ABI', ok.detail.includes('未验证加载/ABI'))
 
   equal('没装 → 跳过（不是失败）', judgeNvim({ installed: false }).status, Level.SKIP)
 
@@ -353,7 +370,7 @@ console.log('\n[9] nvim（缺陷 EI：wrapper / VIMRUNTIME / treesitter）')
   equal('VIMRUNTIME 指错也算留意', badRuntime.status, Level.WARN)
   check('并带上实际指向', badRuntime.detail.includes('/e/share/nvim/runtime'))
 
-  // 第三层：E5113 —— 本轮唯一补不了的（载荷里就没有）
+  // 第三层：E5113 —— 数量为零只能证明 runtime parser 不可见，不能推断载荷缺失。
   const noParser = judgeNvim({
     installed: true,
     execPath: '/e/libexec/nvim/nvim',
@@ -362,11 +379,13 @@ console.log('\n[9] nvim（缺陷 EI：wrapper / VIMRUNTIME / treesitter）')
     runtimeOk: true,
     parserCount: 0,
   })
-  equal('载荷没带 parser → 留意', noParser.status, Level.WARN)
+  equal('runtime parser 不可见 → 留意', noParser.status, Level.WARN)
+  check('只报告可见性，不推断载荷缺失', noParser.detail.includes('没有可见') && !noParser.detail.includes('载荷没带'))
   check('说清不影响编辑保存', noParser.hint.includes('不影响'))
-  check('并说明插件侧补不了', noParser.hint.includes('补不了'))
+  check('提示指向现有修复入口', noParser.hint.includes('修复命令链接'))
+  check('明确未验证实际加载与 ABI', noParser.hint.includes('不等于 parser 加载或 ABI 验证'))
   equal(
-    'parser 目录都不存在（-1）也当没带',
+    'parser 目录不存在（-1）也报告不可见',
     judgeNvim({
       installed: true,
       execPath: '/e/libexec/nvim/nvim',

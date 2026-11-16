@@ -52,6 +52,14 @@ android/app/src/main/assets/alias-links.txt
 # 探针据此放行、关于页把指纹行收起，但编译与安装都正常。
 android/app/src/main/assets/meta/
 
+# DSH 运行时升级载荷（tools/upgrade-dsh-runtime.mjs 的产物，126 MB）+ Python 修复载荷。
+# 两者都是「以 zip 形式塞进 assets」的二进制，由上游 runtime.zip 差分生成，不属于源码。
+# 不入库的硬理由：payload.zip 单文件 126 MB，超过 GitHub 100 MB 的单文件上限，推不上去；
+# 软的：与 runtime.zip 同源，提交等于把 126 MB 二进制复制进历史。缺了它们 gradle 仍能
+# 编过，只是新版 DSH 运行时升级链路与 Python 修复链路没有可投放的载荷。
+android/app/src/main/assets/dsh-upgrade/
+android/app/src/main/assets/python-repair/
+
 # 扩展包池（tools/fetch-extensions.mjs 产物，约 1.0 GiB / 20 项），与 runtime.zip
 # 同理是构建产物；目录清单随包生成于 plugins/kxxy-host/extensions.json。
 android/app/src/main/assets/ext-pool/

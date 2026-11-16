@@ -12,14 +12,13 @@
  *   → materialiseSonameAliases → restoreExecBits → isComplete（十一锚点，含兼容层、PTY 绑定、宿主插件、移动端适配层、office 资产与构建期补丁集的版本标记）
  *
  * 用法：node tools/simulate-install.mjs [zip 路径] [目标目录]
- * 默认目标目录：<系统临时目录>/kxxy-sim-install（每次运行前清空）
+ * 默认目标目录：<项目>/.cache/kxxy-sim-install-<pid>；目标已存在即拒绝，不清空。
  */
 import {
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
-  rmSync,
   statSync,
   writeFileSync,
   chmodSync,
@@ -33,9 +32,10 @@ import {
   readlinkSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { tmpdir } from "node:os";
 import { inflateRawSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { readZipDirectory } from "./lib/zipread.mjs";
+import { officeDirectoryReader, verifyOfficeAssets, OFFICE_LAYER_MARKER } from "./lib/office-assets.mjs";
 
 /** 本脚本所在目录（`tools/`）。静态检查 Kotlin 源码时要用绝对路径。 */
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -54,7 +54,9 @@ const zipCandidates = [
   join(HERE, "..", ".cache", "apk-assets-hold", "runtime.zip"),
 ];
 const zipPath = process.argv[2] ?? zipCandidates.find((p) => existsSync(p)) ?? zipCandidates[0];
-const target = resolve(process.argv[3] ?? join(tmpdir(), "kxxy-sim-install"));
+const target = resolve(process.argv[3] ?? join(HERE, "..", ".cache", `kxxy-sim-install-${process.pid}`));
+if (existsSync(target)) throw new Error(`拒绝覆盖或清空已有模拟目录：${target}`);
+if (!existsSync(dirname(target)) || !statSync(dirname(target)).isDirectory()) throw new Error("模拟目标父目录必须已存在");
 
 /** 与 RuntimeInstaller 的 companion object 保持一致。 */
 const MANIFEST_NAME = "kxxy-runtime.json";
@@ -111,7 +113,8 @@ const PTY_NODE_MARKER = "kxxy-pty-node@1";
 const HOST_PLUGIN_FP_FILE = "lib/node_modules/kxxy-host/lib/.fingerprint";
 const HOST_PLUGIN_ENTRY = "lib/node_modules/kxxy-host/lib/index.js";
 const HOST_PLUGIN_FINGERPRINT = (() => {
-  const metaPath = join(HERE, "..", ".cache", "build-meta.json");
+  const siblingMeta = join(dirname(zipPath), "build.json");
+  const metaPath = process.argv[4] ?? (existsSync(siblingMeta) ? siblingMeta : join(HERE, "..", ".cache", "build-meta.json"));
   if (!existsSync(metaPath)) return null;
   try {
     const value = JSON.parse(readFileSync(metaPath, "utf8")).kxxyHostFingerprint;
@@ -134,33 +137,12 @@ const MOBILE_PLUGIN_ENTRY = "lib/node_modules/dsh-web-mobile/package.json";
 const MOBILE_PLUGIN_CLIENT = "lib/node_modules/dsh-web-mobile/lib/client.js";
 const MOBILE_PLUGIN_MARKER_FILE = "lib/node_modules/dsh-web-mobile/plugin.version";
 
-/**
- * 与 RuntimeInstaller.OFFICE_LAYER_MARKER 保持一致（锚点 9）。
- *
- * LibreOffice wasm 引擎与单文件 CJK 字体是随 runtime 发的「新增资产」，
- * 而 RUNTIME_VERSION 从未变过 —— 老设备升级 APK 时前面的锚点全部通过，
- * isComplete() 判真并跳过重装，设备上永远没有这两份文件，Office 预览
- * 一直报「Office 预览不可用」。标记写在独立小文件里（TTF 头部不能动）。
- *
- * 从 Kotlin 源码读，不抄字面量：@1 → @2 那轮（wasm 0.1.1 → 0.1.5，缺陷 CL）
- * 就是先改了 Kotlin、忘了改这里，模拟安装仍拿 @1 去比对，等于白测。
- */
-const OFFICE_LAYER_MARKER = (() => {
-  const kt = readFileSync(
-    join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"),
-    "utf8",
-  );
-  const m = /OFFICE_LAYER_MARKER\s*=\s*"([^"]+)"/.exec(kt);
-  if (m === null) throw new Error("RuntimeInstaller.kt 未定义 OFFICE_LAYER_MARKER");
-  return m[1];
-})();
-const OFFICE_LAYER_MARKER_FILE = "lib/node_modules/kxxy-host/fonts/office-assets.version";
-const OFFICE_WASM_ENGINE =
-  "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.wasm";
-const OFFICE_FONT_FILES = [
-  "lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf",
-  "lib/node_modules/kxxy-host/fonts/NotoSansSC-Bold.ttf",
-];
+// Office 共享合同与真实 Kotlin 标记必须一致，避免模拟器独自放行旧资产。
+{
+  const kt = readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8");
+  const marker = /private const val OFFICE_LAYER_MARKER\s*=\s*"([^"]+)"/.exec(kt);
+  if (marker?.[1] !== OFFICE_LAYER_MARKER) throw new Error("Office 合同与 RuntimeInstaller 标记不同步");
+}
 
 /**
  * 与 RuntimeInstaller.PATCHSET_MARKER 保持一致（锚点 11）。
@@ -172,7 +154,12 @@ const OFFICE_FONT_FILES = [
  * `grep -c kxxyArchiveApply` 仍是 0 —— 前面的锚点全通过，isComplete()
  * 判真，补丁根本没解出来。标记由 build-runtime.mjs 写在 kxxy-host 目录下。
  */
-const PATCHSET_MARKER = "kxxy-patchset@7";
+const PATCHSET_MARKER = (() => {
+  const kt = readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8");
+  const match = kt.match(/const val PATCHSET_MARKER\s*=\s*"([^"]+)"/);
+  if (!match) throw new Error("RuntimeInstaller.kt 未定义 PATCHSET_MARKER");
+  return match[1];
+})();
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**
@@ -290,21 +277,8 @@ function readAt(offset, len) {
   return out;
 }
 
-// EOCD 在最尾部，最多回看 66,000 字节（22 字节固定头 + 64 KiB 注释上限）。
-const tailLen = Math.min(zipSize, 66_000);
-const tailStart = zipSize - tailLen;
-const tail = readAt(tailStart, tailLen);
-let eocd = -1;
-for (let i = tail.length - 22; i >= 0; i -= 1) {
-  if (tail.readUInt32LE(i) === 0x06054b50) {
-    eocd = tailStart + i;
-    break;
-  }
-}
-if (eocd < 0) throw new Error("找不到 EOCD");
-const count = tail.readUInt16LE(eocd - tailStart + 10);
-const cdStart = tail.readUInt32LE(eocd - tailStart + 16);
-const cdSize = tail.readUInt32LE(eocd - tailStart + 12);
+// 与运行时重封/核验共用有界计数扩展；APK 外层仍不启用 ZIP64。
+const { count, cdOffset: cdStart, cdSize } = readZipDirectory(readAt, zipSize);
 const buf = readAt(cdStart, cdSize); // 只放中央目录，几 MB
 
 /** name → { method, csize, usize, localOffset, comment } */
@@ -359,8 +333,8 @@ function readEntryData(name, e) {
 }
 
 // ---------------------------------------------------------------- extract
-if (existsSync(target)) rmSync(target, { recursive: true, force: true });
-mkdirSync(target, { recursive: true });
+if (existsSync(target)) throw new Error(`模拟目标已出现，拒绝覆盖：${target}`);
+mkdirSync(target);
 
 let extracted = 0;
 let skippedLinks = 0;
@@ -718,12 +692,7 @@ const anchors = [
   // 锚点 8：宿主插件本体。锚点 5 的 package.json 从 v0.1.0 起内容未变，
   // 光判它存在会让「改了 host.js 却只重装 APK」的设备一直跑旧插件。
   ["锚点 8 宿主插件入口", join(target, "lib/node_modules/kxxy-host/lib/index.js")],
-  // 锚点 9：office 预览链。wasm 引擎与 CJK 字体是随 runtime 发的「新增
-  // 资产」，RUNTIME_VERSION 从未变过 ⇒ 老设备前面的锚点全过、跳过重装，
-  // 设备上永远没有这两份文件，Office 预览一直报「Office 预览不可用」。
-  ["锚点 9 office 资产标记", join(target, OFFICE_LAYER_MARKER_FILE)],
-  ["锚点 9 LibreOffice wasm 引擎", join(target, OFFICE_WASM_ENGINE)],
-  ...OFFICE_FONT_FILES.map((f, i) => [`锚点 9 CJK 字体 ${i + 1}`, join(target, f)]),
+  // 锚点 9 的完整 Office 合同在下方独立核验，不再把文件存在当作完整。
   // 锚点 10：内置的第三方移动端插件 dsh-web-mobile。它既不进 @deepseek-ai
   // 计数（锚点 4），也不属于 kxxy-host（锚点 5/8）；缺了它的表现是「手机上
   // 仍是官方桌面布局」——不报错、不留日志，属于最难排查的一类。
@@ -880,13 +849,12 @@ for (const [label, f] of anchors) {
   }
 }
 {
-  // 锚点 9 的第二段判定：office 资产标记文件内容（RuntimeInstaller 只做
-  // contains 匹配，这里同样）。wasm 主体与字体的存在性已由 anchors 循环判过。
-  const marker = join(target, OFFICE_LAYER_MARKER_FILE);
-  if (existsSync(marker)) {
-    const head = readFileSync(marker, "utf8").slice(0, 256);
-    if (!head.includes(OFFICE_LAYER_MARKER)) fail(`锚点 9 版本标记过期：office-assets.version 不含 ${OFFICE_LAYER_MARKER}`);
-    else ok(`锚点 9 office 资产标记匹配（${OFFICE_LAYER_MARKER}）`);
+  // 锚点 9：与 Kotlin 相同的轻量合同；stat 全部资源，仅读取小 JSON 与文件头。
+  try {
+    const office = verifyOfficeAssets(officeDirectoryReader(target), { full: false, runtime: true });
+    ok(`锚点 9 Office 合同匹配：kit/wasm ${office.version}，${office.files.length} 项资源，${OFFICE_LAYER_MARKER}`);
+  } catch (error) {
+    fail(`锚点 9 Office 合同失败：${error.message}`);
   }
 }
 {
