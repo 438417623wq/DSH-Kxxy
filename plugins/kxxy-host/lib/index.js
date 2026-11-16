@@ -55,6 +55,7 @@ import * as mirror from './mirror.mjs'
 import * as netdiag from './netdiag.mjs'
 import * as localinstall from './localinstall.mjs'
 import * as plugins from './plugins.mjs'
+import * as pydeps from './pydeps.mjs'
 import * as selftest from './selftest.mjs'
 import { tarGzSync } from './tar.mjs'
 import { AUTH_ALLOW, AUTH_DENY, AUTH_UNAVAILABLE, authVerdict, authDetail, checkNonce, checkWriteRequest, acceptedNonces, rotateNonce, deniedPageHtml } from './auth.mjs'
@@ -1118,6 +1119,24 @@ export function apply(ctx) {
       })
       .catch((error) => {
         ctx.logger?.warn?.(`[kxxy-host] 默认模型自检失败：${String(error?.message ?? error)}`)
+      })
+
+    // ── 纯 Python 办公库补齐（问题清单【9】）────────────────────────────
+    //
+    // docx / openpyxl / pptx / requests 全是纯 Python，Termux 侧没有对应 deb，
+    // 只能走 pip。后台跑、不 await：失败（没网 / 镜像抽风）不能拖住引擎启动，
+    // 具体取舍见 lib/pydeps.mjs 的文件头。
+    void pydeps
+      .ensurePythonLibs()
+      .then((result) => {
+        if (result?.status === 'installed') {
+          ctx.logger?.info?.(`[kxxy-host] python 办公库已就位：${result.detail}`)
+        } else if (result?.status === 'failed') {
+          ctx.logger?.warn?.(`[kxxy-host] python 办公库补齐失败：${result.detail}`)
+        }
+      })
+      .catch((error) => {
+        ctx.logger?.warn?.(`[kxxy-host] python 办公库补齐异常：${String(error?.message ?? error)}`)
       })
 
     // ── GitHub 直链的绕行助手（缺陷 EH 的方案 C）────────────────────────

@@ -128,6 +128,10 @@ UA = {"User-Agent": "dsh-kxxy-build/1.0"}
 # 首行必须是 kpathsea 魔数，逐字比对；写错一个字符 kpathsea 就会整体跳过索引。
 LS_R_MAGIC = "% ls-R -- filename database for kpathsea; do not change this line."
 
+# `language.def` 的条目形状：`\addlanguage{<lang>}{<pattern>}{<excs>}{<left>}{<right>}`。
+# 只取第二个花括号组（断词文件），它才是「闭包里有没有这个文件」的判据。
+ADD_LANGUAGE = re.compile(r"^\\addlanguage\s*\{[^{}]*\}\s*\{([^{}]*)\}")
+
 # dvipdfmx.cfg 里 `p  a4` 的替身：A4 的精确 pt 尺寸。用长度对可绕开真机上
 # 失效的 paper 名字表（`xdvipdfmx:fatal: Unrecognized paper format: a4`）。
 PAPER_FIX_LINE = "p  595.28pt,841.89pt"
@@ -346,7 +350,7 @@ def should_prune(rel: str) -> bool:
 
 
 def make_hyphenation_minimal(dest: str) -> tuple[str, int]:
-    """把 `language.dat` / `language.def` 收窄到「闭包里真正有断词文件」的语言。
+    r"""把 `language.dat` / `language.def` 收窄到「闭包里真正有断词文件」的语言。
 
     为什么必须做（缺陷 AY 的第二处）：`scheme-basic` 的
     `tex/generic/config/language.dat` **不是** basic 版 —— 它由 tlmgr 从
@@ -362,10 +366,44 @@ def make_hyphenation_minimal(dest: str) -> tuple[str, int]:
     `pdflatex.fmt`（2,264,024 B），`pdflatex t.tex` → `Output written on
     t.pdf (1 page, 3535 bytes)`。
 
+    ⚠️ **逐行过滤，绝不重写整个文件**（v0.9.62 修的回归）。
+
+    早期版本的做法是「重新生成文件，只写我们认出来的条目」，结果是整份文件
+    只剩一行中文注释（82 字节）。这在 `language.dat` 上没问题（它是纯条目表），
+    但 `language.def` 是**TeX 源码**：第一行的 `% e-TeX V2.6` 是 e-TeX 建格式
+    时的**版本探针**（`pdfetex.ini` 会比对它），后面的
+    `\ifx\eTeXversion\undefined … \else … \fi` 是控制流。把它压成纯注释后：
+
+        ! Undefined control sequence.  →  \@sk {Use fallback?}
+        pr@mptloop … End of file on the terminal!
+        !  ==> Fatal error occurred, no output PDF file produced!
+
+    也就是「文件头不符 → 进交互式 fallback → 在 `</dev/null` 下 Emergency stop」，
+    格式构建返回 1，`pdflatex` 于是永远没有 .fmt 可用（真机 pdftex.log 逐字如此）。
+
+    所以现在的做法是**只删「引用了闭包里不存在的断词文件」的那些条目行**，
+    其余每一行（注释、空行、`\ifx`/`\else`/`\fi`、`\input` …）原样保留：
+    `language.def` 的 `\\addlanguage{<lang>}{<pattern>}…` 与 `language.dat` 的
+    `<lang> <pattern> …` 两种条目形状分别用正则/分词识别，只有确实指向缺失
+    文件的条目会被丢掉。这样文件头、控制流、尾部全部保持原样，而条目仍然只
+    保留本闭包能提供的那几条。
+
     保留原文件为 `.orig` 以便排查（不打进 zip，见 bundleTexliveMacros 的
     条目过滤）。返回 (说明, 保留条数)。
     """
     kept: list[str] = []
+    dropped = 0
+
+    def pattern_exists(pattern: str) -> bool:
+        if not pattern or pattern.startswith("="):
+            return True  # `=alias` 不落文件，永远可用
+        for base in ("texmf-dist/tex/generic/hyph-utf8/patterns/tex",
+                     "texmf-dist/tex/generic/hyphen",
+                     "texmf-dist/tex/generic/dehyph"):
+            if os.path.exists(os.path.join(dest, base, pattern)):
+                return True
+        return False
+
     for rel in (
         "texmf-dist/tex/generic/config/language.dat",
         "texmf-dist/tex/generic/config/language.def",
@@ -375,31 +413,40 @@ def make_hyphenation_minimal(dest: str) -> tuple[str, int]:
             continue
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
-        out: list[str] = ["% [kxxy] 收窄到闭包内实际存在的断词文件（见 fetch-texlive.py）"]
+        out: list[str] = []
         for line in lines:
             s = line.strip()
+            # 空行、注释、以及一切非条目的 TeX 控制流：原样保留。
             if not s or s.startswith("%"):
+                out.append(line)
                 continue
-            # 条目形如 `<lang> <file>`，file 可能是 `=alias`（不落文件）
+            m = ADD_LANGUAGE.match(s)
+            if m is not None:
+                pattern = m.group(1).strip()
+                if pattern_exists(pattern):
+                    out.append(line)
+                    kept.append(s)
+                else:
+                    dropped += 1
+                continue
+            if s.startswith("\\"):
+                # `language.def` 里其余的反斜杠行（`\ifx` / `\else` / `\fi` /
+                # `\input` / `\errmessage` …）都是控制流，不能动。
+                out.append(line)
+                continue
             parts = s.split()
             if len(parts) < 2:
+                out.append(line)
                 continue
             pattern = parts[1]
-            if pattern.startswith("="):
-                continue
-            found = False
-            for base in ("texmf-dist/tex/generic/hyph-utf8/patterns/tex",
-                         "texmf-dist/tex/generic/hyphen",
-                         "texmf-dist/tex/generic/dehyph"):
-                if os.path.exists(os.path.join(dest, base, pattern)):
-                    found = True
-                    break
-            if found:
-                out.append(s)
+            if pattern_exists(pattern):
+                out.append(line)
                 kept.append(s)
+            else:
+                dropped += 1
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(out) + "\n")
-    return (f"断词条目 {len(kept)} 条（原 226 条，其余闭包里没有）", len(kept))
+    return (f"断词条目 保留 {len(kept)} 条 / 剔除 {dropped} 条（闭包里没有对应文件）", len(kept))
 
 
 def write_ls_r(dest: str) -> int:

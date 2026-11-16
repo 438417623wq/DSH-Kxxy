@@ -47,6 +47,19 @@ export const SEED_PACKAGES = [
   // 装这三个只多 7.1 MiB（numpy 5.93 含 libopenblas / psutil 0.08 / crypto 1.08），
   // 却把「数据分析、进程监控、加密」三条最常走的 Python 路打通。
   "python-numpy", "python-psutil", "python-cryptography",
+  // 办公/文档/图像三件套（问题清单【9】）：`docx`、`openpyxl`、`pptx`、`PIL`、
+  // `pandas` 之前一个都没有，任何「读一个 xlsx」「生成一份 docx」「裁一张图」
+  // 的脚本都停在 `ModuleNotFoundError`。
+  //
+  // 为什么走 Termux 而不是 pip：这三个都带 C 扩展（lxml 的 libxml2 绑定、
+  // Pillow 的 libjpeg/libwebp、pandas 的 numpy 扩展），PyPI 上没有 android_arm64
+  // 的 wheel，现场编译要 meson/ninja + 完整 NDK 头，手机上一律失败。
+  // Termux 侧是预编译好的 3.14 版（与内置 python 同 ABI：cp314 + aarch64）。
+  //
+  // 纯 Python 的那几个（python-docx / openpyxl / python-pptx / requests）**不放
+  // 这里** —— 它们没有 deb，靠 `pip install` 即可（pip 与环境变量里的清华源都在）。
+  // 补上 lxml/Pillow 之后这些 pip 安装全是纯 wheel 落地，几秒完成。
+  "python-lxml", "python-pillow", "python-pandas",
   // cryptography deb 的 postinst 会再用 pip 装 cffi；离线解包不运行维护脚本。
   // cffi>=2 + pycparser 由 build-python-deps.py 的 Android 构件显式补齐，
   // build-runtime 默认使用已验证构件（可用 --python-deps 指定）并核对 ABI/摘要，
