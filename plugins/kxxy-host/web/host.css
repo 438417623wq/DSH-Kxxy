@@ -9,19 +9,46 @@
    找不到 body 上的 --dsw-*，会全部落到暗色兜底值，浅色切换就只有用了
    body 层变量的顶栏/底栏跟随（真机踩过）。 */
 body {
+  /* 兜底色板：theme.css 正常时用不到。
+     0.9.57 的「浅色一片黑」就是这份兜底造成的：theme.css 里的浅色 token 被
+     解析器整块丢弃，于是所有 var(--dsw-…, <兜底>) 都取了第二参，而第二参只有
+     深色值 —— 深色主题看着正常、浅色直接掉回深色。所以兜底本身也必须分两套，
+     深色那套挂在 body[data-ds-dark-theme] 上，与官方 token 的挂法一致。 */
+  --fb-bg-base: #ffffff;
+  --fb-bg-card: #ffffff;
+  --fb-bg-elevated: #ffffff;
+  --fb-hover: #2631480f;
+  --fb-border-subtle: #0000000a;
+  --fb-border-strong: #0000001a;
+  --fb-text-primary: #0f1115;
+  --fb-text-secondary: #61666b;
+  --fb-text-muted: #81858c;
+}
+body[data-ds-dark-theme] {
+  --fb-bg-base: #151517;
+  --fb-bg-card: #1b1b1c;
+  --fb-bg-elevated: #232324;
+  --fb-hover: #ffffff0f;
+  --fb-border-subtle: #ffffff0f;
+  --fb-border-strong: #ffffff1f;
+  --fb-text-primary: #f9fafb;
+  --fb-text-secondary: #cfd3d6;
+  --fb-text-muted: #979da6;
+}
+body {
   /* 官方设计 Token 映射（theme.css 提供定义，构建期从 dsh-client-ui-theme 抽取）。
      管理页与对话界面同源：官方调色重跑构建即自动跟齐。
-     var() 的第二参是 theme.css 缺失时的兜底。 */
-  --bg-base: var(--dsw-alias-bg-base, #151517);
-  --bg-sidebar: var(--dsw-alias-bg-base, #151517);
-  --bg-card: var(--dsw-alias-bg-layer-1, #1b1b1c);
-  --bg-elevated: var(--dsw-alias-bg-layer-2, #232324);
-  --bg-hover: var(--dsw-alias-interactive-bg-hover, #ffffff0f);
-  --border-subtle: var(--dsw-alias-border-l1, #ffffff0f);
-  --border-strong: var(--dsw-alias-border-l2, #ffffff1f);
-  --text-primary: var(--dsw-alias-label-primary, #f9fafb);
-  --text-secondary: var(--dsw-alias-label-secondary, #cfd3d6);
-  --text-muted: var(--dsw-alias-label-tertiary, #81858c);
+     var() 的第二参是 theme.css 缺失时的兜底（见上面的 --fb-*）。 */
+  --bg-base: var(--dsw-alias-bg-base, var(--fb-bg-base));
+  --bg-sidebar: var(--dsw-alias-bg-base, var(--fb-bg-base));
+  --bg-card: var(--dsw-alias-bg-layer-1, var(--fb-bg-card));
+  --bg-elevated: var(--dsw-alias-bg-layer-2, var(--fb-bg-elevated));
+  --bg-hover: var(--dsw-alias-interactive-bg-hover, var(--fb-hover));
+  --border-subtle: var(--dsw-alias-border-l1, var(--fb-border-subtle));
+  --border-strong: var(--dsw-alias-border-l2, var(--fb-border-strong));
+  --text-primary: var(--dsw-alias-label-primary, var(--fb-text-primary));
+  --text-secondary: var(--dsw-alias-label-secondary, var(--fb-text-secondary));
+  --text-muted: var(--dsw-alias-label-tertiary, var(--fb-text-muted));
   --accent-blue: var(--dsw-static-deepseek-500, #4176e6);
   --accent-blue-hover: var(--dsw-static-deepseek-450, #5686fe);
   --accent-green: var(--dsw-static-green-500, #22c55e);
@@ -406,7 +433,8 @@ html, body {
 
 .icon-button:active {
   transform: scale(0.92);
-  background-color: rgba(255, 255, 255, 0.1);
+  /* 按下反馈用主题变量：浅色下 rgba(255,255,255,.1) 等于没有反馈 */
+  background-color: var(--bg-hover);
   color: var(--text-primary);
 }
 
@@ -428,7 +456,7 @@ html, body {
 }
 
 .badge-subtle {
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--bg-hover);
   color: var(--text-secondary);
   border: 1px solid var(--border-subtle);
 }
@@ -1587,7 +1615,7 @@ html, body {
 }
 
 .button-subtle:active:not(:disabled) {
-  background-color: rgba(255, 255, 255, 0.08);
+  background-color: var(--bg-hover);
   color: var(--text-primary);
 }
 
@@ -2339,7 +2367,7 @@ html, body {
   align-items: center;
   justify-content: space-between;
   padding: 6px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid var(--border-subtle);
   font-size: 12px;
 }
 

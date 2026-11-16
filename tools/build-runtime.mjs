@@ -58,6 +58,7 @@ import { readZipEntries } from "./lib/zipread.mjs";
 import { ZipWriter } from "./lib/zipwrite.mjs";
 import { stampCodexPlugin, attachCodexRuntime } from "./lib/codex.mjs";
 import { stampHostPluginFingerprint } from "./lib/host-fingerprint.mjs";
+import { themeCssFromAsarFiles } from "./lib/theme-css.mjs";
 import { PYTHON_REVISION, PYTHON_HOST_FILES, loadPythonDependencies, verifyPythonInputs, verifyPythonRuntime, createPythonRepairAssets } from "./lib/python-runtime.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -520,57 +521,26 @@ function corepackWrappers() {
  * 让 host.css 直接消费官方的 `--dsw-alias-*` / `--dsw-static-*` 变量、把定义块
  * 原样搬过来 —— 官方以后调色，重跑构建自动跟齐，管理页永远和对话页同源。
  *
- * 抽取分两步（该模块把 CSS 存成 JS 双引号字符串常量，直接按花括号扫会把 JS
- * 代码块也抓进来）：
- *   1. 收集所有含 `--dsw-` 的双引号字符串字面量 → 得到纯 CSS 片段；
- *   2. 解析 selector{block}，只保留**定义了** token 的块（`--dsw-x:` 形态）。
- *      组件样式块（如 `.v01cdW_group{color:var(--dsw-alias-…)}`）只引用不定义，
- *      会被 var() 后无冒号这条判据自然剔除。重复块去重。
+ * 抽取细节与「0.9.57 浅色全黑」事故的来龙去脉见 `tools/lib/theme-css.mjs`：
+ * 那里用真正的字符串字面量扫描取代了会误吞 JS 胶水的配对引号正则，并自带
+ * `assertThemeCss()` 自检 —— 抽坏了宁可构建失败，也不许再发一份坏 CSS。
  */
 function extractOfficialTheme(asarFiles) {
-  const entry = asarFiles.get(
-    "lib/node_modules/@deepseek-ai/dsh-client-ui-theme/lib/client.js",
-  );
-  if (!entry) {
-    console.log("      ⚠️ dsh-client-theme 不在闭包内，跳过 theme.css 生成");
+  let theme;
+  try {
+    theme = themeCssFromAsarFiles(asarFiles);
+  } catch (error) {
+    console.error(`      ✗ theme.css 生成失败：${error.message}`);
+    throw error;
+  }
+  if (!theme) {
+    console.log("      ⚠️ dsh-client-theme 不在闭包内或没有 token，跳过 theme.css 生成");
     return;
   }
-  const js = entry.data.toString("utf8");
-
-  const fragments = [];
-  for (const m of js.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
-    const s = m[1];
-    if (s.includes("--dsw-alias-") || s.includes("--dsw-static-")) fragments.push(s);
-  }
-  if (fragments.length === 0) {
-    console.log("      ⚠️ 主题模块里没有 --dsw token 字符串，跳过 theme.css 生成");
-    return;
-  }
-
-  const cssAll = fragments.join("\n");
-  const blocks = [];
-  const seen = new Set();
-  for (const m of cssAll.matchAll(/([^{}]{1,300})\{([^{}]*)\}/g)) {
-    const selector = m[1].trim();
-    const body = m[2];
-    if (!/--dsw-(?:alias|static)-[\w-]+\s*:/.test(body)) continue;
-    const block = `${selector}{${body}}`;
-    if (seen.has(block)) continue;
-    seen.add(block);
-    blocks.push(block);
-  }
-  if (blocks.length === 0) {
-    console.log("      ⚠️ 未解析出 token 定义块，跳过 theme.css 生成");
-    return;
-  }
-  const header =
-    "/*\n" +
-    " * 官方主题 token（构建期从 @deepseek-ai/dsh-client-ui-theme/lib/client.js 自动抽取）。\n" +
-    " * 请勿手改 —— 改了也会被下次构建覆盖；要调样式请改 host.css 里对变量的引用。\n" +
-    " */\n";
-  const css = header + blocks.join("\n") + "\n";
-  writeFileSync(join(PROJECT, "plugins", "kxxy-host", "web", "theme.css"), css, "utf8");
-  console.log(`      ✓ theme.css：抽取 ${blocks.length} 个 token 块（${css.length} 字节）`);
+  writeFileSync(join(PROJECT, "plugins", "kxxy-host", "web", "theme.css"), theme.css, "utf8");
+  // 用 Buffer.byteLength 而不是 String.length：头部注释是中文，字符数比字节数少，
+  // 按字符数报「字节」会与磁盘上的文件大小对不上（差 94 B，查过一次）。
+  console.log(`      ✓ theme.css：抽取 ${theme.blocks} 个 token 块（${Buffer.byteLength(theme.css, "utf8")} 字节）`);
 }
 
 // -------------------------------------------------------------- office 引擎
