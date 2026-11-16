@@ -1,19 +1,12 @@
 package app.kxxy
 
 import android.content.Context
+import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.util.Log
+import android.webkit.WebView
 
-/**
- * WebView 版本门禁。
- *
- * 为什么必须做：官方前端用了 `??=` 等**解析期**语法，polyfill 补不了。
- * 低于 Chrome 85 的设备会直接白屏（日志里只有一句 SyntaxError）。
- * 与其让用户面对白屏，不如前置检测并给出明确升级指引。
- *
- * 版本探测不用 `WebView.getCurrentWebViewPackage()` —— 参考项目记录该
- * 官方 API「实测有坑」，改为扫 provider 包名。
- */
+/** WebView 版本门禁；系统实际 provider 优先，候选包扫描只作兜底。 */
 object WebViewGate {
 
     /** 官方前端实际门槛：补齐 19 个 API guard 后降到 Chrome 85。 */
@@ -21,7 +14,6 @@ object WebViewGate {
 
     private const val TAG = "KxxyWebViewGate"
 
-    /** 系统 WebView 的候选 provider 包名。 */
     private val PROVIDERS = listOf(
         "com.google.android.webview",
         "com.android.webview",
@@ -33,35 +25,55 @@ object WebViewGate {
         "com.miui.webview",
     )
 
-    /**
-     * 检测 WebView 主版本号。
-     *
-     * 返回 null 表示无法确定 —— 此时**放行**（宁可尝试后白屏，
-     * 也不要因为探测失败把可用设备挡在门外）。
-     */
+    // minSdk=26；该 API 查询当前/选定的包，不创建 WebView，也不加载网页。
+    private fun actualProvider(): PackageInfo? = try {
+        WebView.getCurrentWebViewPackage()
+    } catch (e: RuntimeException) {
+        Log.w(TAG, "actual provider query unavailable: ${e.javaClass.simpleName}")
+        null
+    } catch (e: LinkageError) {
+        Log.w(TAG, "actual provider query unavailable: ${e.javaClass.simpleName}")
+        null
+    }
+
+    private fun major(info: PackageInfo): Int? =
+        info.versionName?.substringBefore('.')?.toIntOrNull()?.takeIf { it > 0 }
+
+    /** 无法确定时放行；实际 provider 版本未知时不拿另一个已安装包冒充它。 */
     fun chromeMajor(ctx: Context): Int? {
-        val pm = ctx.packageManager
+        val actual = actualProvider()
+        if (actual != null) {
+            Log.i(TAG, "actual provider=${actual.packageName} version=${actual.versionName}")
+            return major(actual)
+        }
         for (pkg in PROVIDERS) {
             try {
-                val info = pm.getPackageInfo(pkg, 0)
-                val ver = info.versionName ?: continue
-                // 版本形如 "120.0.6099.144"
-                val major = ver.substringBefore('.').toIntOrNull()
-                if (major != null && major > 0) {
-                    Log.i(TAG, "webview provider=$pkg version=$ver major=$major")
-                    return major
-                }
-            } catch (e: PackageManager.NameNotFoundException) {
+                val info = ctx.packageManager.getPackageInfo(pkg, 0)
+                val value = major(info) ?: continue
+                Log.i(TAG, "fallback candidate=$pkg version=${info.versionName} major=$value (actual unknown)")
+                return value
+            } catch (_: PackageManager.NameNotFoundException) {
+                continue
+            } catch (_: SecurityException) {
                 continue
             }
         }
-        Log.w(TAG, "no webview provider found")
+        Log.w(TAG, "webview version cannot be determined")
         return null
     }
 
-    /** 是否满足官方前端的最低要求。探测失败时放行。 */
+    /** 诊断仅声明实际 provider；候选包存在不能证明它正在被使用。 */
+    @Suppress("UNUSED_PARAMETER")
+    fun diagnosticLabel(ctx: Context): String {
+        val actual = actualProvider()
+            ?: return "actual provider: 无法确定（系统未返回实际包；fallback 候选不代表实际 provider）"
+        val version = actual.versionName ?: "无法确定"
+        val chrome = major(actual)?.toString() ?: "无法确定"
+        return "actual provider: ${actual.packageName}; version=$version; Chrome major=$chrome"
+    }
+
     fun isSupported(ctx: Context): Boolean {
-        val major = chromeMajor(ctx) ?: return true
-        return major >= MIN_CHROME_MAJOR
+        val value = chromeMajor(ctx) ?: return true
+        return value >= MIN_CHROME_MAJOR
     }
 }

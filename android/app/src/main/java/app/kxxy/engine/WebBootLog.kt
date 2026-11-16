@@ -127,4 +127,24 @@ object WebBootLog {
             if (f.isFile) f.delete()
         }.onFailure { Log.w(TAG, "reset failed: ${it.message}") }
     }
+
+    /**
+     * 最近一条启动失败的一句话摘要（给原生救援理由用）。
+     *
+     * 白屏时用户点「原生救援」，对话框里除了「页面是空的」之外还应该带上
+     * 浏览器侧真正的原因（`did not activate` 之类），否则每次都要再导出
+     * 一份完整报告才能往下走。读失败一律返回空串 —— 这个函数跑在 UI 线程。
+     */
+    fun tail(ctx: Context, maxChars: Int = 400): String {
+        val file = runCatching { EngineConfig.webBootFile(ctx) }.getOrNull() ?: return ""
+        if (!file.isFile) return ""
+        return runCatching {
+            val root = JSONObject(file.readText().replace("\uFEFF", ""))
+            val arr = root.optJSONArray("entries") ?: return@runCatching ""
+            if (arr.length() == 0) return@runCatching ""
+            arr.getJSONObject(arr.length() - 1).optString("message")
+                .replace('\n', ' ')
+                .take(maxChars)
+        }.getOrDefault("")
+    }
 }

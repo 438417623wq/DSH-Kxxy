@@ -1,6 +1,9 @@
 package app.kxxy.engine
 
 import android.content.Context
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import app.kxxy.pty.PtyBridge
 import kotlinx.coroutines.CompletableDeferred
@@ -23,12 +26,29 @@ class EngineProcess private constructor(
     private val masterFd: Int,
     val pid: Int,
     private val logFile: File,
+    private val rootWrapper: Boolean,
 ) {
 
     /** 子进程退出时完成；值为**原始 wait status**（用 [PtyBridge.describe] 解码）。 */
     val exitStatus = CompletableDeferred<Int>()
 
     private val stopped = AtomicBoolean(false)
+    private val masterClosed = AtomicBoolean(false)
+    @Volatile private var actualStarted = !rootWrapper
+
+    /** Root wrappers must be observed exec'ing this exact engine, not inferred from wait status. */
+    private fun confirmStarted(nodeBin: File, entryJs: File) {
+        if (!rootWrapper) return
+        val deadline = System.nanoTime() + 1_000_000_000L
+        while (System.nanoTime() < deadline && !exitStatus.isCompleted) {
+            val argv = try { File("/proc/$pid/cmdline").readText().split('\u0000') } catch (_: java.io.IOException) { emptyList() }
+            if (argv.firstOrNull() == nodeBin.absolutePath && entryJs.absolutePath in argv) {
+                actualStarted = true
+                return
+            }
+            Thread.sleep(25)
+        }
+    }
 
     @Volatile
     private var pumpThread: Thread? = null
@@ -132,16 +152,35 @@ class EngineProcess private constructor(
                 throw EngineStartException("fork failed, errno=${-masterFd}")
             }
 
-            logFile.parentFile?.mkdirs()
-            logFile.appendText("---- engine start ${System.currentTimeMillis()} ----\n")
-
-            EngineProcess(masterFd, pid, logFile).also { it.startThreads() }
+            val proc = EngineProcess(masterFd, pid, logFile, rootPrefix != null)
+            var handedOff = false
+            try {
+                logFile.parentFile?.mkdirs()
+                logFile.appendText("---- engine start ${System.currentTimeMillis()} ----\n")
+                proc.startThreads()
+                proc.confirmStarted(nodeBin, entryJs)
+                handedOff = true
+                proc
+            } finally {
+                // Includes failed log append and a partially started thread pair.
+                // A cleanup failure propagates; no unverified writer-stop is reported.
+                if (!handedOff) {
+                    try { proc.abortSpawn() } catch (e: Exception) {
+                        throw EngineStartException("fork 后清理未验证：${e.message}", proc).also { it.initCause(e) }
+                    } catch (e: LinkageError) {
+                        throw EngineStartException("fork 后原生清理失败：${e.message}", proc).also { it.initCause(e) }
+                    }
+                }
+            }
         }
     }
 
     private fun startThreads() {
-        pumpThread = Thread(::pumpLoop, "kxxy-log-pump").apply { isDaemon = true; start() }
-        waitThread = Thread(::waitLoop, "kxxy-waiter").apply { isDaemon = true; start() }
+        pumpThread = Thread(::pumpLoop, "kxxy-log-pump").apply { isDaemon = true }
+        waitThread = Thread(::waitLoop, "kxxy-waiter").apply { isDaemon = true }
+        // Start the reaper first, so a pump-start failure still has a waiter.
+        waitThread!!.start()
+        pumpThread!!.start()
     }
 
     /**
@@ -162,7 +201,12 @@ class EngineProcess private constructor(
             return
         }
 
-        FileInputStream(fd).use { input ->
+        // The stream owns a duplicate, never the native master (avoid double-close/fd reuse).
+        val inputFd = try { Os.dup(fd) } catch (e: ErrnoException) {
+            Log.w(TAG, "cannot duplicate master fd: ${e.errno}")
+            return
+        }
+        FileInputStream(inputFd).use { input ->
             val buf = ByteArray(READ_BUFFER)
             while (!stopped.get()) {
                 val n = try {
@@ -213,34 +257,80 @@ class EngineProcess private constructor(
      * `exec node` 的孙进程会成孤儿继续霸占端口 —— 本方案用 G2
      * （PR_SET_PDEATHSIG）从根上避免该问题。
      */
+    @Synchronized
     fun stop(graceMs: Long = 10_000L) {
-        if (stopped.getAndSet(true)) return
-
-        PtyBridge.nativeKill(pid, PtyBridge.SIGTERM)
-
-        val deadline = System.currentTimeMillis() + graceMs
-        while (System.currentTimeMillis() < deadline) {
-            if (exitStatus.isCompleted) break
-            if (PtyBridge.nativeAlive(pid) == 0) break
-            try {
-                Thread.sleep(50)
-            } catch (_: InterruptedException) {
-                break
-            }
-        }
-
-        if (PtyBridge.nativeAlive(pid) != 0) {
-            Log.w(TAG, "graceful stop timed out after ${graceMs}ms, force killing pid=$pid")
-            PtyBridge.nativeKill(pid, PtyBridge.SIGKILL)
-        }
-
-        runCatching { PtyBridge.nativeClose(masterFd) }
-        pumpThread?.join(1_000)
-        waitThread?.join(1_000)
+        stopped.set(true)
+        terminate(graceMs)
+        closeMaster()
+        joinThreads()
+        if (!actualStarted) throw EngineStartException("Root wrapper 的实际 engine PID 未被确认；不能声明 writersStopped")
+        if (!definitelyExited()) throw EngineStartException("engine pid=$pid 未证实 ESRCH；禁止修复锁")
     }
 
-    /** 是否仍在运行。 */
-    fun isAlive(): Boolean = !exitStatus.isCompleted && PtyBridge.nativeAlive(pid) != 0
+    private fun definitelyExited(): Boolean = try {
+        if (pid <= 0) throw EngineStartException("无效 engine PID")
+        Os.kill(pid, 0)
+        false
+    } catch (e: ErrnoException) {
+        if (e.errno == OsConstants.ESRCH) true
+        else if (e.errno == OsConstants.EPERM) false else throw e
+    }
+
+    private fun awaitDeath(ms: Long): Boolean {
+        val deadline = System.nanoTime() + ms.coerceIn(0L, 10_000L) * 1_000_000L
+        do {
+            if (definitelyExited()) return true
+            if (System.nanoTime() >= deadline) return false
+            Thread.sleep(25)
+        } while (true)
+    }
+
+    private fun terminate(graceMs: Long) {
+        if (definitelyExited()) return
+        PtyBridge.nativeKill(pid, PtyBridge.SIGTERM)
+        if (!awaitDeath(graceMs)) {
+            Log.w(TAG, "force killing known child pid=$pid")
+            PtyBridge.nativeKill(pid, PtyBridge.SIGKILL)
+            if (waitThread?.isAlive != true && !exitStatus.isCompleted) {
+                // waitpid can block even when SIGKILL failed (EPERM); never call it inline.
+                waitThread = Thread(::waitLoop, "kxxy-abort-reaper").apply { isDaemon = true }
+                waitThread!!.start()
+            }
+            if (!awaitDeath(2_000L)) throw EngineStartException("engine pid=$pid 停止失败（存活/EPERM/未知）；保留句柄")
+        }
+    }
+
+    private fun closeMaster() {
+        if (!masterClosed.get()) {
+            PtyBridge.nativeClose(masterFd)
+            masterClosed.set(true)
+        }
+    }
+
+    private fun joinThreads() {
+        listOfNotNull(pumpThread, waitThread).forEach { thread ->
+            if (thread === Thread.currentThread()) throw EngineStartException("不能等待自身 engine task")
+            thread.join(2_000L)
+            if (thread.isAlive) throw EngineStartException("engine task ${thread.name} 未停止")
+        }
+    }
+
+    private fun abortSpawn() {
+        stopped.set(true)
+        try {
+            if (waitThread?.isAlive != true && !exitStatus.isCompleted) {
+                waitThread = Thread(::waitLoop, "kxxy-abort-reaper").apply { isDaemon = true }
+                waitThread!!.start()
+            }
+            terminate(0L)
+        } finally {
+            closeMaster()
+            joinThreads()
+        }
+    }
+
+    /** EPERM means possibly alive, never proof of death. */
+    fun isAlive(): Boolean = !definitelyExited()
 
     /** 调整终端尺寸。 */
     fun resize(rows: Int, cols: Int) {
@@ -275,6 +365,25 @@ class EngineProcess private constructor(
         return TOKEN_RE.findAll(text).lastOrNull()?.groupValues?.get(1)
     }
 
+    /**
+     * 取日志里**最后一次**出现的 token URL，只看尾部 128 KB。
+     *
+     * 与 [extractTokenUrl] 的分工：那个按 spawn 偏移取「本次启动的第一条」，
+     * 用于把就绪判定和启动对齐；这个用于页面已经白掉之后**补救**——
+     * 此时进程可能已经重启过，或者第一条落在环形日志被裁剪的区间里，
+     * 只有「最后一条」才一定属于当前活着的那个引擎进程。
+     */
+    fun extractLastTokenUrl(): String? {
+        val text = try {
+            if (!logFile.isFile) return null
+            val all = logFile.readText()
+            if (all.length > TOKEN_TAIL_BYTES) all.substring(all.length - TOKEN_TAIL_BYTES) else all
+        } catch (e: Exception) {
+            return null
+        }
+        return TOKEN_RE.findAll(text).lastOrNull()?.groupValues?.get(1)
+    }
+
     /** 日志当前长度，用于 spawn 前记录偏移基线。 */
     fun logLength(): Long = try {
         if (logFile.isFile) logFile.length() else 0L
@@ -284,7 +393,7 @@ class EngineProcess private constructor(
 }
 
 /** 引擎启动失败。 */
-class EngineStartException(message: String) : Exception(message)
+class EngineStartException(message: String, internal val failedProcess: EngineProcess? = null) : Exception(message)
 
 /**
  * 匹配官方启动时打印的带 token URL。
@@ -292,3 +401,6 @@ class EngineStartException(message: String) : Exception(message)
  * 官方输出形如：`dsh web: http://127.0.0.1:3080/?token=<hex>`
  */
 private val TOKEN_RE = Regex("""dsh web: (http://127\.0\.0\.1:\d+/\?token=\S+)""")
+
+/** [EngineProcess.extractLastTokenUrl] 的扫描窗口。 */
+private const val TOKEN_TAIL_BYTES = 128 * 1024

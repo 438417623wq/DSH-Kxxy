@@ -370,6 +370,54 @@ int posix_spawnp(pid_t *pid, const char *file,
  * 必须原样透传，不能进 rewrite_path。
  */
 
+/* ── Android x86_64 宿主上的 ARM 兼容层（MuMu / 雷电 / 夜神等模拟器）──────────
+ *
+ * 缺陷 DC。真机症状（MuMu 模拟器，Android 12，x86_64 + houdini 翻译）：
+ *
+ *     $ node --expose-internals .../dsh/lib/bin.js web --patch ... --no-open
+ *     dlopen failed: "/apex/com.android.runtime/lib64/bionic/libc.so" is for
+ *                    EM_X86_64 (62) instead of EM_AARCH64 (183)
+ *     （两行后进程 exit 1，engine.log 里没有任何 JS 堆栈）
+ *
+ * 调用方实测是 **node 自己**（`DLOPEN-FAIL caller=.../engine/bin/node+0x224040c`），
+ * 它按 `/system/lib64/libc.so` 这个**绝对路径**取 libc 句柄。在 ARM64 真机上：
+ *
+ *     /system/lib64/libc.so -> /apex/com.android.runtime/lib64/bionic/libc.so   (ARM64)
+ *
+ * 所以一切正常；而在 x86_64 宿主上同一条软链指向**x86_64** 的 libc，
+ * 被 ARM64 进程 dlopen 就是上面那条 ELF machine 不匹配。
+ *
+ * 这些模拟器会把 ARM 兼容库单独放在 `/system/lib64/arm64/`（32 位在
+ * `/system/lib/arm/`），并且该目录里同名的就是**已经加载进本进程的那一份**
+ * （实测 `dlopen` 返回的句柄与进程自身 libc 完全一致，不会加载第二份 libc）。
+ *
+ * 因此：只有「备选 ARM 路径真实存在」时才改写。真机没有 `arm64/` 子目录，
+ * 这条分支天然不命中，行为与不装本库时逐字节一致。 */
+static int arm_compat_alternate(const char *path, char *out, size_t outlen) {
+    static const char lib64[] = "/system/lib64/";
+    static const char lib32[] = "/system/lib/";
+
+    if (path == NULL || path[0] != '/') return 0;
+
+    const char *base;
+    const char *fmt;
+    if (strncmp(path, lib64, sizeof(lib64) - 1) == 0) {
+        base = path + sizeof(lib64) - 1;
+        fmt = "/system/lib64/arm64/%s";
+    } else if (strncmp(path, lib32, sizeof(lib32) - 1) == 0) {
+        base = path + sizeof(lib32) - 1;
+        fmt = "/system/lib/arm/%s";
+    } else {
+        return 0;
+    }
+
+    /* 只处理「目录下的一层文件名」，不猜子目录。 */
+    if (base[0] == '\0' || strchr(base, '/') != NULL) return 0;
+
+    snprintf(out, outlen, fmt, base);
+    return access(out, R_OK) == 0;
+}
+
 typedef void *(*dlopen_fn)(const char *filename, int flags);
 
 void *dlopen(const char *filename, int flags) {
@@ -377,6 +425,16 @@ void *dlopen(const char *filename, int flags) {
     if (real == NULL) real = (dlopen_fn)dlsym(RTLD_NEXT, "dlopen");
 
     if (filename == NULL || real == NULL) return real(filename, flags);
+
+    /* 缺陷 DC：x86_64 宿主上 /system/lib64/<lib>.so 是 x86_64 版本，
+       ARM 进程必须换成本机兼容层那一份（存在才换）。 */
+    char arm[256];
+    if (arm_compat_alternate(filename, arm, sizeof(arm))) {
+        void *handle = real(arm, flags);
+        if (handle != NULL) return handle;
+        (void)dlerror();
+        return real(filename, flags);
+    }
 
     char *fixed = rewrite_path(filename);
     if (fixed == NULL) return real(filename, flags);

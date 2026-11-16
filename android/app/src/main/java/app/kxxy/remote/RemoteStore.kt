@@ -87,6 +87,18 @@ object RemoteStore {
         val netFingerprint: String? = null,
         /** 用户点过「以后再说」，别再拿信任提示烦他。 */
         val trustPromptSkipped: Boolean = false,
+        /**
+         * 首次遇到证书错误时记下的证书指纹（SHA-256，十六进制）。
+         *
+         * HTTPS 隧道走自签证书是常态，而 Android 默认会直接 cancel。旧做法是
+         * 「只要 host 在设备簿里就 proceed」—— 那等于一旦配对过就永久放弃
+         * 服务端身份校验：任何能劫持 DNS 的人都能冒充那台电脑。
+         *
+         * 改成 TOFU（首次信任即固定）：第一次错误时记下指纹，之后**必须**
+         * 一致才放行。换证书（真的换了隧道证书）时会连不上，用户删掉记录
+         * 重新扫码即可 —— 这个代价远小于「被中间人以后再也发现不了」。
+         */
+        val certSha256: String? = null,
     ) {
         val displayHost: String
             get() = origin.substringAfter("://")
@@ -125,6 +137,7 @@ object RemoteStore {
                 lastOkAt = o.optLong("lastOkAt", 0L),
                 netFingerprint = o.optString("netFingerprint").takeIf { it.isNotEmpty() },
                 trustPromptSkipped = o.optBoolean("trustPromptSkipped", false),
+                certSha256 = o.optString("certSha256").takeIf { it.isNotEmpty() },
             )
         }
         return out.sortedByDescending { it.lastUsedAt }
@@ -165,6 +178,9 @@ object RemoteStore {
             lastOkAt = existing?.lastOkAt ?: 0L,
             netFingerprint = existing?.netFingerprint,
             trustPromptSkipped = existing?.trustPromptSkipped ?: false,
+            // 证书指纹跟着 origin 继承：重新扫码（换了配对码）不该让已固定的
+            // 证书失效，否则每次重启连接器都要重新「首次信任」一次。
+            certSha256 = existing?.certSha256,
         )
         if (idx >= 0) list[idx] = device else list += device
         write(ctx, list)
@@ -235,6 +251,33 @@ object RemoteStore {
     /** 用户对信任提示点了「以后再说」。 */
     fun skipTrustPrompt(ctx: Context, id: String) {
         write(ctx, devices(ctx).map { if (it.id == id) it.copy(trustPromptSkipped = true) else it })
+    }
+
+    /**
+     * 固定一台设备的证书指纹（首次遇到 SSL 错误时调用）。
+     *
+     * 只写一次：已有指纹时不覆盖 —— 否则「换了一张证书」会自动变成「重新
+     * 信任一张新证书」，TOFU 就退化回了「永远放行」。
+     */
+    fun pinCertificate(ctx: Context, id: String, sha256: String) {
+        val value = sha256.trim().lowercase()
+        if (value.isEmpty()) return
+        val list = devices(ctx).map {
+            if (it.id == id && it.certSha256.isNullOrEmpty()) it.copy(certSha256 = value) else it
+        }
+        write(ctx, list)
+        Log.i(TAG, "pinned certificate for $id")
+    }
+
+    /**
+     * 清空证书固定（用户显式操作：隧道换了证书、又确认过新证书可信）。
+     *
+     * 与「删除设备」分开：删除记录是丢掉这台电脑，清指纹只是重新走一次
+     * 首次信任，设备名与信任开关都还在。
+     */
+    fun clearCertificatePin(ctx: Context, id: String) {
+        write(ctx, devices(ctx).map { if (it.id == id) it.copy(certSha256 = null) else it })
+        Log.i(TAG, "cleared certificate pin for $id")
     }
 
     /** 手动断开后进入冷却：这段时间内不自动连。 */
@@ -337,6 +380,9 @@ object RemoteStore {
                     put("trusted", d.trusted)
                     put("failStreak", d.failStreak)
                     put("lastOkAt", d.lastOkAt)
+                    // 只给「有没有固定过」，不下发指纹本身：它是安全状态，
+                    // 不是设备信息，页面没有用到它的地方。
+                    put("certPinned", !d.certSha256.isNullOrEmpty())
                 },
             )
         }
@@ -424,6 +470,10 @@ object RemoteStore {
                     put("failStreak", d.failStreak)
                     put("lastOkAt", d.lastOkAt)
                     d.netFingerprint?.let { put("netFingerprint", it) }
+                    // 这两个字段此前只在读取侧存在、写入侧漏了：
+                    // 「以后再说」重启后失效，证书指纹也存不住。
+                    put("trustPromptSkipped", d.trustPromptSkipped)
+                    d.certSha256?.let { put("certSha256", it) }
                 },
             )
         }

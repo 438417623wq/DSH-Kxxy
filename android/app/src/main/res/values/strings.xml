@@ -51,6 +51,35 @@
     <string name="boot_webview_too_old">系统 WebView 版本过低（需 Chrome 85 以上），请更新「Android System WebView」后重试。</string>
     <string name="boot_hint">首次启动需要解压约 480 MB 运行时，请保持屏幕常亮。</string>
 
+    <!-- 不依赖引擎与 WebView 的原生救援 -->
+    <string name="rescue_entry">诊断/救援</string>
+    <string name="rescue_title">原生启动救援</string>
+    <string name="rescue_busy">操作正在进行，请等待完成。可以查看日志。</string>
+    <string name="rescue_diagnosing_hint">正在只读诊断，超时会结束；可从救援菜单取消。未查明原因前不会改配置。</string>
+    <string name="rescue_logs">查看脱敏启动日志</string>
+    <string name="rescue_save_logs">保存日志</string>
+    <string name="rescue_saved_logs">日志已保存到所选位置。</string>
+    <string name="rescue_loading_logs">正在读取本地日志…</string>
+    <string name="rescue_probe">诊断启动原因</string>
+    <string name="rescue_cancel_probe">取消本轮诊断</string>
+    <string name="rescue_boot_data">修复会话权限和凭据锁</string>
+    <string name="rescue_boot_data_root">用 Root 修复会话和失效锁</string>
+    <string name="rescue_boot_data_confirm">先停止并核验旧引擎退出，修复近期日志指向的私有会话目录权限，备份并隔离已确认失效的凭据锁。会话内容和凭据会保留。异常格式的锁需要另行确认 Root，核验没有相关写入进程后再处理。是否继续？</string>
+    <string name="rescue_boot_data_root_confirm">这次 Root 用于恢复日志命中的私有会话目录属主、权限及安全标签，核验并备份隔离失效的凭据锁。异常格式的锁会先检查相关进程，确认没有写入者后再隔离。会话、凭据和插件会保留；无法完成核验时会停止。是否授权本次 Root 修复？</string>
+    <string name="rescue_permissions">修复用户数据权限</string>
+    <string name="rescue_permissions_root">用 Root 恢复应用文件属主</string>
+    <string name="rescue_permissions_confirm">停止引擎后检查凭据文件、工作区记录及必要父目录，只恢复应用自己的访问权限，不读取或修改文件内容，不删除模型配置和工作区。需要 Root 时会另行确认，是否继续？</string>
+    <string name="rescue_permissions_root_confirm">这些文件可能由之前的 Root 模式创建，普通应用无权改回属主。确认后会申请 Root，仅把凭据文件、工作区记录及必要父目录恢复给应用，并检查安全标签；不递归修改其他目录，不删除或重建数据。是否授权这次 Root 修复？</string>
+    <string name="rescue_runtime">离线修复运行时</string>
+    <string name="rescue_runtime_confirm">先停止本轮启动，再从当前 APK 重新解压运行时。无需联网；保留模型配置、会话、工作区及用户扩展。需要足够存储空间；ABI 或系统原生库不兼容不能靠重装解决。是否继续？</string>
+    <string name="rescue_advanced">高级配置修复/撤销</string>
+    <string name="rescue_webview_settings">打开系统设置更新 WebView</string>
+    <string name="rescue_stop_confirm">诊断前需要停止正在进行的安装/启动，并等待它退出；不会清除应用数据。是否继续？</string>
+    <string name="rescue_stopping">正在停止本轮启动…</string>
+    <string name="rescue_config_confirm">先停止引擎，备份后仅处理故障对应的配置。第三方启用列表可能被调整，但不会清除会话、工作区或凭据。是否继续？</string>
+    <string name="rescue_undo_confirm">停止引擎后撤销最近一次可撤销的配置修复。已有新文件时保留双方，不覆盖新改动；未恢复的备份会保留。是否继续？</string>
+    <string name="rescue_undo_failed">撤销未全部完成；冲突或失败的备份已保留，请查看日志。</string>
+
     <!-- 崩溃自愈（方案 K） -->
     <string name="boot_repair">修复启动</string>
     <string name="boot_diagnose">诊断</string>
@@ -62,8 +91,33 @@
     <string name="boot_repair_failed">修复失败：%1$s</string>
     <string name="boot_recovered">已修复，引擎恢复正常</string>
     <string name="boot_enter">进入主界面</string>
-    <string name="boot_recovered_hint">修复只改启动配置，会话、工作区与插件包都还在。个人设置（主题、模型服务等）被移走的部分可以用「撤销上次修复」原样搬回。</string>
+    <string name="boot_recovered_hint">会话、工作区与个人配置仍保留。已修改的配置有备份；运行时重装不可撤销。请查看本次实际改动。</string>
     <string name="boot_failed_hint">可以先用「诊断」查看具体是哪一层配置坏了；「修复启动」会备份后移走坏配置，不删除插件与数据。</string>
+
+    <!-- 引导页「深海悬浮」（女仆大肥鲸）文案 -->
+    <string name="boot_edition">MAID EDITION</string>
+    <string name="boot_eyebrow">AT YOUR SERVICE</string>
+    <string name="boot_maid_greeting_wait">主人，请稍等片刻。</string>
+    <string name="boot_maid_greeting_starting">主人，马上就准备好啦。</string>
+    <string name="boot_maid_greeting_ready">主人，已经准备好啦。</string>
+    <string name="boot_maid_greeting_failed">遇到一点小麻烦。</string>
+    <string name="boot_maid_greeting_recovered">修好啦，主人。</string>
+    <string name="boot_maid_sub_wait">您的专属小鲸，正在准备工作空间。</string>
+    <string name="boot_maid_sub_starting">小鲸正在唤醒引擎，请稍等片刻。</string>
+    <string name="boot_maid_sub_ready">工作空间已就绪，欢迎开始今天的创作。</string>
+    <string name="boot_maid_sub_failed">别担心，小鲸陪您一起查看原因。</string>
+    <string name="boot_maid_sub_recovered">工作空间已恢复，请确认本次改动。</string>
+    <string name="boot_maid_detail_installing">首次启动正在解压本地运行时</string>
+    <string name="boot_maid_detail_starting">运行时已准备好，正在等待本地服务就绪</string>
+    <string name="boot_maid_step_extract">解压</string>
+    <string name="boot_maid_step_launch">启动</string>
+    <string name="boot_maid_step_ready">就绪</string>
+    <string name="boot_maid_footer_wait">首次启动可能需要一点时间\n请保持应用在前台</string>
+    <string name="boot_maid_footer_starting">正在启动本地服务\n请保持应用在前台</string>
+    <string name="boot_maid_footer_ready">一切准备就绪\n即将进入主界面</string>
+    <string name="boot_maid_footer_failed">先诊断定位原因\n再选择重试或修复启动</string>
+    <string name="boot_maid_footer_recovered">修复后引擎已就绪\n配置修改有备份，运行时重装不可撤销</string>
+    <string name="boot_maid_alt">女仆装扮的蓝色大肥鲸</string>
     <string name="diag_title">启动诊断</string>
     <string name="diag_close">关闭</string>
     <string name="diag_l1">软恢复（L1）</string>

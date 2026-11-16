@@ -22,4 +22,50 @@
     <color name="kxxy_warn">#B26B00</color>
     <color name="kxxy_card_bg">#F4F6F9</color>
     <color name="kxxy_divider">#E2E6EC</color>
+
+    <!--
+      引导页「深海悬浮」（女仆大肥鲸）固定深色配色。
+
+      只给 BootstrapActivity 用：这一屏是品牌化的深海主视觉，刻意不跟随系统
+      深浅色（设计稿即恒定深色），所以只放在 values/ 里、不提供 night 姊妹值。
+      主界面与对话框继续用上面的 kxxy_* 系列，互不影响。
+    -->
+    <color name="boot_bg_core">#22344F</color>
+    <color name="boot_bg_mid">#14263F</color>
+    <color name="boot_bg_deep">#0A172A</color>
+    <color name="boot_text_primary">#EEF4FF</color>
+    <color name="boot_text_secondary">#B1BFD7</color>
+    <color name="boot_text_muted">#9CAECB</color>
+    <color name="boot_panel_bg">#192A42</color>
+    <color name="boot_panel_stroke">#34475F</color>
+    <color name="boot_eyebrow">#A2B4CF</color>
+    <color name="boot_accent">#92BCFF</color>
+    <color name="boot_accent_deep">#658BE9</color>
+    <color name="boot_value">#D0E1FF</color>
+    <color name="boot_track">#34465F</color>
+    <color name="boot_step_idle_bg">#31445F</color>
+    <color name="boot_step_idle_text">#A6B8D0</color>
+    <color name="boot_step_done_bg">#32616A</color>
+    <color name="boot_step_done_text">#C4EDE5</color>
+    <color name="boot_step_active_bg">#668BEB</color>
+    <color name="boot_btn_secondary_bg">#273B56</color>
+    <color name="boot_btn_secondary_stroke">#516883</color>
+    <color name="boot_btn_secondary_text">#EDF4FF</color>
+    <color name="boot_btn_primary_bg">#7CA1F4</color>
+    <color name="boot_btn_primary_stroke">#A1BDFA</color>
+    <color name="boot_btn_primary_text">#10213C</color>
+    <!-- 失败态把面板与数值染成警示色；成功态用 ok 绿。 -->
+    <color name="boot_danger_panel_bg">#302839</color>
+    <color name="boot_danger_panel_stroke">#715160</color>
+    <color name="boot_danger_value">#EFC0D0</color>
+    <color name="boot_danger_detail">#E0B8C7</color>
+    <color name="boot_danger_light">#EFB5C9</color>
+    <color name="boot_ok_light">#B5E2D3</color>
+    <!-- 主视觉周边：光晕 / 落地阴影 / 气泡 / 版本行 -->
+    <color name="boot_halo">#2E8AB7F8</color>
+    <color name="boot_halo_mid">#1279A4E6</color>
+    <color name="boot_ground_shadow">#45061222</color>
+    <color name="boot_bubble_stroke">#59ABCDFA</color>
+    <color name="boot_home_bar">#66A6B5CC</color>
+    <color name="boot_edition">#C0ADCF</color>
 </resources>

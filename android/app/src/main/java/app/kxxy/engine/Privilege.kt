@@ -188,6 +188,23 @@ object Privilege {
         }
     }
 
+    /** 本次权限救援明确获准后使用；不复用探测缓存，不把旧系统授权当用户确认。 */
+    internal suspend fun explicitRepairSuPrefix(): List<String>? {
+        val su = findSu() ?: return null
+        val forms = listOf(listOf("-c"), listOf("0", "/system/bin/sh", "-c"), listOf("root", "-c"))
+        for ((index, form) in forms.withIndex()) {
+            val prefix = listOf(su) + form
+            // 首次系统授权对话框留 15 秒；语法回退仍限 2 秒，总时间有界。
+            val out = runExplicitRepairSu(prefix, "cd / && [ \"$(/system/bin/id -u)\" = 0 ] && printf 'KXXY_REPAIR_ROOT_OK\\n'", if (index == 0) 15_000L else 2_000L)
+            if (out.ok && !out.truncated && out.text.lineSequence().any { it == "KXXY_REPAIR_ROOT_OK" }) return prefix
+        }
+        return null
+    }
+
+    /** 仅权限救援调用：双管道同时排空、限长、检查退出码，且整体有截止时间。 */
+    internal suspend fun runExplicitRepairSu(prefix: List<String>, command: String, timeoutMs: Long = 5_000L): RecoveryProcessRunner.Output =
+        RecoveryProcessRunner.run(ProcessBuilder(prefix + command).redirectErrorStream(true), timeoutMs, 16 * 1024)
+
     // ── Shizuku 探测 ────────────────────────────────────────────────────
 
     /**
@@ -201,27 +218,14 @@ object Privilege {
 
     // ── dsh-home 属主修复 ───────────────────────────────────────────────
 
-    /**
-     * 检测 dsh-home 是否被上次 Root 启动改成了 root 属主。
-     *
-     * 参考项目 m1.26 的引擎崩溃根因：Root 整体提权会把 dsh-home 里新建/写过的
-     * 文件变成 root 属主，之后任何非 Root 启动都会 EACCES。
-     */
-    fun dshHomeNeedsOwnershipFix(ctx: Context): Boolean {
-        if (findSu() == null) return false
-        val home = EngineConfig.dshHome(ctx)
-        if (!home.isDirectory) return false
+    /** 旧入口只检查固定目标；不能为了显示问题就隐式申请 Root。 */
+    @Deprecated("使用 UserDataPermissions.issue；本入口不探测 Root")
+    fun dshHomeNeedsOwnershipFix(ctx: Context): Boolean = UserDataPermissions.issue(ctx) != null
 
-        val uid = android.os.Process.myUid()
-        val out = runSu("find ${shellQuote(home.absolutePath)} -not -user $uid -print -quit", 3_000L)
-        return !out.isNullOrBlank()
-    }
-
-    /** 把 dsh-home 递归 chown 回 app uid。 */
+    /** 历史启动分支曾在这里递归 chown 整个 home；现在禁用，必须经过救援 UI 二次确认。 */
+    @Deprecated("禁止自动全 home chown；显式调用 UserDataPermissions.repair(ctx, allowRoot)")
     fun fixHomeOwnership(ctx: Context) {
-        val home = EngineConfig.dshHome(ctx)
-        val uid = android.os.Process.myUid()
-        runSu("chown -R $uid:$uid ${shellQuote(home.absolutePath)}", 5_000L)
+        Log.w(TAG, "自动 home 属主修复已禁用；请使用用户确认的固定目标权限救援")
     }
 
     // ── 启动前备份（Root 模式） ─────────────────────────────────────────

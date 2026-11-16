@@ -4,6 +4,9 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.util.Log
 import app.kxxy.BuildConfig
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
@@ -65,6 +68,8 @@ class RuntimeInstaller(private val ctx: Context) {
         val topLevelDirs: Set<String>,
         val linkTargets: Map<String, String>,
         val manifest: JSONObject?,
+        val unpackedBytes: Long,
+        val sizes: Map<String, Long>,
     )
 
     /**
@@ -74,8 +79,88 @@ class RuntimeInstaller(private val ctx: Context) {
      * 覆盖升级后 `@deepseek-ai` 目录只剩空壳（JS 文件未落地）但版本戳已写成功，
      * 于是「引擎存在 + 版本匹配」直接跳装，导致 MODULE_NOT_FOUND 反复重启。
      */
-    fun ensureInstalled(onProgress: Progress) {
+    fun ensureInstalled(onProgress: Progress) = synchronized(INSTALL_LOCK) {
+        recordFailure { install(onProgress, force = false) }
+    }
+
+    /** APK-only repair. The caller must stop the engine and maintenance first. */
+    fun forceReinstall(onProgress: Progress) = synchronized(INSTALL_LOCK) {
+        recordFailure { install(onProgress, force = true) }
+    }
+
+    /**
+     * 把安装异常原文落盘，供救援报告引用；成功时删除旧记录。
+     * 记录本身绝不能改变安装结果或掩盖原始异常。
+     */
+    private fun recordFailure(block: () -> Unit) {
+        try {
+            block()
+            runCatching { EngineConfig.installErrorFile(ctx).delete() }
+        } catch (e: Throwable) {
+            runCatching {
+                val file = EngineConfig.installErrorFile(ctx)
+                file.parentFile?.mkdirs()
+                val body = buildString {
+                    append("{\"at\":").append(System.currentTimeMillis())
+                    append(",\"type\":").append(JSONObject.quote(e.javaClass.name))
+                    append(",\"message\":").append(JSONObject.quote(e.message ?: ""))
+                    append(",\"stack\":").append(JSONObject.quote(e.stackTrace.take(8).joinToString("\n") { it.toString() }))
+                    append('}')
+                }
+                file.writeText(body)
+            }
+            throw e
+        }
+    }
+
+    private val pythonRuntimeRepair by lazy {
+        PythonRuntimeRepair(
+            assets = PythonRuntimeRepair.Assets { name -> ctx.assets.open(name) },
+            privateDirectory = ctx.filesDir,
+            expectedHostFingerprint = BuildConfig.HOST_PLUGIN_FINGERPRINT,
+            androidApi = android.os.Build.VERSION.SDK_INT,
+        )
+    }
+
+    private val dshRuntimeUpgrade by lazy {
+        DshRuntimeUpgrade(
+            assets = DshRuntimeUpgrade.Assets { name -> ctx.assets.open(name) },
+            privateDirectory = ctx.filesDir,
+            expectedHostFingerprint = BuildConfig.HOST_PLUGIN_FINGERPRINT,
+        )
+    }
+
+    private fun install(onProgress: Progress, force: Boolean) {
+        RuntimeInstallIo.checkCancelled()
         val root = EngineConfig.engineRoot(ctx)
+        val freshRoot = !force && dshRuntimeUpgrade.isFreshRoot(root)
+        if (!force && !freshRoot && dshRuntimeUpgrade.isConfigured() && !File(root, "bin/node").isFile) {
+            throw DshRuntimeUpgrade.Refused("已有运行时缺少 Node；停止自动重装以保留用户数据，请先导出救援报告")
+        }
+
+        // Python/host 增量修复必须早于指纹锚点及任何自动重装/包装器写入。
+        // 非基线、用户冲突或校验失败均抛错：绝不能跌入下面删除 lib 的全量路径。
+        // 全新/显式 force 安装直接使用 runtime.zip 中的同一组修复文件。
+        if (!force && File(root, "bin/node").isFile) {
+            // Python 冲突必须在 DSH 的第一次写入之前发现，不能放宽原拒绝边界。
+            pythonRuntimeRepair.preflight(root)
+            onProgress.onProgress(0.02f)
+            // 真机上这一步要替换两万多个文件、退役近四千个；必须把真实进度传出去，
+            // 否则启动页会一直停在「解压 0%」，用户只能强杀重来。
+            dshRuntimeUpgrade.restoreCurrentModes(root)
+            val upgraded = dshRuntimeUpgrade.upgrade(root) { frac ->
+                onProgress.onProgress(0.03f + frac * 0.72f)
+            }
+            if (upgraded.replaced.isNotEmpty() || upgraded.backups.isNotEmpty() || upgraded.pruned != 0) {
+                Log.i(TAG, "DSH offline upgrade: ${upgraded.replaced.size} files replaced, ${upgraded.backups.size} retired files backed up, ${upgraded.pruned} empty director(y/ies) pruned")
+            }
+            onProgress.onProgress(0.76f)
+            val repaired = pythonRuntimeRepair.repair(root)
+            if (repaired.replaced.isNotEmpty()) {
+                Log.i(TAG, "python offline repair: ${repaired.replaced.size} managed file(s) atomically replaced")
+            }
+            onProgress.onProgress(0.80f)
+        }
 
         // 锚点 15 的**安装前自愈**，必须早于 isComplete()。
         //
@@ -86,127 +171,107 @@ class RuntimeInstaller(private val ctx: Context) {
         // 两者都是 corepack 官方文档里的命令，用户敲一次就整包重装 741 MiB 显然
         // 不对 —— 这些状态全都能就地修好。`bin/node` 在说明 runtime 已装过，
         // 此时才动；全新安装由 extract 从 zip 里取，不需要这里插手。
-        if (File(root, "bin/node").isFile) healPackagingWrappers(root)
+        if (!force && File(root, "bin/node").isFile) healPackagingWrappers(root)
 
-        if (isComplete(root)) {
-            Log.i(TAG, "runtime already installed and complete")
-            onProgress.onProgress(1f)
-            // 缺陷 DD：老设备上 1618 条别名全是复制出来的实体，`bin/java`
-            // 找不到 `libjli.so`、`bin/mvn` 推出错的 `MAVEN_HOME`。这一步把
-            // 它们按安装期落下的清单改回符号链接；新装的设备上跑一遍全是
-            // 「已是软链」的 no-op。放在最前面，后续步骤都在正确的形态上干活。
+        val pendingInstall = File(root, INCOMPLETE_MARKER)
+        if (!force && !freshRoot && Files.exists(pendingInstall.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            check(Files.isRegularFile(pendingInstall.toPath(), LinkOption.NOFOLLOW_LINKS)) { "拒绝非常规安装标记" }
+            if (isComplete(root, checkMarker = false)) {
+                writeStamp()
+                if (!pendingInstall.delete()) {
+                    EngineConfig.stampFile(ctx).delete()
+                    error("Cannot clear verified runtime incomplete marker")
+                }
+            }
+        }
+
+        // 新装仅有原生元数据，尚无内容可验；解包后的完整性检查仍必须通过。
+        if (!force && !freshRoot && isComplete(root)) {
+            // Only core executable/link repairs belong on the startup critical path.
+            // TeX, extension pool, font/dev defaults run separately after Healthy.
             healCopiedAliases(root)
-            // 可执行位规则会随版本演进，而它**不是**锚点能表达的资产变更：
-            // 文件全都在、标记也匹配，只是某几个文件的 mode 不够。所以这条
-            // 修复单独走「每次启动都跑一次」的幂等路径（缺陷 AW）。
             ensureJvmExecBits(root)
-            // SONAME 别名表会随版本增删（缺陷 BJ 新增了 `libc++.so` /
-            // `libc++abi.so`），而它**不是**锚点能表达的资产变更：runtime.zip
-            // 没变、标记也没变，只是别名表多了一项。所以和 ensureJvmExecBits
-            // 一样走「每次启动都跑一次」的幂等路径 —— 已存在的别名会因
-            // `length() > 0` 被跳过，开销就是几次 stat。
             materialiseSonameAliases(root)
-            // texlinks 必须先于 ensureTexFormats —— 前者把 `bin/pdflatex` 这类
-            // 标准名建出来，而格式生成虽然直接用 `bin/pdftex`/`bin/luahbtex`
-            // 这类引擎本名（不依赖别名），但用户敲的是标准名，两个都到位才完整。
-            ensureTexLinks(root)
-            ensureTexFormats(root)
-            ensureNoShadowingStubs(root)
-            ensureEmacsSiteLoad(root)
-            // 缺陷 CU：guile 的 `.go` 与 `.scm` 的 mtime 先后决定 gdb 是否卡死。
-            // 扩展解包会把 `.scm` 的 mtime 抬到「现在」，而 pool 里的 `.go`
-            // 是打包时刻（poolextract 统一写 mtime=0）—— 于是每次启动 guile
-            // 都认为缓存过期、在内存里重编 boot-9.scm（分钟级），表现为
-            // `gdb --version` 无输出、被 SIGKILL。必须每次启动都校一次。
-            ensureGuileCcacheFresh(root)
-            // 缺陷 CV：fontconfig 的 `<dir>` 不含 kxxy-host/fonts，中文 PDF 的
-            // 字体永远找不到。这里落一份自建配置并用 FONTCONFIG_FILE 指过去
-            // （不能改 etc/fonts/fonts.conf —— 那是扩展池的软链，重装即覆盖）。
-            ensureFontConfig(root)
-            // 缺陷 ED/EE/EF：IM 的 type 列表、git 身份、pip 镜像 —— 都是「装完就该好」
-            // 的默认值，每次启动校一次，扩展重装/首次开机都能自愈。
-            ensureDevEnvDefaults(root)
-            // 缺陷 CW：TeX 的 `web2c/mktex*` 缺可执行位（extract 用
-            // FileOutputStream 写出，忽略 zip 条目的 unix mode），于是
-            // `mktextfm: 1: .../mktexnam: Permission denied`。
-            ensureTexExecBits(root)
-            // exec 重写器每次启动都从 APK 覆盖一次（缺陷 CF）。APK 升级后
-            // nativeLibraryDir 会换，而 LD_PRELOAD 里写的是 <root>/lib 下的
-            // 稳定路径，必须保证那份是**当前这个 APK 编译出来的**版本 ——
-            // 否则重写逻辑改动不会生效，还会出现「半新半旧」的诡异行为。
             installExecShim(root)
             ensureDshWrapper(root)
-            // 旧设备盘上 26 个别名脚本的 shebang 还是字面量 @DSH_ROOT@
-            // （缺陷 CE 的历史残留），靠这一趟自愈，不必重装 runtime。
             repairPlaceholderScripts(root)
-            // resolv.conf 随网络变化，必须每次启动重算（缺陷 CJ）。
             ensureResolvConf(root)
-            ensureExtensionPool(root)
-            ensureTmpDir(ctx)
-            // texlive 与 perl 扩展都是**按需安装**的：全新设备上安装期这一趟
-            // 跑得比扩展解包早，`bin/xetex` 还不存在，于是 ensureTexFormats
-            // 打一句「pdftex/xetex/luahbtex 全缺，跳过格式生成」就放弃了 ——
-            // 而它只在安装期跑过一次，之后用户装了 texlive 也没人来补。
-            // 真机症状：`xelatex --version` 正常，但一编译就
-            // `I can't find the format file 'xelatex.fmt'!`，pandoc 全链路失败
-            // （缺陷 CX 的下游 —— 上游是 perl 的 @INC 指到 Termux 死路径，
-            // 见 EngineConfig.buildEnv 里的 PERL5LIB）。
-            //
-            // **顺序**：texlinks 先、formats 后。texlinks 建出 `bin/xelatex`
-            // 这类标准名，formats 用引擎本名（xetex）生成 `.fmt`，用户敲的
-            // 是标准名，两个都到位才完整。
-            //
-            // 两趟都幂等（四个标准名齐了只剩 4 次 exists()，三个 `.fmt`
-            // 齐了只剩 3 次 stat），所以放进每次启动的路径是安全的；
-            // `.fmt` 的判据含文件大小，生成到一半被杀也会重来。
-            ensureTexLinks(root)
-            ensureTexFormats(root)
+            // 这两步必须留在「启动前」的同步路径，不能只挂在 maintainAfterHealthy()：
+            // 桩库遮蔽会直接让加载 libz/libunwindstack 的进程报
+            // `cannot locate symbol`，而维护阶段只在引擎 Healthy 之后才跑 ——
+            // 老设备一旦因此启动失败，修复就永远不会执行（缺陷 DD/BA 原始语义）。
+            // 两者都是 5 次 stat 加一次小文件写入，留在关键路径上的开销可忽略。
+            ensureNoShadowingStubs(root)
+            ensureEmacsSiteLoad(root)
+            onProgress.onProgress(1f)
             return
         }
 
-        Log.i(TAG, "installing runtime into ${root.absolutePath}")
-        root.mkdirs()
-
-        val index = readZipIndex()
-
-        // 精确顶层替换：只删 zip 里出现过的顶层目录，绝不动 extensions/
-        // （参考项目 v1.2.21 事故：root.deleteRecursively() 把用户下载的扩展全删了）
-        for (top in index.topLevelDirs) {
-            val target = File(root, top)
-            if (target.exists()) deleteTreeSafely(target)
+        // 带增量合同的存量设备绝不因其它锚点失效而删除整个 lib/bin。
+        // 全新空目录仍正常安装；显式 forceReinstall 的原有恢复语义不变。
+        if (!force && !freshRoot && dshRuntimeUpgrade.isConfigured()) {
+            throw DshRuntimeUpgrade.Refused("增量升级后的其它运行时锚点尚未就绪；保留现有 Python、npm 和扩展，请导出救援报告")
         }
+        Log.i(TAG, "installing runtime into ${root.absolutePath}")
+        // Preflight must finish before invalidating the marker or deleting old assets.
+        val index = readZipIndex { frac -> onProgress.onProgress(frac * 0.08f) }
+        preflightSpace(index.unpackedBytes, 0L)
+        RuntimeInstallIo.checkCancelled()
+        if (freshRoot) {
+            check(dshRuntimeUpgrade.isFreshRoot(root)) { "首次安装前目录已变化；停止安装以保留数据" }
+            check(index.topLevelDirs.none { it in setOf("shz", "tapi", "kxxy-state.json", "install-error.json", "native-boot-failure.json") }) {
+                "APK 运行时不能覆盖原生启动元数据"
+            }
+        }
+        root.mkdirs()
+        val incomplete = File(root, INCOMPLETE_MARKER)
+        incomplete.writeText("installing ${System.currentTimeMillis()}")
+        EngineConfig.stampFile(ctx).delete()
+        try {
 
-        extract(root, index.linkTargets, onProgress)
-        // ⚠️ 顺序曾是**语义要求**，缺陷 DD 改成软链后它退化成「无害但保留」。
-        //
-        // 历史上这里是「先物化链接、再改写占位符」，而物化用的是 `copyTo`：
-        // 复制的是当时盘上的本体，此刻本体 shebang 还是字面量
-        // `#!@DSH_ROOT@/bin/python3.14`；等 `rewriteRootPlaceholder` 跑起来，
-        // 它改的是**本体**，别名那份副本已经固化在盘上了。真机症状：
-        //   · `bin/pip`（本体）正常；
-        //   · `bin/pip3`（别名副本）首行是 `#!@DSH_ROOT@/bin/python3.14`。
-        //
-        // 改成软链后别名不再持有字节，占位符改写对本体的效果天然传导到别名，
-        // 先后顺序不再影响正确性。仍然保持「先改写、后建链」，一是因为语义更
-        // 直观，二是 [materialiseLinks] 的 `realFile.isFile` 检查要求本体已落地。
-        rewriteRootPlaceholder(root, index.manifest)
-        materialiseLinks(root, index.linkTargets)
-        materialiseSonameAliases(root)
-        installExecShim(root)
-        ensureDshWrapper(root)
-        ensureResolvConf(root)
-        restoreExecBits(root)
-        ensureJvmExecBits(root)
-        ensureTexLinks(root)
-        ensureTexFormats(root)
-        ensureNoShadowingStubs(root)
-        ensureEmacsSiteLoad(root)
-        ensureGuileCcacheFresh(root)
-        ensureFontConfig(root)
-        ensureDevEnvDefaults(root)
-        ensureTexExecBits(root)
-        ensureTmpDir(ctx)
-        writeStamp(root)
+            // 精确顶层替换：只删 zip 里出现过的顶层目录，绝不动 extensions/
+            // （参考项目 v1.2.21 事故：root.deleteRecursively() 把用户下载的扩展全删了）
+            for (top in index.topLevelDirs) {
+                RuntimeInstallIo.checkCancelled()
+                val target = File(root, top)
+                if (Files.exists(target.toPath(), LinkOption.NOFOLLOW_LINKS)) deleteTreeSafely(target)
+            }
+
+            extract(root, index, onProgress)
+            // ⚠️ 顺序曾是**语义要求**，缺陷 DD 改成软链后它退化成「无害但保留」。
+            //
+            // 历史上这里是「先物化链接、再改写占位符」，而物化用的是 `copyTo`：
+            // 复制的是当时盘上的本体，此刻本体 shebang 还是字面量
+            // `#!@DSH_ROOT@/bin/python3.14`；等 `rewriteRootPlaceholder` 跑起来，
+            // 它改的是**本体**，别名那份副本已经固化在盘上了。真机症状：
+            //   · `bin/pip`（本体）正常；
+            //   · `bin/pip3`（别名副本）首行是 `#!@DSH_ROOT@/bin/python3.14`。
+            //
+            // 改成软链后别名不再持有字节，占位符改写对本体的效果天然传导到别名，
+            // 先后顺序不再影响正确性。仍然保持「先改写、后建链」，一是因为语义更
+            // 直观，二是 [materialiseLinks] 的 `realFile.isFile` 检查要求本体已落地。
+            rewriteRootPlaceholder(root, index.manifest)
+            materialiseLinks(root, index.linkTargets)
+            materialiseSonameAliases(root)
+            installExecShim(root)
+            ensureDshWrapper(root)
+            ensureResolvConf(root)
+            restoreExecBits(root)
+            ensureJvmExecBits(root)
+            check(dshRuntimeUpgrade.restoreCurrentModes(root)) { "APK DSH 目标内容不匹配；停止安装" }
+            RuntimeInstallIo.checkCancelled()
+            check(isComplete(root, checkMarker = false)) { "APK runtime verification failed; offline repair can be retried" }
+            writeStamp()
+            check(incomplete.delete()) { "Cannot clear runtime incomplete marker" }
+        } catch (e: Exception) {
+            EngineConfig.stampFile(ctx).delete()
+            Log.e(TAG, "runtime installation incomplete", e)
+            throw e
+        } catch (e: LinkageError) {
+            EngineConfig.stampFile(ctx).delete()
+            Log.e(TAG, "runtime installation linkage failure", e)
+            throw e
+        }
         // bin/ 与 lib/ 被整体替换，扩展中心装进 engine/{bin,lib} 的链接/副本
         // 全部丢失。extensions/ 在扩展侧留有 .links.json，这里立一个标记，
         // kxxy-host 插件启动时据此重建（五项改进方案 §2.4「升级后的自愈」）。
@@ -218,14 +283,7 @@ class RuntimeInstaller(private val ctx: Context) {
 
         Log.i(TAG, "runtime install complete")
         onProgress.onProgress(1f)
-        ensureExtensionPool(root)
 
-        // 上面 :106/:107 那两趟是在扩展尚未解包时跑的（全新安装时 `extensions/`
-        // 还是空的，`texlinks` 与各引擎都不在），必然静默跳过。包池落盘后如果
-        // 扩展已经就位（升级/重装场景），这里补跑一次就能立刻可用，不必等下一次
-        // 启动走快路径。两个函数都是幂等的，且引擎缺失时开销接近零。
-        ensureTexLinks(root)
-        ensureTexFormats(root)
     }
 
     /**
@@ -238,6 +296,27 @@ class RuntimeInstaller(private val ctx: Context) {
      * 全程 runCatching：包池缺失（旧 APK / 未跑 fetch-extensions）不是致命错误，
      * 扩展中心会把对应条目标成「不可用」而不是崩掉引擎。
      */
+    suspend fun maintainAfterHealthy() {
+        withTimeout(5 * 60_000L) {
+            runInterruptible(Dispatchers.IO) {
+                synchronized(INSTALL_LOCK) {
+                    val root = EngineConfig.engineRoot(ctx)
+                    val steps: List<() -> Unit> = listOf(
+                        { ensureExtensionPool(root) }, { ensureTmpDir(ctx) },
+                        { ensureNoShadowingStubs(root) }, { ensureEmacsSiteLoad(root) },
+                        { ensureGuileCcacheFresh(root) }, { ensureFontConfig(root) },
+                        { ensureDevEnvDefaults(root) }, { ensureTexExecBits(root) },
+                        { ensureTexLinks(root) }, { ensureTexFormats(root) },
+                    )
+                    for (step in steps) {
+                        RuntimeInstallIo.checkCancelled()
+                        step()
+                    }
+                }
+            }
+        }
+    }
+
     private fun ensureExtensionPool(root: File) {
         runCatching {
             val names = ctx.assets.list(POOL_ASSET_DIR) ?: return
@@ -246,6 +325,7 @@ class RuntimeInstaller(private val ctx: Context) {
             poolDir.mkdirs()
             var copied = 0
             for (name in names) {
+                RuntimeInstallIo.checkCancelled()
                 val dest = File(poolDir, name)
                 val assetSize = try {
                     ctx.assets.openFd("$POOL_ASSET_DIR/$name").use { it.length }
@@ -260,7 +340,7 @@ class RuntimeInstaller(private val ctx: Context) {
                 if (dest.isFile && assetSize >= 0 && dest.length() == assetSize) continue
                 ctx.assets.open("$POOL_ASSET_DIR/$name").use { input ->
                     val tmp = File(poolDir, "$name.part")
-                    FileOutputStream(tmp).use { out -> input.copyTo(out) }
+                    FileOutputStream(tmp).use { out -> RuntimeInstallIo.copy(input, out) }
                     if (dest.exists()) dest.delete()
                     if (!tmp.renameTo(dest)) {
                         tmp.copyTo(dest, overwrite = true)
@@ -278,8 +358,21 @@ class RuntimeInstaller(private val ctx: Context) {
      *
      * 任一锚点缺失即认为需要重装。刻意不只看版本戳 —— 见方法注释上方的 m1.13 事故。
      */
-    private fun isComplete(root: File): Boolean {
+    private fun isComplete(root: File, checkMarker: Boolean = true): Boolean {
+        RuntimeInstallIo.checkCancelled()
+        if (checkMarker && File(root, INCOMPLETE_MARKER).exists()) return false
         if (!root.isDirectory) return false
+
+        // 内容锚点而非磁盘 revision 标记：backend 与全部 cffi/pycparser 文件逐个验摘要。
+        // 旧 APK 无修复 meta 时放行；新装直接验 runtime.zip 已携带的文件，不要求补丁日志。
+        // 用异常（而非 false）阻止检查期间变化/不完整 Python 触发破坏用户 lib 的重装。
+        check(pythonRuntimeRepair.isCurrent(root)) {
+            "Python 离线修复内容尚未就绪；停止自动重装以保留用户 site-packages/venv/extensions，请重试"
+        }
+
+        check(dshRuntimeUpgrade.isCurrent(root)) {
+            "DSH 增量内容尚未就绪；停止自动重装以保留用户数据，请重试"
+        }
 
         // 锚点 1：引擎入口存在
         if (!EngineConfig.dshEntry(ctx).isFile) return false
@@ -294,7 +387,7 @@ class RuntimeInstaller(private val ctx: Context) {
         // 锚点 4：@deepseek-ai 下文件数达到下限（防「只剩空壳」）
         val dshAi = File(root, "lib/node_modules/@deepseek-ai")
         if (!dshAi.isDirectory) return false
-        val count = dshAi.walkTopDown().count { it.isFile }
+        val count = dshAi.walkTopDown().count { RuntimeInstallIo.checkCancelled(); it.isFile }
         if (count < MIN_DSH_AI_FILES) {
             Log.w(TAG, "runtime probe: @deepseek-ai has only $count files (need >= $MIN_DSH_AI_FILES)")
             return false
@@ -370,29 +463,8 @@ class RuntimeInstaller(private val ctx: Context) {
             return false
         }
 
-        // 锚点 9：office 预览链（LibreOffice wasm 引擎 + 单文件 CJK 字体）。
-        //
-        // 这两份都是「新增资产」：老设备升级 APK 时 runtime 版本戳不变，前面
-        // 的锚点全通过 ⇒ isComplete() 判真 ⇒ 新资产永远不落地。真机踩过：手工
-        // push 的 wasm 包与字体在下次自愈重装后被整体删除，Office 预览回到
-        // 「Office 预览不可用」。
-        //
-        // 只判标记文件不够，还要判 wasm 主体在位 —— 标记文件很小、写入成功
-        // 而 122 MiB 的 soffice.wasm 被中途截断是完全可能的（存储不足）。
-        if (!markerIsCurrent(root, OFFICE_LAYER_MARKER_FILE, OFFICE_LAYER_MARKER)) {
-            Log.w(TAG, "runtime probe: office assets outdated, forcing reinstall")
-            return false
-        }
-        if (!File(root, OFFICE_WASM_ENGINE).isFile) {
-            Log.w(TAG, "runtime probe: libreoffice wasm engine missing, forcing reinstall")
-            return false
-        }
-        for (font in OFFICE_FONT_FILES) {
-            if (!File(root, font).isFile) {
-                Log.w(TAG, "runtime probe: office font $font missing, forcing reinstall")
-                return false
-            }
-        }
+        // 锚点 9：按 kit 精确版本核验完整 Office 资源合同；不在启动时读取大文件。
+        if (!officeAssetsAreCurrent(root)) return false
 
         // 锚点 10：移动端 UI 插件（dsh-web-mobile）在位。
         //
@@ -407,6 +479,11 @@ class RuntimeInstaller(private val ctx: Context) {
         }
         if (!markerIsCurrent(root, MOBILE_PLUGIN_MARKER_FILE, MOBILE_PLUGIN_MARKER)) {
             Log.w(TAG, "runtime probe: dsh-web-mobile plugin outdated, forcing reinstall")
+            return false
+        }
+
+        if (!codexPluginIsCurrent(root)) {
+            Log.w(TAG, "runtime probe: Codex plugin assets outdated, forcing reinstall")
             return false
         }
 
@@ -476,6 +553,7 @@ class RuntimeInstaller(private val ctx: Context) {
             return false
         }
         for (rel in TEXLIVE_CORE_FILES) {
+            RuntimeInstallIo.checkCancelled()
             val f = File(root, rel)
             if (!f.isFile || f.length() == 0L) {
                 Log.w(TAG, "runtime probe: texlive core file missing/empty: $rel")
@@ -523,6 +601,7 @@ class RuntimeInstaller(private val ctx: Context) {
             return false
         }
         for (rel in PACKAGING_WRAPPERS) {
+            RuntimeInstallIo.checkCancelled()
             val f = File(root, rel)
             if (!f.isFile || f.length() == 0L) {
                 Log.w(TAG, "runtime probe: packaging wrapper missing: $rel")
@@ -579,6 +658,132 @@ class RuntimeInstaller(private val ctx: Context) {
         }
 
         return true
+    }
+
+    /**
+     * Office 轻量探针：清单原文和所有资源长度均绑定精确版本，源码/许可证不可省略。
+     * 大资源只 stat，仅读取小 JSON、8 字节 WASM 头和字体头；内容全哈希在构建期完成。
+     */
+    private fun officeAssetsAreCurrent(root: File): Boolean {
+        return try {
+            RuntimeInstallIo.checkCancelled()
+            require(root.isAbsolute && root.path.split('/', '\\').none { it == "." || it == ".." }) {
+                "Office 运行时根必须是合法绝对目录"
+            }
+            val rootAttributes = Files.readAttributes(
+                root.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS,
+            )
+            require(rootAttributes.isDirectory && !rootAttributes.isSymbolicLink && !rootAttributes.isOther) {
+                "Office 运行时根不是普通目录"
+            }
+            // Windows junction 不属于 isSymbolicLink，且 canonicalFile 不解析它；统一使用真实路径。
+            val base = root.toPath().toRealPath().toFile()
+            val pathPattern = Regex("[A-Za-z0-9@._/-]+")
+            fun checkedPath(path: String): File {
+                require(pathPattern.matches(path) && path.split('/').none { it.isEmpty() || it == "." || it == ".." }) {
+                    "Office 资源路径非法：$path"
+                }
+                return File(base, path)
+            }
+            fun asset(path: String): File {
+                RuntimeInstallIo.checkCancelled()
+                val file = checkedPath(path)
+                require(Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS) && file.toPath().toRealPath() == file.toPath()) {
+                    "Office 资源不是根内原位普通文件：$path"
+                }
+                return file
+            }
+            fun prefix(file: File, count: Int): ByteArray {
+                val bytes = ByteArray(count)
+                FileInputStream(file).use { input ->
+                    var offset = 0
+                    while (offset < bytes.size) {
+                        RuntimeInstallIo.checkCancelled()
+                        val n = input.read(bytes, offset, bytes.size - offset)
+                        require(n > 0) { "Office 读取被截断：${file.name}" }
+                        offset += n
+                    }
+                }
+                return bytes
+            }
+            fun small(path: String, limit: Int = 64 * 1024): ByteArray {
+                val file = asset(path)
+                val length = file.length()
+                require(length > 0 && length <= limit) { "Office 小文件长度非法：$path" }
+                return prefix(file, length.toInt())
+            }
+            fun digest(bytes: ByteArray): String = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(bytes).joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+
+            for (shadow in OFFICE_SHADOW_PATHS) {
+                RuntimeInstallIo.checkCancelled()
+                require(!Files.exists(checkedPath(shadow).toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                    "Office 包路径被嵌套包遮蔽：$shadow"
+                }
+            }
+            val kit = JSONObject(small("${OFFICE_KIT_ROOT}package.json").toString(Charsets.UTF_8))
+            val version = kit.opt("version") as? String
+            val release = OFFICE_RELEASES[version] ?: error("Office kit 版本不受支持：$version")
+            require(kit.opt("name") == "@deepseek-ai/libreoffice-kit" &&
+                kit.getJSONObject("optionalDependencies").opt("@deepseek-ai/libreoffice-kit-wasm") == version) {
+                "Office kit 名称或 wasm 精确依赖不匹配"
+            }
+            val kitExports = kit.getJSONObject("exports")
+            val kitEntry = kitExports.getJSONObject(".")
+            require(kit.opt("type") == "module" && kit.opt("main") == "lib/index.js" &&
+                kitExports.opt("./package.json") == "./package.json" &&
+                kitEntry.keys().asSequence().toSet() == setOf("default", "types") &&
+                kitEntry.opt("default") == "./lib/index.js" && kitEntry.opt("types") == "./lib/types/index.d.ts") {
+                "Office kit 包入口路径不匹配"
+            }
+            require(asset("${OFFICE_KIT_ROOT}lib/index.js").length() in 1L..1024L * 1024) { "Office kit 入口长度非法" }
+            val pkg = JSONObject(small("${OFFICE_WASM_ROOT}package.json").toString(Charsets.UTF_8))
+            val exports = pkg.getJSONObject("exports")
+            require(pkg.opt("name") == "@deepseek-ai/libreoffice-kit-wasm" && pkg.opt("version") == version &&
+                exports.opt("./package.json") == "./package.json" && exports.opt("./prebuilds.json") == "./prebuilds.json") {
+                "Office wasm 包名称、版本或导出路径不匹配"
+            }
+            val manifestBytes = small("${OFFICE_WASM_ROOT}prebuilds.json")
+            require(digest(manifestBytes) == release.first) { "Office manifest 不是该版本完整官方清单" }
+            // 原文摘要已覆盖 schema、engine 四项、source 与 licenses，遍历完整 files 而非仅 wasm 主体。
+            val manifest = JSONObject(manifestBytes.toString(Charsets.UTF_8))
+            val files = manifest.getJSONObject("files")
+            val paths = files.keys().asSequence().toList().sorted()
+            val sizes = buildString {
+                for (path in paths) {
+                    checkedPath(path)
+                    val length = asset(OFFICE_WASM_ROOT + path).length()
+                    require(length > 0) { "Office 资源为空：$path" }
+                    append(path).append(':').append(length).append('\n')
+                }
+            }
+            require(digest(sizes.toByteArray(Charsets.UTF_8)) == release.second) { "Office 完整资源长度指纹不匹配" }
+            val wasm = manifest.getJSONObject("engine").getString("wasm")
+            require(prefix(asset(OFFICE_WASM_ROOT + wasm), 8).contentEquals(byteArrayOf(0, 97, 115, 109, 1, 0, 0, 0))) {
+                "Office WASM 文件头非法"
+            }
+            require(small(OFFICE_LAYER_MARKER_FILE, 256).toString(Charsets.UTF_8).trim() == OFFICE_LAYER_MARKER) {
+                "Office 资产标记过期或非法"
+            }
+            for ((path, length) in OFFICE_FONT_FILES) {
+                val file = asset(path)
+                require(file.length() == length) { "Office 字体缺失或被截断：$path" }
+                val head = prefix(file, 4)
+                require(head.contentEquals(byteArrayOf(0, 1, 0, 0)) ||
+                    head.contentEquals("true".toByteArray(Charsets.US_ASCII)) ||
+                    head.contentEquals("OTTO".toByteArray(Charsets.US_ASCII))) { "Office 字体不是单文件 sfnt：$path" }
+            }
+            true
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw e
+        } catch (e: java.util.concurrent.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            RuntimeInstallIo.checkCancelled()
+            Log.w(TAG, "Office 资产合同校验失败：${e.message}")
+            false
+        }
     }
 
     /**
@@ -677,6 +882,36 @@ class RuntimeInstaller(private val ctx: Context) {
         return true
     }
 
+    /** Codex is optional, but an APK declaring it must carry the matching client and host assets. */
+    private fun codexPluginIsCurrent(root: File): Boolean {
+        val metadata = runCatching {
+            ctx.assets.open("meta/build.json").use { JSONObject(it.readBytes().decodeToString()) }
+        }.getOrNull() ?: return true
+        val expected = metadata.optString("codexPluginFingerprint", "")
+        if (expected.isBlank()) return true
+        val plugin = File(root, "lib/node_modules/dsh-codex-sidebar")
+        val actual = runCatching { File(plugin, "plugin.fingerprint").readText().trim() }.getOrNull()
+        if (actual != expected) return false
+        for (path in listOf("package.json", "cordis.patch.yml", "lib/index.js", "lib/client.js", "lib/transport.mjs", "lib/security.mjs", "lib/service.mjs", "lib/custom-models.mjs", "lib/custom-chat.mjs", "lib/native-models.mjs", "lib/provider-api.mjs", "lib/provider-config.mjs", "lib/provider-http.mjs", "lib/provider-protocols.mjs", "lib/responses-bridge.mjs", "lib/responses-bridge-codec.mjs", "lib/workspace-tools.mjs", "lib/access-policy.mjs", "lib/file-changes.mjs", "lib/thread-actions.mjs", "web/codex.css")) {
+            if (!File(plugin, path).isFile) return false
+        }
+        if (metadata.optBoolean("codexRuntimeIncluded", false)) {
+            val appExecution = metadata.optString("codexRuntimeExecutionMode", "") == "app-process"
+            if (appExecution) {
+                if (!metadata.optBoolean("codexRuntimeAppServerVerified", false)) return false
+                val nativeManifest = runCatching { JSONObject(File(root, "lib/codex/runtime.json").readText()) }.getOrNull() ?: return false
+                if (nativeManifest.optString("executionMode") != "app-process" || !nativeManifest.optBoolean("appServerVerified", false) || nativeManifest.optBoolean("sandboxVerified", true)) return false
+                if (nativeManifest.optString("version") != metadata.optString("codexRuntimeVersion")) return false
+            }
+            for (name in if (appExecution) listOf("codex") else listOf("codex", "bwrap")) {
+                val binary = File(root, "bin/$name")
+                if (!binary.isFile || binary.length() == 0L) return false
+                if (!binary.canExecute() && !binary.setExecutable(true, true)) return false
+            }
+        }
+        return true
+    }
+
     /**
      * 软链形态的包装器是否指向 corepack 的 `dist/`。
      *
@@ -710,28 +945,57 @@ class RuntimeInstaller(private val ctx: Context) {
      *   ② LINK 目标表（别名阶段用）
      *   ③ manifest（占位符清单用）
      */
-    private fun readZipIndex(): ZipIndex {
+    private fun readZipIndex(onProgress: (Float) -> Unit = { }): ZipIndex {
         val tmp = File(ctx.cacheDir, "runtime-probe.zip")
+        val meta = ctx.assets.open("meta/build.json").use { JSONObject(it.readBytes().decodeToString()) }
+        val zipBytes = meta.optLong("runtimeSize", -1L)
+        val unpackedBytes = meta.optLong("runtimeUncompressedBytes", -1L)
+        require(zipBytes > 0 && unpackedBytes > 0) { "APK 缺少运行时大小元数据，无法安全预检重装空间" }
+        preflightSpace(unpackedBytes, zipBytes)
         try {
+            // 近 1 GB 的资产拷贝在真机上要几十秒；不报进度就会和「卡死」无法区分。
             ctx.assets.open(RUNTIME_ASSET).use { input ->
-                FileOutputStream(tmp).use { out -> input.copyTo(out) }
+                FileOutputStream(tmp).use { out ->
+                    val buffer = ByteArray(1 shl 20)
+                    var copied = 0L
+                    var lastPct = -1
+                    while (true) {
+                        RuntimeInstallIo.checkCancelled()
+                        val n = input.read(buffer)
+                        if (n < 0) break
+                        out.write(buffer, 0, n)
+                        copied += n
+                        val pct = ((copied * 100) / zipBytes.coerceAtLeast(1L)).toInt().coerceIn(0, 100)
+                        if (pct != lastPct) { lastPct = pct; onProgress(0.8f * pct / 100f) }
+                    }
+                    out.flush()
+                }
             }
+            check(tmp.length() == zipBytes) { "APK runtime ZIP size differs from meta/build.json" }
 
             val top = LinkedHashSet<String>()
             val links = HashMap<String, String>()
+            val sizes = LinkedHashMap<String, Long>()
+            var totalBytes = 0L
             var manifest: JSONObject? = null
 
             ZipFile(tmp).use { zf ->
                 val entries = zf.entries()
                 while (entries.hasMoreElements()) {
+                    RuntimeInstallIo.checkCancelled()
                     val e = entries.nextElement()
                     val name = e.name
-                    if (name.isEmpty()) continue
+                    RuntimeInstallIo.validateEntry(name)
+                    require(e.size >= 0 && !sizes.containsKey(name)) { "Invalid or duplicate runtime entry: $name" }
+                    sizes[name] = e.size
+                    totalBytes = Math.addExact(totalBytes, e.size)
                     top.add(name.substringBefore('/'))
 
                     val comment = e.comment
                     if (comment != null && comment.startsWith(LINK_PREFIX)) {
-                        links[name] = comment.substring(LINK_PREFIX.length)
+                        val target = comment.substring(LINK_PREFIX.length)
+                        RuntimeInstallIo.validateEntry(target)
+                        links[name] = target
                     }
                     if (name == MANIFEST_NAME) {
                         manifest = runCatching {
@@ -741,8 +1005,10 @@ class RuntimeInstaller(private val ctx: Context) {
                 }
             }
 
-            Log.i(TAG, "zip index: ${top.size} top dirs, ${links.size} links, manifest=${manifest != null}")
-            return ZipIndex(top, links, manifest)
+            check(manifest != null) { "APK runtime manifest is missing or invalid" }
+            preflightSpace(maxOf(totalBytes, unpackedBytes), 0L)
+            Log.i(TAG, "zip index: ${top.size} top dirs, ${links.size} links, bytes=$totalBytes")
+            return ZipIndex(top, links, manifest, maxOf(totalBytes, unpackedBytes), sizes)
         } finally {
             tmp.delete()
         }
@@ -754,8 +1020,17 @@ class RuntimeInstaller(private val ctx: Context) {
      *
      * 进度按中央目录的未压缩总字节预估，保证确定性。
      */
-    private fun extract(root: File, linkTargets: Map<String, String>, onProgress: Progress) {
-        val canonicalRoot = root.canonicalPath
+    private fun preflightSpace(unpackedBytes: Long, zipBytes: Long) {
+        // Android cache/files normally share /data. Conservatively reserve both there;
+        // additionally check the cache volume in case the device places it elsewhere.
+        RuntimeInstallIo.requireSpace(ctx.filesDir.usableSpace,
+            RuntimeInstallIo.requiredSpace(zipBytes, unpackedBytes), "应用数据分区")
+        if (zipBytes > 0) RuntimeInstallIo.requireSpace(ctx.cacheDir.usableSpace,
+            zipBytes + 32L * 1024 * 1024, "APK ZIP 缓存分区")
+    }
+
+    private fun extract(root: File, index: ZipIndex, onProgress: Progress) {
+        val canonicalRoot = root.canonicalPath + File.separator
 
         ctx.assets.open(RUNTIME_ASSET).use { assetStream ->
             ZipInputStream(assetStream.buffered()).use { zis ->
@@ -763,8 +1038,14 @@ class RuntimeInstaller(private val ctx: Context) {
                 var processed = 0L
                 var lastReported = -1
 
+                val seen = HashSet<String>()
                 while (entry != null) {
+                    RuntimeInstallIo.checkCancelled()
                     val name = entry.name
+                    RuntimeInstallIo.validateEntry(name)
+                    check(index.sizes.containsKey(name) && seen.add(name)) { "Runtime ZIP index mismatch: $name" }
+                    val out = File(root, name)
+                    check(out.canonicalPath.startsWith(canonicalRoot)) { "Runtime ZIP path escapes runtime: $name" }
 
                     if (entry.isDirectory) {
                         File(root, name).mkdirs()
@@ -774,28 +1055,20 @@ class RuntimeInstaller(private val ctx: Context) {
                     }
 
                     // 别名条目：本体落地后统一物化（类注释第 3 点）。
-                    if (linkTargets.containsKey(name)) {
-                        zis.closeEntry()
-                        entry = zis.nextEntry
-                        continue
-                    }
-
-                    val out = File(root, name)
-
-                    // zip-slip 防护
-                    if (!out.canonicalPath.startsWith(canonicalRoot)) {
-                        Log.w(TAG, "skip suspicious entry: $name")
+                    if (index.linkTargets.containsKey(name)) {
                         zis.closeEntry()
                         entry = zis.nextEntry
                         continue
                     }
 
                     out.parentFile?.mkdirs()
-                    FileOutputStream(out).use { fos -> zis.copyTo(fos) }
+                    val copied = FileOutputStream(out).use { fos -> RuntimeInstallIo.copy(zis, fos) }
+                    check(copied == index.sizes.getValue(name)) { "Runtime ZIP entry truncated: $name" }
 
-                    processed += entry.size.coerceAtLeast(0)
-                    val pct = ((processed * 100) / TOTAL_UNCOMPRESSED_BYTES).toInt()
-                    if (pct != lastReported && pct <= 95) {
+                    processed += copied
+                    // 8% 已用于资产拷贝与索引，剩余留给解压，避免解压一开始进度条倒退。
+                    val pct = (8 + (processed * 87) / index.unpackedBytes.coerceAtLeast(1L)).toInt().coerceIn(8, 95)
+                    if (pct != lastReported) {
                         lastReported = pct
                         onProgress.onProgress(pct / 100f)
                     }
@@ -839,6 +1112,7 @@ class RuntimeInstaller(private val ctx: Context) {
             if (depth > 3) return
             val children = dir.listFiles() ?: return
             for (f in children) {
+                RuntimeInstallIo.checkCancelled()
                 if (f.isDirectory) {
                     scan(f, depth + 1)
                     continue
@@ -851,6 +1125,7 @@ class RuntimeInstaller(private val ctx: Context) {
                 }
                 var has = false
                 for (n in needles) {
+                    RuntimeInstallIo.checkCancelled()
                     if (indexOf(data, n, 0) >= 0) {
                         has = true
                         break
@@ -894,6 +1169,8 @@ class RuntimeInstaller(private val ctx: Context) {
         val canonicalRoot = root.canonicalPath
 
         for ((alias, target) in linkTargets) {
+
+            RuntimeInstallIo.checkCancelled()
             val aliasFile = File(root, alias)
 
             val realFile = File(root, target)
@@ -933,6 +1210,7 @@ class RuntimeInstaller(private val ctx: Context) {
         }
 
         Log.i(TAG, "materialiseLinks: $created created, $reused reused, $failed failed")
+        check(failed == 0) { "Runtime alias installation failed: $failed link(s)" }
     }
 
     /**
@@ -971,6 +1249,8 @@ class RuntimeInstaller(private val ctx: Context) {
         var failed = 0
 
         for ((alias, target) in pairs) {
+
+            RuntimeInstallIo.checkCancelled()
             val aliasFile = File(root, alias)
             if (Files.isSymbolicLink(aliasFile.toPath())) continue
             if (!aliasFile.isFile) continue
@@ -1000,6 +1280,7 @@ class RuntimeInstaller(private val ctx: Context) {
         val out = ArrayList<Pair<String, String>>()
         ctx.assets.open(ALIAS_LIST_ASSET).bufferedReader().useLines { lines ->
             for (line in lines) {
+                RuntimeInstallIo.checkCancelled()
                 val tab = line.indexOf('\t')
                 if (tab <= 0) continue
                 out.add(line.substring(0, tab) to line.substring(tab + 1))
@@ -1053,6 +1334,7 @@ class RuntimeInstaller(private val ctx: Context) {
         var missing = 0
         var touchedFiles = 0
         for (i in 0 until paths.length()) {
+            RuntimeInstallIo.checkCancelled()
             val rel = paths.optString(i)
             if (rel.isEmpty()) continue
             val f = File(root, rel)
@@ -1064,6 +1346,7 @@ class RuntimeInstaller(private val ctx: Context) {
                 val data = f.readBytes()
                 var out = data
                 for ((needle, value) in rules) {
+                    RuntimeInstallIo.checkCancelled()
                     out = replaceAll(out, needle, value)
                 }
                 if (out !== data) {
@@ -1106,6 +1389,7 @@ class RuntimeInstaller(private val ctx: Context) {
         val limit = haystack.size - needle.size
         outer@ for (i in from..limit) {
             for (j in needle.indices) {
+                RuntimeInstallIo.checkCancelled()
                 if (haystack[i + j] != needle[j]) continue@outer
             }
             return i
@@ -1131,6 +1415,7 @@ class RuntimeInstaller(private val ctx: Context) {
      * 是链接就**只删链接本身**（`File.delete()` 删链接不删目标），是目录才下钻。
      */
     private fun deleteTreeSafely(target: File) {
+        RuntimeInstallIo.checkCancelled()
         val path = target.toPath()
         val isLink = try {
             Files.isSymbolicLink(path)
@@ -1141,7 +1426,7 @@ class RuntimeInstaller(private val ctx: Context) {
 
         // 软链（含指向目录的软链）一律只删链接本体，绝不下钻。
         if (isLink) {
-            if (!target.delete()) Log.w(TAG, "deleteTreeSafely: cannot unlink $target")
+            check(target.delete()) { "Cannot unlink runtime asset: $target" }
             return
         }
 
@@ -1152,7 +1437,7 @@ class RuntimeInstaller(private val ctx: Context) {
             }
         }
 
-        if (!target.delete()) Log.w(TAG, "deleteTreeSafely: cannot delete $target")
+        check(target.delete()) { "Cannot delete runtime asset: $target" }
     }
 
     /**
@@ -1229,6 +1514,8 @@ class RuntimeInstaller(private val ctx: Context) {
         if (!lib.isDirectory) return
 
         for ((alias, real) in SONAME_ALIASES) {
+
+            RuntimeInstallIo.checkCancelled()
             val aliasFile = File(lib, alias)
             if (aliasFile.isFile && aliasFile.length() > 0) continue
 
@@ -1269,6 +1556,8 @@ class RuntimeInstaller(private val ctx: Context) {
         var changed = 0
 
         for (dir in listOf(File(root, "bin"), File(root, "usr/bin"), File(root, "libexec"))) {
+
+            RuntimeInstallIo.checkCancelled()
             if (!dir.isDirectory) continue
             dir.walkTopDown()
                 .maxDepth(MAX_SCAN_DEPTH)
@@ -1381,6 +1670,7 @@ class RuntimeInstaller(private val ctx: Context) {
      */
     private fun ensureNoShadowingStubs(root: File) {
         for (rel in SHADOWING_STUBS) {
+            RuntimeInstallIo.checkCancelled()
             val f = File(root, rel)
             if (!f.exists()) continue
             val size = f.length()
@@ -1624,6 +1914,7 @@ class RuntimeInstaller(private val ctx: Context) {
             // `DejaVu Sans` 这类真实存在的族名 —— 用户显式要 DejaVu 时就该给
             // DejaVu，硬顶成 Noto 属于"修一个问题、造一个问题"。
             for (generic in listOf("Sans", "sans", "Sans Serif", "Helvetica", "Arial")) {
+                RuntimeInstallIo.checkCancelled()
                 append("  <alias binding=\"same\"><family>${xmlEscape(generic)}</family>")
                 append("<prefer><family>Noto Sans SC</family></prefer></alias>\n")
             }
@@ -1682,6 +1973,7 @@ class RuntimeInstaller(private val ctx: Context) {
                 "Arial" to "Arial",
             )
             for ((name, family) in names) {
+                RuntimeInstallIo.checkCancelled()
                 append("  <type name=\"${xmlEscape(name)}\" fullname=\"${xmlEscape(family)}\"")
                 append(" family=\"${xmlEscape(family)}\" style=\"Normal\" stretch=\"Normal\"")
                 append(" weight=\"400\" glyphs=\"$glyphs\" format=\"TrueType\"/>\n")
@@ -1689,6 +1981,8 @@ class RuntimeInstaller(private val ctx: Context) {
         }
 
         for (rel in listOf("etc/ImageMagick-7", "etc/ImageMagick-6")) {
+
+            RuntimeInstallIo.checkCancelled()
             val dir = File(root, rel)
             if (!dir.isDirectory) continue
             val target = File(dir, "type.xml")
@@ -1778,6 +2072,7 @@ class RuntimeInstaller(private val ctx: Context) {
             File(home, ".pip/pip.conf"),
         )
         for (target in targets) {
+            RuntimeInstallIo.checkCancelled()
             if (target.isFile && target.length() > 0L) continue
             runCatching {
                 target.parentFile?.mkdirs()
@@ -1885,6 +2180,7 @@ class RuntimeInstaller(private val ctx: Context) {
         val out = StringBuilder()
         var inside = false
         for (line in text.split('\n')) {
+            RuntimeInstallIo.checkCancelled()
             if (line.trim() == RAW_MIRROR_BEGIN) {
                 inside = true
                 continue
@@ -1968,6 +2264,7 @@ class RuntimeInstaller(private val ctx: Context) {
      */
     private fun healPackagingWrappers(root: File) {
         for (rel in COREPACK_SHIM_NAMES) {
+            RuntimeInstallIo.checkCancelled()
             val name = rel.substringAfterLast('/')
             val target = File(root, rel)
             if (Files.isSymbolicLink(target.toPath())) {
@@ -2249,7 +2546,7 @@ class RuntimeInstaller(private val ctx: Context) {
             pb.redirectErrorStream(true)
             val out = File(EngineConfig.tmpDir(ctx), "texlinks.log")
             pb.redirectOutput(out)
-            val rc = runCatching { pb.start().waitFor() }
+            val rc = runCatching { RuntimeInstallIo.run(pb, 60_000L) }
                 .onFailure { Log.w(TAG, "ensureTexLinks failed: ${it.message}") }
                 .getOrDefault(-1)
 
@@ -2290,6 +2587,7 @@ class RuntimeInstaller(private val ctx: Context) {
         bin.mkdirs()
         var linked = 0
         for (name in TEX_LINK_NAMES) {
+            RuntimeInstallIo.checkCancelled()
             val source = File(extBin, name)
             if (!source.isFile) continue
             val dest = File(bin, name)
@@ -2358,6 +2656,7 @@ class RuntimeInstaller(private val ctx: Context) {
         web2c.mkdirs()
         var made = 0
         for ((name, fmt) in wanted) {
+            RuntimeInstallIo.checkCancelled()
             if (fmt.isFile && fmt.length() >= MIN_FMT_BYTES) continue
             // 引擎选择：`lualatex` 走 `luahbtex`（HarfBuzz 版 LuaTeX），
             // `xelatex` 走 `xetex`，其余都是 pdftex 系。
@@ -2409,7 +2708,7 @@ class RuntimeInstaller(private val ctx: Context) {
                 // 到 API 34 才有（编译期能过、低版本运行期 NoSuchMethodError）。
                 // 落到一个临时文件，跑完随中间文件一起删。
                 pb.redirectOutput(File(web2c, "$name.out"))
-                pb.start().waitFor()
+                RuntimeInstallIo.run(pb, 60_000L)
             }.onFailure { Log.w(TAG, "ensureTexFormats($name) failed: ${it.message}") }
                 .getOrDefault(-1)
 
@@ -2442,11 +2741,13 @@ class RuntimeInstaller(private val ctx: Context) {
         false
     }
 
-    private fun writeStamp(root: File) {
-        runCatching { EngineConfig.stampFile(ctx).writeText(RUNTIME_VERSION) }
+    private fun writeStamp() {
+        EngineConfig.stampFile(ctx).writeText(RUNTIME_VERSION)
     }
 
     companion object {
+        private val INSTALL_LOCK = Any()
+        private const val INCOMPLETE_MARKER = ".runtime-incomplete"
         private const val TAG = "KxxyRuntime"
         const val RUNTIME_ASSET = "runtime.zip"
 
@@ -2605,7 +2906,7 @@ class RuntimeInstaller(private val ctx: Context) {
         private const val MOBILE_PLUGIN_CLIENT = "lib/node_modules/dsh-web-mobile/lib/client.js"
         private const val MOBILE_PLUGIN_MARKER_FILE =
             "lib/node_modules/dsh-web-mobile/plugin.version"
-        private const val MOBILE_PLUGIN_MARKER = "kxxy-mobile-plugin@1"
+        private const val MOBILE_PLUGIN_MARKER = "kxxy-mobile-plugin@2"
 
         /**
          * office 预览链版本标记（锚点 9），由构建期写入
@@ -2628,18 +2929,40 @@ class RuntimeInstaller(private val ctx: Context) {
          *  incomplete manifest.`。不带标记的设备只靠重装 runtime 是拿不到
          * 新引擎的，所以标记必须一起升。
          */
-        private const val OFFICE_LAYER_MARKER = "kxxy-office@2"
+        // @3：同时支持 kit/wasm 0.1.5 与 0.2.3，按完整清单和长度指纹识别半包。
+        private const val OFFICE_LAYER_MARKER = "kxxy-office@3"
         private const val OFFICE_LAYER_MARKER_FILE =
             "lib/node_modules/kxxy-host/fonts/office-assets.version"
 
-        /** wasm 引擎主体；122 MiB，光有标记文件不足以证明它完整落地。 */
-        private const val OFFICE_WASM_ENGINE =
-            "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/assets/soffice.wasm"
+        private const val OFFICE_KIT_ROOT = "lib/node_modules/@deepseek-ai/libreoffice-kit/"
+        private const val OFFICE_WASM_ROOT = "lib/node_modules/@deepseek-ai/libreoffice-kit-wasm/"
 
-        /** 随 runtime 发布的单文件 CJK 字体（正体 + 粗体）。 */
-        private val OFFICE_FONT_FILES = listOf(
-            "lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf",
-            "lib/node_modules/kxxy-host/fonts/NotoSansSC-Bold.ttf",
+        // 与 tools/lib/office-assets.mjs 一致：完整 manifest 摘要、全部资源的路径/长度摘要。
+        private val OFFICE_RELEASES = mapOf(
+            "0.1.5" to Pair(
+                "302237d6b29faf2dc2edcf81cf97b6f8bedc45639216d2887911977c9a1b784e",
+                "de52c4cfba8673f8310e80a20dff5fb4a4f68fdb62fc75655ea16465af5298b0",
+            ),
+            "0.2.3" to Pair(
+                "de3888ea4f94ef0feb35dce4fb457bc6c837e4d957fd1a1c6f195827c21ffbda",
+                "8e6fe513c6ba849f0c1d935dfc6f2404434d03e453c426bec107aef4a64c0204",
+            ),
+        )
+        private val OFFICE_SHADOW_PATHS = listOf(
+            "${OFFICE_KIT_ROOT}lib/node_modules/@deepseek-ai/libreoffice-kit-wasm",
+            "${OFFICE_KIT_ROOT}node_modules/@deepseek-ai/libreoffice-kit-wasm",
+            "lib/node_modules/@deepseek-ai/node_modules/@deepseek-ai/libreoffice-kit-wasm",
+            "lib/node_modules/@deepseek-ai/dsh-office-kit/lib/node_modules/@deepseek-ai/libreoffice-kit",
+            "lib/node_modules/@deepseek-ai/dsh-office-kit/node_modules/@deepseek-ai/libreoffice-kit",
+            "lib/node_modules/@deepseek-ai/dsh-office-to-pdf/lib/node_modules/@deepseek-ai/libreoffice-kit",
+            "lib/node_modules/@deepseek-ai/dsh-office-to-pdf/node_modules/@deepseek-ai/libreoffice-kit",
+            "lib/node_modules/@deepseek-ai/node_modules/@deepseek-ai/libreoffice-kit",
+        )
+
+        /** 随 runtime 发布的单文件 CJK 字体；启动时仅核对长度与 sfnt 文件头。 */
+        private val OFFICE_FONT_FILES = mapOf(
+            "lib/node_modules/kxxy-host/fonts/NotoSansSC-Regular.ttf" to 10559284L,
+            "lib/node_modules/kxxy-host/fonts/NotoSansSC-Bold.ttf" to 10549020L,
         )
 
         /**
@@ -2659,7 +2982,7 @@ class RuntimeInstaller(private val ctx: Context) {
          * 同理，**自有插件（kxxy-host）的前端资源有实质改动**也要 +1 —— 那些
          * 文件同样在 runtime.zip 里，标记不变就等于「新 APK 装了个旧设置页」。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@22"
+        private const val PATCHSET_MARKER = "kxxy-patchset@25"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**

@@ -40,7 +40,16 @@ object EngineConfig {
      * 对象字段按声明顺序初始化，放后面会拿到 null。
      */
     const val MOBILE_PLUGIN_NAME = "dsh-web-mobile"
-    const val MOBILE_PLUGIN_VERSION = "3.1.0"
+
+    /**
+     * 3.3.5（2026-11-15）：3.1.0 的抽屉锚在 frame 的 first child 上，遇到
+     * 宿主 0.2.2-rc.2 的「drawerMask 排在 sidebarCol 之前」就把皮肤画到遮罩上，
+     * 真侧栏被整块盖住 ⇒ 竖屏侧栏白屏。三处版本号必须同步：
+     * build-runtime.mjs 的 MOBILE_PLUGIN_PKG、这里、以及 patches.mjs 的声明。
+     */
+    const val MOBILE_PLUGIN_VERSION = "3.3.5"
+    const val CODEX_PLUGIN_NAME = "dsh-codex-sidebar"
+    const val CODEX_PLUGIN_VERSION = "0.1.0"
 
     /** 引擎监听端口。官方前端与 WebView 都硬编码它。 */
     const val DEFAULT_PORT = 3080
@@ -92,6 +101,7 @@ object EngineConfig {
 
     /** 原生层 → 引擎的修复结果（引擎重启后新进程读，页面上展示）。 */
     const val RECOVERY_RESULT_FILE_NAME = "recovery-result.json"
+    const val INSTALL_ERROR_FILE_NAME = "install-error.json"
 
     /** 运行时根目录。 */
     fun engineRoot(ctx: Context): File = File(ctx.filesDir, "engine")
@@ -141,6 +151,16 @@ object EngineConfig {
      */
     fun recoveryResultFile(ctx: Context): File =
         File(engineRoot(ctx), RECOVERY_RESULT_FILE_NAME)
+
+    /**
+     * 最近一次运行时安装失败的原始异常。
+     *
+     * 为什么需要落盘：安装异常此前只进 logcat，而救援报告读不到 logcat ——
+     * 真机上「卡住/失败」时用户能给的只有报告，于是只能靠猜。这里写在
+     * engine/ 下（顶层文件，不在任何被整棵替换的目录里），供救援报告引用。
+     */
+    fun installErrorFile(ctx: Context): File =
+        File(engineRoot(ctx), INSTALL_ERROR_FILE_NAME)
 
     /**
      * 宿主偏好文件（kxxy-host 插件写的 set-priv-mode / set-toggle 落在这里）。
@@ -767,6 +787,8 @@ object EngineConfig {
             "PREFIX=${root.absolutePath}",
             "HOME=${home.absolutePath}",
             "DSH_HOME=${home.absolutePath}",
+            "KXXY_CODEX_HOME=${File(ctx.filesDir, "codex-home").absolutePath}",
+            "KXXY_CODEX_BIN=${File(root, "bin/codex").absolutePath}",
             "TMPDIR=${tmp.absolutePath}",
             // 官方终端面板的默认 shell 取 process.env.SHELL || userInfo().shell；
             // Termux 编译的 node 在 libuv 里把 passwd 回落硬编码成 Termux 的 bash
@@ -1440,10 +1462,10 @@ object EngineConfig {
      *   3. permission 必须给全 presets 表 —— 插件 schema 默认只带
      *      workspace-write + danger-full-access，丢 read-only 会少一个预设。
      *
-     * `office-to-pdf` 那一行同样受约束 1 支配：它原本在上游
-     * `@deepseek-ai/dsh-web-app/cordis.patch.yml` 里没有 config，这里补上
-     * `fontDirectories`。不给它就只能靠 `systemFontDirectories()`，而那条路在
-     * Android 上返回的是 XDG 目录（`/usr/share/fonts` 之类），一个都不存在。
+     * Office 不再写入 overlay：rc.2 将 office-to-pdf 改为 office-kit，旧 id 会被
+     * 加载器告警跳过；改用新 id 仍会整体覆盖用户 config（包括 outputDirectory）。
+     * Android 缺省字体由 patches.mjs 的 patchOfficeDefaultFonts 在服务构造器补齐，
+     * 通过 KXXY_ENGINE_ROOT 沿用 officeFontsDir，仅改转换选项、不回写显式配置。
      */
     fun overlayContent(ctx: Context): String = """
         # [dsh-kxxy] Android compatibility overlay (auto-generated, do not edit)
@@ -1484,10 +1506,6 @@ object EngineConfig {
                 approval: never
                 name: danger-full-access
                 description: No sandbox boundary.
-        - id: office-to-pdf
-          config:
-            fontDirectories:
-              - ${officeFontsDir(ctx).absolutePath}
         - insert:
             - id: kxxy-host
               name: kxxy-host
@@ -1619,6 +1637,23 @@ object EngineConfig {
                 if (bundles.optString(i) == MOBILE_PLUGIN_NAME) present = true
             }
             if (!present) bundles.put(MOBILE_PLUGIN_NAME)
+
+            // Codex is optional: seed it once, then preserve disable/uninstall choices.
+            val migrations = json.optJSONObject("kxxyMigrations") ?: org.json.JSONObject()
+            val codexAvailable = File(engineRoot(ctx), "lib/node_modules/$CODEX_PLUGIN_NAME/package.json").isFile
+            if (codexAvailable && !migrations.optBoolean("codexSidebarSeeded", false)) {
+                val alreadyInstalled = dependencies.has(CODEX_PLUGIN_NAME)
+                if (!alreadyInstalled) {
+                    dependencies.put(CODEX_PLUGIN_NAME, CODEX_PLUGIN_VERSION)
+                    var codexPresent = false
+                    for (i in 0 until bundles.length()) {
+                        if (bundles.optString(i) == CODEX_PLUGIN_NAME) codexPresent = true
+                    }
+                    if (!codexPresent) bundles.put(CODEX_PLUGIN_NAME)
+                }
+                migrations.put("codexSidebarSeeded", true)
+                json.put("kxxyMigrations", migrations)
+            }
             profile.put("bundles", bundles)
             dsh.put("profile", profile)
             json.put("dsh", dsh)
@@ -1648,6 +1683,7 @@ object EngineConfig {
         val json = org.json.JSONObject()
             .put("name", "dsh-profile-web")
             .put("private", true)
+            .put("kxxyMigrations", org.json.JSONObject().put("codexSidebarSeeded", true))
             .put("dependencies", org.json.JSONObject().put(MOBILE_PLUGIN_NAME, MOBILE_PLUGIN_VERSION))
             .put("dsh", org.json.JSONObject().put("profile", org.json.JSONObject().put("bundles", bundles)))
         return json.toString(2) + "\n"

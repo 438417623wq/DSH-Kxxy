@@ -1,7 +1,11 @@
 package app.kxxy
 
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.Intent
 import android.os.Bundle
+import android.view.Gravity
+import android.view.View
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
@@ -10,12 +14,15 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Button
 import android.widget.FrameLayout
 import app.kxxy.engine.EngineConfig
 import app.kxxy.engine.EngineSupervisor
 import app.kxxy.engine.PermCatalog
+import app.kxxy.engine.RescueDiagnostics
 import app.kxxy.engine.ShizukuBridge
 import app.kxxy.engine.WebBootLog
+import app.kxxy.engine.WebReadiness
 import app.kxxy.remote.QrScanActivity
 import app.kxxy.remote.RemoteBar
 import app.kxxy.remote.RemoteLink
@@ -27,7 +34,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 /**
- * 主界面 —— 纯 WebView 容器。
+ * 主界面 —— WebView 容器与不依赖网页的原生救援入口。
  *
  * 方案 T 的核心：**全部 UI 都在 Web 层**。
  *   `/`      → 官方 React 前端（对话 + 86 个插槽 + 插件生态）
@@ -39,7 +46,7 @@ import kotlinx.coroutines.launch
  *   ③ 注入方案 R 的移动端适配层
  *
  * 刻意不做的事：
- *   - 不构造任何原生控件（除了 WebView 本身）
+ *   - 不构造业务原生控件（WebView 故障时的救援按钮/确认框除外）
  *   - 不实现任何业务 UI（设置页、扩展中心、终端都在 Web 层）
  *   - 不拦截 URL（除非是外部链接）
  */
@@ -51,6 +58,16 @@ class MainActivity : Activity() {
     private lateinit var webView: WebView
 
     private lateinit var rootLayout: FrameLayout
+
+    private var webViewUsable = false
+    private var localDocumentFailed = false
+    private var pageReady = false
+    private var engineWasHealthy = false
+    private var rescueButton: Button? = null
+    private var rescueDialog: AlertDialog? = null
+    private var rescueReason: String? = null
+    private var rescuePrompted = false
+    private var leavingForRescue = false
 
     /**
      * 远程会话的设备条（远程模式下可见）。
@@ -85,6 +102,16 @@ class MainActivity : Activity() {
     /** 远端页面是否真的加载完成（onPageFinished）。自动连接的成败判据。 */
     @Volatile
     private var remotePageLoaded = false
+
+    /**
+     * 本轮远程主框架的 HTTP 错误码（0 = 没有错误）。
+     *
+     * 存在理由很具体：`onPageFinished` 只表示「加载结束」，401/403/502 的
+     * 错误页同样会走到它。没有这个字段时，一台配对已失效的电脑会被记成
+     * 「可用」，失败计数清零，自动连接下次还会照样往里撞。
+     */
+    @Volatile
+    private var remoteMainFrameError: Int = 0
 
     /**
      * 自动连接的看门狗。
@@ -124,6 +151,56 @@ class MainActivity : Activity() {
     /** 本机 origin 的会话 cookie 是否已经换到手。 */
     @Volatile
     private var localSessionMinted = false
+
+    /**
+     * 本机首页自愈次数。
+     *
+     * 触发点：主文档 4xx（404 空 body / 401 未授权）或「加载完成但页面是空的」。
+     * 每次自愈都重新从引擎日志取一次 token 再加载；连续 [LOCAL_RECOVERY_LIMIT]
+     * 次仍不行就把原生救援弹出来 —— 白屏从此有一个用户能按的出口，
+     * 并且下一份救援报告里会带上 WebBootLog 的最后一条。
+     */
+    private var localRecoveryAttempts = 0
+
+    /** 正在等引擎日志里的 token（避免重复排程）。 */
+    private var waitingForEngineToken = false
+
+    /** 本次页面加载已经量过几次空白（慢设备上首帧可能晚于 3 秒）。 */
+    private var blankChecks = 0
+
+    /**
+     * 首屏空白检测。
+     *
+     * 为什么需要它：0.2.2 的前端在 boot 阶段抛错时**不会**渲染错误卡
+     * （`c9` 只在桌面壳里存在，浏览器里直接 rethrow），页面就停在
+     * `<div id="root"></div>` 空壳上 —— 200、无网络错误、无 HTTP 错误，
+     * 唯一现象就是白。磁盘侧的 `WebBootLog` 抓得到 console，但用户看不到。
+     * 这里在 onPageFinished 之后量一次 DOM，空就按白屏处理。
+     */
+    private val blankPageCheck: Runnable = Runnable { runBlankPageCheck() }
+
+    private fun runBlankPageCheck() {
+        if (!webViewUsable || remoteMode || leavingForRescue || !urlLoaded) return
+        val path = currentPath ?: return
+        if (path.startsWith("/kxxy")) return
+        webView.evaluateJavascript(WebReadiness.BLANK_PROBE) { raw ->
+            if (WebReadiness.isBlank(raw)) {
+                // 慢设备上首帧可能还没到：先再等一轮，仍然空才算白屏。
+                // 否则「加载慢」会被误判成「加载坏」，把用户踢进一次多余的重载。
+                if (blankChecks < BLANK_RECHECK_LIMIT) {
+                    blankChecks++
+                    webView.removeCallbacks(blankPageCheck)
+                    webView.postDelayed(blankPageCheck, BLANK_RECHECK_DELAY_MS)
+                } else {
+                    recoverLocalDocument("页面已加载但没有任何内容（前端未渲染）")
+                }
+            } else {
+                // 页面真的画出来了：自愈计数归零，并把之前因白屏弹出的救援收掉。
+                localRecoveryAttempts = 0
+                clearRescue()
+            }
+        }
+    }
 
     /** 补换 cookie 之后要落到控制台（onPageFinished 消费）。 */
     @Volatile
@@ -179,49 +256,141 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        webView = WebView(this)
         val root = FrameLayout(this).apply {
-            // 跟随系统深浅色：原先硬编码深色，浅色主题下会在 WebView
-            // 首次绘制前闪一块深底。取值见 res/values{,-night}/colors.xml。
             setBackgroundColor(getColor(R.color.kxxy_window_bg))
-            addView(
-                webView,
-                FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                ),
-            )
         }
         rootLayout = root
         setContentView(root)
 
-        // 远程设备条常驻但默认隐藏；进入远程模式时才 show，并把 WebView 下移，
-        // 避免盖住远端页面自己的顶栏（详见 RemoteBar 的类注释）。
-        remoteBar = RemoteBar(this).also {
-            it.attachTo(root, webView)
-            it.onDisconnect = { exitRemote(cooldown = true) }
-        }
-
-        setupWebView()
+        // 在首个 URL 之前保存通知目标，避免被冷启动远程自动连接覆盖。
+        handleLaunchIntent(intent)
+        initializeWebView()
         EngineService.start(this)
 
-        // 引擎可能还在启动：订阅状态，Healthy 后加载
+        // 无论进 Main 时是否 Healthy，都持续观察；appScope 是 Default，UI 必须切回主线程。
         val current = supervisor.state.value
-        if (current is EngineSupervisor.State.Healthy) {
-            loadEngineUrl(current.tokenUrl)
-        } else {
-            stateJob = app.appScope.launch {
-                supervisor.state.collectLatest { st ->
-                    if (st is EngineSupervisor.State.Healthy && !urlLoaded) {
-                        loadEngineUrl(st.tokenUrl)
-                    }
+        applyEngineState(current)
+        if (current !is EngineSupervisor.State.Healthy && !remoteMode) {
+            offerRescue("本机引擎尚未就绪（${current.javaClass.simpleName}）")
+        }
+        stateJob = app.appScope.launch {
+            supervisor.state.collectLatest { st ->
+                runOnUiThread {
+                    if (!isFinishing && !isDestroyed && !leavingForRescue) applyEngineState(st)
                 }
             }
         }
+    }
 
-        // 冷启动时带过来的 attention 意图（用户点了通知栏里的「需要你确认」）。
-        // 此时 WebView 还没开始加载，所以只会存进 pending，由 onPageFinished 消费。
-        handleLaunchIntent(intent)
+    private fun initializeWebView() {
+        try {
+            webView = WebView(this)
+            rootLayout.addView(webView, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            ))
+            setupWebView()
+            remoteBar = RemoteBar(this).also {
+                it.attachTo(rootLayout, webView)
+                it.onDisconnect = { exitRemote(cooldown = true) }
+            }
+            webViewUsable = true
+        } catch (e: RuntimeException) {
+            onWebViewUnavailable("WebView 初始化异常：${e.javaClass.simpleName}")
+        } catch (e: LinkageError) {
+            // ROM/provider 类或 native 库缺失是可恢复的组件故障；不吞 OOM 等致命错误。
+            onWebViewUnavailable("WebView provider 无法加载：${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun applyEngineState(st: EngineSupervisor.State) {
+        if (st is EngineSupervisor.State.Healthy) {
+            engineWasHealthy = true
+            if (st.tokenUrl != null && st.tokenUrl != engineTokenUrl) {
+                engineTokenUrl = st.tokenUrl
+                localSessionMinted = false
+            }
+            if (!webViewUsable) return
+            if (!urlLoaded) loadEngineUrl(st.tokenUrl)
+            if (rescueReason?.startsWith("本机引擎") == true) clearRescue()
+            flushPendingAttention()
+        } else if (!remoteMode && (engineWasHealthy || st is EngineSupervisor.State.Failed ||
+                st is EngineSupervisor.State.Stopped || st is EngineSupervisor.State.Backoff)) {
+            offerRescue("本机引擎不可用（${st.javaClass.simpleName}），可前往原生救援")
+        }
+    }
+
+    /** 持久的原生按钮不依赖网页；每次故障只主动弹一次，取消后仍可手动打开。 */
+    private fun offerRescue(reason: String, webViewFailure: Boolean = false) {
+        if ((remoteMode && !webViewFailure) || isFinishing || isDestroyed || leavingForRescue) return
+        if (!webViewUsable && rescueReason != null && !webViewFailure) return
+        rescueReason = RescueDiagnostics.redact(reason).take(600)
+        val button = rescueButton ?: Button(this).apply {
+            text = "原生救援"
+            setOnClickListener { confirmRescue() }
+            rootLayout.addView(this, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END,
+            ))
+            rescueButton = this
+        }
+        button.visibility = View.VISIBLE
+        button.bringToFront()
+        if (!rescuePrompted) {
+            rescuePrompted = true
+            confirmRescue()
+        }
+    }
+
+    private fun confirmRescue() {
+        if (rescueDialog != null || isFinishing || isDestroyed || leavingForRescue) return
+        val reason = rescueReason ?: return
+        rescueDialog = AlertDialog.Builder(this)
+            .setTitle("前往原生救援？")
+            .setMessage("$reason\n\n仅在确认后打开救援页，不会自动重试跳转。")
+            .setNegativeButton("暂不前往", null)
+            .setPositiveButton("前往救援") { _, _ ->
+                leavingForRescue = true
+                startActivity(Intent(this, BootstrapActivity::class.java)
+                    .putExtra(BootstrapActivity.EXTRA_RESCUE, true)
+                    .putExtra(BootstrapActivity.EXTRA_RESCUE_REASON, reason))
+                finish()
+            }
+            .create().also { dialog ->
+                dialog.setOnDismissListener { rescueDialog = null }
+                dialog.show()
+            }
+    }
+
+    private fun clearRescue() {
+        rescueReason = null
+        rescuePrompted = false
+        rescueButton?.visibility = View.GONE
+        rescueDialog?.dismiss()
+    }
+
+    private fun onWebViewUnavailable(reason: String) {
+        webViewUsable = false
+        pageReady = false
+        urlLoaded = false
+        pendingConsole = false
+        localSessionMinted = false
+        filePathCallback?.onReceiveValue(null)
+        filePathCallback = null
+        // 死亡 renderer 的权限请求不能再调用 grant/deny。
+        pendingWebPermission = null
+        if (::webView.isInitialized) {
+            webView.removeCallbacks(remoteWatchdog)
+            (webView.parent as? ViewGroup)?.removeView(webView)
+            try {
+                webView.destroy()
+            } catch (_: RuntimeException) {
+                // provider teardown 失败不影响原生入口。
+            } catch (_: LinkageError) {
+                // 初始化阶段缺失的 provider/native 类也可能影响 destroy。
+            }
+        }
+        remoteBar?.hide()
+        offerRescue(reason, webViewFailure = true)
     }
 
     private fun setupWebView() {
@@ -409,7 +578,16 @@ class MainActivity : Activity() {
                 error: android.webkit.WebResourceError,
             ) {
                 super.onReceivedError(view, request, error)
-                if (!request.isForMainFrame || !remoteMode) return
+                if (!request.isForMainFrame || !webViewUsable) return
+                if (!remoteMode) {
+                    if (!isLocalDocument(request.url)) return
+                    localDocumentFailed = true
+                    pageReady = false
+                    pendingConsole = false
+                    localSessionMinted = false
+                    offerRescue("本机主文档网络错误（${error.errorCode}）")
+                    return
+                }
                 Log.w(TAG, "remote load failed: ${error.errorCode} ${error.description}")
                 webView.removeCallbacks(remoteWatchdog)
                 val id = remoteDeviceId
@@ -427,26 +605,124 @@ class MainActivity : Activity() {
                 }
             }
 
+            override fun onReceivedHttpError(
+                view: WebView,
+                request: WebResourceRequest,
+                errorResponse: android.webkit.WebResourceResponse,
+            ) {
+                super.onReceivedHttpError(view, request, errorResponse)
+                if (!webViewUsable || !request.isForMainFrame) return
+                /*
+                 * 远程页的 4xx/5xx 也不是「连上了」。
+                 *
+                 * 旧实现这里直接 return（`|| remoteMode`），于是配对失败页、
+                 * 401、上游 502 都会照常走 onPageFinished → markUsed(true)，
+                 * 结果是：设备列表显示「可用」、失败计数被清零、自动连接
+                 * 继续把一台其实进不去的电脑当正常设备。这里只记录状态，
+                 * 判定留给 onPageFinished —— 那里才知道这次加载的结局。
+                 */
+                if (remoteMode) {
+                    if (errorResponse.statusCode >= 400) remoteMainFrameError = errorResponse.statusCode
+                    return
+                }
+                if (!isLocalDocument(request.url)) return
+                val code = errorResponse.statusCode
+                if (code >= 500) {
+                    localDocumentFailed = true
+                    pageReady = false
+                    pendingConsole = false
+                    localSessionMinted = false
+                    offerRescue("本机主文档服务错误（HTTP $code）")
+                    return
+                }
+                /*
+                 * 401/403/404 现在也要处理。
+                 *
+                 * 老注释说「401/403 属于鉴权流程，不触发救援」—— 那只在
+                 * 「token 已经换到、页面会自己重试」时成立。真实链路里
+                 * 401 意味着 cookie 没换到，404 意味着 WebUI 根本还没挂载
+                 * （空 body），两者在 WebView 里都只是一片白：不会触发
+                 * onReceivedError，也不会走任何重试。用户看到的就是
+                 * 「进了 DSH 界面，全白」（0.9.48 真机）。
+                 *
+                 * 这里改成自愈入口：重新取 token 再加载，连续失败才弹救援。
+                 */
+                if (WebReadiness.needsRecovery(code)) {
+                    localDocumentFailed = true
+                    pageReady = false
+                    pendingConsole = false
+                    localSessionMinted = false
+                    recoverLocalDocument("本机主文档 HTTP $code")
+                }
+            }
+
+            override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
+                onWebViewUnavailable(if (detail.didCrash()) "WebView renderer 崩溃" else "WebView renderer 被系统回收")
+                return true // 已移除并销毁死亡 WebView；不能再让默认实现杀掉 Activity。
+            }
+
+            override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                pageReady = false
+                localDocumentFailed = false
+                // 每次导航重置：上一次加载的错误码不能污染这一次的判定。
+                remoteMainFrameError = 0
+                blankChecks = 0
+                webView.removeCallbacks(blankPageCheck)
+            }
+
             /**
              * 自签证书的 HTTPS 隧道。
              *
-             * 默认实现是「一律取消」，而 Cloudflare / Tailscale / frp 之外的
-             * 自建隧道很常见就是自签。放行条件必须收得很紧：
-             * **只对已配对 origin 放行，且只在远程模式下**。本地回环走 http，
-             * 永远走不到这里；一旦有人把用户骗去连一个陌生域名，那个域名
-             * 不在设备簿里，仍然会被拦住。
+             * Android 默认一律取消，而自签证书在自建隧道里是常态。放行条件
+             * 必须同时满足，缺一条就拒绝：
+             *
+             *   1. 处在远程模式（本机回环走 http，永远走不到这里）；
+             *   2. 这台主机在设备簿里；
+             *   3. 不是主机名不匹配 —— 那说明证书根本不是签给这个域名的，
+             *      再谈「固定」没有意义；
+             *   4. 证书指纹与首次信任时记下的一致（首次则记录，TOFU）。
+             *
+             * 为什么不再用「host 在簿里就 proceed」：配对一次就永久放弃服务端
+             * 身份校验，任何能劫持 DNS（或拿到同一私网网段）的人都能冒充那台
+             * 电脑，而用户不会有任何提示。TOFU 的代价是「隧道真的换了证书」
+             * 时会连不上 —— 那时删掉记录重扫一次即可，方向是对的。
              */
             override fun onReceivedSslError(
                 view: WebView,
                 handler: android.webkit.SslErrorHandler,
                 error: android.net.http.SslError,
             ) {
-                val host = runCatching { android.net.Uri.parse(error.url).host }.getOrNull()
-                val trusted = remoteMode && host != null &&
-                    RemoteStore.devices(this@MainActivity).any { it.host == host?.lowercase() }
-                if (trusted) {
-                    Log.w(TAG, "ssl error accepted for paired host: $host (${error.primaryError})")
-                    handler.proceed()
+                val host = runCatching { android.net.Uri.parse(error.url).host }.getOrNull()?.lowercase()
+                val device = if (remoteMode && host != null) {
+                    RemoteStore.devices(this@MainActivity).firstOrNull { it.host.lowercase() == host }
+                } else {
+                    null
+                }
+                val fingerprint = sslFingerprint(error.certificate)
+                val hostnameMismatch = error.primaryError == android.net.http.SslError.SSL_IDMISMATCH
+
+                if (device != null && fingerprint != null && !hostnameMismatch) {
+                    val pinned = device.certSha256
+                    when {
+                        pinned.isNullOrEmpty() -> {
+                            RemoteStore.pinCertificate(this@MainActivity, device.id, fingerprint)
+                            Log.w(TAG, "ssl: first trust for $host, pinned ${fingerprint.take(16)}…")
+                            handler.proceed()
+                        }
+                        pinned.equals(fingerprint, ignoreCase = true) -> {
+                            Log.w(TAG, "ssl: pinned certificate accepted for $host (${error.primaryError})")
+                            handler.proceed()
+                        }
+                        else -> {
+                            Log.w(TAG, "ssl: certificate changed for $host, refusing")
+                            RemoteStore.noteError(
+                                this@MainActivity,
+                                "「${device.label}」的证书和上次不一样，已拒绝连接。如果确实换了隧道证书，删掉这台再重新扫码。",
+                            )
+                            handler.cancel()
+                        }
+                    }
                 } else {
                     Log.w(TAG, "ssl error rejected: $host (${error.primaryError})")
                     handler.cancel()
@@ -455,15 +731,40 @@ class MainActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                if (!webViewUsable || (!remoteMode && localDocumentFailed)) return
+                pageReady = true
+                if (!remoteMode && isLocalDocument(android.net.Uri.parse(url)) &&
+                    rescueReason?.startsWith("本机主文档") == true) clearRescue()
                 Log.i(TAG, "page finished: $url")
                 // 「连上了」的判据只有这一处。
                 //
                 // 退出远程时回写成功是错的（断开一次成功会话和加载成功是两件事），
                 // 而自动连接必须知道**真的能打开**才敢把一次连接记成成功。
+                //
+                // 但「加载结束」本身不等于「可用」：配对失败页、401、上游 502
+                // 也会走到这里。所以把本轮主框架的错误码一起带进判定。
                 if (remoteMode) {
                     remotePageLoaded = true
                     webView.removeCallbacks(remoteWatchdog)
-                    remoteDeviceId?.let { RemoteStore.markUsed(this@MainActivity, it, true) }
+                    val failure = remoteMainFrameError
+                    val id = remoteDeviceId
+                    if (id != null) {
+                        if (failure >= 400) {
+                            RemoteStore.markUsed(this@MainActivity, id, false)
+                            val label = RemoteStore.find(this@MainActivity, id)?.label ?: "这台电脑"
+                            if (remoteAuto) {
+                                // 自动连接碰到「能打开但不是 DSH」的页面：退回本机，
+                                // 别把用户丢在一个显示着错误页的远程视图里。
+                                RemoteStore.startAutoBackoff(this@MainActivity)
+                                RemoteStore.noteError(this@MainActivity, "没连上「$label」（HTTP $failure），已回到本机")
+                                exitRemote()
+                                return
+                            }
+                            remoteBar?.flashHint("「$label」返回 HTTP $failure，可能配对已失效", 8_000L)
+                        } else {
+                            RemoteStore.markUsed(this@MainActivity, id, true)
+                        }
+                    }
                 }
                 currentPath = pathOf(url)
                 /*
@@ -483,6 +784,40 @@ class MainActivity : Activity() {
                 }
                 // 页面就绪后立刻把挂起的 attention 意图送进去（冷启动路径）。
                 flushPendingAttention()
+
+                /*
+                 * 首屏空白检测：200 + 无网络错误 + 无 HTTP 错误，页面照样可能
+                 * 是空的（前端 boot 抛错时在浏览器里不会画错误卡）。这里在
+                 * 3 秒后量一次 DOM，空就进自愈流程。
+                 *
+                 * 只管本机官方页：`/kxxy` 是宿主管理页（自带完整 HTML），
+                 * 远程页有它自己的看门狗与设备条，都不该被这里判成白屏。
+                 */
+                val local = !remoteMode && isLocalDocument(android.net.Uri.parse(url))
+                val path = pathOf(url).orEmpty()
+                if (local && !path.startsWith("/kxxy")) {
+                    applyMobileFrameFix()
+                    blankChecks = 0
+                    webView.removeCallbacks(blankPageCheck)
+                    webView.postDelayed(blankPageCheck, BLANK_CHECK_DELAY_MS)
+                }
+            }
+
+            /**
+             * 首次绘制前的注入点。
+             *
+             * `dsh-web-mobile` 的移动端列宽样式在 React 挂载后才进 DOM，而它那条
+             * `grid-template-columns` 把 0.2.2 的主列按进 0 宽的第 2 轨（见
+             * [WebReadiness.MOBILE_FRAME_CSS]）。`onPageCommitVisible` 早于
+             * `onPageFinished`，能少一帧白，插进去的 `<style>` 自带幂等守卫，
+             * 两个时机都调也不会重复。
+             */
+            override fun onPageCommitVisible(view: WebView, url: String) {
+                super.onPageCommitVisible(view, url)
+                if (!webViewUsable || remoteMode || localDocumentFailed) return
+                if (isLocalDocument(android.net.Uri.parse(url)) && !pathOf(url).orEmpty().startsWith("/kxxy")) {
+                    applyMobileFrameFix()
+                }
             }
 
             /**
@@ -786,6 +1121,9 @@ class MainActivity : Activity() {
      * 尝试 `kxxy://` 跳转，桥会按本地规则执行（那是安全漏洞，不是时序瑕疵）。
      */
     private fun enterRemote(device: RemoteStore.Device, auto: Boolean = false) {
+        if (!webViewUsable) return
+        clearRescue()
+        pageReady = false
         remoteDeviceId = device.id
         remoteMode = true
         remoteAuto = auto
@@ -840,6 +1178,14 @@ class MainActivity : Activity() {
      * @param anchor 落在控制台哪个锚点（`#remote` 从远程退出时用）
      */
     private fun openConsole(anchor: String = "") {
+        if (!webViewUsable) return
+        val state = supervisor.state.value
+        if (state !is EngineSupervisor.State.Healthy) {
+            offerRescue("本机引擎尚未就绪（${state.javaClass.simpleName}）")
+            return
+        }
+        pageReady = false
+        localDocumentFailed = false
         val tokenUrl = engineTokenUrl
         if (!localSessionMinted && tokenUrl != null) {
             pendingConsoleAnchor = anchor
@@ -1170,7 +1516,7 @@ class MainActivity : Activity() {
      */
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (!urlLoaded || !::webView.isInitialized) {
+        if (!urlLoaded || !webViewUsable) {
             super.onBackPressed()
             return
         }
@@ -1225,12 +1571,16 @@ class MainActivity : Activity() {
         pendingSessionId = intent.getStringExtra(EXTRA_SESSION_ID)
         Log.i(TAG, "launch intent: attention=$attentionId")
         flushPendingAttention()
+        if (!remoteMode && supervisor.state.value !is EngineSupervisor.State.Healthy) {
+            offerRescue("本机引擎尚未就绪，通知目标将在页面就绪后投递")
+        }
     }
 
     /** 页面已就绪时把挂起的意图送进前端。 */
     private fun flushPendingAttention() {
         val id = pendingAttentionId ?: return
-        if (!urlLoaded || !::webView.isInitialized) return
+        if (!urlLoaded || !webViewUsable || !pageReady || remoteMode ||
+            supervisor.state.value !is EngineSupervisor.State.Healthy) return
         pendingAttentionId = null
         val sessionId = pendingSessionId
         pendingSessionId = null
@@ -1303,6 +1653,52 @@ class MainActivity : Activity() {
         Log.w(TAG, "notification settings intent unavailable")
     }
 
+    private fun isLocalDocument(uri: android.net.Uri): Boolean =
+        uri.scheme in setOf("http", "https") &&
+            uri.host in setOf("127.0.0.1", "localhost") &&
+            uri.port == EngineConfig.DEFAULT_PORT
+
+    /**
+     * 证书指纹（SHA-256，小写十六进制）。
+     *
+     * 用 `SslCertificate.x509Certificate` 的 DER 原文做摘要，而不是比对
+     * subject/issuer 之类的字段 —— 那些是证书内容的一部分，可以伪造；
+     * 指纹是整张证书的哈希，换一张就变。
+     *
+     * 拿不到证书（老系统或异常）时返回 null，调用方一律按拒绝处理：
+     * 「判不了」不能等于「放行」。
+     */
+    private fun sslFingerprint(certificate: android.net.http.SslCertificate?): String? {
+        val x509 = certificate?.x509Certificate ?: return null
+        return runCatching {
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(x509.encoded)
+                .joinToString("") { "%02x".format(it) }
+        }.getOrNull()
+    }
+
+    /**
+     * 把移动端列宽兜底样式插进当前文档（[WebReadiness.MOBILE_FRAME_CSS]）。
+     *
+     * 只做一件事：把主列钉回第 1 轨。0.2.2 给三列加了显式 `grid-area`，而内置的
+     * `dsh-web-mobile@3.1.0` 仍按 0.2.1 的「自动排布」假设强制
+     * `grid-template-columns: 1fr 0 0`，结果主列落进 0 宽的第 2 轨 —— 真机上就是
+     * 「进 DSH 界面纯白」，DOM 里却有完整内容。
+     *
+     * 幂等由脚本里的 `#kxxy-mobile-frame` 守卫保证；`onPageCommitVisible` 与
+     * `onPageFinished` 各调一次不会重复插。
+     */
+    private fun applyMobileFrameFix() {
+        if (!webViewUsable || remoteMode) return
+        runCatching {
+            webView.evaluateJavascript(WebReadiness.mobileFrameFixScript()) { result ->
+                if (result != null && result.contains("err")) {
+                    Log.w(TAG, "mobile frame fix injection failed: $result")
+                }
+            }
+        }.onFailure { Log.w(TAG, "mobile frame fix threw: ${it.message}") }
+    }
+
     private fun pathOf(url: String): String? =
         runCatching { android.net.Uri.parse(url).path }.getOrNull()
 
@@ -1310,10 +1706,15 @@ class MainActivity : Activity() {
      * 加载引擎 URL。
      *
      * token 来自引擎日志（`dsh web: http://127.0.0.1:3080/?token=…`）。
-     * 若提取失败则退化为不带 token 加载 —— 官方前端会返回 401 并触发
-     * 一次重定向，用户在界面上重新扫码/授权即可，比白屏好。
+     *
+     * ⚠️ 取不到 token 时**不能**退回裸地址：webserver 在 WebUI 挂载前对 `/`
+     * 回 404 空 body，WebView 渲染出来是一整片白，而且 4xx 不触发任何
+     * 网络错误回调 —— 用户看到的就是「进了界面什么都没」。
+     * 现在的策略是等（[waitForEngineToken]），等不到就弹原生救援。
      */
     private fun loadEngineUrl(tokenUrl: String?) {
+        if (!webViewUsable || leavingForRescue) return
+        if (waitingForEngineToken) return
         if (tokenUrl != null) engineTokenUrl = tokenUrl
         if (urlLoaded) return
         urlLoaded = true
@@ -1335,11 +1736,105 @@ class MainActivity : Activity() {
             }
         }
 
-        val target = tokenUrl ?: "http://127.0.0.1:${EngineConfig.DEFAULT_PORT}/"
+        val target = tokenUrl ?: engineTokenUrl
+        if (target == null) {
+            // 没有 token 就**绝不**加载裸 `/`。
+            //
+            // webserver 在 fallback owner 注册前对 `/` 回的是 404 + 空 body
+            // （responderFor 找不到命名路由就 `writeHead(404); res.end()`），
+            // WebView 把空 body 渲染成一整片白；而 4xx 既不触发 onReceivedError，
+            // 原来也不触发救援 —— 于是白屏永久停留。0.9.48 真机的白屏就是这个。
+            Log.i(TAG, "engine healthy without token url; waiting for it")
+            waitForEngineToken(0)
+            return
+        }
+        urlLoaded = true
         Log.i(TAG, "loading engine url: ${target.take(64)}…")
         // 带 token 才算"把 cookie 换到手"；裸地址那一次不算，稍后回本机要补。
-        localSessionMinted = tokenUrl != null
+        localSessionMinted = true
         webView.loadUrl(target)
+    }
+
+    /**
+     * 等引擎把带 token 的 URL 打进日志，拿到再加载首屏。
+     *
+     * 与 [loadEngineUrl] 的分工：那个决定「要不要加载」，这个负责
+     * 「暂时还加载不了时怎么等」。0.2.2 的 `dsh web:` 行在 loader 全部激活
+     * 并审计完之后才打印，慢设备上会明显晚于 HTTP 端口就绪；监管器那边
+     * 已经把等待窗口放宽到 12 秒，这里再用日志尾部兜底重取，
+     * 连续 [TOKEN_RETRY_LIMIT] 次拿不到才认输并把救援弹出来。
+     */
+    private fun waitForEngineToken(attempt: Int) {
+        if (!webViewUsable || remoteMode || leavingForRescue || urlLoaded || waitingForEngineToken) return
+        waitingForEngineToken = true
+        webView.postDelayed({
+            waitingForEngineToken = false
+            if (!webViewUsable || remoteMode || leavingForRescue || urlLoaded) return@postDelayed
+            app.appScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val token = runCatching { supervisor.refreshTokenUrl() }.getOrNull()
+                runOnUiThread {
+                    if (!webViewUsable || remoteMode || leavingForRescue || urlLoaded || isFinishing) return@runOnUiThread
+                    if (token != null) {
+                        engineTokenUrl = token
+                        localSessionMinted = true
+                        localRecoveryAttempts = 0
+                        urlLoaded = true
+                        Log.i(TAG, "engine token arrived after ${attempt + 1} wait(s)")
+                        webView.loadUrl(token)
+                    } else if (attempt + 1 < TOKEN_RETRY_LIMIT) {
+                        waitForEngineToken(attempt + 1)
+                    } else {
+                        offerRescue("引擎已就绪，但日志里一直没有会话 token（WebUI 可能没挂载），请进入原生救援导出诊断")
+                    }
+                }
+            }
+        }, TOKEN_RETRY_INTERVAL_MS)
+    }
+
+    /**
+     * 本机首页自愈：重新取 token 再加载；连续失败就把救援弹给用户。
+     *
+     * 只在「主文档 4xx」和「页面渲染为空」两条路上调用 —— 两条都属于
+     * 「引擎活着、网页没出来」，正是白屏的两种真实形状。
+     */
+    private fun recoverLocalDocument(reason: String) {
+        if (!webViewUsable || remoteMode || leavingForRescue || isFinishing || isDestroyed) return
+        if (localRecoveryAttempts >= LOCAL_RECOVERY_LIMIT) {
+            val boot = runCatching { WebBootLog.tail(this, 400) }.getOrDefault("")
+            offerRescue(
+                buildString {
+                    append("对话页打不开：").append(reason)
+                    if (boot.isNotBlank()) append("；网页日志：").append(boot)
+                },
+            )
+            return
+        }
+        localRecoveryAttempts++
+        Log.w(TAG, "local document recovery #$localRecoveryAttempts: $reason")
+        blankChecks = 0
+        webView.removeCallbacks(blankPageCheck)
+        pageReady = false
+        localDocumentFailed = false
+        pendingConsole = false
+        localSessionMinted = false
+        // 先占住「已加载」这个槽位：状态回调（applyEngineState）看到 urlLoaded
+        // 就不会再排一次加载，避免和这里的重载互相踩。
+        urlLoaded = true
+        app.appScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val token = runCatching { supervisor.refreshTokenUrl() }.getOrNull()
+            runOnUiThread {
+                if (!webViewUsable || remoteMode || leavingForRescue || isFinishing) return@runOnUiThread
+                if (token != null) {
+                    engineTokenUrl = token
+                    localSessionMinted = true
+                    webView.loadUrl(token)
+                } else {
+                    // 还没有 token：让出槽位，交给 token 等待流程（它自带重试与最终救援）。
+                    urlLoaded = false
+                    waitForEngineToken(0)
+                }
+            }
+        }
     }
 
     /** 恢复 WebView 的 JS 定时器。
@@ -1351,7 +1846,7 @@ class MainActivity : Activity() {
      */
     override fun onResume() {
         super.onResume()
-        if (::webView.isInitialized) {
+        if (webViewUsable) {
             runCatching { webView.onResume() }
             runCatching { webView.resumeTimers() }
         }
@@ -1360,24 +1855,25 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         // 刻意不调用 super.onPause() 里的 WebView 暂停逻辑，同时显式 resumeTimers
-        if (::webView.isInitialized) {
+        if (webViewUsable) {
             runCatching { webView.resumeTimers() }
         }
         // 远端 cookie 落盘。WebView 只在内存里维护 cookie，进程被回收就丢；
         // 用户下次打开又要重新配对。这里在每次退到后台时刷一次（成本极低，
         // 且 flush 在 IO 线程完成）。
-        runCatching { android.webkit.CookieManager.getInstance().flush() }
+        if (webViewUsable) runCatching { android.webkit.CookieManager.getInstance().flush() }
     }
 
     override fun onDestroy() {
         stateJob?.cancel()
+        rescueDialog?.dismiss()
         // 悬空的文件选择回调会让 WebView 之后所有 input 点击静默失效
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
         // 同理：悬空的权限请求会让网页侧的 getUserMedia Promise 永不 resolve
         pendingWebPermission?.let { runCatching { it.deny() } }
         pendingWebPermission = null
-        if (::webView.isInitialized) {
+        if (webViewUsable) {
             runCatching {
                 (webView.parent as? ViewGroup)?.removeView(webView)
                 webView.destroy()
@@ -1421,5 +1917,29 @@ class MainActivity : Activity() {
 
         /** 该请求所属的会话（可能为空：引擎没给就不跳会话）。 */
         const val EXTRA_SESSION_ID = "kxxy.extra.session_id"
+
+        /**
+         * 首屏等 token 的轮询间隔与上限。
+         *
+         * 8 × 400ms ≈ 3.2 秒：引擎已经在 Healthy，日志里那一行通常紧接着就来；
+         * 真拿不到就交给救援面板，不再让用户对着白屏猜。
+         */
+        private const val TOKEN_RETRY_INTERVAL_MS = 400L
+        private const val TOKEN_RETRY_LIMIT = 8
+
+        /** 白屏/4xx 自愈的总次数上限（超过就弹救援）。 */
+        private const val LOCAL_RECOVERY_LIMIT = 2
+
+        /**
+         * 首屏加载完成后等多久再量 DOM。
+         *
+         * 官方前端首帧之前会先挂一个 loading 卡（也在 #root 里），所以不能
+         * 一 loaded 就判；3 秒足够它走完插件激活或抛出 boot 错误。
+         */
+        private const val BLANK_CHECK_DELAY_MS = 3_000L
+
+        /** 空白再确认：最多多等 2 轮、每轮 2.5 秒（合计 ≈8 秒）再判定白屏。 */
+        private const val BLANK_RECHECK_LIMIT = 2
+        private const val BLANK_RECHECK_DELAY_MS = 2_500L
     }
 }

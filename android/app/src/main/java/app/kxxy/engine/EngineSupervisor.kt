@@ -13,7 +13,15 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.coroutineContext
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -112,6 +120,12 @@ class EngineSupervisor(private val ctx: Context) {
     @Volatile
     private var requestJob: Job? = null
 
+    @Volatile
+    private var maintenanceJob: Job? = null
+    private val lifecycleMutex = Mutex()
+    @Volatile
+    private var controlInProgress = false
+
     /** 用户显式退出标记：置位后所有自动启动路径都必须跳过。 */
     private val userStopped = AtomicBoolean(false)
 
@@ -148,23 +162,37 @@ class EngineSupervisor(private val ctx: Context) {
 
     /** 用户点「启动/重启」。清除退出标记并（重新）进入监管循环。 */
     fun start() {
-        userStopped.set(false)
-        if (supervisionJob?.isActive == true) {
-            Log.i(TAG, "supervision already running, ignoring start()")
+        if (process != null) {
+            Log.w(TAG, "unverified process handle retained; stop must succeed before start")
             return
         }
-        supervisionJob = scope.launch {
-            try {
-                supervisionLoop()
-            } finally {
-                // 监管循环退出（用户停止、连续失败放弃）后心跳已无意义：
-                // 继续跑只会每 5 秒读一次 /proc 再发现 process == null。
-                heartbeatJob?.cancel()
-                heartbeatJob = null
+        if (controlInProgress) return
+        scope.launch {
+            lifecycleMutex.withLock {
+                if (controlInProgress) return@withLock
+                if (supervisionJob?.isActive == true) {
+                    Log.i(TAG, "supervision already running, ignoring start()")
+                    return@withLock
+                }
+                if (process != null) return@withLock
+                userStopped.set(false)
+                supervisionJob = scope.launch {
+                    try {
+                        supervisionLoop()
+                    } finally {
+                        withContext(NonCancellable) {
+                            maintenanceJob?.cancelAndJoin()
+                            maintenanceJob = null
+                            heartbeatJob?.cancelAndJoin()
+                            heartbeatJob = null
+                            cleanupProcess(process, 1_000L)
+                        }
+                    }
+                }
+                startHeartbeat()
+                startRequestWatcher()
             }
         }
-        startHeartbeat()
-        startRequestWatcher()
     }
 
     /**
@@ -210,7 +238,9 @@ class EngineSupervisor(private val ctx: Context) {
                     runCatching { recoveryReq.delete() }
                     if (!raw.isNullOrBlank()) {
                         Log.i(TAG, "recovery.request consumed: ${raw.take(120)}")
-                        runRecovery(raw)
+                        // A sibling action job may stop/join this watcher; never run
+                        // the repair on the watcher itself (self-cancel/self-join).
+                        scope.launch { runRecovery(raw) }
                         // 修复必然伴随重启（配置改完不重启不生效），
                         // 所以这里 continue，别再走本轮的后续判断。
                         continue
@@ -409,18 +439,66 @@ class EngineSupervisor(private val ctx: Context) {
     }
 
     /** 用户点「停止」（不置退出标记，仅停当前进程）。 */
-    suspend fun stop(graceMs: Long = 3_500L) {
-        heartbeatJob?.cancel()
-        heartbeatJob = null
-        requestJob?.cancel()
-        requestJob = null
-        supervisionJob?.cancel()
-        supervisionJob = null
-        withContext(Dispatchers.IO) {
-            process?.stop(graceMs)
-            process = null
+    suspend fun stop(graceMs: Long = 3_500L) = lifecycleMutex.withLock {
+        controlInProgress = true
+        try { stopLocked(graceMs) } finally { controlInProgress = false }
+    }
+
+    private suspend fun stopLocked(graceMs: Long = 3_500L) {
+        val caller = coroutineContext[Job]
+        val jobs = listOfNotNull(requestJob, heartbeatJob, maintenanceJob, supervisionJob)
+        if (jobs.any { it === caller }) throw EngineStartException("不能从 writer task 自身声明停机；必须由独立控制任务调用")
+        jobs.forEach { it.cancel() }
+        withContext(NonCancellable) {
+            jobs.forEach { it.join() }
+            requestJob = null
+            heartbeatJob = null
+            maintenanceJob = null
+            supervisionJob = null
+            cleanupProcess(process, graceMs)
+            _state.value = State.Stopped
         }
-        _state.value = State.Stopped
+    }
+
+    private suspend fun cleanupProcess(proc: EngineProcess?, graceMs: Long) {
+        if (proc == null) return
+        withContext(NonCancellable + Dispatchers.IO) {
+            proc.stop(graceMs)
+            // stop verifies known PID ESRCH and joins native tasks; failure retains handle.
+            if (process === proc) process = null
+        }
+    }
+
+    /** Serial stop + repair, never restart. Callers decide when to restart. */
+    suspend fun performRecovery(
+        level: RecoveryManager.Level,
+        headline: String = "",
+        target: RecoveryManager.Target? = null,
+        allowRoot: Boolean = false,
+    ): RecoveryManager.Result = lifecycleMutex.withLock {
+        controlInProgress = true
+        try {
+            stopLocked()
+            val outcome = RecoveryManager(ctx).recover(level, headline, target, allowRoot, writersStopped = true)
+            if (outcome.target == RecoveryManager.Target.USER_DATA_PERMISSIONS || outcome.target == RecoveryManager.Target.BOOT_DATA) {
+                writeRecoveryResult(EngineConfig.recoveryResultFile(ctx), level.name, outcome.success,
+                    outcome.changes, outcome.detail, target = outcome.target.name)
+            }
+            outcome
+        } finally {
+            controlInProgress = false
+        }
+    }
+
+    /** Serial stop + undo; no implicit engine start, including failure. */
+    suspend fun performUndo(): Boolean = lifecycleMutex.withLock {
+        controlInProgress = true
+        try {
+            stopLocked()
+            RecoveryManager(ctx).undoLatest()
+        } finally {
+            controlInProgress = false
+        }
     }
 
     /**
@@ -469,42 +547,42 @@ class EngineSupervisor(private val ctx: Context) {
      *    多等一次；而成功则必须重启（配置被搬回去了）。
      */
     private suspend fun runRecovery(raw: String) {
-        val level = runCatching {
-            org.json.JSONObject(raw).optString("level", "L1").uppercase()
-        }.getOrElse { "L1" }
-        val headline = runCatching {
-            org.json.JSONObject(raw).optString("headline", "")
-        }.getOrDefault("")
-
-        val manager = RecoveryManager(ctx)
+        val request = try { org.json.JSONObject(raw) } catch (e: Exception) {
+            Log.w(TAG, "malformed recovery request", e)
+            return
+        }
+        val level = request.optString("level", "L1").uppercase()
+        val headline = request.optString("headline", "")
+        val targetText = request.optString("target", "").trim()
+        val target = if (targetText.isEmpty()) null else
+            RecoveryManager.Target.entries.firstOrNull { it.name.equals(targetText, ignoreCase = true) }
+                ?: RecoveryManager.Target.UNKNOWN
         val resultFile = EngineConfig.recoveryResultFile(ctx)
-
-        if (level == "UNDO") {
-            val ok = runCatching { manager.undoLatest() }
-                .onFailure { Log.w(TAG, "undo failed: ${it.message}") }
-                .getOrDefault(false)
-            writeRecoveryResult(resultFile, level, ok, emptyList(),
-                if (ok) "" else "没有可撤销的修复记录，或撤销过程中出错")
-            if (!ok) return
-            Log.i(TAG, "undo done -> restarting engine")
-            restart()
-            return
+        val requestedAt = request.optLong("requestedAt", 0L)
+        fun result(ok: Boolean, changes: List<String>, error: String) = writeRecoveryResult(
+            resultFile, level, ok, changes, error, requestedAt, target?.name,
+        )
+        try {
+            if (level == "UNDO") {
+                val ok = performUndo()
+                result(ok, emptyList(),
+                    if (ok) "" else "没有可撤销的修复记录，或撤销过程中出错")
+                if (ok) restart()
+                return
+            }
+            val outcome = performRecovery(parseLevel(level), headline, target)
+            result(outcome.success, outcome.changes, outcome.detail)
+            if (outcome.success) restart()
+            else Log.w(TAG, "recovery did not complete: ${outcome.detail}")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: LinkageError) {
+            Log.e(TAG, "recovery native linkage failed", e)
+            result(false, emptyList(), "${e.javaClass.simpleName}: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "recovery failed; engine remains stopped", e)
+            result(false, emptyList(), e.message ?: e.javaClass.simpleName)
         }
-
-        val outcome = runCatching { manager.recover(level = parseLevel(level), headline = headline) }
-            .onFailure { Log.w(TAG, "recover($level) failed: ${it.message}") }
-
-        val failure = outcome.exceptionOrNull()
-        if (failure != null) {
-            writeRecoveryResult(resultFile, level, false, emptyList(), failure.message ?: "未知错误")
-            Log.w(TAG, "recovery failed, engine left as-is: ${failure.message}")
-            return
-        }
-
-        val result = outcome.getOrThrow()
-        writeRecoveryResult(resultFile, level, true, result.changes, "")
-        Log.i(TAG, "recover($level) done, ${result.changes.size} change(s) -> restarting engine")
-        restart()
     }
 
     private fun parseLevel(level: String): RecoveryManager.Level = when (level.uppercase()) {
@@ -527,6 +605,8 @@ class EngineSupervisor(private val ctx: Context) {
         ok: Boolean,
         changes: List<String>,
         error: String,
+        requestedAt: Long = 0L,
+        target: String? = null,
     ) {
         runCatching {
             val json = buildString {
@@ -534,6 +614,8 @@ class EngineSupervisor(private val ctx: Context) {
                 append("  \"level\": \"$level\",\n")
                 append("  \"ok\": $ok,\n")
                 append("  \"at\": ${System.currentTimeMillis()},\n")
+                append("  \"requestedAt\": $requestedAt,\n")
+                append("  \"target\": ${target?.let { jsonString(it) } ?: "null"},\n")
                 append("  \"error\": \"${escapeJson(error)}\",\n")
                 append("  \"changes\": [")
                 changes.forEachIndexed { i, c ->
@@ -544,7 +626,12 @@ class EngineSupervisor(private val ctx: Context) {
                 append("}\n")
             }
             file.parentFile?.mkdirs()
-            file.writeText(json)
+            val tmp = File(file.parentFile, "${file.name}.tmp")
+            tmp.writeText(json)
+            if (!tmp.renameTo(file)) {
+                file.writeText(json)
+                tmp.delete()
+            }
         }.onFailure { Log.w(TAG, "writeRecoveryResult failed: ${it.message}") }
     }
 
@@ -561,6 +648,7 @@ class EngineSupervisor(private val ctx: Context) {
         var backoffIndex = 0
 
         while (true) {
+            coroutineContext.ensureActive()
             if (userStopped.get()) {
                 Log.i(TAG, "supervision loop exit: user stopped")
                 _state.value = State.Stopped
@@ -570,18 +658,22 @@ class EngineSupervisor(private val ctx: Context) {
             // 本轮是否因「真实死亡」而失败。健康超时不计入。
             var deterministicFailure: String? = null
             var proc: EngineProcess? = null
+            var phase = "install"
 
             try {
                 _state.value = State.Installing(0f)
-                RuntimeInstaller(ctx).ensureInstalled { frac ->
-                    // 仅整 1% 变化才发布，避免高频 StateFlow 发射
-                    val rounded = kotlin.math.floor(frac * 100f) / 100f
-                    if (rounded != _installProgress.value) {
-                        _installProgress.value = rounded
-                        _state.value = State.Installing(rounded)
+                runInterruptible(Dispatchers.IO) {
+                    RuntimeInstaller(ctx).ensureInstalled { frac ->
+                        val rounded = kotlin.math.floor(frac * 100f) / 100f
+                        if (rounded != _installProgress.value) {
+                            _installProgress.value = rounded
+                            _state.value = State.Installing(rounded)
+                        }
                     }
                 }
+                coroutineContext.ensureActive()
 
+                phase = "prepare"
                 EngineConfig.ensureOverlay(ctx)
                 ensureDirs()
                 // 闸门脚本必须每轮重装：RuntimeInstaller 重装 runtime 时会整棵覆盖
@@ -593,10 +685,15 @@ class EngineSupervisor(private val ctx: Context) {
                 // 重装 runtime 会让它复活。见 TermuxApiServer.installShim。
                 TermuxApiServer.installShim(ctx)
 
+                phase = "spawn"
                 _state.value = State.Starting
-                proc = spawnEngine()
+                // Do not lose a just-forked process to withContext's prompt
+                // cancellation before its handle is assigned and finally can reap it.
+                proc = withContext(NonCancellable) { spawnEngine() }
                 process = proc
+                coroutineContext.ensureActive()
 
+                phase = "health"
                 val healthy = pollHealth(EngineConfig.DEFAULT_PORT, proc)
                 if (!healthy) {
                     if (proc.exitStatus.isCompleted) {
@@ -611,22 +708,13 @@ class EngineSupervisor(private val ctx: Context) {
                         proc.stop(graceMs = 1_000L)
                         process = null
                         Log.w(TAG, deterministicFailure)
+                        recordNativeFailure(phase, "EngineExit", deterministicFailure)
                     } else {
-                        // 健康检查超时：进程还活着只是没监听端口，这是我们主动放弃
-                        Log.w(TAG, "health check timed out after ${EngineConfig.HEALTH_TIMEOUT_MS}ms")
-                        proc.stop(graceMs = 2_000L)
-                        process = null
-                        backoffIndex++
-                        if (backoffIndex > EngineConfig.MAX_RESTART) {
-                            _state.value = State.Failed("引擎连续 ${EngineConfig.MAX_RESTART} 次启动失败")
-                            return
-                        }
-                        val delayMs = EngineConfig.BACKOFF_STEPS[
-                            (backoffIndex - 1).coerceAtMost(EngineConfig.BACKOFF_STEPS.size - 1)
-                        ]
-                        _state.value = State.Backoff(delayMs, backoffIndex)
-                        delay(delayMs)
-                        continue
+                        val reason = "引擎健康检查超时（${healthTimeoutMs / 1000} 秒，进程仍存活）：$lastHealthError${errorHint(proc)}；慢设备已延长等待，可重试或进入启动救援"
+                        Log.w(TAG, reason)
+                        recordNativeFailure(phase, "HealthTimeout", reason)
+                        _state.value = State.Failed(reason)
+                        return
                     }
                 } else {
                     // 健康：清零退避（连同「同一条错误重复了几次」的账）
@@ -636,10 +724,26 @@ class EngineSupervisor(private val ctx: Context) {
                     val tokenUrl = extractTokenUrlWithRetry(proc)
                     lastGoodUrl = tokenUrl
                     _state.value = State.Healthy(EngineConfig.DEFAULT_PORT, tokenUrl)
+                    File(EngineConfig.engineRoot(ctx), "native-boot-failure.json").delete()
+                    phase = "running"
+                    maintenanceJob?.cancelAndJoin()
+                    maintenanceJob = scope.launch {
+                        try {
+                            RuntimeInstaller(ctx).maintainAfterHealthy()
+                        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                            Log.w(TAG, "runtime maintenance timed out; engine stays Healthy", e)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: LinkageError) {
+                            Log.e(TAG, "runtime maintenance linkage failed", e)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "runtime maintenance failed; engine stays Healthy", e)
+                        }
+                    }
 
                     // 阻塞等待引擎退出
                     val status = proc.exitStatus.await()
-                    process = null
+                    cleanupProcess(proc, 1_000L)
 
                     if (userStopped.get()) {
                         _state.value = State.Stopped
@@ -651,14 +755,36 @@ class EngineSupervisor(private val ctx: Context) {
                     Log.w(TAG, deterministicFailure)
                 }
 
+            } catch (e: LinkageError) {
+                val reason = "原生运行库加载失败（${e.javaClass.simpleName}）：${e.message ?: "无详细消息"}"
+                Log.e(TAG, reason, e)
+                recordNativeFailure(phase, e.javaClass.simpleName, reason)
+                try {
+                    withContext(Dispatchers.IO) {
+                        EngineConfig.logFile(ctx).appendText("\n---- supervisor linkage failure ----\n${android.util.Log.getStackTraceString(e)}\n")
+                    }
+                } catch (logError: Exception) {
+                    Log.w(TAG, "cannot persist linkage failure", logError)
+                }
+                _state.value = State.Failed(reason)
+                return
             } catch (e: EngineStartException) {
+                e.failedProcess?.let { failed -> proc = failed; process = failed }
                 deterministicFailure = e.message ?: "engine start failed"
                 Log.e(TAG, "spawn failed", e)
+                recordNativeFailure(phase, e.javaClass.simpleName, deterministicFailure)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
                 deterministicFailure = e.message ?: e.javaClass.simpleName
                 Log.e(TAG, "supervision iteration failed", e)
+                recordNativeFailure(phase, e.javaClass.simpleName, deterministicFailure)
+            } finally {
+                withContext(NonCancellable) {
+                    maintenanceJob?.cancelAndJoin()
+                    maintenanceJob = null
+                    cleanupProcess(proc, 1_000L)
+                }
             }
 
             if (deterministicFailure != null) {
@@ -715,6 +841,20 @@ class EngineSupervisor(private val ctx: Context) {
      * 正常运行时的旧内容；`Error:` / `throw` / `Exception` / `Cannot find` 这些
      * 前缀覆盖了官方启动链上绝大多数致命错误的开头。
      */
+    /** Kept across stop/recovery so native rescue can export the original failure. */
+    private fun recordNativeFailure(phase: String, exception: String, reason: String?) {
+        try {
+            val root = EngineConfig.engineRoot(ctx).apply { mkdirs() }
+            val file = File(root, "native-boot-failure.json")
+            val tmp = File(root, "native-boot-failure.json.tmp")
+            val safe = RescueDiagnostics.redact(reason.orEmpty()).take(2_048)
+            tmp.writeText("{\"phase\":${jsonString(phase)},\"exception\":${jsonString(exception)},\"reason\":${jsonString(safe)},\"at\":${System.currentTimeMillis()}}\n")
+            if (!tmp.renameTo(file)) { file.writeText(tmp.readText()); tmp.delete() }
+        } catch (e: Exception) {
+            Log.w(TAG, "cannot persist native boot failure", e)
+        }
+    }
+
     private fun errorHint(proc: EngineProcess): String {
         val tail = runCatching { proc.tailLog(16 * 1024) }.getOrDefault("")
         if (tail.isEmpty()) return ""
@@ -781,6 +921,7 @@ class EngineSupervisor(private val ctx: Context) {
             val json = buildString {
                 append("{\n")
                 append("  \"supervisor\": \"${s.javaClass.simpleName}\",\n")
+                if (s is State.Failed) append("  \"reason\": ${jsonString(s.reason)},\n")
                 append("  \"pid\": ${proc?.pid ?: 0},\n")
                 append("  \"uptimeSec\": $uptimeSec,\n")
                 append("  \"memoryMB\": $memoryMB,\n")
@@ -985,6 +1126,9 @@ class EngineSupervisor(private val ctx: Context) {
     @Volatile
     private var effectivePrivMode: String = "normal"
 
+    /** 上次启动实际生效的运行身份；未启动时为默认 normal，不触发 Root 探测。 */
+    fun effectivePrivilegeMode(): String = effectivePrivMode
+
     private suspend fun spawnEngine(): EngineProcess {
         val logOffset = EngineConfig.logFile(ctx).let { if (it.isFile) it.length() else 0L }
 
@@ -1007,12 +1151,7 @@ class EngineSupervisor(private val ctx: Context) {
                 Log.w(TAG, "privMode=root requested but no usable su; falling back to normal")
                 effectiveMode = "normal"
             } else {
-                // 参考项目 m1.26 事故链的两道防护：root 启动会把 dsh-home 写成
-                // root 属主（之后非 root 启动全 EACCES），先修属主再备份。
-                if (Privilege.dshHomeNeedsOwnershipFix(ctx)) {
-                    Log.w(TAG, "dsh-home ownership broken (previous root run?), fixing")
-                    Privilege.fixHomeOwnership(ctx)
-                }
+                // 不在启动时递归改属主。Root→普通模式的权限恢复由原生救援明确确认。
                 Privilege.backupHome(ctx)
                 rootPrefix = prefix
             }
@@ -1057,12 +1196,24 @@ class EngineSupervisor(private val ctx: Context) {
      *
      * 判定 `code in 200..499` 即就绪 —— 官方 WebUI 起来后可能返回 401
      * （等待 token 鉴权），但 HTTP 栈已应答就说明监听成功。
+     *
+     * ⚠️ 唯独 404 不算就绪。webserver 的规则是「没有命名路由命中就先答
+     * 404（空 body），直到 fallback owner 注册」（见 dsh-host-webserver 的
+     * responderFor）。也就是说 404 恰恰证明 WebUI **还没挂载**。把它当成就绪，
+     * 宿主会在前端还没挂上时就去取 token（此时日志里根本没有那行），
+     * 然后拿裸 `/` 加载出一张永久白页 —— 0.9.48 真机白屏就是这个形状：
+     * 404 空 body 在 WebView 里就是一整片白，而 4xx 又不触发网络错误救援。
      */
+    private val healthTimeoutMs = EngineConfig.HEALTH_TIMEOUT_MS.coerceAtLeast(120_000L).coerceAtMost(180_000L)
+    @Volatile private var lastHealthError = "HTTP 未应答"
+
     private suspend fun pollHealth(port: Int, proc: EngineProcess): Boolean =
         withContext(Dispatchers.IO) {
-            val deadline = System.currentTimeMillis() + EngineConfig.HEALTH_TIMEOUT_MS
+            val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(healthTimeoutMs)
+            lastHealthError = "HTTP 未应答"
 
-            while (System.currentTimeMillis() < deadline) {
+            while (System.nanoTime() < deadline) {
+                coroutineContext.ensureActive()
                 // 进程已死就没必要继续等
                 if (proc.exitStatus.isCompleted) return@withContext false
 
@@ -1077,30 +1228,68 @@ class EngineSupervisor(private val ctx: Context) {
                     } finally {
                         runCatching { conn.disconnect() }
                     }
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
+                    lastHealthError = "${e.javaClass.simpleName}: ${e.message.orEmpty().take(180)}"
                     -1
                 }
 
-                if (code in 200..499) return@withContext true
+                if (WebReadiness.isReady(code)) return@withContext true
+                if (code == WebReadiness.HTTP_NOT_FOUND) {
+                    // 404 = fallback owner 还没注册（见方法注释），继续等，别提前宣布健康。
+                    lastHealthError = "HTTP 404（WebUI 尚未挂载）"
+                    delay(EngineConfig.HEALTH_INTERVAL_MS)
+                    continue
+                }
+                if (code >= 0) lastHealthError = "HTTP $code"
                 delay(EngineConfig.HEALTH_INTERVAL_MS)
             }
             false
         }
 
     /**
-     * 从日志提取带 token 的 URL，最多重试 6 次 × 100ms。
+     * 从日志提取带 token 的 URL，最多重试 12 秒（120 × 100ms）。
      *
      * ⚠️ 只搜 spawn 之后的日志段（logBaseline）。搜全文会拿到上一次启动的
      * 旧 token，导致 WebView 401 白页 —— 参考项目实测过这个事故。
+     *
+     * 为什么从 600ms 放宽到 12s：0.2.2 的 `dsh web:` 那行是在
+     * `loader.await()` + 启动审计之后才打印的（见 dsh-web-app 的 announceReady），
+     * 而 HTTP 栈早在 fallback 注册前就会应答。两者之间的间隔在慢设备上
+     * 远不止 600ms；拿不到 token 就走裸 `/`，等于用一张 404 白页收场。
+     * 这 12 秒只在「已经健康但日志里还没有那一行」时消耗，正常设备第一次
+     * 轮询就命中，不会拖慢启动。
      */
     private suspend fun extractTokenUrlWithRetry(proc: EngineProcess): String? {
-        repeat(6) {
+        repeat(TOKEN_WAIT_ATTEMPTS) {
             val url = proc.extractTokenUrl(logBaseline)
             if (url != null) return url
-            delay(100L)
+            delay(TOKEN_WAIT_INTERVAL_MS)
         }
         Log.w(TAG, "token url not found in engine log")
         return null
+    }
+
+    /**
+     * 补救：重新从日志尾部取一次 token，并把 Healthy 状态里的 URL 换掉。
+     *
+     * 页面白掉之后宿主只有这一条自愈路径 —— 引擎自己不会重新打印旧 token，
+     * 但日志里那一行一定还在（除非被环形日志裁掉）。读到新值就顺手更新
+     * [State.Healthy.tokenUrl]，MainActivity 下次 collect 就能直接用。
+     *
+     * 只在 IO 线程调用（要读日志文件）。
+     */
+    fun refreshTokenUrl(): String? {
+        val proc = process ?: return lastGoodUrl
+        val url = proc.extractLastTokenUrl() ?: return lastGoodUrl
+        lastGoodUrl = url
+        val current = _state.value
+        if (current is State.Healthy && current.tokenUrl != url) {
+            _state.value = State.Healthy(current.port, url)
+            Log.i(TAG, "token url refreshed from engine log")
+        }
+        return url
     }
 
     /**
@@ -1156,5 +1345,9 @@ class EngineSupervisor(private val ctx: Context) {
          * Ctrl+C 延迟已到肉眼可感的程度。stat 一次几百字节的文件开销可忽略。
          */
         private const val REQUEST_POLL_MS = 1_000L
+
+        /** token 等待：120 × 100ms = 12s，覆盖 0.2.2 延迟打印 URL 的情况。 */
+        private const val TOKEN_WAIT_ATTEMPTS = 120
+        private const val TOKEN_WAIT_INTERVAL_MS = 100L
     }
 }
