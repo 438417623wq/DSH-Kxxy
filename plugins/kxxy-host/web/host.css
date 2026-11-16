@@ -4072,3 +4072,1066 @@ input, textarea, select {
   .plugin-refresh.spin svg { animation: none; }
   .pi-progress-fill.indeterminate { animation: none; }
 }
+
+/* ==========================================================================
+   dsl — 控制台设计系统 v2（2026-11-16）
+   --------------------------------------------------------------------------
+   改版动机不是配色，是结构：v1 只有 `.card` 一种容器，于是概览页放了 9 张
+   同构卡片、扩展页 26 个扩展就是 26 张卡、插件页在第一个插件前面塞了 260px
+   说明。本段给出一套并行组件（全部 `dsl-` 前缀），只覆写「视觉与节奏」，
+   不改任何宿主 id / 结构锚点 —— 那样 `host.js` 会命中不到 DOM。
+
+   ⚠ 真机 WebView 是 Chrome 104，**禁用**：`:has()`(105)、`color-mix()`(111)、
+   `@container`(105)、`dvh`(108)、CSS 嵌套(112)、`text-wrap: balance`(114)。
+   需要混色的地方一律预生成字面量，深浅各一套。
+
+   ⚠ 不能从 `--dsw-alias-bg-layer-*` 推导层级：浅色下 layer-1/2/3 实测全是
+   `#fff`，推出来的三层背景是同一个白，卡片必然糊在页面上（v1 就是这个病）。
+   ========================================================================== */
+
+body {
+  --dsl-page: #f2f4f7;
+  --dsl-card: #ffffff;
+  --dsl-inset: #f7f8fa;
+  --dsl-line: rgba(15, 17, 21, 0.08);
+  --dsl-line-strong: rgba(15, 17, 21, 0.14);
+  --dsl-t1: #0f1115;
+  --dsl-t2: #61666b;
+  --dsl-t3: #81858c;
+  --dsl-accent: #4176e6;
+  --dsl-accent-soft: #eef3fe;
+  --dsl-ok: #1f8a4c;
+  --dsl-ok-soft: #e8f8ee;
+  --dsl-warn: #b4710c;
+  --dsl-warn-soft: #fdf3e4;
+  --dsl-bad: #c0322c;
+  --dsl-bad-soft: #fdeceb;
+
+  /* 7 档字号：正文下限 15，注释下限 11。v1 的 `10px + ellipsis` 在真机上
+     等于把信息删掉了，这一版所有行尾说明都不再单行截断。 */
+  --dsl-fs-hero: 19px;
+  --dsl-fs-title: 17px;
+  --dsl-fs-body: 15px;
+  --dsl-fs-row: 14.5px;
+  --dsl-fs-label: 12.5px;
+  --dsl-fs-note: 12px;
+  --dsl-fs-mini: 11px;
+}
+
+body[data-ds-dark-theme] {
+  --dsl-page: #101012;
+  --dsl-card: #1b1b1d;
+  --dsl-inset: #232326;
+  --dsl-line: rgba(255, 255, 255, 0.09);
+  --dsl-line-strong: rgba(255, 255, 255, 0.16);
+  --dsl-t1: #f9fafb;
+  --dsl-t2: #cfd3d6;
+  --dsl-t3: #979da6;
+  --dsl-accent: #7aaaff;
+  --dsl-accent-soft: rgba(122, 170, 255, 0.14);
+  --dsl-ok: #4ed17e;
+  --dsl-ok-soft: rgba(78, 209, 126, 0.14);
+  --dsl-warn: #f7ad31;
+  --dsl-warn-soft: rgba(247, 173, 49, 0.14);
+  --dsl-bad: #f25a5a;
+  --dsl-bad-soft: rgba(242, 90, 90, 0.14);
+}
+
+/* ── 1. 页面底与卡片：卡片必须能从页面上「浮起来」 ─────────────────────── */
+
+html,
+body {
+  background-color: var(--dsl-page);
+}
+
+.app-shell {
+  background-color: var(--dsl-page);
+}
+
+.card {
+  background-color: var(--dsl-card);
+  border: 1px solid var(--dsl-line);
+  border-radius: 14px;
+  padding: 14px;
+  margin-bottom: 10px;
+  box-shadow: none;
+}
+
+/* — 引擎主卡：一块卡装「结论 + 元信息 + 指标带」。v1 这里是四张独立卡片
+     上下堆叠（1 张结论卡 + 3 张等宽指标卡），同构重复四次。 */
+.dsl-hero {
+  padding: 14px 14px 0;
+}
+
+.dsl-hero .hero-header {
+  padding-bottom: 12px;
+}
+
+.dsl-hero .hero-status-text {
+  font-size: var(--dsl-fs-hero);
+  letter-spacing: -0.2px;
+}
+
+/* 指标带：三格等分，格间一条 1px 竖线（用 ::before 画在每格左侧，
+   首格不画）。比 v1 的三张独立卡片少两条外框、少 20px 横向缝隙。 */
+.dsl-statbar {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  border-top: 1px solid var(--dsl-line);
+}
+
+.dsl-stat {
+  position: relative;
+  padding: 10px 4px 11px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.dsl-stat + .dsl-stat {
+  padding-left: 12px;
+}
+
+.dsl-stat + .dsl-stat::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 11px;
+  bottom: 11px;
+  width: 1px;
+  background-color: var(--dsl-line);
+}
+
+.dsl-stat .metric-value-wrap {
+  margin: 0;
+}
+
+.dsl-stat .metric-value {
+  font-size: 17px;
+}
+
+.dsl-stat .metric-foot {
+  margin-top: 1px;
+}
+
+.metric-label {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+  letter-spacing: 0.02em;
+}
+
+.metric-value {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.metric-unit {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+}
+
+/* v1：10px + nowrap + ellipsis —— 真机上 `127.0.0.1:3080` 直接被切一半。
+   改成可换行、11px、两行上限，宁可占高一点也不丢字。 */
+.metric-foot {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+}
+
+/* ── 2. 标题降级：v1 里每张卡都顶着一行「15px 600 黑」标题，一屏重复 6 次，
+      视觉噪音盖过内容。改成 12.5px 字重 600 的次要色小标题，卡与卡之间靠
+      「组标题在卡外」这件事本身来分隔（见 .dsl-group 系列）。 ─────────── */
+
+.card-title {
+  font-size: var(--dsl-fs-label);
+  font-weight: 600;
+  color: var(--dsl-t3);
+  letter-spacing: 0.03em;
+}
+
+.card-subtitle {
+  font-size: var(--dsl-fs-note);
+  color: var(--dsl-t3);
+  line-height: 1.5;
+}
+
+.card-title-row {
+  margin-bottom: 11px;
+}
+
+.card-title-group {
+  margin-bottom: 10px;
+}
+
+/* ── 3. 按钮权重：一屏只留一个主按钮 ──────────────────────────────────
+      v1 里 `.button-primary` 与 `.button-subtle` 用的是同一个蓝，主次不分。
+      subtle 直接降级成「无底无边界的文字按钮」，把视觉重心让给 primary。 */
+
+.button-primary {
+  background-color: var(--dsl-accent);
+  border-color: var(--dsl-accent);
+  box-shadow: 0 1px 2px rgba(15, 17, 21, 0.12);
+}
+
+.button-subtle {
+  background-color: transparent;
+  border-color: var(--dsl-line-strong);
+  color: var(--dsl-t2);
+}
+
+.button-subtle:active {
+  background-color: var(--dsl-inset);
+}
+
+.button-block {
+  min-height: 42px;
+}
+
+/* ── 4. 底栏：中央悬浮「对话」FAB ─────────────────────────────────────
+      全 App 最高频动作是「回到对话页」，v1 只给了页头右上一个 12px 胶囊，
+      权重比旁边的绿色状态点还低。底栏中央留一个缺口，FAB 骑在缺口上。 */
+
+.tabbar-inner {
+  /* FAB 抬到底栏之上，柱状阴影会穿过它，所以底栏本身不再画分割线 */
+  position: relative;
+  border-top: none;
+}
+
+.tabbar {
+  border-top: 1px solid var(--dsl-line);
+}
+
+.dsl-fab {
+  position: fixed;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 14px);
+  transform: translateX(-50%);
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  border: none;
+  background-color: var(--dsl-accent);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 111;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(65, 118, 230, 0.36), 0 1px 0 rgba(255, 255, 255, 0.2) inset;
+  transition: transform var(--transition-fast);
+}
+
+.dsl-fab:active {
+  transform: translateX(-50%) scale(0.94);
+}
+
+.dsl-fab svg {
+  width: 24px;
+  height: 24px;
+}
+
+/* 底栏为 FAB 让出位置：两侧各留一格的空隙由 grid 的 padding 承担 */
+.tabbar-inner {
+  padding: 0 26px;
+}
+
+/* 中央这一列空着，只负责把四个页签推开、给 FAB 让出落点。 */
+.tabbar-gap {
+  height: var(--tabbar-height);
+  pointer-events: none;
+}
+
+/* ── 5. 行：从「一张卡一件事」改成「一行一件事」 ────────────────────────
+      适用于扩展列表、插件列表、设备列表。行内结构固定为
+      [图标] [标题 / 副标题] [尾部落位]。 */
+
+.dsl-group {
+  background-color: var(--dsl-card);
+  border: 1px solid var(--dsl-line);
+  border-radius: 14px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+
+.dsl-group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 4px 7px;
+}
+
+.dsl-group-title {
+  font-size: var(--dsl-fs-label);
+  font-weight: 600;
+  color: var(--dsl-t3);
+  letter-spacing: 0.03em;
+}
+
+.dsl-group-tail {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+}
+
+.dsl-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 13px;
+  min-height: 52px;
+  border-top: 1px solid var(--dsl-line);
+  position: relative;
+}
+
+.dsl-row:first-child {
+  border-top: none;
+}
+
+.dsl-row-ico {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--dsl-inset);
+  color: var(--dsl-t2);
+}
+
+.dsl-row-ico.ok { background-color: var(--dsl-ok-soft); color: var(--dsl-ok); }
+.dsl-row-ico.warn { background-color: var(--dsl-warn-soft); color: var(--dsl-warn); }
+.dsl-row-ico.bad { background-color: var(--dsl-bad-soft); color: var(--dsl-bad); }
+.dsl-row-ico.accent { background-color: var(--dsl-accent-soft); color: var(--dsl-accent); }
+
+.dsl-row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.dsl-row-title {
+  font-size: var(--dsl-fs-row);
+  font-weight: 500;
+  color: var(--dsl-t1);
+  line-height: 1.35;
+}
+
+.dsl-row-sub {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+  line-height: 1.45;
+  margin-top: 1px;
+}
+
+.dsl-row-tail {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+}
+
+/* ── 6. 胶囊：状态必须带文字。v1 有些地方只有一个色点，色弱/深色下判不出。 */
+
+.dsl-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 21px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: var(--dsl-fs-mini);
+  font-weight: 600;
+  line-height: 1;
+  background-color: var(--dsl-inset);
+  color: var(--dsl-t2);
+}
+
+.dsl-chip.ok { background-color: var(--dsl-ok-soft); color: var(--dsl-ok); }
+.dsl-chip.warn { background-color: var(--dsl-warn-soft); color: var(--dsl-warn); }
+.dsl-chip.bad { background-color: var(--dsl-bad-soft); color: var(--dsl-bad); }
+.dsl-chip.accent { background-color: var(--dsl-accent-soft); color: var(--dsl-accent); }
+
+/* ── 7. 说明文字不再单独占一张卡 ──────────────────────────────────────── */
+
+.dsl-note {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 11px;
+  background-color: var(--dsl-inset);
+  font-size: var(--dsl-fs-note);
+  line-height: 1.55;
+  color: var(--dsl-t2);
+  margin-bottom: 10px;
+}
+
+.dsl-note svg {
+  flex: none;
+  margin-top: 1px;
+  color: var(--dsl-t3);
+}
+
+.dsl-note b {
+  color: var(--dsl-t1);
+  font-weight: 600;
+}
+
+.dsl-foot-note {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+  line-height: 1.6;
+  padding: 4px 4px 2px;
+}
+
+/* ── 8. 折叠项：标题自带结论 ──────────────────────────────────────────── */
+
+.fold-card {
+  padding: 0;
+}
+
+.fold-card > .fold > summary {
+  padding: 13px 14px;
+  min-height: 50px;
+}
+
+/* 概览页的三组折叠详情共用一圈外框（见 index.html 的 .dsl-folds 注释）。
+   组内每张卡退化成「一行 + 展开区」，分隔线由 border-top 提供。 */
+.dsl-folds > .card {
+  margin: 0;
+  border: none;
+  border-top: 1px solid var(--dsl-line);
+  border-radius: 0;
+  background-color: transparent;
+  padding: 0;
+}
+
+.dsl-folds > .card:first-child {
+  border-top: none;
+}
+
+.dsl-folds .fold-summary,
+.dsl-folds .patch-summary {
+  padding: 12px 14px;
+  min-height: 48px;
+}
+
+.dsl-folds .fold-body,
+.dsl-folds .patch-content-body {
+  padding: 0 14px 12px;
+}
+
+/* ── 9. 页头：标题降为 16px，把空间让给右上角的状态胶囊 ─────────────── */
+.header-title {
+  font-size: 16px;
+  letter-spacing: -0.1px;
+}
+
+/* 老 WebView 圆角/毛玻璃兜底：不支持 backdrop-filter 时用不透明底 */
+@supports not (backdrop-filter: blur(2px)) {
+  .app-header {
+    background-color: var(--dsl-page);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dsl-fab {
+    transition: none;
+  }
+}
+
+/* ── 10. 远程页：粘贴连接串默认收起 ─────────────────────────────────────
+   「添加电脑」原本是 312px 高：标题组 + 扫码按钮 + 「或者粘贴连接串」分隔行
+   + 两个输入框 + 一个整宽主按钮。而扫码是主路径，绝大多数用户一次都不会
+   用到那三个控件。收进 details 后这一卡降到 ~120px，设备列表与添加入口
+   一起落在首屏。折叠状态由 host.js 在聚焦输入框 / 扫码失败时撑开。 */
+
+.remote-paste {
+  margin-top: 9px;
+  border-top: 1px solid var(--dsl-line);
+}
+
+.remote-paste > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 11px 2px 1px;
+  font-size: var(--dsl-fs-note);
+  color: var(--dsl-t2);
+  cursor: pointer;
+  list-style: none;
+  min-height: 38px;
+}
+
+.remote-paste > summary::-webkit-details-marker {
+  display: none;
+}
+
+.remote-paste > summary .chevron-icon {
+  color: var(--dsl-t3);
+  transition: transform var(--transition-fast);
+}
+
+.remote-paste[open] > summary .chevron-icon {
+  transform: rotate(180deg);
+}
+
+.remote-paste-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 9px;
+}
+
+/* 扫码按钮压成一行：46px 高度保持不变（触控安全），但去掉大块留白 */
+.remote-add-card .remote-scan-button {
+  min-height: 46px;
+}
+
+/* 设备行：名称与徽章同行，地址与状态降档；行内右侧两个按钮不换行 */
+.remote-item {
+  padding: 11px 13px;
+}
+
+.remote-item-name {
+  font-size: var(--dsl-fs-row);
+  font-weight: 600;
+}
+
+.remote-item-meta {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+  overflow-wrap: anywhere;
+}
+
+.remote-item-status {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t2);
+}
+
+.remote-item-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 设备列表本身按「一组」呈现，不再是散落的卡片 */
+.remote-list {
+  background-color: var(--dsl-card);
+  border: 1px solid var(--dsl-line);
+  border-radius: 14px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+
+.remote-list > .remote-item + .remote-item {
+  border-top: 1px solid var(--dsl-line);
+}
+
+.remote-list:empty {
+  display: none;
+}
+
+.remote-list-head {
+  padding: 2px 4px 7px;
+}
+
+.remote-list-label {
+  font-size: var(--dsl-fs-label);
+  font-weight: 600;
+  color: var(--dsl-t3);
+  letter-spacing: 0.03em;
+}
+
+.remote-list-count {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+}
+
+/* ── 11. 扩展页：26 张同构卡片 → 一组连续行 ────────────────────────────
+   v1 每个扩展都是一张 `.card`（14px 内边距 + 1px 边框 + 16px 圆角 + 10px
+   间距），26 个扩展就是 26 个浮动方块、垂直 3100px。而它们回答的是同一类
+   问题（这个东西装不装），本该是一张列表。
+
+   改成：外层 `.ext-group-body` 提供那一圈外框，卡本身退化成「行」。
+   行内顺序用 flex-order 重排（DOM 不变，`data-ext-id` 与勾选框都还在）：
+     ① 名称 + 版本   ② 类目 · 体积   ③ 描述（单行截断）
+   `bins` 标签（ffmpeg、ffprobe…）默认隐藏 —— 那是开发者关心的可执行名，
+   普通用户只会把它读成噪音；需要时在「高级」里查。 */
+
+.ext-group {
+  margin-bottom: 12px;
+}
+
+.ext-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  background-color: var(--dsl-card);
+  border: 1px solid var(--dsl-line);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.ext-group-body > .ext-card {
+  padding: 10px 12px;
+  margin: 0;
+  border: none;
+  border-top: 1px solid var(--dsl-line);
+  border-radius: 0;
+  background-color: transparent;
+}
+
+.ext-group-body > .ext-card:first-child {
+  border-top: none;
+}
+
+.ext-card-inner {
+  align-items: center;
+  gap: 10px;
+}
+
+.ext-icon-box {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  flex: none;
+}
+
+.ext-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.ext-header {
+  order: 1;
+  margin-bottom: 0;
+  gap: 6px;
+}
+
+.ext-name {
+  font-size: var(--dsl-fs-row);
+  font-weight: 600;
+  color: var(--dsl-t1);
+}
+
+.ext-version {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+}
+
+.ext-meta {
+  order: 2;
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+  margin: 0;
+}
+
+.ext-desc {
+  order: 3;
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t2);
+  line-height: 1.45;
+  margin: 1px 0 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.ext-tags {
+  display: none;
+}
+
+.ext-action {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* 分组标题在外侧，字号降为「组标题」而非「页面标题」 */
+.ext-group-title {
+  padding: 2px 4px 7px;
+  font-size: var(--dsl-fs-label);
+  font-weight: 600;
+  color: var(--dsl-t3);
+  letter-spacing: 0.03em;
+}
+
+/* 动作区必须横排：v1 的 `.ext-action` 是 `flex-direction: column`，两个按钮
+   竖排会把「已激活」行撑成 84px，同一张列表里出现两种行高。 */
+.ext-action {
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 76px;
+}
+
+.ext-chip-ok {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: var(--dsl-fs-mini);
+  font-weight: 600;
+  color: var(--dsl-ok);
+  background-color: var(--dsl-ok-soft);
+}
+
+.ext-action .button {
+  width: auto;
+  min-width: 62px;
+  white-space: nowrap;
+}
+
+/* 行内描述：一行截断就够，完整说明在设备详情里。三行会让 26 项多出 1000px。 */
+.ext-desc {
+  -webkit-line-clamp: 1;
+}
+
+/* ── 12. 插件页：卡片列表 → 一组行 ─────────────────────────────────────
+   v1 每个插件是一张 13px 内边距的卡片，卡里再分三段：图标+名称+开关、
+   （可选）失败原因、脚注「已加入启动清单 / 未在启动清单」。
+   脚注这一行是纯粹的重复 —— 开关本身就是状态的唯一表达，再写一遍只是
+   把每个插件撑高 22px。现在脚注只在真的异常时出现（加载失败/已停用/未装全）。 */
+
+.plugin-note {
+  margin-bottom: 10px;
+}
+
+.plugin-group {
+  margin-bottom: 12px;
+}
+
+.plugin-group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px 7px;
+}
+
+.plugin-group-title {
+  font-size: var(--dsl-fs-label);
+  font-weight: 600;
+  color: var(--dsl-t3);
+  letter-spacing: 0.03em;
+}
+
+.plugin-group-meta {
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-cards {
+  gap: 0;
+  margin-top: 0;
+  background-color: var(--dsl-card);
+  border: 1px solid var(--dsl-line);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.plugin-cards > .plugin-card {
+  padding: 11px 13px;
+  border: none;
+  border-top: 1px solid var(--dsl-line);
+  border-radius: 0;
+  background-color: transparent;
+}
+
+.plugin-cards > .plugin-card:first-child {
+  border-top: none;
+}
+
+.plugin-ico {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  font-size: var(--dsl-fs-mini);
+}
+
+.plugin-name {
+  font-size: var(--dsl-fs-row);
+  line-height: 1.35;
+}
+
+.plugin-pkg {
+  font-size: var(--dsl-fs-mini);
+  line-height: 1.45;
+  color: var(--dsl-t3);
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.plugin-card-foot {
+  margin-top: 6px;
+  padding: 0;
+  border: none;
+}
+
+.plugin-foot-meta {
+  font-size: var(--dsl-fs-mini);
+  gap: 5px;
+}
+
+.plugin-reason {
+  font-size: var(--dsl-fs-mini);
+  line-height: 1.5;
+  margin-top: 5px;
+  color: var(--dsl-bad);
+  font-family: var(--font-mono);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 核心组件折叠区：独立一条安静的行，跟在列表后面（不是列表里的最后一行 ——
+   它折叠时只有 40px，展开时才是一串只读行，形态与列表不同，不该共用外框） */
+.plugin-group > .plugin-core {
+  margin: 8px 0 0;
+  border: 1px solid var(--dsl-line);
+  background-color: var(--dsl-card);
+  border-radius: 12px;
+  padding: 0 12px;
+}
+
+.plugin-group > .plugin-core[hidden] {
+  display: none;
+}
+
+/* 工具栏：标题 22px 重复了页头，副标题一句话说完了功能，两者都收掉；
+   搜索框与筛选片保留（它们是操作，不是说明）。 */
+.plugin-toolbar {
+  padding: 0 0 12px;
+}
+
+.plugin-title {
+  font-size: var(--dsl-fs-title);
+  font-weight: 600;
+  letter-spacing: -0.2px;
+}
+
+.plugin-sub {
+  display: none;
+}
+
+.plugin-entry-row {
+  margin-top: 0;
+}
+
+.plugin-scope-note {
+  margin-top: 7px;
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+  line-height: 1.5;
+}
+
+.plugin-search,
+.plugin-chips {
+  margin-top: 9px;
+}
+
+.plugin-refresh {
+  flex: none;
+}
+
+/* ── 13. 设置页：外壳去掉、行加分隔线、维护区收成一层 ───────────────────
+   「系统级守护设置」与「宿主运行权限等级」原本是两张卡片，卡里再套标题 +
+   一组行 —— 与概览页的三张诊断卡是同一个问题：外壳只起到「分组」作用，
+   却被画成了最重的一层。现在外壳消失，组标题回到页面底上，行装进一个
+   14px 圆角的白底里。 */
+
+.dsl-plain {
+  margin-bottom: 14px;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 0;
+}
+
+.dsl-plain > .card-title-group {
+  margin-bottom: 0;
+  padding: 2px 4px 7px;
+}
+
+.dsl-plain > .card-title-group .card-title {
+  font-size: var(--dsl-fs-label);
+  font-weight: 600;
+  color: var(--dsl-t3);
+  letter-spacing: 0.03em;
+}
+
+/* 副标题是「控制 Agent 进程…」这类解释，组标题已经说清范围，收掉 */
+.dsl-plain > .card-title-group .card-subtitle {
+  display: none;
+}
+
+.dsl-plain .setting-list {
+  gap: 0;
+  margin-top: 0;
+  background-color: var(--dsl-card);
+  border: 1px solid var(--dsl-line);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.dsl-plain .setting-row {
+  align-items: center;
+  gap: 12px;
+  padding: 11px 13px;
+  border-bottom: none;
+  border-top: 1px solid var(--dsl-line);
+}
+
+.dsl-plain .setting-row:first-child {
+  border-top: none;
+}
+
+.dsl-plain .setting-row:last-child {
+  padding-bottom: 11px;
+}
+
+.dsl-plain .setting-title {
+  font-size: var(--dsl-fs-row);
+  font-weight: 500;
+}
+
+.dsl-plain .setting-desc {
+  font-size: var(--dsl-fs-mini);
+  line-height: 1.45;
+  color: var(--dsl-t3);
+}
+
+/* 权限等级：三张卡 → 一组可点行（卡片本来就长得像单选，直接合并） */
+.dsl-plain .priv-cards {
+  gap: 0;
+  margin-bottom: 0;
+  background-color: var(--dsl-card);
+  border: 1px solid var(--dsl-line);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.dsl-plain .priv-card {
+  margin: 0;
+  padding: 12px 13px;
+  border: none;
+  border-top: 1px solid var(--dsl-line);
+  border-radius: 0;
+  background-color: transparent;
+}
+
+.dsl-plain .priv-card:first-child {
+  border-top: none;
+}
+
+.dsl-plain .priv-apply {
+  margin-top: 10px;
+}
+
+.dsl-plain .segment-hint {
+  margin-top: 8px;
+  font-size: var(--dsl-fs-mini);
+  line-height: 1.5;
+  color: var(--dsl-t3);
+}
+
+/* 维护区：主按钮 + 一层折叠。折叠头三行信息压成一行标题 + 一行灰字。 */
+.maint-more {
+  margin-top: 10px;
+  border-top: 1px solid var(--dsl-line);
+}
+
+.maint-more > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 11px 2px 3px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.maint-more > summary::-webkit-details-marker {
+  display: none;
+}
+
+.maint-more-title {
+  flex: none;
+  font-size: var(--dsl-fs-note);
+  font-weight: 600;
+  color: var(--dsl-t2);
+}
+
+.maint-more-sub {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--dsl-fs-mini);
+  color: var(--dsl-t3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.maint-more > summary .chevron-icon {
+  flex: none;
+  align-self: center;
+  color: var(--dsl-t3);
+  transition: transform var(--transition-fast);
+}
+
+.maint-more[open] > summary .chevron-icon {
+  transform: rotate(180deg);
+}
+
+.maint-more .danger-actions-grid {
+  margin-top: 10px;
+}
+
+/* 深色下遗留控件（圆形图标按钮、次级按钮）沿用了浅色的「白底 + 极淡描边」，
+   在 #101012 的页面底上会变成一枚发光的白圆点。用设计 token 显式接管。 */
+body[data-ds-dark-theme] .icon-button {
+  background-color: var(--dsl-inset);
+  border-color: var(--dsl-line);
+  color: var(--dsl-t2);
+}
+
+body[data-ds-dark-theme] .icon-button:active {
+  background-color: rgba(255, 255, 255, 0.1);
+  color: var(--dsl-t1);
+}
+
+body[data-ds-dark-theme] .button-subtle,
+body[data-ds-dark-theme] .plugin-entry-secondary {
+  background-color: var(--dsl-inset);
+  border-color: var(--dsl-line);
+  color: var(--dsl-t2);
+}
+
+body[data-ds-dark-theme] .button-installed {
+  background-color: var(--dsl-inset);
+  color: var(--dsl-t2);
+}

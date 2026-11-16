@@ -278,6 +278,7 @@
     btnRemoteTrust: document.getElementById('btn-remote-trust'),
     btnRemoteBack: document.getElementById('btn-remote-back'),
     remoteUrlInput: document.getElementById('remote-url-input'),
+    remotePaste: document.getElementById('remote-paste'),
     remoteLabelInput: document.getElementById('remote-label-input'),
     btnRemoteSubmit: document.getElementById('btn-remote-submit'),
     remoteAddError: document.getElementById('remote-add-error'),
@@ -453,6 +454,12 @@
     if (!dom.remoteAddError) return;
     dom.remoteAddError.textContent = message || '';
     dom.remoteAddError.hidden = !message;
+    /*
+     * 报错必须把粘贴区撑开。输入框默认收在 `#remote-paste` 这个 details 里，
+     * 出错时不展开的话，用户只能看到一行红字挂在「添加电脑」卡底部 ——
+     * 而需要他改的那个输入框还折叠着，等于让报错指不到东西。
+     */
+    if (message) dom.remotePaste && (dom.remotePaste.open = true);
   }
 
   /**
@@ -663,6 +670,8 @@
     dom.btnRemoteManage?.addEventListener('click', () => showRemoteView());
     dom.btnRemoteAdd?.addEventListener('click', () => {
       showRemoteView();
+      // 输入框收在 details 里，focus() 不会自动展开，先撑开再聚焦
+      if (dom.remotePaste) dom.remotePaste.open = true;
       dom.remoteUrlInput?.focus();
     });
     dom.btnRemoteBack?.addEventListener('click', () => hideRemoteView());
@@ -1841,7 +1850,8 @@
     if (sizeLabel) metaBits.push(`约 ${sizeLabel}`);
     if (ext.bundled) metaBits.push('内置包池 · 零联网');
     else if (!ext.installed) metaBits.push('非包池来源');
-    if (CATEGORY_LABELS[ext.category]) metaBits.push(CATEGORY_LABELS[ext.category]);
+    // 类目不再写进 meta：它已经由分组标题承担了，重复一遍只是噪音
+    // （未知类目统一归入「开发工具」，同理）。
 
     const card = document.createElement('div');
     card.className = 'card ext-card';
@@ -1873,7 +1883,9 @@
     if (installing) {
       action.appendChild(progressButton(installing));
     } else if (ext.installed) {
-      action.appendChild(el('<button class="button button-installed button-sm" disabled>已激活</button>'));
+      // 已激活不再用「禁用按钮」表达 —— 灰色不可点的按钮既占掉 76px 宽度，
+      // 又把行高撑成两行（两个 30px 按钮竖排）。状态用小胶囊，动作只留一个按钮。
+      action.appendChild(el('<span class="ext-chip-ok">已激活</span>'));
       const un = el('<button class="button button-subtle button-sm ext-remove">卸载</button>');
       un.addEventListener('click', () => removeExtension(ext.id, name));
       action.appendChild(un);
@@ -3440,9 +3452,7 @@
           </div>
         </div>
         ${p.failed && p.reason ? `<div class="plugin-reason">${escapeHtml(p.reason)}</div>` : ''}
-        <div class="plugin-card-foot">
-          <span class="plugin-foot-meta">${badges.join(' ')}<span>${p.enabled ? '已加入启动清单' : '未在启动清单'}</span></span>
-        </div>
+        ${badges.length ? `<div class="plugin-card-foot"><span class="plugin-foot-meta">${badges.join(' ')}</span></div>` : ''}
       `;
 
       if (!p.protected) {

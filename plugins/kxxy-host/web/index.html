@@ -68,8 +68,17 @@
         -->
         <div class="attention-host" id="attention-host" hidden></div>
 
-        <!-- 引擎状态主卡 -->
-        <div class="card hero-status-card">
+        <!--
+          引擎状态主卡 + 三指标，合成**一块**。
+
+          v1 是四张独立卡片上下堆叠（一张结论卡 + 3 张等宽指标卡）：同样
+          `padding:16px / radius:16px / margin-bottom:12px`，一屏里重复四次，
+          阅读时眼睛要在同构的方块之间不断重建层级。合成一块之后：
+            · 上半是结论（状态点 + 「引擎运行中」+ PID/架构/Node 徽章）
+            · 下半是一条三分栏指标带，竖线分隔，数值等宽对齐
+          省下约 54px 高度，也把「一块卡 = 一件事」还给了页面。
+        -->
+        <div class="card dsl-hero">
           <div class="hero-header">
             <div class="hero-indicator">
               <span class="pulse-dot-large dot-green" id="hero-pulse-dot"></span>
@@ -90,51 +99,32 @@
               </button>
             </div>
           </div>
-        </div>
 
-        <!-- 3 指标小卡横排 -->
-        <div class="metric-grid">
-          <div class="card metric-card">
-            <div class="metric-icon memory-icon" aria-hidden="true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="2" y="4" width="20" height="16" rx="2"/>
-                <path d="M6 8v8M10 8v8M14 8v8M18 8v8"/>
-              </svg>
+          <!-- 指标带：三格等分 + 竖线分隔。数值不换行、单位降档、脚注两行封顶
+               （v1 的 10px + ellipsis 会把 `127.0.0.1:3080` 切掉一半）。 -->
+          <div class="dsl-statbar">
+            <div class="dsl-stat">
+              <span class="metric-label">内存占用</span>
+              <div class="metric-value-wrap">
+                <span class="metric-value" id="metric-memory">142</span>
+                <span class="metric-unit">MB</span>
+              </div>
+              <span class="metric-foot">RSS 常驻</span>
             </div>
-            <span class="metric-label">内存占用</span>
-            <div class="metric-value-wrap">
-              <span class="metric-value" id="metric-memory">142</span>
-              <span class="metric-unit">MB</span>
+            <div class="dsl-stat">
+              <span class="metric-label">运行时长</span>
+              <div class="metric-value-wrap">
+                <span class="metric-value" id="metric-uptime">03:42:19</span>
+              </div>
+              <span class="metric-foot">本次进程</span>
             </div>
-            <span class="metric-foot">RSS 物理常驻</span>
-          </div>
-
-          <div class="card metric-card">
-            <div class="metric-icon uptime-icon" aria-hidden="true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="12" r="10"/>
-                <polyline points="12 6 12 12 16 14"/>
-              </svg>
+            <div class="dsl-stat">
+              <span class="metric-label">监听端口</span>
+              <div class="metric-value-wrap">
+                <span class="metric-value" id="metric-port">3080</span>
+              </div>
+              <span class="metric-foot">127.0.0.1:3080</span>
             </div>
-            <span class="metric-label">运行时长</span>
-            <div class="metric-value-wrap">
-              <span class="metric-value" id="metric-uptime">03:42:19</span>
-            </div>
-            <span class="metric-foot">持续运行状态</span>
-          </div>
-
-          <div class="card metric-card">
-            <div class="metric-icon port-icon" aria-hidden="true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="12" r="3"/>
-                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-              </svg>
-            </div>
-            <span class="metric-label">监听端口</span>
-            <div class="metric-value-wrap">
-              <span class="metric-value" id="metric-port">3080</span>
-            </div>
-            <span class="metric-foot">127.0.0.1:3080</span>
           </div>
         </div>
 
@@ -183,7 +173,7 @@
           </div>
 
           <div class="remote-empty" id="remote-empty">
-            <p class="remote-empty-text">电脑上跑一次连接器（点进去有分步说明），然后用手机扫它给出的二维码，或者把连接串粘进来。</p>
+            <p class="remote-empty-text">电脑上启动连接器，然后扫码或粘贴连接串。</p>
             <button class="button button-subtle button-sm" id="btn-remote-add" type="button">添加电脑</button>
           </div>
         </div>
@@ -235,282 +225,292 @@
           一个写着「3 项待处理」的收起状态，等于让用户自己去点开找是哪三项 ——
           折叠不能把故障藏起来。用户手动收起后记进 localStorage，不再反复弹开。
         -->
-        <div class="card block-card fold-card">
-          <details class="fold" id="health-checks-details">
-            <summary class="fold-summary">
-              <span class="fold-summary-left">
-                <span class="fold-title">启动与加载体检</span>
-                <span class="fold-sub">配置项任一条坏了引擎就起不来</span>
-              </span>
-              <span class="fold-summary-right">
-                <span class="badge badge-subtle" id="health-count-badge">—</span>
-                <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <polyline points="6 9 12 15 18 9"></polyline>
-                </svg>
-              </span>
-            </summary>
-            <div class="fold-body">
-              <div class="check-list" id="health-checks">
-                <div class="check-item">
-                  <div class="check-status-icon" aria-hidden="true">…</div>
-                  <div class="check-content">
-                    <div class="check-main"><span class="check-name">正在读取…</span></div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </details>
-        </div>
-
-        <!-- 修复区：力度由检查结果决定，默认只给最轻的那档 -->
-        <div class="card block-card" id="health-repair-card" hidden>
-          <div class="card-title-group">
-            <h3 class="card-title">修复</h3>
-            <span class="card-subtitle" id="health-repair-hint">修复会重启引擎，当前页面会短暂断开</span>
-          </div>
-
-          <div class="repair-levels" id="health-levels"></div>
-        </div>
-
-        <!-- 上次修复记录 + 撤销入口。
-             撤销按钮必须挂在这里而不是「修复」卡里：修复成功后检查全绿、
-             修复卡会被整块隐藏（缺陷 BW 的原始症状），按钮跟着一起消失
-             就等于把「可撤销」的承诺吞掉了。 -->
-        <div class="card block-card" id="health-last-card" hidden>
-          <div class="card-title-group">
-            <h3 class="card-title">上次修复</h3>
-            <span class="card-subtitle" id="health-last-time">—</span>
-          </div>
-          <div class="repair-changes" id="health-last-changes"></div>
-          <div class="repair-foot" id="health-repair-foot" hidden>
-            <button class="button button-subtle button-block" id="btn-health-undo">撤销上次修复</button>
-          </div>
-        </div>
-
-        <!-- 修复进行中的遮罩提示（引擎重启会断连，给用户明确预期） -->
-        <div class="card block-card health-busy" id="health-busy" hidden>
-          <div class="health-busy-inner">
-            <span class="health-busy-spinner" aria-hidden="true"></span>
-            <div>
-              <div class="health-busy-title" id="health-busy-title">正在修复…</div>
-              <div class="health-busy-desc" id="health-busy-desc">引擎将重启，页面会自动重连</div>
-            </div>
-          </div>
-        </div>
-
         <!--
-          运行时完整性检查列表 (7 项)。
+          维护与排错：三组折叠详情合成**一个组**。
 
-          与上面那块一样默认折叠：这 7 项是「跑起来之后好不好」，正常时 7/7
-          全绿的信息量只有一行。徽章把结论留在收起状态上，点开才看逐条。
-        -->
-        <div class="card block-card fold-card">
-          <details class="fold" id="runtime-checks-details">
-            <summary class="fold-summary">
-              <span class="fold-summary-left">
-                <span class="fold-title">运行时完整性检查</span>
-                <span class="fold-sub">系统基础设施与 IPC 状态</span>
-              </span>
-              <span class="fold-summary-right">
-                <span class="badge badge-success" id="runtime-all-status">7 / 7 通过</span>
-                <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <polyline points="6 9 12 15 18 9"></polyline>
-                </svg>
-              </span>
-            </summary>
-            <div class="fold-body">
-              <div class="check-list" id="runtime-checks-container">
-                <div class="check-item">
-                  <div class="check-status-icon success" aria-hidden="true">✓</div>
-                  <div class="check-content">
-                    <div class="check-main">
-                      <span class="check-name">Node.js 运行时执行体</span>
-                      <span class="check-badge">ELF aarch64</span>
+          v1 是三张独立卡片，各自一圈 1px 边框 + 16px 圆角 + 12px 间距 ——
+          展开任何一张都会把另外两张推走，读起来像三件互不相干的事。
+          实际上它们回答的是同一个问题（引擎是不是健康的），只是粒度不同：
+          配置能不能启动 → 运行时好不好 → 打了哪些补丁。
+          合成一组之后共用一圈外框，组内用 1px 分隔线。  -->
+        <div class="dsl-group dsl-folds">
+          <div class="card block-card fold-card">
+            <details class="fold" id="health-checks-details">
+              <summary class="fold-summary">
+                <span class="fold-summary-left">
+                  <span class="fold-title">启动与加载体检</span>
+                  <span class="fold-sub">配置项任一条坏了引擎就起不来</span>
+                </span>
+                <span class="fold-summary-right">
+                  <span class="badge badge-subtle" id="health-count-badge">—</span>
+                  <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                  </svg>
+                </span>
+              </summary>
+              <div class="fold-body">
+                <div class="check-list" id="health-checks">
+                  <div class="check-item">
+                    <div class="check-status-icon" aria-hidden="true">…</div>
+                    <div class="check-content">
+                      <div class="check-main"><span class="check-name">正在读取…</span></div>
                     </div>
-                    <div class="check-detail">/data/data/app.kxxy/files/engine/bin/node · 正常可执行</div>
                   </div>
                 </div>
+              </div>
+            </details>
+          </div>
 
-                <div class="check-item">
-                  <div class="check-status-icon success" aria-hidden="true">✓</div>
-                  <div class="check-content">
-                    <div class="check-main">
-                      <span class="check-name">Harness Core 核心包</span>
-                      <span class="check-badge">v2.1.0-prod</span>
-                    </div>
-                    <div class="check-detail">/files/engine/lib/node_modules/@deepseek-ai/dsh · SHA-256 签名一致</div>
-                  </div>
-                </div>
+          <!-- 修复区：力度由检查结果决定，默认只给最轻的那档 -->
+          <div class="card block-card" id="health-repair-card" hidden>
+            <div class="card-title-group">
+              <h3 class="card-title">修复</h3>
+              <span class="card-subtitle" id="health-repair-hint">修复会重启引擎，当前页面会短暂断开</span>
+            </div>
 
-                <div class="check-item">
-                  <div class="check-status-icon success" aria-hidden="true">✓</div>
-                  <div class="check-content">
-                    <div class="check-main">
-                      <span class="check-name">Android Bionic Linker 适配</span>
-                      <span class="check-badge">Linker64</span>
-                    </div>
-                    <div class="check-detail">系统级 /system/bin/linker64 动态库重定向已挂载</div>
-                  </div>
-                </div>
+            <div class="repair-levels" id="health-levels"></div>
+          </div>
 
-                <div class="check-item">
-                  <div class="check-status-icon success" aria-hidden="true">✓</div>
-                  <div class="check-content">
-                    <div class="check-main">
-                      <span class="check-name">UNIX IPC 命名通道</span>
-                      <span class="check-badge">Domain Socket</span>
-                    </div>
-                    <div class="check-detail">files/engine/kxxy-state.json 处于可写入监听态</div>
-                  </div>
-                </div>
+          <!-- 上次修复记录 + 撤销入口。
+               撤销按钮必须挂在这里而不是「修复」卡里：修复成功后检查全绿、
+               修复卡会被整块隐藏（缺陷 BW 的原始症状），按钮跟着一起消失
+               就等于把「可撤销」的承诺吞掉了。 -->
+          <div class="card block-card" id="health-last-card" hidden>
+            <div class="card-title-group">
+              <h3 class="card-title">上次修复</h3>
+              <span class="card-subtitle" id="health-last-time">—</span>
+            </div>
+            <div class="repair-changes" id="health-last-changes"></div>
+            <div class="repair-foot" id="health-repair-foot" hidden>
+              <button class="button button-subtle button-block" id="btn-health-undo">撤销上次修复</button>
+            </div>
+          </div>
 
-                <div class="check-item">
-                  <div class="check-status-icon success" aria-hidden="true">✓</div>
-                  <div class="check-content">
-                    <div class="check-main">
-                      <span class="check-name">SQLite3 原生驱动组件</span>
-                      <span class="check-badge">WAL 模式</span>
-                    </div>
-                    <div class="check-detail">better-sqlite3 模块 binding 载入无符号冲突</div>
-                  </div>
-                </div>
-
-                <div class="check-item">
-                  <div class="check-status-icon success" aria-hidden="true">✓</div>
-                  <div class="check-content">
-                    <div class="check-main">
-                      <span class="check-name">用户 Workspace 隔离沙箱</span>
-                      <span class="check-badge">POSIX Perms</span>
-                    </div>
-                    <div class="check-detail">/sdcard/Android/data/app.kxxy/files 权限可读写 (0755)</div>
-                  </div>
-                </div>
-
-                <div class="check-item">
-                  <div class="check-status-icon success" aria-hidden="true">✓</div>
-                  <div class="check-content">
-                    <div class="check-main">
-                      <span class="check-name">Localhost 回环网络策略</span>
-                      <span class="check-badge">IPv4 Loopback</span>
-                    </div>
-                    <div class="check-detail">TCP 3080 端口无外网暴露风险，仅限本地 WebView</div>
-                  </div>
-                </div>
+          <!-- 修复进行中的遮罩提示（引擎重启会断连，给用户明确预期） -->
+          <div class="card block-card health-busy" id="health-busy" hidden>
+            <div class="health-busy-inner">
+              <span class="health-busy-spinner" aria-hidden="true"></span>
+              <div>
+                <div class="health-busy-title" id="health-busy-title">正在修复…</div>
+                <div class="health-busy-desc" id="health-busy-desc">引擎将重启，页面会自动重连</div>
               </div>
             </div>
-          </details>
-        </div>
+          </div>
 
-        <!-- 13 项补丁状态折叠列表 -->
-        <div class="card block-card patch-card">
-          <details class="patch-accordion" id="patch-details-wrapper">
-            <summary class="patch-summary">
-              <div class="patch-summary-left">
-                <span class="accordion-title">已载入 Android 宿主补丁</span>
-                <span class="badge badge-accent">13 项全部生效</span>
-              </div>
-              <div class="patch-summary-right">
-                <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <polyline points="6 9 12 15 18 9"></polyline>
-                </svg>
-              </div>
-            </summary>
-            <div class="patch-content-body">
-              <div class="patch-grid">
-                <div class="patch-item">
-                  <div class="patch-id">P01</div>
-                  <div class="patch-info">
-                    <span class="patch-name">process.binding 兼容模拟层</span>
-                    <span class="patch-desc">为 Android 上被裁切的底层 Node 绑定提供兼容垫片</span>
+          <!--
+            运行时完整性检查列表 (7 项)。
+
+            与上面那块一样默认折叠：这 7 项是「跑起来之后好不好」，正常时 7/7
+            全绿的信息量只有一行。徽章把结论留在收起状态上，点开才看逐条。
+          -->
+          <div class="card block-card fold-card">
+            <details class="fold" id="runtime-checks-details">
+              <summary class="fold-summary">
+                <span class="fold-summary-left">
+                  <span class="fold-title">运行时完整性检查</span>
+                  <span class="fold-sub">系统基础设施与 IPC 状态</span>
+                </span>
+                <span class="fold-summary-right">
+                  <span class="badge badge-success" id="runtime-all-status">7 / 7 通过</span>
+                  <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                  </svg>
+                </span>
+              </summary>
+              <div class="fold-body">
+                <div class="check-list" id="runtime-checks-container">
+                  <div class="check-item">
+                    <div class="check-status-icon success" aria-hidden="true">✓</div>
+                    <div class="check-content">
+                      <div class="check-main">
+                        <span class="check-name">Node.js 运行时执行体</span>
+                        <span class="check-badge">ELF aarch64</span>
+                      </div>
+                      <div class="check-detail">/data/data/app.kxxy/files/engine/bin/node · 正常可执行</div>
+                    </div>
                   </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P02</div>
-                  <div class="patch-info">
-                    <span class="patch-name">child_process.spawn POSIX 适配</span>
-                    <span class="patch-desc">强制重定向 /bin/sh 到宿主内嵌的 Toybox Shell 环境</span>
+
+                  <div class="check-item">
+                    <div class="check-status-icon success" aria-hidden="true">✓</div>
+                    <div class="check-content">
+                      <div class="check-main">
+                        <span class="check-name">Harness Core 核心包</span>
+                        <span class="check-badge">v2.1.0-prod</span>
+                      </div>
+                      <div class="check-detail">/files/engine/lib/node_modules/@deepseek-ai/dsh · SHA-256 签名一致</div>
+                    </div>
                   </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P03</div>
-                  <div class="patch-info">
-                    <span class="patch-name">DNS 绕过 Android Netd 守护</span>
-                    <span class="patch-desc">使用纯 JS c-ares 逻辑直连公共 DNS，避免 getaddrinfo 权限阻断</span>
+
+                  <div class="check-item">
+                    <div class="check-status-icon success" aria-hidden="true">✓</div>
+                    <div class="check-content">
+                      <div class="check-main">
+                        <span class="check-name">Android Bionic Linker 适配</span>
+                        <span class="check-badge">Linker64</span>
+                      </div>
+                      <div class="check-detail">系统级 /system/bin/linker64 动态库重定向已挂载</div>
+                    </div>
                   </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P04</div>
-                  <div class="patch-info">
-                    <span class="patch-name">os.cpus() 核心热插拔模拟</span>
-                    <span class="patch-desc">规避 Android 内核在低功耗时隐藏脱机 CPU 核心导致的越界</span>
+
+                  <div class="check-item">
+                    <div class="check-status-icon success" aria-hidden="true">✓</div>
+                    <div class="check-content">
+                      <div class="check-main">
+                        <span class="check-name">UNIX IPC 命名通道</span>
+                        <span class="check-badge">Domain Socket</span>
+                      </div>
+                      <div class="check-detail">files/engine/kxxy-state.json 处于可写入监听态</div>
+                    </div>
                   </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P05</div>
-                  <div class="patch-info">
-                    <span class="patch-name">fs.stat 沙箱权限抹平</span>
-                    <span class="patch-desc">将 Android 特有虚拟 uid/gid 映射至标准 POSIX 模拟用户</span>
+
+                  <div class="check-item">
+                    <div class="check-status-icon success" aria-hidden="true">✓</div>
+                    <div class="check-content">
+                      <div class="check-main">
+                        <span class="check-name">SQLite3 原生驱动组件</span>
+                        <span class="check-badge">WAL 模式</span>
+                      </div>
+                      <div class="check-detail">better-sqlite3 模块 binding 载入无符号冲突</div>
+                    </div>
                   </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P06</div>
-                  <div class="patch-info">
-                    <span class="patch-name">pthread 亲和性隔离规避</span>
-                    <span class="patch-desc">拦截 thread-affinity 调用，防止部分定制 ROM 下被 SELinux 杀进程</span>
+
+                  <div class="check-item">
+                    <div class="check-status-icon success" aria-hidden="true">✓</div>
+                    <div class="check-content">
+                      <div class="check-main">
+                        <span class="check-name">用户 Workspace 隔离沙箱</span>
+                        <span class="check-badge">POSIX Perms</span>
+                      </div>
+                      <div class="check-detail">/sdcard/Android/data/app.kxxy/files 权限可读写 (0755)</div>
+                    </div>
                   </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P07</div>
-                  <div class="patch-info">
-                    <span class="patch-name">Terminfo 无色彩终端降级</span>
-                    <span class="patch-desc">为内嵌 WebView 提供安全的 xterm-256color 终端转义支持</span>
-                  </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P08</div>
-                  <div class="patch-info">
-                    <span class="patch-name">WorkerThreads 内存限额优化</span>
-                    <span class="patch-desc">对 Android LMK (低内存杀手) 适配的堆内存阈值动态裁剪</span>
-                  </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P09</div>
-                  <div class="patch-info">
-                    <span class="patch-name">OpenSSL CA 证书重定向</span>
-                    <span class="patch-desc">将 Node TLS 证书链指向 Android 系统 /system/etc/security/cacerts</span>
-                  </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P10</div>
-                  <div class="patch-info">
-                    <span class="patch-name">WebSocket 心跳防打盹 (Doze Mode)</span>
-                    <span class="patch-desc">高频自适应 ping 保持套接字活性，防止进入系统浅睡眠</span>
-                  </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P11</div>
-                  <div class="patch-info">
-                    <span class="patch-name">V8 JIT W^X 内存重映射</span>
-                    <span class="patch-desc">规避 Android 高版本内核对可执行堆内存的写保护强制崩溃</span>
-                  </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P12</div>
-                  <div class="patch-info">
-                    <span class="patch-name">本地路由 /kxxy 独立反代挂载</span>
-                    <span class="patch-desc">在同一个 HTTP 服务内部无感分流宿主管理接口与官方 React 视图</span>
-                  </div>
-                </div>
-                <div class="patch-item">
-                  <div class="patch-id">P13</div>
-                  <div class="patch-info">
-                    <span class="patch-name">SIGINT / SIGTERM 优雅退出捕获</span>
-                    <span class="patch-desc">接收 Android Activity 销毁信号并安全刷写 SQLite 日志与配置缓存</span>
+
+                  <div class="check-item">
+                    <div class="check-status-icon success" aria-hidden="true">✓</div>
+                    <div class="check-content">
+                      <div class="check-main">
+                        <span class="check-name">Localhost 回环网络策略</span>
+                        <span class="check-badge">IPv4 Loopback</span>
+                      </div>
+                      <div class="check-detail">TCP 3080 端口无外网暴露风险，仅限本地 WebView</div>
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
-          </details>
+            </details>
+          </div>
+
+          <!-- 13 项补丁状态折叠列表 -->
+          <div class="card block-card patch-card">
+            <details class="patch-accordion" id="patch-details-wrapper">
+              <summary class="patch-summary">
+                <div class="patch-summary-left">
+                  <span class="accordion-title">已载入 Android 宿主补丁</span>
+                  <span class="badge badge-accent">13 项全部生效</span>
+                </div>
+                <div class="patch-summary-right">
+                  <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                  </svg>
+                </div>
+              </summary>
+              <div class="patch-content-body">
+                <div class="patch-grid">
+                  <div class="patch-item">
+                    <div class="patch-id">P01</div>
+                    <div class="patch-info">
+                      <span class="patch-name">process.binding 兼容模拟层</span>
+                      <span class="patch-desc">为 Android 上被裁切的底层 Node 绑定提供兼容垫片</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P02</div>
+                    <div class="patch-info">
+                      <span class="patch-name">child_process.spawn POSIX 适配</span>
+                      <span class="patch-desc">强制重定向 /bin/sh 到宿主内嵌的 Toybox Shell 环境</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P03</div>
+                    <div class="patch-info">
+                      <span class="patch-name">DNS 绕过 Android Netd 守护</span>
+                      <span class="patch-desc">使用纯 JS c-ares 逻辑直连公共 DNS，避免 getaddrinfo 权限阻断</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P04</div>
+                    <div class="patch-info">
+                      <span class="patch-name">os.cpus() 核心热插拔模拟</span>
+                      <span class="patch-desc">规避 Android 内核在低功耗时隐藏脱机 CPU 核心导致的越界</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P05</div>
+                    <div class="patch-info">
+                      <span class="patch-name">fs.stat 沙箱权限抹平</span>
+                      <span class="patch-desc">将 Android 特有虚拟 uid/gid 映射至标准 POSIX 模拟用户</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P06</div>
+                    <div class="patch-info">
+                      <span class="patch-name">pthread 亲和性隔离规避</span>
+                      <span class="patch-desc">拦截 thread-affinity 调用，防止部分定制 ROM 下被 SELinux 杀进程</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P07</div>
+                    <div class="patch-info">
+                      <span class="patch-name">Terminfo 无色彩终端降级</span>
+                      <span class="patch-desc">为内嵌 WebView 提供安全的 xterm-256color 终端转义支持</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P08</div>
+                    <div class="patch-info">
+                      <span class="patch-name">WorkerThreads 内存限额优化</span>
+                      <span class="patch-desc">对 Android LMK (低内存杀手) 适配的堆内存阈值动态裁剪</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P09</div>
+                    <div class="patch-info">
+                      <span class="patch-name">OpenSSL CA 证书重定向</span>
+                      <span class="patch-desc">将 Node TLS 证书链指向 Android 系统 /system/etc/security/cacerts</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P10</div>
+                    <div class="patch-info">
+                      <span class="patch-name">WebSocket 心跳防打盹 (Doze Mode)</span>
+                      <span class="patch-desc">高频自适应 ping 保持套接字活性，防止进入系统浅睡眠</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P11</div>
+                    <div class="patch-info">
+                      <span class="patch-name">V8 JIT W^X 内存重映射</span>
+                      <span class="patch-desc">规避 Android 高版本内核对可执行堆内存的写保护强制崩溃</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P12</div>
+                    <div class="patch-info">
+                      <span class="patch-name">本地路由 /kxxy 独立反代挂载</span>
+                      <span class="patch-desc">在同一个 HTTP 服务内部无感分流宿主管理接口与官方 React 视图</span>
+                    </div>
+                  </div>
+                  <div class="patch-item">
+                    <div class="patch-id">P13</div>
+                    <div class="patch-info">
+                      <span class="patch-name">SIGINT / SIGTERM 优雅退出捕获</span>
+                      <span class="patch-desc">接收 Android Activity 销毁信号并安全刷写 SQLite 日志与配置缓存</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </details>
+          </div>
         </div>
       </section>
 
@@ -585,12 +585,9 @@
           </div>
         </div>
 
-        <div class="card builtin-note-card">
-          <span class="builtin-note-icon" aria-hidden="true">🧩</span>
-          <div class="builtin-note-info">
-            <span class="builtin-note-title">停用插件不会丢数据</span>
-            <span class="builtin-note-sub">停用只是把插件从启动清单里摘掉，包体与会话都保留，随时能开回来。对话页进不去时，先回这里关掉可疑的那个。</span>
-          </div>
+        <div class="dsl-note plugin-note">
+          <svg class="dsl-note-ico" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5.4M12 7.8h.01"/></svg>
+          <span>停用只把插件从启动清单摘掉，<b>包体与会话都保留</b>，随时能开回来。对话页进不去时，先回这里关掉可疑的那个。</span>
         </div>
 
         <!-- 失败告警：只有真的检测到加载失败才显示 -->
@@ -602,10 +599,10 @@
           <button class="button button-warning button-sm" id="btn-plugin-disable-broken">一键停用</button>
         </div>
 
-        <div class="card block-card">
-          <div class="card-title-group">
-            <h3 class="card-title">已安装插件</h3>
-            <span class="card-subtitle" id="plugin-list-meta">与官方插件页同一份清单（profile bundles）</span>
+        <div class="plugin-group">
+          <div class="plugin-group-head">
+            <span class="plugin-group-title">已安装插件</span>
+            <span class="plugin-group-meta" id="plugin-list-meta">与官方插件页同一份清单</span>
           </div>
           <div class="plugin-cards" id="plugin-list">
             <div class="empty-state">正在加载插件清单…</div>
@@ -668,6 +665,87 @@
         </div>
 
         <!--
+          已配对的电脑放在**最前面**。
+
+          v1 的次序是「教程 → 添加 → 设备」，一条 122 行的四步教程 + 三张
+          接入方式说明把设备列表推到了第三屏以下。老用户每次进这一页，
+          要做的就是「点那台电脑的连接」，却必须先滚过整份安装文档。
+          现在改成「设备 → 添加 → 教程」，教程在有设备时由 host.js 自动
+          收起（见 remoteStepsResolved），没问题的人根本看不到它。  -->
+        <div class="remote-list-head">
+          <span class="remote-list-label">已配对的电脑</span>
+          <span class="remote-list-count" id="remote-list-count"></span>
+        </div>
+        <div class="remote-list" id="remote-list"></div>
+        <div class="empty-state" id="remote-list-empty" hidden>还没有配对的电脑</div>
+
+        <div class="card remote-add-card">
+          <div class="card-title-row" style="margin-bottom:10px">
+            <span class="card-title">添加电脑</span>
+            <span class="card-subtitle">扫码最快</span>
+          </div>
+
+          <!--
+            扫码是主按钮，粘贴是次选。
+
+            v0.9.14 之前这里只有输入框 —— 用户要在手机上手打/跨设备复制一串
+            带配对码的 URL，而电脑上那个连接器本来就把同一串东西显示成了
+            二维码。能扫的不让粘，是这个页面最没必要的一道摩擦。
+          -->
+          <button class="remote-scan-button" id="btn-remote-scan" type="button">
+            <svg class="remote-scan-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 8V5a2 2 0 0 1 2-2h3"/>
+              <path d="M16 3h3a2 2 0 0 1 2 2v3"/>
+              <path d="M21 16v3a2 2 0 0 1-2 2h-3"/>
+              <path d="M8 21H5a2 2 0 0 1-2-2v-3"/>
+              <rect x="7.5" y="7.5" width="4" height="4" rx="0.6"/>
+              <rect x="12.5" y="12.5" width="4" height="4" rx="0.6"/>
+            </svg>
+            <span class="remote-scan-label">扫码连接</span>
+            <span class="remote-scan-hint">对着电脑上的二维码</span>
+          </button>
+
+          <!--
+            粘贴区默认收起：扫码是主路径，两个输入框 + 一个大按钮铺在首屏
+            等于让 90% 的用户为 10% 的情况让出位置（实测这一卡 312px）。
+            收起后「没有二维码」这件事本身就是那一行的文案 —— 需要的人一眼
+            认领，不需要的人完全看不到。
+            id 保留在 details 上（remote-paste），host.js 在聚焦输入框和
+            扫码失败时会把它撑开。
+          -->
+          <details class="remote-paste" id="remote-paste">
+            <summary>
+              <span>没有二维码？粘贴连接串</span>
+              <svg class="chevron-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </summary>
+            <div class="remote-paste-body">
+              <input
+                class="remote-input"
+                id="remote-url-input"
+                type="text"
+                inputmode="url"
+                autocomplete="off"
+                autocapitalize="off"
+                autocorrect="off"
+                spellcheck="false"
+                placeholder="http://192.168.1.23:8080/__kxxy_pair?code=…"
+              >
+              <input
+                class="remote-input"
+                id="remote-label-input"
+                type="text"
+                maxlength="24"
+                placeholder="给它起个名字（可选）"
+              >
+              <button class="button button-primary button-block" id="btn-remote-submit" type="button">添加并连接</button>
+              <p class="remote-hint" id="remote-add-error" hidden></p>
+            </div>
+          </details>
+        </div>
+
+        <!--
           第一次连接的引导。
 
           存在理由：v0.9.13 上线后收到的第一个问题就是「我怎么连接我的电脑啊」——
@@ -684,7 +762,7 @@
         -->
         <details class="card remote-steps" id="remote-steps" open>
           <summary class="remote-steps-summary">
-            <span class="remote-steps-title">第一次连接？电脑上装个插件就行</span>
+            <span class="remote-steps-title">第一次连接 · 电脑上装个插件</span>
             <svg class="chevron-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="6 9 12 15 18 9"></polyline>
             </svg>
@@ -805,71 +883,12 @@
           </div>
         </details>
 
-        <div class="card remote-add-card">
-          <div class="card-title-group">
-            <span class="card-title">添加电脑</span>
-            <span class="card-subtitle">扫码最快；没有二维码就粘贴连接串</span>
-          </div>
-
-          <!--
-            扫码是主按钮，粘贴是次选。
-
-            v0.9.14 之前这里只有输入框 —— 用户要在手机上手打/跨设备复制一串
-            带配对码的 URL，而电脑上那个连接器本来就把同一串东西显示成了
-            二维码。能扫的不让粘，是这个页面最没必要的一道摩擦。
-          -->
-          <button class="remote-scan-button" id="btn-remote-scan" type="button">
-            <svg class="remote-scan-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M3 8V5a2 2 0 0 1 2-2h3"/>
-              <path d="M16 3h3a2 2 0 0 1 2 2v3"/>
-              <path d="M21 16v3a2 2 0 0 1-2 2h-3"/>
-              <path d="M8 21H5a2 2 0 0 1-2-2v-3"/>
-              <rect x="7.5" y="7.5" width="4" height="4" rx="0.6"/>
-              <rect x="12.5" y="12.5" width="4" height="4" rx="0.6"/>
-            </svg>
-            <span class="remote-scan-label">扫码连接</span>
-            <span class="remote-scan-hint">对着电脑上的二维码</span>
-          </button>
-
-          <div class="remote-or"><span>或者粘贴连接串</span></div>
-
-          <input
-            class="remote-input"
-            id="remote-url-input"
-            type="text"
-            inputmode="url"
-            autocomplete="off"
-            autocapitalize="off"
-            autocorrect="off"
-            spellcheck="false"
-            placeholder="http://192.168.1.23:8080/__kxxy_pair?code=…"
-          >
-          <input
-            class="remote-input"
-            id="remote-label-input"
-            type="text"
-            maxlength="24"
-            placeholder="给它起个名字（可选）"
-          >
-          <button class="button button-primary button-block" id="btn-remote-submit" type="button">添加并连接</button>
-          <p class="remote-hint" id="remote-add-error" hidden></p>
-        </div>
-
-        <div class="remote-list-head">
-          <span class="remote-list-label">已配对的电脑</span>
-          <span class="remote-list-count" id="remote-list-count"></span>
-        </div>
-        <div class="remote-list" id="remote-list"></div>
-        <div class="empty-state" id="remote-list-empty" hidden>还没有配对的电脑</div>
-
         <div class="card remote-note-card">
           <span class="remote-note-title">连接之后</span>
           <ul class="remote-note-list">
             <li>同一 WiFi 下自动走局域网直连，不经过任何服务器。</li>
-            <li>电脑关机时这条记录会保留，点「连接」会提示连不上，不会丢配对。</li>
-            <li>远程会话里顶部会出现设备条，右侧「断开」随时回到本机。</li>
-            <li>设备卡上的状态只说「上一次」的结果：没有心跳，所以它不是「现在在线」。</li>
-            <li>「移除」只删手机里的记录，电脑侧对这台手机的授权仍然有效。</li>
+            <li>电脑关机时记录会保留，点「连接」会提示连不上，不会丢配对。</li>
+            <li>状态只说「上一次」的结果：没有心跳，所以它不是「现在在线」。</li>
           </ul>
         </div>
       </section>
@@ -925,7 +944,7 @@
         </div>
 
         <!-- 宿主运行权限等级：模式卡片组 -->
-        <div class="card block-card">
+        <div class="dsl-plain">
           <div class="card-title-group">
             <h3 class="card-title">宿主运行权限等级</h3>
             <span class="card-subtitle">控制 Agent 进程获取宿主 Android API 及系统执行边界</span>
@@ -940,7 +959,7 @@
         </div>
 
         <!-- 功能开关组 -->
-        <div class="card block-card">
+        <div class="dsl-plain">
           <div class="card-title-group">
             <h3 class="card-title">系统级守护设置</h3>
             <span class="card-subtitle">保障后台任务运行与网络通信</span>
@@ -1040,14 +1059,23 @@
             <span class="card-subtitle">进程控制与运行排错日志</span>
           </div>
 
-          <div class="danger-actions-grid">
-            <button class="button button-warning button-block" id="btn-restart-engine">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
-              </svg>
-              <span>重启引擎进程</span>
-            </button>
+          <!-- 主操作只有一个：重启。其余六个是排错时才用的，收进下面的折叠区 ——
+               v1 把它们排成 2×4 的按钮矩阵（287px），日常进来是一片「不知道该点哪个」。 -->
+          <button class="button button-warning button-block" id="btn-restart-engine">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+            </svg>
+            <span>重启引擎进程</span>
+          </button>
 
+          <details class="maint-more" id="maint-more">
+            <summary>
+              <span class="maint-more-title">更多维护操作</span>
+              <span class="maint-more-sub">诊断日志 · 命令修复 · 镜像测速 · 一键验收</span>
+              <svg class="chevron-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </summary>
+
+            <div class="danger-actions-grid">
             <button class="button button-subtle button-block" id="btn-export-logs">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -1110,7 +1138,8 @@
               </svg>
               <span>插件管理</span>
             </button>
-          </div>
+            </div>
+          </details>
 
           <!-- 验收结果：每条一行（状态点 + 标题 + 证据 + 该点哪个按钮）。
                刻意放在按钮下方同一个卡片里 —— 用户点完按钮眼睛不用移动 -->
@@ -1383,6 +1412,13 @@
           <span class="tab-label">扩展</span>
         </button>
 
+        <!-- FAB 占位：正中央这一列留给下面的「对话」悬浮按钮。grid 的列数由子元素
+             个数决定（见 .tabbar-inner 的 grid-auto-flow），所以必须真的插一个
+             空元素，光靠 padding 挤不出缺口。位置必须在第 3 列 —— 4 个页签 + 1 个
+             缺口共 5 列，居中的是第 3 列；放到「插件」后面的话缺口会偏右 68px，
+             FAB 就压到页签上了。 -->
+        <div class="tabbar-gap" aria-hidden="true"></div>
+
         <button class="tab-item" data-target="plugins">
           <div class="tab-icon">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1406,6 +1442,15 @@
         </button>
       </div>
     </nav>
+
+    <!-- 中央悬浮「对话」按钮：全 App 最高频动作。v1 只有页头右上一个 12px 胶囊，
+         权重比旁边的状态点还低，用户每次都得先找。用 <a> 而不是 <button>：
+         它就是一次整页跳转（控制台与对话页同源不同路由），不需要 JS 参与。 -->
+    <a class="dsl-fab" href="/" aria-label="回到对话页" title="回到对话页">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20.5 11.8c0 3.9-3.8 7-8.5 7-1 0-2-.15-2.9-.42L4.5 20l1.1-3.3c-1.3-1.2-2.1-2.9-2.1-4.9 0-3.9 3.8-7 8.5-7s8.5 3.1 8.5 7z"/>
+      </svg>
+    </a>
   </div>
 
   <script src="/kxxy/assets/host.js"></script>
