@@ -141,25 +141,41 @@ class RuntimeInstaller(private val ctx: Context) {
         // Python/host 增量修复必须早于指纹锚点及任何自动重装/包装器写入。
         // 非基线、用户冲突或校验失败均抛错：绝不能跌入下面删除 lib 的全量路径。
         // 全新/显式 force 安装直接使用 runtime.zip 中的同一组修复文件。
+        //
+        // ⚠ 唯一例外是「载荷不适配本机」（宿主指纹既不是基线也不是目标）：
+        // 那说明设备停在别的版本上，增量载荷没有一条能安全落地的路径，而**全量安装
+        // 本身是安全的**（只替换 zip 里的顶层目录，`extensions/` 与用户数据不动）。
+        // 0.9.57 装机事故正是这里没有出口：插件一改，载荷 base/host 都指向新指纹，
+        // 设备上还是上一版，preflight 抛 Refused → 启动即失败，只能手工进「诊断/救援」
+        // 做一次离线修复。未适配的情形降级为全量重装（约 90 秒），仍然保留用户数据。
+        var incrementalSkipped = false
         if (!force && File(root, "bin/node").isFile) {
-            // Python 冲突必须在 DSH 的第一次写入之前发现，不能放宽原拒绝边界。
-            pythonRuntimeRepair.preflight(root)
-            onProgress.onProgress(0.02f)
-            // 真机上这一步要替换两万多个文件、退役近四千个；必须把真实进度传出去，
-            // 否则启动页会一直停在「解压 0%」，用户只能强杀重来。
-            dshRuntimeUpgrade.restoreCurrentModes(root)
-            val upgraded = dshRuntimeUpgrade.upgrade(root) { frac ->
-                onProgress.onProgress(0.03f + frac * 0.72f)
+            try {
+                // Python 冲突必须在 DSH 的第一次写入之前发现，不能放宽原拒绝边界。
+                pythonRuntimeRepair.preflight(root)
+                onProgress.onProgress(0.02f)
+                // 真机上这一步要替换两万多个文件、退役近四千个；必须把真实进度传出去，
+                // 否则启动页会一直停在「解压 0%」，用户只能强杀重来。
+                dshRuntimeUpgrade.restoreCurrentModes(root)
+                val upgraded = dshRuntimeUpgrade.upgrade(root) { frac ->
+                    onProgress.onProgress(0.03f + frac * 0.72f)
+                }
+                if (upgraded.replaced.isNotEmpty() || upgraded.backups.isNotEmpty() || upgraded.pruned != 0) {
+                    Log.i(TAG, "DSH offline upgrade: ${upgraded.replaced.size} files replaced, ${upgraded.backups.size} retired files backed up, ${upgraded.pruned} empty director(y/ies) pruned")
+                }
+                onProgress.onProgress(0.76f)
+                val repaired = pythonRuntimeRepair.repair(root)
+                if (repaired.replaced.isNotEmpty()) {
+                    Log.i(TAG, "python offline repair: ${repaired.replaced.size} managed file(s) atomically replaced")
+                }
+                onProgress.onProgress(0.80f)
+            } catch (e: PythonRuntimeRepair.NotApplicable) {
+                incrementalSkipped = true
+                Log.w(TAG, "python 增量修复不适配本机，改走全量安装：${e.message}")
+            } catch (e: DshRuntimeUpgrade.NotApplicable) {
+                incrementalSkipped = true
+                Log.w(TAG, "DSH 增量升级不适配本机，改走全量安装：${e.message}")
             }
-            if (upgraded.replaced.isNotEmpty() || upgraded.backups.isNotEmpty() || upgraded.pruned != 0) {
-                Log.i(TAG, "DSH offline upgrade: ${upgraded.replaced.size} files replaced, ${upgraded.backups.size} retired files backed up, ${upgraded.pruned} empty director(y/ies) pruned")
-            }
-            onProgress.onProgress(0.76f)
-            val repaired = pythonRuntimeRepair.repair(root)
-            if (repaired.replaced.isNotEmpty()) {
-                Log.i(TAG, "python offline repair: ${repaired.replaced.size} managed file(s) atomically replaced")
-            }
-            onProgress.onProgress(0.80f)
         }
 
         // 锚点 15 的**安装前自愈**，必须早于 isComplete()。
@@ -174,7 +190,9 @@ class RuntimeInstaller(private val ctx: Context) {
         if (!force && File(root, "bin/node").isFile) healPackagingWrappers(root)
 
         val pendingInstall = File(root, INCOMPLETE_MARKER)
-        if (!force && !freshRoot && Files.exists(pendingInstall.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+        // 同 `isComplete()` 的理由：`incrementalSkipped` 时这个探针只会因为
+        // 「增量内容未就绪」抛错，而下一步就是全量重装，它没有决策价值。
+        if (!force && !freshRoot && !incrementalSkipped && Files.exists(pendingInstall.toPath(), LinkOption.NOFOLLOW_LINKS)) {
             check(Files.isRegularFile(pendingInstall.toPath(), LinkOption.NOFOLLOW_LINKS)) { "拒绝非常规安装标记" }
             if (isComplete(root, checkMarker = false)) {
                 writeStamp()
@@ -186,7 +204,9 @@ class RuntimeInstaller(private val ctx: Context) {
         }
 
         // 新装仅有原生元数据，尚无内容可验；解包后的完整性检查仍必须通过。
-        if (!force && !freshRoot && isComplete(root)) {
+        // `incrementalSkipped` 时不探：这份探针会给「Python/DSH 增量内容未就绪」直接抛错，
+        // 而我们已经确定要走全量，探针结论对决策没有价值。
+        if (!force && !freshRoot && !incrementalSkipped && isComplete(root)) {
             // Only core executable/link repairs belong on the startup critical path.
             // TeX, extension pool, font/dev defaults run separately after Healthy.
             healCopiedAliases(root)
@@ -209,7 +229,9 @@ class RuntimeInstaller(private val ctx: Context) {
 
         // 带增量合同的存量设备绝不因其它锚点失效而删除整个 lib/bin。
         // 全新空目录仍正常安装；显式 forceReinstall 的原有恢复语义不变。
-        if (!force && !freshRoot && dshRuntimeUpgrade.isConfigured()) {
+        // 增量载荷判为「不适配本机」时同样放行到全量：不放行的话，设备就卡在
+        // 「增量没得做、全量不让做」的死角里。
+        if (!force && !freshRoot && !incrementalSkipped && dshRuntimeUpgrade.isConfigured()) {
             throw DshRuntimeUpgrade.Refused("增量升级后的其它运行时锚点尚未就绪；保留现有 Python、npm 和扩展，请导出救援报告")
         }
         Log.i(TAG, "installing runtime into ${root.absolutePath}")

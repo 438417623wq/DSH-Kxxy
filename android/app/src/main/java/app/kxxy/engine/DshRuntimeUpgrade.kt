@@ -47,7 +47,14 @@ internal class DshRuntimeUpgrade(
         val backups: Map<String, File>,
         val pruned: Int = 0,
     )
-    class Refused(message: String, cause: Throwable? = null) : IOException("DSH 离线升级：$message；不会自动清空或重装用户运行时", cause)
+    open class Refused(message: String, cause: Throwable? = null) : IOException("DSH 离线升级：$message；不会自动清空或重装用户运行时", cause)
+
+    /**
+     * 载荷不适配本机（设备宿主指纹既非基线也非目标）。语义与
+     * [PythonRuntimeRepair.NotApplicable] 一致：调用方可以安全地改走全量安装，
+     * 用户文件冲突仍然只能是 [Refused]。
+     */
+    class NotApplicable(message: String) : Refused(message)
 
     private data class Managed(val path: String, val size: Long, val mode: Int, val sha: String?, val previous: Set<String>)
     private data class Manifest(val baseHost: String, val host: String, val payloadSha: String, val payloadSize: Long, val files: List<Managed>)
@@ -297,7 +304,9 @@ internal class DshRuntimeUpgrade(
     private fun applicableHost(scope: Scope, m: Manifest) {
         val actual = hostFingerprint(scope)
         // 缺失指纹也是受管缺失状态，随后逐条 SHA 预检；非空但陌生的指纹绝不放行。
-        if (actual != null && actual != m.baseHost && actual != m.host) refuse("未知宿主指纹，不适用此增量升级（${actual.take(16)}）")
+        if (actual != null && actual != m.baseHost && actual != m.host) {
+            throw NotApplicable("未知宿主指纹，不适用此增量升级（${actual.take(16)}）")
+        }
     }
 
     private fun hostFingerprint(scope: Scope): String? {

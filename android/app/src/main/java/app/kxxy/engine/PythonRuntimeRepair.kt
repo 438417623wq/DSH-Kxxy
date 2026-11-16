@@ -44,7 +44,20 @@ internal class PythonRuntimeRepair(
 ) {
     fun interface Assets { fun open(name: String): InputStream }
     data class Result(val supported: Boolean, val replaced: List<String>)
-    class Refused(message: String, cause: Throwable? = null) : IOException("Python 离线修复：$message；不会自动清空或重装用户运行时", cause)
+    open class Refused(message: String, cause: Throwable? = null) : IOException("Python 离线修复：$message；不会自动清空或重装用户运行时", cause)
+
+    /**
+     * 载荷**不适用于本机**（设备宿主指纹既不是这份载荷的基线、也不是目标）。
+     *
+     * 与 [Refused] 的其它情形（用户改过文件、内容冲突、校验失败）分开：那些必须硬拒绝，
+     * 而「不适配」只说明设备停在别的版本上，**改走全量安装是安全的** ——
+     * 全量只替换 zip 里的顶层目录，`extensions/` 与用户数据不动。
+     *
+     * 0.9.57 装机事故就是这条没有出口：插件一改，载荷的 base/host 都指向新指纹，
+     * 设备上还是上一版指纹，preflight 直接抛 Refused，`install()` 再也走不到全量分支，
+     * 用户只能进「诊断/救援 → 离线修复运行时」手工救一次。
+     */
+    class NotApplicable(message: String) : Refused(message)
 
     private data class Managed(val path: String, val size: Long, val sha256: String, val mode: Int, val role: String, val previous: String?)
     private data class Manifest(val revision: String, val payloadSha: String, val payloadSize: Int, val baseHost: String, val host: String, val files: List<Managed>)
@@ -159,6 +172,10 @@ internal class PythonRuntimeRepair(
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
             throw e
+        } catch (e: NotApplicable) {
+            // 不适配必须原样上抛：套进「修复未完成」的 Refused 会让调用方失去
+            // 「可以安全改走全量安装」这个判断依据。
+            throw e
         } catch (e: Exception) {
             throw Refused("修复未完成，已确认替换 ${replacements.size} 个受管文件，其余文件请重试时重新校验。${e.message}", e)
         } finally {
@@ -175,7 +192,9 @@ internal class PythonRuntimeRepair(
 
     private fun applicableHost(scope: Scope, m: Manifest) {
         val actual = hostFingerprint(scope)
-        if (actual != m.baseHost && actual != m.host) refuse("不适用此增量修复：设备宿主指纹不匹配基线或目标（${actual?.take(16) ?: "缺失"}）")
+        if (actual != m.baseHost && actual != m.host) {
+            throw NotApplicable("不适用此增量修复：设备宿主指纹不匹配基线或目标（${actual?.take(16) ?: "缺失"}）")
+        }
     }
 
     private fun hostFingerprint(scope: Scope): String? {
