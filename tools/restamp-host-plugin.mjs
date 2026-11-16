@@ -264,6 +264,7 @@ async function main() {
     if (entry) repairPrevious.set(path, readEntryData(fd, entry))
   }
 
+
   // ── 内容指纹：与全量构建同源（整棵树，含构建期产物）────────────────────
   const tree = new Map([...kept, ...files])
   const fingerprint = stampHostPluginFingerprint(tree)
@@ -293,6 +294,39 @@ async function main() {
     )
   }
   console.log(`旧指纹 ${fpBefore}`)
+
+  /*
+   * 修复包不是「只有宿主那 7 个文件」——它还得带上**受管的 Python 字节**
+   * （site-packages、原生后端 .so、bin/python3、dist-info 元数据与版本文件），
+   * 否则设备侧会以「清单缺少 Python 原生后端、包元数据或版本文件」拒绝修复
+   * （实测踩过：只带宿主文件时，第二个 Refused 就是这个）。
+   *
+   * 这些字节在运行时里原样存在，而且这次重封根本不动它们，所以清单直接从
+   * **上一份 python-repair 的 manifest** 抄路径、从输入 zip 取值即可 ——
+   * 既不依赖打包机上的 wheel 归档，也不会与全量构建的文件集漂移。
+   */
+  const repairPythonFiles = new Map()
+  if (opts.assets) {
+    const prevRepairPath = join(opts.assets, 'manifest.json')
+    if (existsSync(prevRepairPath)) {
+      const prevRepair = JSON.parse(readFileSync(prevRepairPath, 'utf8'))
+      if (prevRepair.baseHostFingerprint !== fpBefore) {
+        throw new Error(
+          `python-repair 基线指纹 ${String(prevRepair.baseHostFingerprint).slice(0, 12)} 与运行时 ${fpBefore.slice(0, 12)} 不符，` +
+            '请先从上一版 APK 里恢复 assets/python-repair 再重封',
+        )
+      }
+      for (const record of prevRepair.files) {
+        if (record.role !== 'python') continue
+        const entry = cd.entries.find((e) => e.name === record.path)
+        if (!entry) throw new Error(`运行时缺少修复包声明的 Python 文件：${record.path}`)
+        repairPythonFiles.set(record.path, { data: readEntryData(fd, entry), mode: record.mode })
+      }
+      console.log(`Python 修复包：沿用上一份清单的 ${repairPythonFiles.size} 个受管 Python 文件`)
+    } else {
+      throw new Error(`找不到 ${prevRepairPath} —— 修复包必须以上一版为基线增量重算`)
+    }
+  }
   if (fpBefore === fingerprint) console.log('  ! 指纹与旧包一致 —— 这次重封不会触发设备重装')
 
   // 源码里删掉的文件：只报告，不主动从运行时剔除（那 10 个产物看起来就像
@@ -457,7 +491,7 @@ async function main() {
    * `previous` 提供旧字节以便设备做三方比对。
    */
   if (opts.assets) {
-    const repairFiles = new Map()
+    const repairFiles = new Map(repairPythonFiles)
     const previous = new Map(repairPrevious)
     for (const name of PYTHON_HOST_FILES) {
       const path = `${HOST_PLUGIN_BASE}${name}`
