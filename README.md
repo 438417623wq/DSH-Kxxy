@@ -107,6 +107,8 @@ dsh-kxxy/
 
 ## 三、构建
 
+> **Python 依赖修复（0.9.42）**：默认装配 `tools/prebuilt/python-android-cp314/` 中已验证的 CFFI 2.0.0 与 pycparser 2.23，核对目标 Python/原生库摘要后才能出包。不再依赖 deb 的联网 postinst。新解释器/库版本须重建匹配构件，不能直接复用。维护区“一键验收（含 Python）”可做实际功能检查；NumPy/psutil 的旧平台标签仍如实报告。详见 [Python 修复与验证边界](docs/python-runtime-repair-0.9.42.md)。
+
 前置：JDK 17、Android SDK（platforms 36 / build-tools 36 / ndk 28.2 / cmake 3.22.1）。
 本机没有 gradle wrapper，用已安装的 Gradle 8.10.2。
 
@@ -188,6 +190,14 @@ $env:KXXY_PYTHON = $py
 & $node tools/test-archive-providers.mjs
 & $node tools/test-media-providers.mjs
 & $node tools/test-extinstall.mjs
+& $node tools/test-nvim-parsers.mjs      # parser 视图、自愈、重建与用户文件保护（不验证端上 ABI）
+& $node tools/test-selftest.mjs
+& $py -I -B tools/test-poolextract.py   # 包池目录/文件链接物化，含 Neovim 实际布局
+
+# 仅使用缓存 deb 生成独立 shells.pool；不覆盖现有池，验证 7 个 parser 的字节内容
+& $py -I tools/verify-nvim-pool.py --spec .cache/pool-spec.json --debs .cache/debs `
+  --stage .cache/stage --original-pool android/app/src/main/assets/ext-pool/shells.pool `
+  --out-parent .cache
 
 & $node tools/test-compat-open.mjs& $node tools/test-native-command.mjs
 & $node tools/test-signing.mjs           # 固定签名契约（指纹 / 接线 / 无 debug 密钥残留）
