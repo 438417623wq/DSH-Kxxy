@@ -697,8 +697,17 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * 给写请求加 `x-kxxy-nonce`，`lib/index.js` 校验它。**前端与后端必须同版本**：
  * 新页面配旧插件 = 多带一个被忽略的头（无害），旧页面配新插件 = 所有写操作 403。
  * 正因为这种组合会"静默变砖"，补丁集必须涨 —— 它是唯一能保证两边一起换的锚点。
+ *
+ * 25 → 26：控制台五页全站改版（2026-11-16）。改动**只**落在 `kxxy-host/web/`
+ * （`host.css` 追加 1065 行 `.dsl-*` 组件层、`index.html` 重排五页、`host.js` 四处配合）。
+ * 这是本轮最贵的一课：`host.css` 不在 Python 增量修复的受管名单里
+ * （`PythonRuntimeRepair.HOST_WEB_FILES` 只有 `index.html` 与 `host.js`），
+ * 不升编号时设备会把这两个文件换成新的、**样式却留在上一版** —— 真机表现是
+ * 「结构全对、视觉全丢」，底栏中央那个 `.dsl-fab` 因为没有 54px 的圆框约束，
+ * 被 WebView 按 SVG 默认的 300×150 撑成一只盖住半屏的紫色大气泡（0.9.59 #959002 实测）。
+ * 判据同 10 → 11：**自有插件的任意前端资源有实质改动，都要 +1**。
  */
-const PATCHSET_MARKER = "kxxy-patchset@25";
+const PATCHSET_MARKER = "kxxy-patchset@26";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

@@ -21,7 +21,7 @@ const PROJECT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const FROM = '0.2.1-rc.5', TO = '0.2.2-rc.2'
 const NM = 'lib/node_modules/'
 const ROOTS = ['@deepseek-ai/dsh', '@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
-const PATCHSET = 'kxxy-patchset@25'
+const PATCHSET = 'kxxy-patchset@26'
 const ROOT_MANIFEST = 'kxxy-runtime.json'
 const HOST_FP = `${HOST_PLUGIN_BASE}lib/.fingerprint`
 const SCHEMA = 'kxxy-dsh-upgrade@1'

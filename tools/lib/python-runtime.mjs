@@ -16,7 +16,18 @@ export const PYTHON_SOURCES = Object.freeze({
   cffi: { version: '2.0.0', sha256: '44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529' },
   pycparser: { version: '2.23', sha256: 'e5c6e8d3fbad53479cab09ac03729e0a9faf2bee3db8208a550daf5af81a5934' },
 })
-export const PYTHON_HOST_FILES = ['lib/selftest.mjs', 'lib/python-selftest.mjs', 'lib/python-probe.py', 'lib/index.js', 'lib/.fingerprint', 'web/host.js', 'web/index.html']
+/**
+ * 随增量修复下发的宿主文件（与 `PythonRuntimeRepair.HOST_FILES` / `HOST_WEB_FILES`
+ * 逐项对应，两边必须同名）。
+ *
+ * `web/` 那几项原来只有 `host.js` 与 `index.html`，0.9.60 的控制台改版就栽在这个
+ * 缺口上：样式表没进名单，装机后新结构配旧 CSS。现在把控制台要用的 web 资源
+ * 全部纳入 —— 改样式不再需要升补丁集编号、也不必让设备重解压 790 MiB。
+ */
+export const PYTHON_HOST_FILES = [
+  'lib/selftest.mjs', 'lib/python-selftest.mjs', 'lib/python-probe.py', 'lib/index.js', 'lib/.fingerprint',
+  'web/index.html', 'web/host.js', 'web/host.css', 'web/theme.css', 'web/compat.js', 'web/modern.js',
+]
 export const isRepairHostPath = (path) => path === 'kxxy-runtime.json' || PYTHON_HOST_FILES.some((name) => path === `lib/node_modules/kxxy-host/${name}`)
 export const sha256 = (data) => createHash('sha256').update(data).digest('hex')
 export const jsonBytes = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}\n`)

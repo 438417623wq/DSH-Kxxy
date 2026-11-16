@@ -17,6 +17,19 @@
  * 指纹，结果是「APK 装了新包、设备还在跑旧界面」—— 一声不响。所以这里直接复用
  * `lib/host-fingerprint.mjs` 的 `stampHostPluginFingerprint`，与全量构建逐字节一致。
  *
+ * ── 补丁集标记也必须一起动 ──────────────────────────────────────────────────
+ *
+ * 光换文件 + 换指纹**不够**：设备上 `isComplete()` 的锚点 11 只看
+ * `kxxy-host/patchset.version` 这一行标记。标记不变时它判「运行时完整」，
+ * 直接返回，连 `lib/` 都不会重解压 —— 而 `PythonRuntimeRepair.HOST_WEB_FILES`
+ * 的受管名单只有 `index.html` 与 `host.js`，样式表(`host.css`)、`theme.css`、
+ * `compat.js`、`modern.js` 根本没人换。真机现象：结构是新版、视觉是旧版
+ * （0.9.59 #959002：`.dsl-fab` 没有 54px 圆框，SVG 按默认 300×150 撑满半屏）。
+ *
+ * 所以这里同时把 `patchset.version` 重写成当前编号，取值直接读
+ * `build-runtime.mjs` 的 `PATCHSET_MARKER`，并与 `RuntimeInstaller.kt` 对账 ——
+ * 两边不一致时设备会判「标记不符」而无限重装，必须当场拦下。
+ *
  * ── 用法 ────────────────────────────────────────────────────────────────────
  *
  *   node tools/restamp-host-plugin.mjs \
@@ -107,6 +120,29 @@ function collectHostFiles() {
   }
   walk(HOST_SOURCE)
   return files
+}
+
+/**
+ * 当前补丁集编号：以 `build-runtime.mjs` 的 `PATCHSET_MARKER` 为准，
+ * 并与 `RuntimeInstaller.PATCHSET_MARKER`（设备侧锚点 11 的判据）逐字对账。
+ * 两边不一致时设备会判「标记不符」而无限重装，所以这里直接拒绝出包。
+ */
+function resolvePatchsetMarker() {
+  const read = (rel, re, label) => {
+    const value = re.exec(readFileSync(join(PROJECT, rel), 'utf8'))?.[1]
+    if (!value) throw new Error(`${label} 里找不到补丁集编号`)
+    return value
+  }
+  const built = read('tools/build-runtime.mjs', /const PATCHSET_MARKER = "([^"]+)"/, 'build-runtime.mjs')
+  const installed = read(
+    'android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt',
+    /PATCHSET_MARKER\s*=\s*"([^"]+)"/,
+    'RuntimeInstaller.kt',
+  )
+  if (built !== installed) {
+    throw new Error(`补丁集编号不一致：build-runtime=${built} 而 RuntimeInstaller=${installed}；设备会判标记不符`)
+  }
+  return built
 }
 
 function readAt(fd, offset, len) {
@@ -256,6 +292,22 @@ async function main() {
   }
   console.log(`源码树 ${files.size} 个文件；运行时另有 ${kept.size} 个构建期产物（原样保留）`)
 
+  // 补丁集标记必须跟着走，否则设备锚点 11 判「已完整」、整个 lib/ 都不重解压，
+  // 新样式表永远落不到设备上（详见文件头「补丁集标记也必须一起动」）。
+  // 注意要进 `files`（替换集）而不是只进 `kept`：写出阶段只重写 `files` 里的条目，
+  // `kept` 仅参与指纹计算与「保留 N 个」的计数 —— 上一版就是这么漏的。
+  const patchsetMarker = resolvePatchsetMarker()
+  const patchsetPath = `${HOST_PLUGIN_BASE}patchset.version`
+  if (!kept.has(patchsetPath)) throw new Error(`运行时缺少补丁集标记：${patchsetPath}`)
+  const patchsetBefore = kept.get(patchsetPath).data.toString('utf8').trim()
+  if (patchsetBefore !== patchsetMarker) {
+    kept.delete(patchsetPath)
+    files.set(patchsetPath, { data: Buffer.from(`${patchsetMarker}\n`, 'utf8'), mode: 0o644 })
+    console.log(`补丁集标记 ${patchsetBefore} → ${patchsetMarker}（设备将重解压整个 lib/）`)
+  } else {
+    console.log(`  ! 补丁集标记已是 ${patchsetMarker} —— 设备不会因此重解压`)
+  }
+
   // 修复包要用到的旧字节必须在 fd 关闭前读完（写出阶段结束时 fd 已 close）
   const repairPrevious = new Map()
   for (const name of PYTHON_HOST_FILES) {
@@ -310,12 +362,31 @@ async function main() {
     const prevRepairPath = join(opts.assets, 'manifest.json')
     if (existsSync(prevRepairPath)) {
       const prevRepair = JSON.parse(readFileSync(prevRepairPath, 'utf8'))
-      if (prevRepair.baseHostFingerprint !== fpBefore) {
+      /*
+       * 接受两种基线，本质是同一件事：**输入 zip 必须是设备上真实存在的那个状态**。
+       *
+       *   · 等于上一份 manifest 的 `baseHostFingerprint` —— 还在同一个已发布基线上重封；
+       *   · 等于上一份 manifest 的 `hostFingerprint` —— 上一版**已经发出去**了，这次是
+       *     从它接续（链式）。这时新的 base 就是它，`previous` 取输入 zip 里的字节，
+       *     正好等于设备上现在的内容，三方比对才成立。
+       *
+       * 少了第二条，每改一次样式都得回到 0.9.58 那份老包当基线，设备的宿主指纹
+       * 既不是 base 也不是 host ⇒ PythonRuntimeRepair 判「不适用」⇒ 每次装机都
+       * 白重解压 790 MiB。0.9.60 就是这么装的。
+       */
+      const prevBase = prevRepair.baseHostFingerprint
+      const prevHost = prevRepair.hostFingerprint
+      if (fpBefore !== prevBase && fpBefore !== prevHost) {
         throw new Error(
-          `python-repair 基线指纹 ${String(prevRepair.baseHostFingerprint).slice(0, 12)} 与运行时 ${fpBefore.slice(0, 12)} 不符，` +
-            '请先从上一版 APK 里恢复 assets/python-repair 再重封',
+          `python-repair 基线指纹 ${String(prevBase).slice(0, 12)}（或已发布的 ${String(prevHost).slice(0, 12)}）` +
+            `与运行时 ${fpBefore.slice(0, 12)} 不符，请先从上一版 APK 里恢复 assets/python-repair 再重封`,
         )
       }
+      console.log(
+        fpBefore === prevHost
+          ? `修复包链式接续：上一版已发布指纹 ${fpBefore.slice(0, 12)} 作为新基线`
+          : `修复包延续同一基线 ${fpBefore.slice(0, 12)}`,
+      )
       for (const record of prevRepair.files) {
         if (record.role !== 'python') continue
         const entry = cd.entries.find((e) => e.name === record.path)
@@ -523,6 +594,29 @@ async function main() {
     meta.kxxyHostMarker = marker
     writeFileSyncSafe(opts.meta, `${JSON.stringify(meta, null, 2)}\n`)
     console.log(`  meta 已更新：${opts.meta}（${marker}）`)
+  }
+
+  /*
+   * `.cache/build-meta.json` 是**构建机副本**：`build-apk.ps1` 拿它打日志，
+   * `verify-runtime.mjs`（锚点 8）与 `simulate-install.mjs` 拿它跟产物对账。
+   * 不同步的后果是产物明明对了，校验却报「指纹与 build-meta.json 不符」——
+   * 上一次重封就踩在这里，白查了一轮。
+   */
+  const cacheMetaPath = join(PROJECT, '.cache', 'build-meta.json')
+  if (existsSync(cacheMetaPath)) {
+    const cacheMeta = JSON.parse(readFileSync(cacheMetaPath, 'utf8'))
+    cacheMeta.generatedAt = new Date().toISOString()
+    cacheMeta.runtimeSha256 = sha
+    cacheMeta.runtimeSize = offset
+    cacheMeta.runtimeEntries = cdEntries.length
+    cacheMeta.kxxyHostFingerprint = fingerprint
+    cacheMeta.kxxyHostMarker = marker
+    if (opts.meta && existsSync(opts.meta)) {
+      const meta = JSON.parse(readFileSync(opts.meta, 'utf8'))
+      if (meta.pythonRepairManifestSha256) cacheMeta.pythonRepairManifestSha256 = meta.pythonRepairManifestSha256
+    }
+    writeFileSyncSafe(cacheMetaPath, `${JSON.stringify(cacheMeta, null, 2)}\n`)
+    console.log(`  构建机副本同步：${cacheMetaPath}`)
   }
 }
 
