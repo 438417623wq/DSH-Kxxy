@@ -1,0 +1,1104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>DSH Kxxy 控制台 · 全站改造稿</title>
+<style>
+/* ==========================================================================
+   DSH Kxxy 控制台 · 全站改造稿（共享样式）
+   设计语言：inset grouped list（分组卡 + 卡外分组标题）+ 单行式信息密度
+   约束：WebView 104 可用 —— 不用 :has / color-mix / @container / dvh / 嵌套 CSS
+   ========================================================================== */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #dfe2e7;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+               "Microsoft YaHei", sans-serif;
+  padding: 22px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px 18px;
+  align-items: flex-start;
+}
+
+.frame { width: 393px; }
+.frame > figcaption {
+  font-size: 12px; font-weight: 600; color: #4d5259;
+  margin: 0 0 8px 4px; letter-spacing: .02em;
+}
+.frame > figcaption span { font-weight: 400; color: #7b8087; }
+
+/* ── 手机外壳 ─────────────────────────────────────────────────────────── */
+.phone {
+  --bg: #f2f4f7;
+  --card: #ffffff;
+  --inset: #f7f8fa;
+  --line: rgba(15, 17, 21, .07);
+  --line-strong: rgba(15, 17, 21, .11);
+  --t1: #0f1115;
+  --t2: #61666b;
+  --t3: #8b9096;
+  --accent: #4176e6;
+  --accent-bg: #eaf1fe;
+  --ok: #1f8a4c;
+  --ok-bg: #e8f8ee;
+  --warn: #b06a10;
+  --warn-bg: #fdf3e3;
+  --err: #cf3a30;
+  --err-bg: #fdecea;
+  --shadow: 0 1px 2px rgba(15, 17, 21, .04), 0 8px 24px rgba(15, 17, 21, .06);
+
+  width: 393px;
+  height: 873px;
+  background: var(--bg);
+  color: var(--t1);
+  border-radius: 26px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  box-shadow: 0 18px 42px rgba(15, 17, 21, .18), 0 0 0 1px rgba(15, 17, 21, .07);
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+.phone.dark {
+  --bg: #101012;
+  --card: #1b1b1d;
+  --inset: #232326;
+  --line: rgba(255, 255, 255, .08);
+  --line-strong: rgba(255, 255, 255, .13);
+  --t1: #f4f5f7;
+  --t2: #a8adb4;
+  --t3: #7d838b;
+  --accent: #5b8cf7;
+  --accent-bg: rgba(91, 140, 247, .14);
+  --ok: #4ed17e;
+  --ok-bg: rgba(78, 209, 126, .14);
+  --warn: #f7ad31;
+  --warn-bg: rgba(247, 173, 49, .14);
+  --err: #f25a5a;
+  --err-bg: rgba(242, 90, 90, .14);
+  --shadow: 0 1px 2px rgba(0, 0, 0, .3);
+}
+
+/* 状态栏占位（真机是系统状态栏，这里只画个示意） */
+.statusbar {
+  height: 24px; flex: none;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 18px; font-size: 11px; font-weight: 600; color: var(--t2);
+}
+
+/* ── 顶部导航 ─────────────────────────────────────────────────────────── */
+.nav {
+  flex: none;
+  height: 50px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+}
+.nav-logo {
+  width: 26px; height: 26px; border-radius: 8px;
+  background: var(--accent-bg);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent); flex: none;
+}
+.nav-title { font-size: 17px; font-weight: 650; letter-spacing: -.01em; }
+.nav-sub { font-size: 11px; color: var(--t3); font-weight: 500; }
+.nav-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.nav-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 28px; padding: 0 10px; border-radius: 999px;
+  background: var(--ok-bg); color: var(--ok);
+  font-size: 12px; font-weight: 600;
+}
+.nav-pill i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; display: block; }
+.icon-btn {
+  width: 32px; height: 32px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--t2); background: transparent; border: 0;
+}
+.icon-btn.soft { background: var(--card); box-shadow: 0 0 0 1px var(--line); }
+.text-btn { font-size: 13px; font-weight: 600; color: var(--accent); background: 0; border: 0; }
+
+/* ── 滚动区 ───────────────────────────────────────────────────────────── */
+.scroll {
+  flex: 1;
+  overflow: hidden;
+  padding: 4px 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* ── 分组 ─────────────────────────────────────────────────────────────── */
+.grp-head {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 0 4px 7px;
+}
+.grp-title { font-size: 12.5px; font-weight: 600; color: var(--t3); letter-spacing: .03em; }
+.grp-title.plain { color: var(--t2); }
+.grp-link { margin-left: auto; font-size: 12.5px; font-weight: 600; color: var(--accent); }
+.grp {
+  background: var(--card);
+  border-radius: 14px;
+  box-shadow: 0 0 0 1px var(--line);
+  overflow: hidden;
+}
+.grp + .grp { margin-top: 0; }
+
+/* ── 行 ───────────────────────────────────────────────────────────────── */
+.row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  position: relative;
+}
+.row + .row::before {
+  content: ""; position: absolute; left: 14px; right: 0; top: 0;
+  height: 1px; background: var(--line);
+}
+.row.has-ico + .row.has-ico::before { left: 56px; }
+.row-main { min-width: 0; flex: 1; }
+.row-title { font-size: 15px; font-weight: 550; letter-spacing: -.005em; }
+.row-title.sm { font-size: 14.5px; }
+.row-sub {
+  font-size: 12px; color: var(--t3); margin-top: 2px;
+  line-height: 1.35;
+}
+.row-sub.mono { font-family: "SF Mono", Consolas, Menlo, monospace; font-size: 11px; }
+.row-tail { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: none; }
+.row-val { font-size: 13px; color: var(--t3); }
+.chev { color: var(--t3); flex: none; opacity: .85; }
+
+.row-ico {
+  width: 32px; height: 32px; border-radius: 9px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--inset); color: var(--t2);
+}
+.row-ico.blue { background: var(--accent-bg); color: var(--accent); }
+.row-ico.green { background: var(--ok-bg); color: var(--ok); }
+.row-ico.amber { background: var(--warn-bg); color: var(--warn); }
+.row-ico.red { background: var(--err-bg); color: var(--err); }
+
+/* ── 状态胶囊 ─────────────────────────────────────────────────────────── */
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 22px; padding: 0 8px; border-radius: 999px;
+  font-size: 11.5px; font-weight: 600; white-space: nowrap;
+  background: var(--inset); color: var(--t2);
+}
+.chip.ok { background: var(--ok-bg); color: var(--ok); }
+.chip.warn { background: var(--warn-bg); color: var(--warn); }
+.chip.err { background: var(--err-bg); color: var(--err); }
+.chip.blue { background: var(--accent-bg); color: var(--accent); }
+.chip.mono { font-family: "SF Mono", Consolas, Menlo, monospace; font-weight: 500; letter-spacing: -.02em; }
+
+/* ── 按钮 ─────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 32px; padding: 0 14px; border-radius: 10px; border: 0;
+  font-size: 13px; font-weight: 650; font-family: inherit;
+}
+.btn.pri { background: var(--accent); color: #fff; }
+.btn.soft { background: var(--inset); color: var(--t1); box-shadow: inset 0 0 0 1px var(--line); }
+.btn.danger { background: var(--err-bg); color: var(--err); }
+.btn.block { width: 100%; height: 42px; border-radius: 12px; font-size: 14.5px; }
+.btn.sm { height: 28px; padding: 0 10px; font-size: 12.5px; border-radius: 8px; }
+.btn.ghost { background: transparent; color: var(--accent); }
+
+/* ── 引擎主卡（hero） ─────────────────────────────────────────────────── */
+.hero {
+  background: var(--card);
+  border-radius: 16px;
+  box-shadow: 0 0 0 1px var(--line), var(--shadow);
+  overflow: hidden;
+}
+.hero-top { display: flex; align-items: flex-start; gap: 12px; padding: 15px 14px 14px; }
+.hero-dot {
+  width: 10px; height: 10px; border-radius: 50%; flex: none; margin-top: 6px;
+  background: var(--ok);
+  box-shadow: 0 0 0 4px var(--ok-bg);
+}
+.hero-title { font-size: 19px; font-weight: 700; letter-spacing: -.02em; }
+.hero-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.hero-actions { margin-left: auto; display: flex; gap: 6px; }
+
+.stats { display: flex; border-top: 1px solid var(--line); }
+.stat { flex: 1; padding: 10px 0 12px; text-align: center; position: relative; }
+.stat + .stat::before {
+  content: ""; position: absolute; left: 0; top: 12px; bottom: 12px;
+  width: 1px; background: var(--line);
+}
+.stat-k { font-size: 11.5px; color: var(--t3); }
+.stat-v {
+  font-size: 17px; font-weight: 650; margin-top: 3px;
+  font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+}
+.stat-v small { font-size: 11.5px; font-weight: 600; color: var(--t3); margin-left: 1px; }
+
+/* ── 内嵌提示条 ───────────────────────────────────────────────────────── */
+.note {
+  display: flex; gap: 9px; align-items: flex-start;
+  padding: 10px 12px; border-radius: 12px;
+  background: var(--accent-bg);
+  font-size: 12px; line-height: 1.45; color: var(--t2);
+}
+.note b { color: var(--t1); font-weight: 650; }
+.note-ico { color: var(--accent); flex: none; margin-top: 1px; }
+
+/* ── 标签 chip 行 ─────────────────────────────────────────────────────── */
+.chips { display: flex; gap: 8px; padding: 0 2px; overflow: hidden; }
+.tag {
+  height: 30px; padding: 0 12px; border-radius: 999px;
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 13px; font-weight: 550; color: var(--t2);
+  background: var(--card); box-shadow: 0 0 0 1px var(--line);
+  white-space: nowrap;
+}
+.tag.on { background: var(--t1); color: var(--bg); box-shadow: none; }
+.tag small { font-size: 11px; opacity: .65; }
+
+/* ── 搜索框 ───────────────────────────────────────────────────────────── */
+.search {
+  display: flex; align-items: center; gap: 8px;
+  height: 38px; padding: 0 12px; border-radius: 11px;
+  background: var(--card); box-shadow: 0 0 0 1px var(--line);
+  color: var(--t3); font-size: 13.5px;
+}
+
+/* ── 开关 ─────────────────────────────────────────────────────────────── */
+.sw {
+  width: 46px; height: 28px; border-radius: 999px; flex: none;
+  background: var(--line-strong); position: relative;
+}
+.sw::after {
+  content: ""; position: absolute; top: 3px; left: 3px;
+  width: 22px; height: 22px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .25);
+}
+.sw.on { background: var(--ok); }
+.sw.on::after { left: auto; right: 3px; }
+
+/* ── 分段控件 ─────────────────────────────────────────────────────────── */
+.seg {
+  display: flex; gap: 3px; padding: 3px;
+  background: var(--inset); border-radius: 10px;
+}
+.seg > span {
+  flex: 1; height: 30px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 550; color: var(--t2);
+}
+.seg > span.on {
+  background: var(--card); color: var(--t1); font-weight: 650;
+  box-shadow: 0 1px 3px rgba(15, 17, 21, .1), 0 0 0 1px var(--line);
+}
+
+/* ── 底栏 + 中央 FAB ──────────────────────────────────────────────────── */
+.tabbar {
+  flex: none; height: 68px; position: relative;
+  display: flex; align-items: flex-start; padding: 0 6px;
+  background: var(--card);
+  box-shadow: 0 -1px 0 var(--line);
+}
+.tab {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding-top: 9px; color: var(--t3); font-size: 10.5px; font-weight: 550;
+}
+.tab.on { color: var(--accent); }
+.tab svg { width: 21px; height: 21px; }
+.tab-gap { width: 66px; flex: none; }
+.fab {
+  position: absolute; left: 50%; transform: translateX(-50%); top: -20px;
+  width: 54px; height: 54px; border-radius: 18px;
+  background: var(--accent); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 8px 18px rgba(65, 118, 230, .38), 0 0 0 5px var(--bg);
+}
+
+/* ── 弹层 ─────────────────────────────────────────────────────────────── */
+.mask {
+  position: absolute; inset: 0; background: rgba(9, 11, 15, .38);
+}
+.sheet {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  background: var(--card);
+  border-radius: 20px 20px 0 0;
+  padding: 8px 14px 18px;
+  box-shadow: 0 -10px 30px rgba(0, 0, 0, .18);
+}
+.sheet-grip {
+  width: 36px; height: 4px; border-radius: 999px;
+  background: var(--line-strong); margin: 0 auto 10px;
+}
+.sheet-title { font-size: 16px; font-weight: 650; margin-bottom: 2px; }
+.sheet-sub { font-size: 12px; color: var(--t3); margin-bottom: 12px; }
+.sheet .grp { box-shadow: 0 0 0 1px var(--line); background: var(--inset); }
+.sheet .row + .row::before { background: var(--line); }
+
+
+  /* ── 页面级补充组件 ─────────────────────────────────────── */
+  .radio {
+    width: 22px; height: 22px; border-radius: 50%; flex: none;
+    box-shadow: inset 0 0 0 1.5px var(--line-strong);
+  }
+  .radio.on {
+    box-shadow: inset 0 0 0 2px var(--accent);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .radio.on::after {
+    content: ""; width: 11px; height: 11px; border-radius: 50%; background: var(--accent);
+  }
+  .row.muted { opacity: .55; }
+  .err-line {
+    font-family: "SF Mono", Consolas, Menlo, monospace;
+    font-size: 10.5px; color: var(--err);
+    margin-top: 3px; word-break: break-all; line-height: 1.35;
+  }
+  .pending {
+    position: absolute; left: 10px; right: 10px; bottom: 76px;
+    background: var(--t1); color: var(--bg);
+    border-radius: 14px; padding: 10px 12px;
+    display: flex; align-items: center; gap: 10px;
+    box-shadow: 0 10px 24px rgba(15, 17, 21, .28);
+  }
+  .pending-t { font-size: 12px; line-height: 1.4; opacity: .85; }
+  .pending-t b { font-weight: 650; opacity: 1; }
+  .pending .btn { background: #fff; color: #0f1115; height: 30px; font-size: 12.5px; }
+  .qr {
+    height: 168px; border-radius: 14px; background: var(--inset);
+    box-shadow: inset 0 0 0 1px var(--line);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; color: var(--t3); font-size: 12px;
+  }
+  .qr-glyph {
+    width: 84px; height: 84px; border-radius: 10px;
+    background:
+      linear-gradient(var(--t2), var(--t2)) 6px 6px / 22px 22px no-repeat,
+      linear-gradient(var(--t2), var(--t2)) 56px 6px / 22px 22px no-repeat,
+      linear-gradient(var(--t2), var(--t2)) 6px 56px / 22px 22px no-repeat,
+      linear-gradient(var(--t2), var(--t2)) 38px 38px / 10px 10px no-repeat,
+      linear-gradient(var(--t2), var(--t2)) 52px 52px / 8px 8px no-repeat,
+      linear-gradient(var(--t2), var(--t2)) 62px 44px / 16px 6px no-repeat;
+    opacity: .45;
+  }
+  .foot-note { font-size: 11px; color: var(--t3); padding: 0 6px; line-height: 1.5; }
+
+
+  .sheet .grp { border-radius: 12px; }
+  .panel-label { font-size: 12px; font-weight: 600; color: #4d5259; margin: 0 0 8px 4px; }
+  /* 远程会话：细悬浮胶囊 */
+  .chat-bg { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+  .bubble {
+    max-width: 78%; padding: 10px 12px; border-radius: 14px;
+    background: var(--card); box-shadow: 0 0 0 1px var(--line);
+    font-size: 13.5px; line-height: 1.5;
+  }
+  .bubble.me { align-self: flex-end; background: var(--accent); color: #fff; box-shadow: none; }
+  .floatbar {
+    position: absolute; left: 50%; transform: translateX(-50%); top: 54px;
+    height: 30px; padding: 0 12px 0 10px; border-radius: 999px;
+    display: flex; align-items: center; gap: 7px;
+    background: rgba(255, 255, 255, .92);
+    box-shadow: 0 4px 14px rgba(15, 17, 21, .14), 0 0 0 1px rgba(15, 17, 21, .06);
+    font-size: 11.5px; font-weight: 550; color: #0f1115; white-space: nowrap;
+  }
+  .floatbar .dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; }
+  .floatbar .sep { width: 1px; height: 12px; background: rgba(15,17,21,.12); }
+  .floatbar .dim { color: #61666b; font-weight: 500; }
+
+</style>
+</head>
+<body>
+
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <g id="i-chev"><path d="M9 5l7 7-7 7"/></g>
+    <g id="i-back"><path d="M15 5l-7 7 7 7"/></g>
+    <g id="i-check"><path d="M4 12.5l5 5L20 6.5"/></g>
+    <g id="i-pc"><rect x="2.5" y="4" width="19" height="12.5" rx="2.2"/><path d="M8 20.5h8M12 16.5v4"/></g>
+    <g id="i-pulse"><path d="M2.5 12.5h4l2.2-6.5 4.2 13 2.3-6.5h6.3"/></g>
+    <g id="i-search"><circle cx="10.8" cy="10.8" r="7"/><path d="M16 16l5 5"/></g>
+    <g id="i-ext"><path d="M12 2.6l8.4 4.7v9.4L12 21.4 3.6 16.7V7.3z"/><path d="M3.6 7.3L12 12l8.4-4.7M12 12v9.4"/></g>
+    <g id="i-plug"><path d="M9 2.6v6M15 2.6v6M6 8.6h12v2.6a6 6 0 0 1-12 0z"/><path d="M12 17.2v4.2"/></g>
+    <g id="i-gear"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.4v2.6M12 19v2.6M2.4 12H5M19 12h2.6M5.2 5.2L7 7M17 17l1.8 1.8M18.8 5.2L17 7M7 17l-1.8 1.8"/></g>
+    <g id="i-chat"><path d="M20.6 11.8c0 3.9-3.8 7-8.6 7-1 0-2-.15-2.9-.42L4.4 20l1.1-3.3c-1.3-1.2-2.1-2.9-2.1-4.9 0-3.9 3.8-7 8.6-7s8.6 3.1 8.6 7z"/></g>
+    <g id="i-shield"><path d="M12 2.6l7.4 3v6.1c0 4.6-3.1 7.9-7.4 9.7-4.3-1.8-7.4-5.1-7.4-9.7V5.6z"/><path d="M8.8 12l2.4 2.4 4-4.4"/></g>
+    <g id="i-clock"><circle cx="12" cy="12" r="8.6"/><path d="M12 7v5.4l3.4 2"/></g>
+    <g id="i-mem"><rect x="2.6" y="5.4" width="18.8" height="13.2" rx="2"/><path d="M7 9v6M11 9v6M15 9v6M19 9v6"/></g>
+    <g id="i-refresh"><path d="M20.5 5.5v5.6h-5.6"/><path d="M20.1 14.6A8.4 8.4 0 1 1 19 7.9l1.5 3.2"/></g>
+    <g id="i-warn"><path d="M12 8.4v4.4M12 16.4h.01"/><path d="M10.3 3.9L2.2 18a1.9 1.9 0 0 0 1.7 2.9h16.2a1.9 1.9 0 0 0 1.7-2.9L13.7 3.9a2 2 0 0 0-3.4 0z"/></g>
+    <g id="i-more"><circle cx="5.5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="18.5" cy="12" r="1.6"/></g>
+    <g id="i-info"><circle cx="12" cy="12" r="8.6"/><path d="M12 11v5.4M12 7.8h.01"/></g>
+    <g id="i-down"><path d="M12 3.6v11.8M7.5 11l4.5 4.6 4.5-4.6"/><path d="M4 19.4h16"/></g>
+    <g id="i-tool"><path d="M14.7 6.3a3.9 3.9 0 0 0 4.9 4.9l-9.3 9.3a2 2 0 0 1-2.8 0l-2.1-2.1a2 2 0 0 1 0-2.8z"/><path d="M9.4 11.1l3.5 3.5"/></g>
+    <g id="i-qr"><path d="M3.5 8.5V5.5a2 2 0 0 1 2-2h3M15.5 3.5h3a2 2 0 0 1 2 2v3M20.5 15.5v3a2 2 0 0 1-2 2h-3M8.5 20.5h-3a2 2 0 0 1-2-2v-3"/><rect x="7.5" y="7.5" width="4" height="4" rx=".6"/><rect x="12.5" y="12.5" width="4" height="4" rx=".6"/></g>
+    <g id="i-lock"><rect x="4.6" y="10.4" width="14.8" height="10.6" rx="2.4"/><path d="M8.2 10.4V7.6a3.8 3.8 0 0 1 7.6 0v2.8"/></g>
+  </defs>
+</svg>
+
+<!-- ══════════════ ① 概览 ══════════════ -->
+<figure class="frame">
+  <figcaption>① 概览 <span>· 引擎 / 远程 / 诊断 / 维护，四组一屏</span></figcaption>
+  <div class="phone">
+    <div class="statusbar"><span>9:41</span><span>5G ▮▮▮</span></div>
+    <div class="nav">
+      <div class="nav-logo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 2.6l8.4 4.7v9.4L12 21.4 3.6 16.7V7.3z"/><path d="M12 21.4V12M3.6 7.3L12 12l8.4-4.7"/></svg></div>
+      <div>
+        <div class="nav-title">概览</div>
+        <div class="nav-sub">v0.9.57 · Android 13</div>
+      </div>
+      <div class="nav-actions">
+        <span class="nav-pill"><i></i>引擎正常</span>
+        <button class="icon-btn soft"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><use href="#i-refresh"/></svg></button>
+      </div>
+    </div>
+
+    <div class="scroll">
+      <div class="hero">
+        <div class="hero-top">
+          <span class="hero-dot"></span>
+          <div class="row-main">
+            <div class="hero-title">引擎运行中</div>
+            <div class="hero-meta">
+              <span class="chip mono">PID 28419</span>
+              <span class="chip mono">aarch64</span>
+              <span class="chip mono">Node v24.18</span>
+            </div>
+          </div>
+        </div>
+        <div class="stats">
+          <div class="stat"><div class="stat-k">内存</div><div class="stat-v">142<small>MB</small></div></div>
+          <div class="stat"><div class="stat-k">运行</div><div class="stat-v">3<small>h</small>42<small>m</small></div></div>
+          <div class="stat"><div class="stat-k">端口</div><div class="stat-v">3080</div></div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head">
+          <span class="grp-title">远程接入</span>
+          <span class="grp-link">管理</span>
+        </div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico blue"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pc"/></svg></div>
+            <div class="row-main">
+              <div class="row-title">DESKTOP-8F2K</div>
+              <div class="row-sub">上次成功 · 3 分钟前 · 局域网</div>
+            </div>
+            <div class="row-tail"><button class="btn pri sm">连接</button></div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head">
+          <span class="grp-title">诊断</span>
+          <span class="grp-link">全部结果</span>
+        </div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico green"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-check"/></svg></div>
+            <div class="row-main">
+              <div class="row-title">启动与加载体检</div>
+              <div class="row-sub">11 项 · 配置任一条坏了引擎就起不来</div>
+            </div>
+            <div class="row-tail"><span class="chip ok">通过</span><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico blue"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pulse"/></svg></div>
+            <div class="row-main">
+              <div class="row-title">运行时完整性</div>
+              <div class="row-sub">系统基础设施与 IPC 状态</div>
+            </div>
+            <div class="row-tail"><span class="chip ok">7 / 7</span><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-ext"/></svg></div>
+            <div class="row-main">
+              <div class="row-title">宿主补丁</div>
+              <div class="row-sub">Android 兼容层</div>
+            </div>
+            <div class="row-tail"><span class="chip ok">13 项生效</span><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">维护</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-tool"/></svg></div>
+            <div class="row-main"><div class="row-title sm">服务与排错</div><div class="row-sub">重启引擎 · 日志 · 一键验收</div></div>
+            <div class="row-tail"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-info"/></svg></div>
+            <div class="row-main"><div class="row-title sm">关于</div></div>
+            <div class="row-tail"><span class="row-val">0.9.57</span><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="foot-note">引擎只监听 127.0.0.1，手机以外的设备要进来，走上面的「远程接入」。</div>
+    </div>
+
+    <div class="tabbar">
+      <div class="tab on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/></svg><span>概览</span></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-ext"/></svg><span>扩展</span></div>
+      <div class="tab-gap"></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-plug"/></svg><span>插件</span></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear"/></svg><span>设置</span></div>
+      <div class="fab"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chat"/></svg></div>
+    </div>
+  </div>
+</figure>
+
+<!-- ══════════════ ② 扩展 ══════════════ -->
+<figure class="frame">
+  <figcaption>② 扩展 <span>· 分类 chips + 分组行，一屏看到 8 项</span></figcaption>
+  <div class="phone">
+    <div class="statusbar"><span>9:41</span><span>5G ▮▮▮</span></div>
+    <div class="nav">
+      <div>
+        <div class="nav-title">扩展</div>
+        <div class="nav-sub">全部随 APK 内置 · 零联网</div>
+      </div>
+      <div class="nav-actions"><button class="text-btn">多选</button></div>
+    </div>
+
+    <div class="scroll">
+      <div class="note">
+        <svg class="note-ico" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><use href="#i-info"/></svg>
+        <span>激活与卸载都在本地解包，不联网也不用镜像源。要装第三方插件，去<b>对话页 → 侧栏「插件」</b>。</span>
+      </div>
+
+      <div class="chips">
+        <span class="tag on">全部 <small>26</small></span>
+        <span class="tag">语言与编译链</span>
+        <span class="tag">媒体与文档</span>
+        <span class="tag">开发工具</span>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">已激活 · 2</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico green"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><use href="#i-ext"/></svg></div>
+            <div class="row-main"><div class="row-title">Python 3.12</div><div class="row-sub">语言与编译链 · v3.12.4 · 62 MB</div></div>
+            <div class="row-tail"><span class="chip ok">已激活</span></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico green"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><use href="#i-ext"/></svg></div>
+            <div class="row-main"><div class="row-title">FFmpeg 6.1</div><div class="row-sub">媒体与文档 · v6.1.1 · 38 MB</div></div>
+            <div class="row-tail"><span class="chip ok">已激活</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">语言与编译链 · 8</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><use href="#i-ext"/></svg></div>
+            <div class="row-main"><div class="row-title">Node.js 20</div><div class="row-sub">v20.11.1 · 44 MB</div></div>
+            <div class="row-tail"><button class="btn soft sm">激活</button></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><use href="#i-ext"/></svg></div>
+            <div class="row-main"><div class="row-title">Rust 工具链</div><div class="row-sub">v1.78.0 · 210 MB</div></div>
+            <div class="row-tail"><button class="btn soft sm">激活</button></div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">媒体与文档 · 7</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><use href="#i-ext"/></svg></div>
+            <div class="row-main"><div class="row-title">Pandoc</div><div class="row-sub">v3.1.9 · 26 MB</div></div>
+            <div class="row-tail"><button class="btn soft sm">激活</button></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><use href="#i-ext"/></svg></div>
+            <div class="row-main"><div class="row-title">Poppler · PDF 工具</div><div class="row-sub">v23.08 · 18 MB</div></div>
+            <div class="row-tail"><button class="btn soft sm">激活</button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tabbar">
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/></svg><span>概览</span></div>
+      <div class="tab on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-ext"/></svg><span>扩展</span></div>
+      <div class="tab-gap"></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-plug"/></svg><span>插件</span></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear"/></svg><span>设置</span></div>
+      <div class="fab"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chat"/></svg></div>
+    </div>
+  </div>
+</figure>
+
+<!-- ══════════════ ③ 插件 ══════════════ -->
+<figure class="frame">
+  <figcaption>③ 插件 <span>· 搜索 + 筛选 + 行内启停，异常行带错误首行</span></figcaption>
+  <div class="phone">
+    <div class="statusbar"><span>9:41</span><span>5G ▮▮▮</span></div>
+    <div class="nav">
+      <div>
+        <div class="nav-title">插件</div>
+        <div class="nav-sub">12 个 · 9 个已启用</div>
+      </div>
+      <div class="nav-actions">
+        <button class="icon-btn soft"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><use href="#i-refresh"/></svg></button>
+        <button class="text-btn">安装</button>
+      </div>
+    </div>
+
+    <div class="scroll">
+      <div class="search">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><use href="#i-search"/></svg>
+        <span>搜索名称或包名</span>
+      </div>
+
+      <div class="chips">
+        <span class="tag on">全部 <small>12</small></span>
+        <span class="tag">已启用 <small>9</small></span>
+        <span class="tag">已停用 <small>2</small></span>
+        <span class="tag">异常 <small>1</small></span>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">已安装</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico blue"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-plug"/></svg></div>
+            <div class="row-main"><div class="row-title">移动端界面</div><div class="row-sub mono">dsh-web-mobile · 3.3.5</div></div>
+            <div class="row-tail"><span class="sw on"></span></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico blue"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-plug"/></svg></div>
+            <div class="row-main"><div class="row-title">远程接入</div><div class="row-sub mono">dsh-remote-link · 0.3.0</div></div>
+            <div class="row-tail"><span class="sw on"></span></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico red"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-warn"/></svg></div>
+            <div class="row-main">
+              <div class="row-title">图像增强工具</div>
+              <div class="err-line">加载失败 · Cannot find module 'sharp'</div>
+            </div>
+            <div class="row-tail"><button class="btn danger sm">停用</button></div>
+          </div>
+          <div class="row has-ico muted">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-plug"/></svg></div>
+            <div class="row-main"><div class="row-title">旧版桥接</div><div class="row-sub mono">legacy-bridge · 1.0.4 · 已停用</div></div>
+            <div class="row-tail"><span class="sw"></span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="note">
+        <svg class="note-ico" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><use href="#i-info"/></svg>
+        <span>停用只把插件从启动清单摘掉，<b>包体与会话都保留</b>。</span>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">受保护</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-lock"/></svg></div>
+            <div class="row-main"><div class="row-title sm">核心组件</div><div class="row-sub">18 个 · 不提供停用开关</div></div>
+            <div class="row-tail"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="pending">
+      <div class="pending-t"><b>有变更待生效</b> · 重启后加载</div>
+      <button class="btn">应用并重启</button>
+    </div>
+
+    <div class="tabbar">
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/></svg><span>概览</span></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-ext"/></svg><span>扩展</span></div>
+      <div class="tab-gap"></div>
+      <div class="tab on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-plug"/></svg><span>插件</span></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear"/></svg><span>设置</span></div>
+      <div class="fab"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chat"/></svg></div>
+    </div>
+  </div>
+</figure>
+
+<!-- ══════════════ ④ 远程 ══════════════ -->
+<figure class="frame">
+  <figcaption>④ 远程接入 <span>· 设备前置，教程收成一行</span></figcaption>
+  <div class="phone">
+    <div class="statusbar"><span>9:41</span><span>5G ▮▮▮</span></div>
+    <div class="nav">
+      <button class="icon-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-back"/></svg></button>
+      <div class="nav-title" style="font-size:16px">远程控制</div>
+      <div class="nav-actions"><button class="icon-btn soft"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><use href="#i-more"/></svg></button></div>
+    </div>
+
+    <div class="scroll">
+      <div class="hero">
+        <div class="hero-top">
+          <div class="row-ico blue" style="width:42px;height:42px;border-radius:12px">
+            <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pc"/></svg>
+          </div>
+          <div class="row-main">
+            <div class="row-title" style="font-size:17px">未连接</div>
+            <div class="row-sub">在电脑上启动接入，然后扫码或粘贴连接串</div>
+          </div>
+        </div>
+        <div class="stats" style="border-top:1px solid var(--line)">
+          <div class="stat"><div class="stat-k">已配对</div><div class="stat-v">2</div></div>
+          <div class="stat"><div class="stat-k">上次成功</div><div class="stat-v" style="font-size:14px">3 分钟前</div></div>
+          <div class="stat"><div class="stat-k">通道</div><div class="stat-v" style="font-size:14px">局域网</div></div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">我的电脑</span><span class="grp-link">刷新</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico blue"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pc"/></svg></div>
+            <div class="row-main">
+              <div class="row-title">DESKTOP-8F2K</div>
+              <div class="row-sub">192.168.1.23:8766 · 3 分钟前</div>
+            </div>
+            <div class="row-tail"><span class="chip ok">局域网</span><button class="btn pri sm">连接</button></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico blue"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pc"/></svg></div>
+            <div class="row-main">
+              <div class="row-title">macbook-air</div>
+              <div class="row-sub">qwerty.trycloudflare.com · 昨天</div>
+            </div>
+            <div class="row-tail"><span class="chip blue">公网</span><button class="btn soft sm">连接</button></div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">添加电脑</span></div>
+        <div class="grp" style="padding:12px 12px 10px">
+          <div class="seg" style="margin-bottom:10px"><span class="on">扫码</span><span>粘贴连接串</span></div>
+          <div class="qr">
+            <div class="qr-glyph"></div>
+            <span>对准电脑面板上的二维码</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="grp">
+        <div class="row">
+          <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-info"/></svg></div>
+          <div class="row-main"><div class="row-title sm">第一次连接？</div><div class="row-sub">电脑上装个插件，三步搞定</div></div>
+          <div class="row-tail"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+        </div>
+      </div>
+
+      <div class="foot-note">状态只说「上一次」的结果：没有心跳，不代表此刻在线。</div>
+    </div>
+
+    <div class="tabbar">
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/></svg><span>概览</span></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-ext"/></svg><span>扩展</span></div>
+      <div class="tab-gap"></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-plug"/></svg><span>插件</span></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear"/></svg><span>设置</span></div>
+      <div class="fab"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chat"/></svg></div>
+    </div>
+  </div>
+</figure>
+
+<!-- ══════════════ ⑤ 设置 ══════════════ -->
+<figure class="frame">
+  <figcaption>⑤ 设置 <span>· 外观 / 权限保活 / 运行等级 / 维护，四组收一屏</span></figcaption>
+  <div class="phone">
+    <div class="statusbar"><span>9:41</span><span>5G ▮▮▮</span></div>
+    <div class="nav">
+      <div>
+        <div class="nav-title">设置</div>
+        <div class="nav-sub">控制台与对话页同源</div>
+      </div>
+    </div>
+
+    <div class="scroll">
+      <div>
+        <div class="grp-head"><span class="grp-title">外观</span></div>
+        <div class="grp" style="padding:10px 12px">
+          <div class="seg"><span>跟随系统</span><span class="on">浅色</span><span>深色</span></div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">权限与保活</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico amber"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-shield"/></svg></div>
+            <div class="row-main"><div class="row-title">系统权限</div><div class="row-sub">16 项 · 还差 3 项</div></div>
+            <div class="row-tail"><span class="chip warn">待授权</span><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico green"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clock"/></svg></div>
+            <div class="row-main"><div class="row-title">息屏继续运行</div><div class="row-sub">10 分钟无任务自动让位</div></div>
+            <div class="row-tail"><span class="sw on"></span></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-shield"/></svg></div>
+            <div class="row-main"><div class="row-title">无障碍看门狗</div><div class="row-sub">引擎异常退出后自动拉起</div></div>
+            <div class="row-tail"><span class="sw on"></span></div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">运行权限等级</span></div>
+        <div class="grp" style="padding:12px">
+          <div class="seg"><span>标准</span><span class="on">增强 · 推荐</span><span>完全</span></div>
+          <div class="row-sub" style="margin-top:8px">可读写共享目录，允许调用相机与通知。切换等级会重启引擎，会话不丢。</div>
+        </div>
+        <div style="padding-top:8px"><button class="btn block soft">应用并重启引擎</button></div>
+      </div>
+
+      <div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-tool"/></svg></div>
+            <div class="row-main"><div class="row-title">服务管理与维护</div><div class="row-sub">重启 · 日志 · 一键验收</div></div>
+            <div class="row-tail"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-info"/></svg></div>
+            <div class="row-main"><div class="row-title">关于</div></div>
+            <div class="row-tail"><span class="row-val">0.9.57</span><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+        </div>
+      </div>
+      <div class="foot-note" style="text-align:center">DSH Kxxy 0.9.57 · 作者 开心小元</div>
+    </div>
+
+    <div class="tabbar">
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/></svg><span>概览</span></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-ext"/></svg><span>扩展</span></div>
+      <div class="tab-gap"></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-plug"/></svg><span>插件</span></div>
+      <div class="tab on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear"/></svg><span>设置</span></div>
+      <div class="fab"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chat"/></svg></div>
+    </div>
+  </div>
+</figure>
+
+
+
+
+
+
+<!-- ══════════════ ⑥ 概览（深色） ══════════════ -->
+<figure class="frame">
+  <figcaption>⑥ 概览 · 深色 <span>· 同一套结构，只换 token</span></figcaption>
+  <div class="phone dark">
+    <div class="statusbar"><span>9:41</span><span>5G ▮▮▮</span></div>
+    <div class="nav">
+      <div class="nav-logo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 2.6l8.4 4.7v9.4L12 21.4 3.6 16.7V7.3z"/><path d="M12 21.4V12M3.6 7.3L12 12l8.4-4.7"/></svg></div>
+      <div>
+        <div class="nav-title">概览</div>
+        <div class="nav-sub">v0.9.57 · Android 13</div>
+      </div>
+      <div class="nav-actions">
+        <span class="nav-pill"><i></i>引擎正常</span>
+        <button class="icon-btn soft"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><use href="#i-refresh"/></svg></button>
+      </div>
+    </div>
+
+    <div class="scroll">
+      <div class="hero">
+        <div class="hero-top">
+          <span class="hero-dot"></span>
+          <div class="row-main">
+            <div class="hero-title">引擎运行中</div>
+            <div class="hero-meta">
+              <span class="chip mono">PID 28419</span>
+              <span class="chip mono">aarch64</span>
+              <span class="chip mono">Node v24.18</span>
+            </div>
+          </div>
+        </div>
+        <div class="stats">
+          <div class="stat"><div class="stat-k">内存</div><div class="stat-v">142<small>MB</small></div></div>
+          <div class="stat"><div class="stat-k">运行</div><div class="stat-v">3<small>h</small>42<small>m</small></div></div>
+          <div class="stat"><div class="stat-k">端口</div><div class="stat-v">3080</div></div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">远程接入</span><span class="grp-link">管理</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico blue"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pc"/></svg></div>
+            <div class="row-main"><div class="row-title">DESKTOP-8F2K</div><div class="row-sub">上次成功 · 3 分钟前 · 局域网</div></div>
+            <div class="row-tail"><button class="btn pri sm">连接</button></div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">诊断</span><span class="grp-link">全部结果</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico green"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-check"/></svg></div>
+            <div class="row-main"><div class="row-title">启动与加载体检</div><div class="row-sub">11 项 · 配置任一条坏了引擎就起不来</div></div>
+            <div class="row-tail"><span class="chip ok">通过</span><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico blue"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pulse"/></svg></div>
+            <div class="row-main"><div class="row-title">运行时完整性</div><div class="row-sub">系统基础设施与 IPC 状态</div></div>
+            <div class="row-tail"><span class="chip ok">7 / 7</span><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+          <div class="row has-ico">
+            <div class="row-ico amber"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-warn"/></svg></div>
+            <div class="row-main"><div class="row-title">宿主补丁</div><div class="row-sub">2 项未生效 · 点开看是哪两条</div></div>
+            <div class="row-tail"><span class="chip warn">11 / 13</span><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="grp-head"><span class="grp-title">维护</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-tool"/></svg></div>
+            <div class="row-main"><div class="row-title sm">服务与排错</div><div class="row-sub">重启引擎 · 日志 · 一键验收</div></div>
+            <div class="row-tail"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tabbar">
+      <div class="tab on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/></svg><span>概览</span></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-ext"/></svg><span>扩展</span></div>
+      <div class="tab-gap"></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-plug"/></svg><span>插件</span></div>
+      <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear"/></svg><span>设置</span></div>
+      <div class="fab"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chat"/></svg></div>
+    </div>
+  </div>
+</figure>
+
+<!-- ══════════════ ⑦ 维护弹层 ══════════════ -->
+<figure class="frame">
+  <figcaption>⑦ 维护与排错 <span>· 底部弹层替代第七张卡片</span></figcaption>
+  <div class="phone">
+    <div class="statusbar"><span>9:41</span><span>5G ▮▮▮</span></div>
+    <div class="nav">
+      <div class="nav-logo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 2.6l8.4 4.7v9.4L12 21.4 3.6 16.7V7.3z"/><path d="M12 21.4V12M3.6 7.3L12 12l8.4-4.7"/></svg></div>
+      <div><div class="nav-title">概览</div><div class="nav-sub">v0.9.57 · Android 13</div></div>
+      <div class="nav-actions"><span class="nav-pill"><i></i>引擎正常</span></div>
+    </div>
+
+    <div class="scroll">
+      <div class="hero">
+        <div class="hero-top">
+          <span class="hero-dot"></span>
+          <div class="row-main">
+            <div class="hero-title">引擎运行中</div>
+            <div class="hero-meta">
+              <span class="chip mono">PID 28419</span>
+              <span class="chip mono">aarch64</span>
+            </div>
+          </div>
+        </div>
+        <div class="stats">
+          <div class="stat"><div class="stat-k">内存</div><div class="stat-v">142<small>MB</small></div></div>
+          <div class="stat"><div class="stat-k">运行</div><div class="stat-v">3<small>h</small>42<small>m</small></div></div>
+          <div class="stat"><div class="stat-k">端口</div><div class="stat-v">3080</div></div>
+        </div>
+      </div>
+      <div>
+        <div class="grp-head"><span class="grp-title">远程接入</span><span class="grp-link">管理</span></div>
+        <div class="grp">
+          <div class="row has-ico">
+            <div class="row-ico blue"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pc"/></svg></div>
+            <div class="row-main"><div class="row-title">DESKTOP-8F2K</div><div class="row-sub">上次成功 · 3 分钟前 · 局域网</div></div>
+            <div class="row-tail"><button class="btn pri sm">连接</button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mask"></div>
+    <div class="sheet">
+      <div class="sheet-grip"></div>
+      <div class="sheet-title">维护与排错</div>
+      <div class="sheet-sub">这些动作会改动引擎，做完页面会短暂断开</div>
+
+      <div class="grp">
+        <div class="row has-ico">
+          <div class="row-ico blue"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-refresh"/></svg></div>
+          <div class="row-main"><div class="row-title sm">重启引擎进程</div></div>
+          <div class="row-tail"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+        </div>
+        <div class="row has-ico">
+          <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-down"/></svg></div>
+          <div class="row-main"><div class="row-title sm">导出诊断日志</div></div>
+          <div class="row-tail"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+        </div>
+        <div class="row has-ico">
+          <div class="row-ico green"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-check-circle"/></svg></div>
+          <div class="row-main"><div class="row-title sm">一键验收</div><div class="row-sub">含 Python · 在引擎同一套 env 下跑</div></div>
+          <div class="row-tail"><svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chev"/></svg></div>
+        </div>
+      </div>
+
+      <div class="grp" style="margin-top:10px">
+        <div class="row has-ico">
+          <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-link"/></svg></div>
+          <div class="row-main"><div class="row-title sm">修复命令链接</div></div>
+        </div>
+        <div class="row has-ico">
+          <div class="row-ico"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><use href="#i-info"/></svg></div>
+          <div class="row-main"><div class="row-title sm">实测直链镜像</div><div class="row-sub">raw.githubusercontent 被拦时</div></div>
+        </div>
+      </div>
+
+      <button class="btn block soft" style="margin-top:12px">关闭</button>
+    </div>
+  </div>
+</figure>
+
+<!-- ══════════════ ⑧ 远程会话设备条 ══════════════ -->
+<figure class="frame">
+  <figcaption>⑧ 远程会话 <span>· 50dp 通栏 → 30dp 悬浮胶囊</span></figcaption>
+  <div class="phone">
+    <div class="statusbar"><span>9:41</span><span>5G ▮▮▮</span></div>
+    <div class="floatbar">
+      <span class="dot"></span><span>DESKTOP-8F2K</span><span class="sep"></span><span class="dim">局域网 · 12ms</span>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" style="color:#8b9096"><use href="#i-more"/></svg>
+    </div>
+
+    <div class="chat-bg" style="padding-top:58px;flex:1">
+      <div class="bubble" style="background:transparent;box-shadow:none;color:var(--t3);font-size:12px;padding:0 2px">对话 · 默认工作区 · 标准模式</div>
+      <div class="bubble">帮我把 tools/build-runtime 里的 stage 目录清理逻辑看一下，有没有可能误删 .cache。</div>
+      <div class="bubble me">我先读构建脚本，确认 rm 的作用范围再改。</div>
+      <div class="bubble">好，注意别动 <span style="font-family:monospace;font-size:12.5px">.cache/stage</span>，那是增量目录。</div>
+      <div style="margin-top:auto"></div>
+      <div class="search" style="height:44px;border-radius:14px;color:var(--t3)">发消息给 DSH…</div>
+    </div>
+
+    <div style="height:22px"></div>
+  </div>
+</figure>
+
+
+</body>
+</html>
