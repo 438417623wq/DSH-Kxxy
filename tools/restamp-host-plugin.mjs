@@ -45,6 +45,7 @@ import { fileURLToPath } from 'node:url'
 import { deflateRawSync, inflateRawSync } from 'node:zlib'
 
 import { HOST_PLUGIN_BASE, stampHostPluginFingerprint } from './lib/host-fingerprint.mjs'
+import { PYTHON_HOST_FILES, createPythonRepairAssets } from './lib/python-runtime.mjs'
 import { readZipDirectory } from './lib/zipread.mjs'
 import { zipEndRecords, MAX_ZIP_ENTRIES, ZIP32_SENTINEL } from './lib/zipwrite.mjs'
 
@@ -64,6 +65,7 @@ function parseArgs(argv) {
     input: null,
     output: null,
     meta: join(PROJECT, 'android', 'app', 'src', 'main', 'assets', 'meta', 'build.json'),
+    assets: join(PROJECT, 'android', 'app', 'src', 'main', 'assets', 'python-repair'),
     alias: null,
     checkOnly: false,
   }
@@ -72,10 +74,11 @@ function parseArgs(argv) {
     if (a === '--in') opts.input = resolve(argv[++i])
     else if (a === '--out') opts.output = resolve(argv[++i])
     else if (a === '--meta') opts.meta = resolve(argv[++i])
+    else if (a === '--assets') opts.assets = resolve(argv[++i])
     else if (a === '--alias') opts.alias = resolve(argv[++i])
     else if (a === '--check-only') opts.checkOnly = true
     else if (a === '--help' || a === '-h') {
-      console.log('用法：node tools/restamp-host-plugin.mjs --in <runtime.zip> --out <new.zip> [--meta <build.json>] [--check-only]')
+      console.log('用法：node tools/restamp-host-plugin.mjs --in <runtime.zip> --out <new.zip> [--meta <build.json>] [--assets <python-repair>] [--check-only]')
       process.exit(0)
     } else throw new Error(`未知参数：${a}`)
   }
@@ -253,6 +256,14 @@ async function main() {
   }
   console.log(`源码树 ${files.size} 个文件；运行时另有 ${kept.size} 个构建期产物（原样保留）`)
 
+  // 修复包要用到的旧字节必须在 fd 关闭前读完（写出阶段结束时 fd 已 close）
+  const repairPrevious = new Map()
+  for (const name of PYTHON_HOST_FILES) {
+    const path = `${HOST_PLUGIN_BASE}${name}`
+    const entry = oldHost.find((e) => e.name === path)
+    if (entry) repairPrevious.set(path, readEntryData(fd, entry))
+  }
+
   // ── 内容指纹：与全量构建同源（整棵树，含构建期产物）────────────────────
   const tree = new Map([...kept, ...files])
   const fingerprint = stampHostPluginFingerprint(tree)
@@ -262,15 +273,41 @@ async function main() {
   files.set(`${HOST_PLUGIN_BASE}lib/.fingerprint`, tree.get(`${HOST_PLUGIN_BASE}lib/.fingerprint`))
   console.log(`指纹 ${fingerprint}（${marker}）`)
 
-  const fpEntry = cd.entries.find((e) => e.name === `${HOST_PLUGIN_BASE}lib/.fingerprint`)
-  const fpBefore = fpEntry
-    ? (readEntryData(fd, fpEntry).toString('utf8').match(/fingerprint:([0-9a-f]{64})/)?.[1] ?? '(解析失败)')
-    : '(缺失)'
+  const manifestEntry = cd.entries.find((e) => e.name === 'kxxy-runtime.json')
+  if (!manifestEntry) throw new Error('运行时缺少 kxxy-runtime.json')
+  const oldManifestBytes = readEntryData(fd, manifestEntry)
+  const oldManifest = JSON.parse(oldManifestBytes.toString('utf8'))
+  const fpBefore = oldManifest.plugins?.hostFingerprint
+  if (!/^[a-f0-9]{64}$/.test(fpBefore ?? '')) throw new Error('kxxy-runtime.json 缺少 plugins.hostFingerprint')
+  // 输入必须是**干净的基线**：`lib/.fingerprint` 与 kxxy-runtime.json 的声明
+  // 必须一致。拿一份已经被重封过一半的 zip 当输入，`previous`（旧字节）就会
+  // 指向新内容，设备端三方比对必然失败 —— 这是实测踩过的第二个坑。
+  const fpFileEntry = cd.entries.find((e) => e.name === `${HOST_PLUGIN_BASE}lib/.fingerprint`)
+  const fpFile = fpFileEntry
+    ? (readEntryData(fd, fpFileEntry).toString('utf8').match(/fingerprint:([0-9a-f]{64})/)?.[1] ?? '')
+    : ''
+  if (fpFile && fpFile !== fpBefore) {
+    throw new Error(
+      `输入运行时自相矛盾：lib/.fingerprint=${fpFile.slice(0, 12)} 而 kxxy-runtime.json 声明 ${fpBefore.slice(0, 12)}。` +
+        '请换成未被重封过的基线包（例如 .cache/rt-<上一版>/runtime.zip）。',
+    )
+  }
   console.log(`旧指纹 ${fpBefore}`)
   if (fpBefore === fingerprint) console.log('  ! 指纹与旧包一致 —— 这次重封不会触发设备重装')
 
   // 源码里删掉的文件：只报告，不主动从运行时剔除（那 10 个产物看起来就像
   // 「源码里没有」，删了会断功能）
+  // kxxy-runtime.json 里还有一份插件指纹，设备侧 PythonRuntimeRepair 的 lineage
+  // 校验读的正是 `plugins.hostFingerprint`。只改 .fingerprint 而漏了这里，
+  // 设备会以「目标宿主指纹与 APK metadata 不符」拒绝启动（实测踩过）。
+  const newManifest = {
+    ...oldManifest,
+    plugins: { ...(oldManifest.plugins ?? {}), hostFingerprint: fingerprint, hostMarker: marker },
+    builtAt: new Date().toISOString(),
+  }
+  const newManifestBytes = Buffer.from(`${JSON.stringify(newManifest, null, 2)}\n`, 'utf8')
+  files.set('kxxy-runtime.json', { data: newManifestBytes, mode: 0o644 })
+
   const stale = oldHost.map((e) => e.name).filter((name) => !files.has(name) && !kept.has(name))
   const additions = [...files.keys()].filter((name) => !cd.entries.some((e) => e.name === name))
   console.log(`将替换 ${files.size} 个、新增 ${additions.length} 个、保留 ${kept.size} 个`)
@@ -408,6 +445,38 @@ async function main() {
     console.log(`  alias-links.txt ← ${aliasSrc}`)
   } else {
     console.log(`  ! 未找到 alias-links.txt（${aliasSrc}），打包前请手工放一份`)
+  }
+
+  /*
+   * Python 修复资产（`assets/python-repair/{payload.zip,manifest.json}`）里也钉着
+   * 宿主指纹，而且是**两份**：`baseHostFingerprint`（设备当前该有的）与
+   * `hostFingerprint`（这次要装到的）。只更新 build.json 会让两者对不上，
+   * 设备侧 PythonRuntimeRepair 直接 Refused，表现为「装完新包反而开不了机」。
+   *
+   * 这里按「上一份运行时 → 这一份」重算：base 取旧 zip 的指纹，host 取新指纹，
+   * `previous` 提供旧字节以便设备做三方比对。
+   */
+  if (opts.assets) {
+    const repairFiles = new Map()
+    const previous = new Map(repairPrevious)
+    for (const name of PYTHON_HOST_FILES) {
+      const path = `${HOST_PLUGIN_BASE}${name}`
+      const file = files.get(path)
+      if (file) repairFiles.set(path, file)
+    }
+    repairFiles.set('kxxy-runtime.json', { data: newManifestBytes, mode: 0o644 })
+    previous.set('kxxy-runtime.json', oldManifestBytes)
+    const assets = await createPythonRepairAssets(opts.assets, repairFiles, {
+      baseHostFingerprint: fpBefore,
+      hostFingerprint: fingerprint,
+      previous,
+    })
+    console.log(`Python 修复资产 → ${opts.assets}（base ${fpBefore.slice(0, 12)} → host ${fingerprint.slice(0, 12)}）`)
+    if (opts.meta && existsSync(opts.meta)) {
+      const meta = JSON.parse(readFileSync(opts.meta, 'utf8'))
+      meta.pythonRepairManifestSha256 = assets.manifestSha256
+      writeFileSyncSafe(opts.meta, `${JSON.stringify(meta, null, 2)}\n`)
+    }
   }
 
   if (opts.meta && existsSync(opts.meta)) {
