@@ -2698,6 +2698,24 @@ class RuntimeInstaller(private val ctx: Context) {
             val argv = mutableListOf(
                 engineFile.absolutePath,
                 "-ini",
+                // `-interaction=nonstopmode` 必须给（问题清单【3】的最后一环）。
+                //
+                // 真机症状：`ensureTexFormats` 一条都建不出来，rc!=0，`$TEXMFVAR`
+                // 里只剩 `pdftex.log`，而 `pdflatex t.tex` 报
+                // `I can't find the format file 'pdflatex.fmt'!`。
+                //
+                // 根因是格式源里的 `language.def` 头部与 e-TeX 期望不符（见
+                // tools/fetch-texlive.py 的 `make_hyphenation_minimal`）时，
+                // `hyphen.cfg` 会走 `\@sk {Use fallback?}` 交互式分支：
+                //
+                //     ! Emergency stop.  <read *>  pr@mptloop ... End of file on the terminal!
+                //
+                // 我们的 stdin 不是终端（进程由 Java 拉起），读到 EOF 就直接
+                // Emergency stop。给了 nonstopmode 之后这个 prompt 取默认答案
+                // （即用 fallback），格式照常落盘 —— 真机 A/B：不给 rc=1、
+                // 一个 .fmt 都没有；给了 rc=0、`pdflatex.fmt` 2,264,172 B、
+                // 同一个二进制随后 `Output written on t2.pdf (1 page, 11188 bytes)`。
+                "-interaction=nonstopmode",
                 "-jobname=$name",
                 "-progname=$name",
                 "-output-directory=${web2c.absolutePath}",

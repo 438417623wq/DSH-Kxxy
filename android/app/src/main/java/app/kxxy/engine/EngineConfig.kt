@@ -198,6 +198,56 @@ object EngineConfig {
     fun workspaces(ctx: Context): File = File(dshHome(ctx), "workspaces")
 
     /**
+     * tmux 的 socket 目录（问题清单【6】）。
+     *
+     * 真机症状：`tmux new-session -d` 直接报 `no suitable socket path`，
+     * `tmux -V` 正常 —— 也就是说二进制没问题，只是**找不到能建 socket 的目录**。
+     *
+     * 根因：tmux 只认 `TMUX_TMPDIR`，**完全不看 `TMPDIR`**（它源码里那串
+     * `TMUX_TMPDIR` → `/tmp` → `/var/tmp` 的回落顺序是硬编码的）。Android 上
+     * `/tmp` 归 root 且不存在，于是三条路全断。
+     *
+     * 为什么不用 `<tmp>` 本身：tmux 会对 socket 目录做**权限自检** —— 目录被
+     * 组/其他用户可访问时直接拒用（"directory too permissive"），而我们共享的
+     * `<files>/tmp` 是 0771。所以单独开一个 0700 的子目录。
+     */
+    fun tmuxSocketDir(ctx: Context): File = File(tmpDir(ctx), "tmux")
+
+    /**
+     * 建好 [tmuxSocketDir] 并压到 0700。
+     *
+     * 两件事都不能省：目录不存在 tmux 直接放弃；目录权限松了 tmux 会以
+     * "directory too permissive" 拒用（它把「socket 被别人连上」当成安全问题，
+     * 而 `<files>/tmp` 是 0771）。`Os.chmod` 而不是 `File.setWritable` ——
+     * 后者只能改「他人」那一组位，做不到精确的 0700。
+     */
+    private fun ensureTmuxSocketDir(ctx: Context): File {
+        val dir = tmuxSocketDir(ctx)
+        runCatching {
+            if (!dir.isDirectory) dir.mkdirs()
+            android.system.Os.chmod(dir.absolutePath, 448) // 0700
+        }.onFailure { Log.w(TAG, "tmux socket dir: ${it.message}") }
+        return dir
+    }
+
+    /**
+     * Perl 的 local::lib 根（问题清单【8】）。
+     *
+     * 真机症状：`cpan install JSON::PP` 之类走完后 `perl -MJSON::PP` 报
+     * `Can't locate JSON/PP.pm in @INC`，看起来像「装了但没生效」。
+     *
+     * 根因：perl 的 `@INC` 里带着编译期写死的 Termux 前缀
+     * （`/data/data/com.termux/files/usr/lib/perl5/...`），cpan 默认把模块
+     * 装到 `$Config{sitelib}` —— 那正是这条死路径。文件其实写进去了，但
+     * 那个目录在设备上根本不存在（写不进去时 cpan 也会静默失败）。
+     *
+     * 正解是 local::lib 那一套：`INSTALL_BASE` 指到 `$HOME/.perl5`，模块落到
+     * `$HOME/.perl5/lib/perl5`，再把这个目录放进 `PERL5LIB`（`PERL5LIB` 会
+     * 排在所有内置路径**之前**，所以死路径不影响加载）。
+     */
+    fun perlLocalLib(ctx: Context): File = File(dshHome(ctx), ".perl5")
+
+    /**
      * TeX Live 的**用户树** `$TEXMFVAR`（缺陷 AY 的最后一块拼图）。
      *
      * 为什么要自己指定而不是让 kpathsea 用默认值：TeX Live 的默认值是
@@ -498,6 +548,23 @@ object EngineConfig {
         }
         if (dirs.isEmpty()) return File(root, "lib/perl5").absolutePath
         return dirs.joinToString(":") { it.absolutePath }
+    }
+
+    /**
+     * `$HOME/.perl5` 下的 local::lib 目录（问题清单【8】）。
+     *
+     * 形状（local::lib 的约定，`cpan` 自己按 `INSTALL_BASE` 建）：
+     *   `.perl5/lib/perl5`                  —— 纯 perl 模块
+     *   `.perl5/lib/perl5/<archname>`       —— 带 .so 的模块（`aarch64-android`）
+     *
+     * **不判断存在性**：目录第一次由 cpan 创建，此刻还不存在，但 `PERL5LIB` 里
+     * 挂一条不存在的路径完全无害（perl 只是扫不到东西）。反过来若按存在性过滤，
+     * 「先 export 再 cpan」这个顺序就永远装不上 —— 因为第一次 cpan 跑的时候
+     * 目录还不存在，装完也不会重新算环境。
+     */
+    private fun perlLocalLibPath(home: File): String {
+        val base = File(home, ".perl5/lib/perl5")
+        return "${base.absolutePath}:${File(base, "aarch64-android").absolutePath}"
     }
 
     /**
@@ -862,7 +929,16 @@ object EngineConfig {
             // perl 脚本都直接 BEGIN failed —— 包括 TeX Live 的 fmtutil.pl /
             // mktexfmt / tlmgr（它们全是 perl 脚本），于是「装了 TeX Live 却
             // 生成不了格式文件、编不出任何文档」。
-            "PERL5LIB=${perlLibPath(root)}",
+            "PERL5LIB=${perlLocalLibPath(home)}:${perlLibPath(root)}",
+            // cpan 的安装目标（问题清单【8】，详见 [perlLocalLib]）。
+            //
+            // `PERL_MM_OPT` 被 `ExtUtils::MakeMaker` 读取，`PERL_MB_OPT` 被
+            // `Module::Build` 读取 —— cpan 装模块两条路都可能走，必须成对给。
+            // 不给的话它们落到 `$Config{sitelib}`，也就是那条编译期写死的
+            // Termux 前缀，写不进去（或写进一个设备上不存在的目录）。
+            "PERL_MM_OPT=INSTALL_BASE=${perlLocalLib(ctx).absolutePath}",
+            "PERL_MB_OPT=--install_base ${perlLocalLib(ctx).absolutePath}",
+            "PERL_LOCAL_LIB_ROOT=${perlLocalLib(ctx).absolutePath}",
             // ruby 的 $LOAD_PATH 修复（缺陷 BS）。没有它，`ruby` 本身能跑，
             // 但任何 `require` 都失败 —— `gem`、`bundle`、`irb` 全部不可用。
             // 详见 [rubyLibPath] 的注释。
@@ -1100,6 +1176,8 @@ object EngineConfig {
             // 都没用 —— app 连创建它的权限都没有，唯一可行的就是让它们别去碰。
             "TMP=${tmp.absolutePath}",
             "TEMP=${tmp.absolutePath}",
+            // tmux 的 socket 目录（问题清单【6】，详见 [tmuxSocketDir]）。
+            "TMUX_TMPDIR=${ensureTmuxSocketDir(ctx).absolutePath}",
         )
 
         // JAVA_HOME：kotlinc 与 gradle 都优先读它，比 PATH 更硬。
