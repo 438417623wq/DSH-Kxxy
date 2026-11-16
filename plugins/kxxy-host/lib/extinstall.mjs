@@ -38,6 +38,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -536,8 +537,11 @@ export function buildViews(root, id, extDir) {
   for (const sub of ['etc', 'share', 'opt', 'sbin', 'var', 'libexec']) {
     const from = join(extDir, sub)
     if (!existsSync(from)) continue
-    mergeViews(from, join(root, sub), sub, views)
+    mergeViews(from, join(root, sub), sub, views, sub === 'share' && existsSync(join(extLib, 'tree_sitter')))
   }
+
+  // share/nvim/runtime 可能刚被合并成自有目录链；parser 要有实体父目录。
+  installNvimParsers(root, extDir, { libs, views })
 
   // layout 戳在这里打，而不是在 runInstall 里补 —— 凡是走到 buildViews 的
   // 路径（安装、将来的重装配工具）写出的清单都自带版本，漏一个就会让
@@ -580,7 +584,9 @@ export function buildViews(root, id, extDir) {
  *
  * 成本已量化：改成递归合并后新增链接约 80 条（旧实现 43 条），可忽略。
  */
-function mergeViews(srcDir, dstDir, rel, views) {
+function mergeViews(srcDir, dstDir, rel, views, guardNvim = false) {
+  // parser 接入前先守住整条路径，不能让通用合并把用户/其他扩展的链接物化。
+  if (guardNvim && !nvimRouteOwned(dirname(dstDir), dirname(srcDir))) return
   let names
   try { names = readdirSync(srcDir) } catch { return }
   try { mkdirSync(dstDir, { recursive: true }) } catch { return }
@@ -945,6 +951,128 @@ export function ensureLibexecView(root) {
   return result
 }
 
+/** parser 目录链只能指向当前扩展的对应目录，不能借合并写进第三方目录。 */
+function nvimRouteOwned(root, extDir) {
+  try {
+    for (const rel of ['share', 'share/nvim', 'share/nvim/runtime', 'share/nvim/runtime/parser']) {
+      const src = join(extDir, rel)
+      if (isPresent(src) && lstatSync(src).isSymbolicLink()) return false
+      const dst = join(root, rel)
+      if (!isPresent(dst)) continue
+      const st = lstatSync(dst)
+      if (st.isSymbolicLink()) {
+        if (!existsSync(dst) || realpathSync(dst) !== realpathSync(src)) return false
+      } else if (!st.isDirectory()) return false
+    }
+    return true
+  } catch { return false }
+}
+
+/** 把自有目录链拆成实体目录与子项链接；清单同步拆分，卸载不吞用户副本。 */
+function nvimPhysicalParents(root, extDir, links) {
+  if (!nvimRouteOwned(root, extDir)) return false
+  const views = links.views ?? []
+  for (const rel of ['share', 'share/nvim', 'share/nvim/runtime', 'share/nvim/runtime/parser']) {
+    const dst = join(root, rel)
+    if (!isPresent(dst)) {
+      try { mkdirSync(dst) } catch { return false }
+      continue
+    }
+    if (!lstatSync(dst).isSymbolicLink()) continue
+    const src = join(extDir, rel)
+    const own = views.find((v) => v.target === dst && !v.shadowed && resolve(v.src) === resolve(src))
+    if (!own) return false
+    let children
+    try { children = readdirSync(src) } catch { return false }
+    try {
+      unlinkSync(dst)
+      mkdirSync(dst)
+    } catch {
+      if (!isPresent(dst)) { try { symlinkSync(src, dst) } catch { /* 下次自愈再试 */ } }
+      return false
+    }
+    const index = views.indexOf(own)
+    views.splice(index, 1)
+    for (const child of children) {
+      const target = join(dst, child)
+      const childSrc = join(src, child)
+      try {
+        symlinkSync(childSrc, target)
+        views.push({ name: `${rel}/${child}`, target, src: childSrc, kind: 'view' })
+      } catch { return false }
+    }
+  }
+  links.views = views
+  return true
+}
+
+/** 新装和已装扩展共用；副本沿用 libs 的摘要账本，升级/卸载不另造协议。 */
+function installNvimParsers(root, extDir, links) {
+  const result = { added: 0, items: [] }
+  const sourceDir = join(extDir, 'lib', 'tree_sitter')
+  if (!existsSync(join(extDir, 'share/nvim/runtime')) || !existsSync(sourceDir)) return result
+  let names
+  try {
+    if (lstatSync(sourceDir).isSymbolicLink()) return result
+    names = readdirSync(sourceDir).filter((name) => /^[a-z][a-z0-9_]*\.so$/.test(name))
+    if (names.length === 0 || !nvimPhysicalParents(root, extDir, links)) return result
+  } catch { return result }
+  const libs = links.libs ?? []
+  const views = links.views ?? []
+  for (const name of names) {
+    const src = join(sourceDir, name)
+    const target = join(root, 'share/nvim/runtime/parser', name)
+    try {
+      if (!lstatSync(src).isFile()) continue
+      const data = readFileSync(src)
+      const digest = sha256(data)
+      const previous = libs.find((lib) => lib.target === target)
+      if (isPresent(target)) {
+        const st = lstatSync(target)
+        if (!st.isSymbolicLink()) continue // 已有实体文件（包括用户修改）绝不覆盖/认领
+        const view = views.find((v) => v.target === target && !v.shadowed)
+        const expected = join(extDir, 'share/nvim/runtime/parser', name)
+        if (!view || resolve(view.src) !== resolve(expected) || !existsSync(target)) continue
+        if (realpathSync(target) !== realpathSync(expected)) continue
+        unlinkSync(target)
+      }
+      copyFileSync(src, target)
+      const record = { name: `tree_sitter/${name}`, target, sha256: digest }
+      if (previous) Object.assign(previous, record)
+      else libs.push(record)
+      const kept = views.filter((v) => v.target !== target)
+      views.splice(0, views.length, ...kept)
+      result.added += 1
+      if (result.items.length < 12) result.items.push({ ext: basename(extDir), entry: `share/nvim/runtime/parser/${name}`, target })
+    } catch { /* 单个 parser 失败不阻断其余语言 */ }
+  }
+  links.libs = libs
+  return result
+}
+
+/** 给受管理的旧扩展补 parser 视图，每次启动/手动修复可跑，幂等且不重装。 */
+export function ensureNvimParsers(root) {
+  const result = { added: 0, items: [] }
+  if (!root) return result
+  let dirs
+  try { dirs = readdirSync(extensionsDir(root), { withFileTypes: true }) } catch { return result }
+  for (const dir of dirs) {
+    if (!dir.isDirectory() || dir.name.endsWith('.tmp-install')) continue
+    const extDir = join(extensionsDir(root), dir.name)
+    const file = join(extDir, '.links.json')
+    try {
+      const links = JSON.parse(readFileSync(file, 'utf8'))
+      if (links.extId !== dir.name || !Array.isArray(links.views) || !Array.isArray(links.libs)) continue
+      const before = JSON.stringify(links)
+      const fixed = installNvimParsers(root, extDir, links)
+      if (JSON.stringify(links) !== before) writeFileSync(file, JSON.stringify(links, null, 2) + '\n')
+      result.added += fixed.added
+      result.items.push(...fixed.items.slice(0, Math.max(0, 12 - result.items.length)))
+    } catch { /* 无清单/损坏/只读的扩展不动 */ }
+  }
+  return result
+}
+
 /**
  * 递归列出 bin 树里的**条目本身**（含悬空软链 —— `existsSync` 对它们返 false，
  * 所以这里必须用 `lstatSync` 走 `readdirSync(withFileTypes)`，不能先过滤存在性）。
@@ -1168,6 +1296,7 @@ export function removeExtension(root, id) {
     }
     for (const lib of links.libs ?? []) {
       try {
+        if (lib.name.startsWith('tree_sitter/') && (!nvimRouteOwned(root, extDir) || lstatSync(lib.target).isSymbolicLink())) continue
         if (!existsSync(lib.target)) continue
         if (sha256(readFileSync(lib.target)) === lib.sha256) {
           unlinkSync(lib.target)
@@ -1260,6 +1389,7 @@ export function relinkAll(root) {
       if (!existsSync(linksFile)) continue
       try {
         const links = JSON.parse(readFileSync(linksFile, 'utf8'))
+        const before = JSON.stringify(links)
         // runtime 升级后 bin/ lib/ 可能被整体删空（目录本身都没了），
         // copyFileSync / symlinkSync 不会自动建父目录，必须先补上
         mkdirSync(join(root, 'bin'), { recursive: true })
@@ -1275,9 +1405,12 @@ export function relinkAll(root) {
           // 缺陷 BH：裸名会遮蔽系统真库，重建时也不再补回来
           if (SHADOWING_BARE_LIBS.has(lib.name)) continue
           try {
-            if (existsSync(lib.target)) continue
+            if (isPresent(lib.target)) continue
             const src = join(extDir, 'lib', lib.name)
             if (!existsSync(src)) continue
+            if (lib.name.startsWith('tree_sitter/')) {
+              if (!nvimPhysicalParents(root, extDir, links)) continue
+            } else mkdirSync(dirname(lib.target), { recursive: true })
             copyFileSync(src, lib.target)
           } catch { /* 单条失败继续 */ }
         }
@@ -1305,6 +1438,7 @@ export function relinkAll(root) {
             symlinkSync(view.src, view.target)
           } catch { /* 单条失败继续 */ }
         }
+        if (JSON.stringify(links) !== before) writeFileSync(linksFile, JSON.stringify(links, null, 2) + '\n')
         rebuilt += 1
       } catch {
         // 清单损坏等整体失败不阻断其他扩展

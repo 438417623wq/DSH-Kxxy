@@ -100,8 +100,10 @@ export const Verdict = {
  * @typedef {{code: string, title: string, verdict: string, detail: string, fixHint?: string}} Check
  */
 
-function check(code, title, verdict, detail, fixHint) {
-  return { code, title, verdict, detail, fixHint }
+function check(code, title, verdict, detail, fixHint, target = code) {
+  const repairTargets = ['PROFILE_PATCH', 'HOME_PATCH', 'OVERLAY', 'MANIFEST', 'BUNDLES', 'RUNTIME']
+  return { code, title, verdict, detail, fixHint,
+    target: verdict === Verdict.BAD && repairTargets.includes(target) ? target : 'UNKNOWN' }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +263,7 @@ function checkProfileManifest(file, coreBundles) {
   if (!Array.isArray(bundles)) {
     return check(code, title, Verdict.BAD,
       'dsh.profile.bundles 缺失或不是数组（引擎会退回内置默认，移动端 UI 会消失）',
-      '点「一键修复」会写入核心三项')
+      '确认后只修复 bundle 列表，补回核心三项', 'BUNDLES')
   }
 
   const missing = coreBundles.filter((b) => !bundles.includes(b))
@@ -270,7 +272,7 @@ function checkProfileManifest(file, coreBundles) {
       `核心 bundle 缺失：${missing.join(', ')}`,
       missing.includes('dsh-web-mobile')
         ? '缺移动端 UI 插件，修复后会补回'
-        : '点「一键修复」会补回核心三项')
+        : '确认后只修复 bundle 列表，补回核心三项', 'BUNDLES')
   }
 
   const extra = bundles.filter((b) => !coreBundles.includes(b))
@@ -296,7 +298,8 @@ function checkOverlay(file) {
   let st
   try {
     st = statSync(file)
-  } catch {
+  } catch (e) {
+    if (e?.code !== 'ENOENT') return check(code, title, Verdict.UNKNOWN, `读取失败：${e?.message ?? e}`)
     return check(code, title, Verdict.BAD, '文件不存在',
       '引擎启动时原生层会自动重建；若反复消失说明运行时被改动')
   }
@@ -402,8 +405,8 @@ function checkRuntime(root) {
   const bad = []
   // 可执行位只在 POSIX 上有意义。Windows 的 stat 把 mode 合成为
   // 「可写就 0o666、只读就 0o444」，恒不带 x 位 —— 于是冒烟测试在开发机
-  // 上会把 bin/node 判成「缺可执行位」，进而把力度抬到 L3（建议重建整个
-  // 运行时）。那是个纯粹的构建机假阳性，必须按平台跳过。
+  // 上会把 bin/node 判成「缺可执行位」，误推荐离线重解运行时。
+  // 那是个纯粹的构建机假阳性，必须按平台跳过。
   const checkExec = process.platform !== 'win32'
   for (const [rel, label, needExec] of probes) {
     const full = join(root, rel)
@@ -411,13 +414,14 @@ function checkRuntime(root) {
       const st = statSync(full)
       if (!st.isFile() || st.size === 0) bad.push(`${label} 为空`)
       else if (needExec && checkExec && (st.mode & 0o111) === 0) bad.push(`${label} 缺可执行位`)
-    } catch {
-      bad.push(`${label} 缺失`)
+    } catch (e) {
+      if (e?.code === 'ENOENT') bad.push(`${label} 缺失`)
+      else return check(code, title, Verdict.UNKNOWN, `${label} 无法验证：${e?.message ?? e}`)
     }
   }
   if (bad.length) {
     return check(code, title, Verdict.BAD, bad.join('；'),
-      '运行时被破坏，需要重新解压（L3 修复）')
+      '运行时被破坏，请用「离线重解运行时」从 APK 重解；不会联网重建 profile 插件目录')
   }
   return check(code, title, Verdict.OK, '关键文件齐全')
 }
@@ -906,16 +910,13 @@ export function runHealthCheck(root) {
   const warn = checks.filter((c) => c.verdict === Verdict.WARN)
   const unknown = checks.filter((c) => c.verdict === Verdict.UNKNOWN)
 
-  // 建议力度：红项里只要有「补丁/清单」类，L1 就能解（移文件 + 收缩 bundle）；
-  // 只有运行时坏了才需要 L3。
-  //
-  // WEB_BOOT 刻意排除：它的成因是插件与移动端客户端不兼容，而修复动的是补丁与
-  // bundle 列表 —— 既治不了病，还会连带搬走主题与模型配置（缺陷 BW/CA 的教训）。
-  // 它只报红，正确动作是去「插件」页停用那一个插件。
-  let level = 'NONE'
-  const repairable = bad.filter((c) => c.code !== 'WEB_BOOT')
-  if (repairable.some((c) => c.code === 'RUNTIME')) level = 'L3'
-  else if (repairable.length) level = 'L1'
+  // 只有确切的 BAD 证据才推荐定向动作。扩展接入点、WEB_BOOT、UNKNOWN
+  // 都不靠启动修复解决；RUNTIME 是 L1 + RUNTIME 的独立离线重解入口，
+  // 与 L3 联网重建 profile node_modules 无关。
+  const repairable = bad.filter((c) => c.target !== 'UNKNOWN')
+  const target = repairable.find((c) => c.target === 'RUNTIME')?.target
+    ?? repairable[0]?.target ?? 'UNKNOWN'
+  const level = target === 'UNKNOWN' ? 'NONE' : 'L1'
 
   const webBootBad = bad.some((c) => c.code === 'WEB_BOOT')
   let headline
@@ -929,6 +930,7 @@ export function runHealthCheck(root) {
     ok: bad.length === 0,
     headline,
     level,
+    target,
     checkedAt: Date.now(),
     paths: {
       dshHome: p.dshHome,

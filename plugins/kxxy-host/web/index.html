@@ -164,6 +164,12 @@
             <div class="remote-hero-text">
               <span class="remote-name" id="remote-hero-name">—</span>
               <span class="remote-meta" id="remote-hero-meta">—</span>
+              <!--
+                状态单独一行，而且文案是「上次成功 · 3 分钟前」。
+                不写「在线」：这个值来自 onPageFinished 写回的历史结果，
+                没有心跳，画成在线等于替用户假设电脑此刻开着。
+              -->
+              <span class="remote-status" id="remote-hero-status"></span>
             </div>
             <!--
               「自动连」跟着最近使用的那台走。
@@ -546,6 +552,39 @@
         所以这里必须有一份能用的插件清单，否则用户只能清数据或重装。
       -->
       <section class="view-pane" data-view="plugins" id="view-plugins">
+        <!--
+          插件页 2.0：管理 + 安装一体。
+          · 「本地安装」是本插件页新增的能力（.tgz 静态检查 → 确认 → 提交）；
+          · 「安装插件」把对话页官方入口同步过来（控制台不重造安装器）；
+          · 启停 / 排障语义与旧版逐条一致（见 host.js renderPlugins 注释）。
+        -->
+        <div class="plugin-toolbar">
+          <div class="plugin-toolbar-head">
+            <div>
+              <h3 class="plugin-title">我的插件</h3>
+              <p class="plugin-sub">安装、管理与排障，在这里一次完成。</p>
+            </div>
+            <button class="plugin-refresh" id="btn-plugins-refresh" type="button" aria-label="刷新插件清单">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            </button>
+          </div>
+          <div class="plugin-entry-row">
+            <button class="button button-primary plugin-entry" id="btn-plugin-local-install" type="button">本地安装</button>
+            <button class="plugin-entry-secondary" id="btn-plugin-online-add" type="button">安装插件</button>
+          </div>
+          <p class="plugin-scope-note">「安装插件」与对话页「＋ 添加插件」是同一份能力；与扩展中心（FFmpeg 等工具包）互相独立。</p>
+          <label class="plugin-search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input type="search" id="plugin-search-input" placeholder="搜索名称或包名" aria-label="搜索已安装插件">
+          </label>
+          <div class="plugin-chips" role="group" aria-label="插件状态筛选">
+            <button class="plugin-chip active" data-plugin-filter="all" type="button">全部</button>
+            <button class="plugin-chip" data-plugin-filter="enabled" type="button">已启用</button>
+            <button class="plugin-chip" data-plugin-filter="disabled" type="button">已停用</button>
+            <button class="plugin-chip" data-plugin-filter="failed" type="button">异常</button>
+          </div>
+        </div>
+
         <div class="card builtin-note-card">
           <span class="builtin-note-icon" aria-hidden="true">🧩</span>
           <div class="builtin-note-info">
@@ -566,20 +605,26 @@
         <div class="card block-card">
           <div class="card-title-group">
             <h3 class="card-title">已安装插件</h3>
-            <span class="card-subtitle">与官方插件页同一份清单（profile bundles）—— 停用即从启动清单移除，包体保留</span>
+            <span class="card-subtitle" id="plugin-list-meta">与官方插件页同一份清单（profile bundles）</span>
           </div>
-          <div class="setting-list" id="plugin-list">
-            <div class="setting-row">
-              <div class="setting-info">
-                <span class="setting-title">加载中…</span>
-              </div>
-            </div>
+          <div class="plugin-cards" id="plugin-list">
+            <div class="empty-state">正在加载插件清单…</div>
           </div>
-          <div class="perm-actions">
-            <button class="button button-primary button-block" id="btn-plugin-restart" disabled>应用并重启引擎</button>
-            <div class="perm-hint" id="plugin-hint">改动要重启引擎才生效。重启期间对话页会短暂断开，会话不会丢。</div>
-          </div>
+          <details class="plugin-core" id="plugin-core-box" hidden>
+            <summary>核心组件<span id="plugin-core-count"></span> · 受保护，不提供停用开关</summary>
+            <div class="plugin-core-list" id="plugin-core-list"></div>
+          </details>
         </div>
+
+        <!-- 待生效常驻条：有未应用的改动时出现，吸底不遮列表 -->
+        <div class="plugin-pending" id="plugin-pending" hidden>
+          <div class="plugin-pending-text">
+            <strong>有变更待生效</strong>
+            <span id="plugin-hint">改动要重启引擎才生效。重启期间对话页会短暂断开，会话不会丢。</span>
+          </div>
+          <button class="button button-primary button-sm" id="btn-plugin-restart" disabled>应用并重启引擎</button>
+        </div>
+
       </section>
 
       <!-- 4. 设置视图 -->
@@ -690,12 +735,33 @@
                 <span class="remote-step-desc">手机和电脑连同一个 WiFi 就能连上。连上之后可以勾「信任」——下次打开 App 直接进去，不必再扫。</span>
               </li>
             </ol>
+            <!--
+              三种接入方式的区别。
+
+              原来的写法是一整段「想在外面连？用 Tailscale / Cloudflare…」，
+              但它把「局域网直连」「私有组网」「公网 HTTPS」混成了一句 ——
+              用户在排查时对不上自己实际做的那一步（尤其是「我明明映射了
+              域名，为什么还要装 Tailscale」）。拆成三行之后，每一行都回答
+              一个问题：要不要额外软件、地址长什么样、风险在哪。
+            -->
             <div class="remote-steps-note">
-              <span class="remote-steps-note-title">想在外面（4G / 别的网络）连？</span>
+              <span class="remote-steps-note-title">这三种「连得上」不是一回事</span>
+              <ul class="remote-modes">
+                <li>
+                  <span class="remote-mode-name">同一个 Wi-Fi</span>
+                  <span class="remote-mode-desc">连电脑的局域网地址，不经过任何服务器。最快，也最受限。</span>
+                </li>
+                <li>
+                  <span class="remote-mode-name">私有组网</span>
+                  <span class="remote-mode-desc">Tailscale 这类，手机要装同一个 App 并登录。地址是组网内网段（如 100.x）。</span>
+                </li>
+                <li>
+                  <span class="remote-mode-name">公网 HTTPS</span>
+                  <span class="remote-mode-desc">Cloudflare Tunnel / frp 把电脑的<b>接入端口</b>（插件默认 <code class="remote-inline-code">8765</code>）映射成一条固定域名，手机不用装额外软件。连接器建议带 <code class="remote-inline-code">--public-origin</code> 重启。</span>
+                </li>
+              </ul>
               <span class="remote-steps-note-desc">
-                Kxxy 自己不做打洞。用 Tailscale、Cloudflare Tunnel、frp 之类的工具，把电脑上的
-                <b>接入端口</b>（插件默认 <code class="remote-inline-code">8765</code>）映射成一条地址，
-                再把连接串里的 <code class="remote-inline-code">192.168.1.23:8765</code> 换成那条隧道域名即可。
+                把连接串里的 <code class="remote-inline-code">192.168.1.23:8765</code> 换成那条域名即可。
                 别去暴露 DSH 自己的 3080 —— 它的登录凭证只认本机，而且没有配对门。
               </span>
             </div>
@@ -802,6 +868,8 @@
             <li>同一 WiFi 下自动走局域网直连，不经过任何服务器。</li>
             <li>电脑关机时这条记录会保留，点「连接」会提示连不上，不会丢配对。</li>
             <li>远程会话里顶部会出现设备条，右侧「断开」随时回到本机。</li>
+            <li>设备卡上的状态只说「上一次」的结果：没有心跳，所以它不是「现在在线」。</li>
+            <li>「移除」只删手机里的记录，电脑侧对这台手机的授权仍然有效。</li>
           </ul>
         </div>
       </section>
@@ -1028,7 +1096,7 @@
                 <path d="M9 11l3 3L22 4"/>
                 <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
               </svg>
-              <span>一键验收（七项）</span>
+              <span>一键验收（含 Python）</span>
             </button>
 
             <!-- 直达插件页：对话页白屏时用户第一反应是「把刚装的插件关掉」，
@@ -1056,6 +1124,67 @@
         </div>
       </section>
     </main>
+
+    <!-- 安装弹层放在视图外：页签 fadeIn 的 transform 不能成为 fixed 遮罩的定位容器。 -->
+    <div class="plugin-sheet-mask" id="plugin-install-sheet" hidden>
+      <div class="plugin-sheet" role="dialog" aria-modal="true" aria-labelledby="pi-title">
+        <div class="plugin-sheet-head">
+          <h3 id="pi-title">安装插件</h3>
+          <button class="plugin-sheet-close" id="pi-close" type="button" aria-label="关闭">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="plugin-sheet-tabs" role="tablist" aria-label="安装来源">
+          <button id="pi-tab-local" role="tab" aria-selected="true" type="button">本地插件包</button>
+          <button id="pi-tab-online" role="tab" aria-selected="false" type="button">在线添加</button>
+        </div>
+
+        <!-- 步骤 1：选包（本地） -->
+        <div class="plugin-sheet-step" id="pi-step-select">
+          <label class="plugin-dropzone">
+            <input type="file" id="pi-file-input" accept=".tgz,application/gzip,application/x-gzip" hidden>
+            <span class="plugin-dropzone-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/></svg>
+            </span>
+            <strong>从手机选择插件包</strong>
+            <span class="plugin-dropzone-sub">支持 npm 发布包（.tgz）。源码 ZIP 与原生扩展包不是插件，装了也加载不了。</span>
+            <span class="button button-primary button-sm" role="button">选择文件</span>
+          </label>
+        </div>
+
+        <!-- 步骤 1：在线添加（引导到官方入口） -->
+        <div class="plugin-sheet-step" id="pi-step-online" hidden>
+          <div class="plugin-online-guide">
+            <p>在线安装由<strong>对话页 → 侧栏「插件」→「＋ 添加插件」</strong>的官方界面负责，装完会出现在这里的同一份清单里。</p>
+            <a class="button button-primary plugin-online-link" href="/">打开对话页</a>
+          </div>
+        </div>
+
+        <!-- 步骤 2：检查报告与确认 -->
+        <div class="plugin-sheet-step" id="pi-step-review" hidden>
+          <div class="pi-report" id="pi-report"></div>
+          <label class="pi-check"><input type="checkbox" id="pi-enable" checked><span>安装后加入启用清单（重启引擎后加载）</span></label>
+          <label class="pi-check" id="pi-overwrite-row" hidden><input type="checkbox" id="pi-overwrite"><span>覆盖同名插件：先移除旧包体再装入（清单有备份）</span></label>
+          <div class="plugin-sheet-actions">
+            <button class="plugin-btn-ghost" id="pi-cancel" type="button">取消</button>
+            <button class="button button-primary" id="pi-confirm" type="button">确认安装</button>
+          </div>
+        </div>
+
+        <!-- 步骤 3：进度 -->
+        <div class="plugin-sheet-step" id="pi-step-progress" hidden>
+          <div class="pi-progress-label" id="pi-progress-label">正在处理…</div>
+          <div class="pi-progress"><div class="pi-progress-fill" id="pi-progress-fill"></div></div>
+        </div>
+
+        <!-- 步骤 4：结果 -->
+        <div class="plugin-sheet-step" id="pi-step-result" hidden>
+          <div class="pi-result-icon" aria-hidden="true">✓</div>
+          <div class="pi-result-text" id="pi-result-text"></div>
+          <button class="button button-primary button-block" id="pi-done" type="button">完成</button>
+        </div>
+      </div>
+    </div>
 
     <!-- 关于弹窗：遮罩点击 / 关闭按钮 / Esc 都能关。
          id 全部沿用原「宿主环境参数」卡片（info-node-ver 仍由 fetchState 实时写入 Node 版本），

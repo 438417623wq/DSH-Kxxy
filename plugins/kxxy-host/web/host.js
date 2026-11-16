@@ -224,12 +224,22 @@
 
     // 插件视图（对话页白屏时的停用入口）
     pluginList: document.getElementById('plugin-list'),
+    pluginListMeta: document.getElementById('plugin-list-meta'),
+    pluginCoreBox: document.getElementById('plugin-core-box'),
+    pluginCoreCount: document.getElementById('plugin-core-count'),
+    pluginCoreList: document.getElementById('plugin-core-list'),
     pluginAlert: document.getElementById('plugin-alert'),
     pluginAlertTitle: document.getElementById('plugin-alert-title'),
     pluginAlertDesc: document.getElementById('plugin-alert-desc'),
     btnPluginDisableBroken: document.getElementById('btn-plugin-disable-broken'),
     btnPluginRestart: document.getElementById('btn-plugin-restart'),
     pluginHint: document.getElementById('plugin-hint'),
+    pluginPending: document.getElementById('plugin-pending'),
+    btnPluginsRefresh: document.getElementById('btn-plugins-refresh'),
+    pluginSearchInput: document.getElementById('plugin-search-input'),
+    pluginInstallSheet: document.getElementById('plugin-install-sheet'),
+    btnPluginLocalInstall: document.getElementById('btn-plugin-local-install'),
+    btnPluginOnlineAdd: document.getElementById('btn-plugin-online-add'),
     btnOpenPlugins: document.getElementById('btn-open-plugins'),
 
     // 体检元素（已并入概览页，DOM id 保持不变）
@@ -260,6 +270,7 @@
     remoteHeroDot: document.getElementById('remote-hero-dot'),
     remoteHeroName: document.getElementById('remote-hero-name'),
     remoteHeroMeta: document.getElementById('remote-hero-meta'),
+    remoteHeroStatus: document.getElementById('remote-hero-status'),
     remoteEmpty: document.getElementById('remote-empty'),
     btnRemoteManage: document.getElementById('btn-remote-manage'),
     btnRemoteAdd: document.getElementById('btn-remote-add'),
@@ -284,6 +295,27 @@
     tabItems: document.querySelectorAll('.tab-item'),
     viewPanes: document.querySelectorAll('.view-pane')
   };
+
+  // ==========================================
+  // 插件页入口按钮的双保险绑定
+  // ==========================================
+  // 真机事故：插件页列表能渲染（goToView→fetchPlugins 不依赖 init 完成态），
+  // 但「本地安装 / 安装插件」点了没反应 —— init() 里某个更早的子步骤抛错会
+  // 连带杀掉排在后面的 initPlugins，入口按钮的绑定就永远没执行。
+  // 这里在模块求值期直接绑定（脚本在 </body> 前加载，元素已就位），幂等。
+  function bindPluginEntryButtons() {
+    if (window.__kxxyPluginEntryBound) return;
+    const localBtn = document.getElementById('btn-plugin-local-install');
+    const onlineBtn = document.getElementById('btn-plugin-online-add');
+    if (!localBtn && !onlineBtn) return;
+    if (localBtn) localBtn.addEventListener('click', () => openInstallSheet('local'));
+    if (onlineBtn) onlineBtn.addEventListener('click', () => openInstallSheet('online'));
+    window.__kxxyPluginEntryBound = true;
+  }
+  bindPluginEntryButtons();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bindPluginEntryButtons, { once: true });
+  }
 
   // ==========================================
   // Toast 通知系统
@@ -346,8 +378,34 @@
    */
   let remoteStepsResolved = false;
 
+  /**
+   * 接入方式的标签。
+   *
+   * 措辞刻意不用「隧道」当唯一说法：`kind === 'tunnel'` 覆盖的是「不是局域网
+   * 直连」的全部情况，既有公网域名，也有 Tailscale 这类私有组网。把两者统称
+   * 「隧道」会让用户在排查时对不上自己实际做的那一步。
+   */
   function remoteKindLabel(device) {
-    return device.kind === 'lan' ? '局域网' : '隧道';
+    return device.kind === 'lan' ? '局域网' : '公网 / 私有组网';
+  }
+
+  /**
+   * 设备状态文案 —— 只描述**上一次连接的结果**，不冒充实时在线。
+   *
+   * `ok` 是原生在 onPageFinished 里回写的历史结果，不是心跳。把它画成绿点
+   * 加「在线」，等于让用户以为电脑此刻正连着，而实际上可能早就关机了。
+   */
+  function remoteStatusText(device) {
+    if (device.ok === false) return '上次连接失败';
+    if (!device.lastOkAt) return '还没有成功连过';
+    return `上次成功 · ${relativeTime(device.lastOkAt)}`;
+  }
+
+  /** 状态点的三态：失败（橙）/ 成功过（绿）/ 未知（灰）。 */
+  function remoteStatusClass(device) {
+    if (device.ok === false) return 'is-stale';
+    if (!device.lastOkAt) return 'is-unknown';
+    return 'is-ok';
   }
 
   /** 「3 分钟前 / 昨天 / 9 月 12 日」——不引入依赖，够用即可。 */
@@ -451,8 +509,13 @@
           <div class="remote-item-top">
             <span class="remote-item-name">${escapeHtml(d.label)}</span>
             <span class="remote-badge${d.kind === 'tunnel' ? ' is-tunnel' : ''}">${remoteKindLabel(d)}</span>
+            ${d.certPinned ? '<span class="remote-badge is-pinned" title="证书指纹已固定：只有同一张证书才接受">证书已固定</span>' : ''}
           </div>
           <span class="remote-item-meta">${escapeHtml(d.host)}</span>
+          <span class="remote-item-status">
+            <span class="remote-dot ${remoteStatusClass(d)}" aria-hidden="true"></span>
+            ${escapeHtml(remoteStatusText(d))}
+          </span>
         </div>
         <div class="remote-item-actions">
           <button
@@ -463,7 +526,11 @@
             title="${d.trusted ? '已开启自动连接，点击关闭' : '信任这台电脑，下次打开 App 自动连接'}"
           >自动连</button>
           <button class="button button-primary button-sm" data-remote-act="connect" data-id="${escapeHtml(d.id)}" type="button">连接</button>
-          <button class="remote-delete" data-remote-act="remove" data-id="${escapeHtml(d.id)}" type="button" aria-label="删除 ${escapeHtml(d.label)}">✕</button>
+          <button class="remote-delete" data-remote-act="remove" data-id="${escapeHtml(d.id)}" type="button" aria-label="删除 ${escapeHtml(d.label)}">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>
+            </svg>
+          </button>
         </div>
       </div>`
       )
@@ -494,8 +561,16 @@
       dom.remoteHero.hidden = false;
       dom.remoteEmpty.hidden = true;
       dom.remoteHeroName.textContent = hero.label;
-      dom.remoteHeroMeta.textContent = `${remoteKindLabel(hero)} · ${hero.host} · ${relativeTime(hero.lastUsedAt)}`;
-      dom.remoteHeroDot.classList.toggle('is-stale', hero.ok === false);
+      // 第二行只放「怎么接的」，状态单独一行 —— 混在一行里时，
+      // 「局域网 · 192.168.1.23:8080 · 3 分钟前」会被读成「现在连着」。
+      dom.remoteHeroMeta.textContent = `${remoteKindLabel(hero)} · ${hero.host}`;
+      if (dom.remoteHeroStatus) dom.remoteHeroStatus.textContent = remoteStatusText(hero);
+      dom.remoteHeroDot.className = `remote-dot ${remoteStatusClass(hero)}`;
+      dom.remoteHeroDot.title = hero.ok === false
+        ? '上次连接失败：先确认电脑上的连接器和 DSH 都在运行'
+        : hero.lastOkAt
+          ? '这是上一次的连接结果，不是实时在线状态'
+          : '还没有成功连过这台电脑';
       dom.btnRemoteConnect.dataset.id = hero.id;
       if (dom.btnRemoteTrust) {
         dom.btnRemoteTrust.dataset.id = hero.id;
@@ -711,9 +786,20 @@
       }
       if (act === 'remove') {
         const device = (remoteSnapshot?.devices || []).find((d) => d.id === id);
+        /*
+         * 这里必须说清「移除」到底做了什么。
+         *
+         * 它只删手机本地的记录：电脑侧的会话还在（连接器按会话授权），
+         * 所以「移除」不等于「撤销授权」。真要断掉这条授权，得在电脑上
+         * 重启连接器（所有会话失效），或用管理接口撤销。
+         * 不写清楚的话，用户以为「移除了就安全了」。
+         */
         const ok = await confirmDialog({
           title: '移除这台电脑',
-          desc: `将从手机里移除「${device?.label || '这台设备'}」的配对记录。电脑上的 DSH 不受影响，重新粘贴连接串即可再配上。`,
+          desc:
+            `将从手机里移除「${device?.label || '这台设备'}」的配对记录与证书固定。\n` +
+            '电脑上的 DSH 不受影响。\n' +
+            '注意：这只是删本地记录，电脑侧对这台手机的授权仍然有效。要彻底断开，请在电脑上重启连接器（所有设备失效）。',
           tone: 'warning',
           okText: '移除',
         });
@@ -2572,15 +2658,15 @@
       });
     }
 
-    // 一键验收（七项真机自检）
+    // 一键验收（运行环境与 Python 功能）
     //
-    // 结果不能只弹 toast：七条结论要同时在场才能对照（哪条红、证据是什么、
+    // 结果不能只弹 toast：多条结论要同时在场才能对照（哪条红、证据是什么、
     // 该点哪个按钮），而 toast 会一条顶一条。这里渲染成一行一条，并把
     // 「复制结果」留在面板右上 —— 用户要贴回来给我看时不用手抄。
     if (dom.btnSelftest) {
       dom.btnSelftest.addEventListener('click', async () => {
         dom.btnSelftest.disabled = true;
-        showToast('正在验收（最多约 10 秒）...', 'info');
+        showToast('正在验收（包含 Python，通常约 20 秒）...', 'info');
         try {
           const res = await apiPost('/kxxy/api/action', { action: 'selftest' });
           renderSelftest(res);
@@ -2923,17 +3009,17 @@
     if (bad.length) openFoldForAttention(dom.healthChecksDetails);
 
     // ── 修复区 ────────────────────────────────────────────
-    // 只在「有能靠修复解决的红项」时出现。
-    //
-    // WEB_BOOT 必须排除：它的成因是插件与移动端客户端不兼容，修复动的是补丁与
-    // bundle 列表，点下去既治不了病，还会把主题/模型配置一起搬走。把「修复」
-    // 按钮摆在一个修不好的红项下面，等于骗用户去点错的地方。
-    const repairableBad = bad.filter((c) => c.code !== 'WEB_BOOT');
+    // 只给确切证据的定向修复按钮；扩展/网页端故障和 UNKNOWN 不改配置。
+    const repairableBad = bad.filter((c) =>
+      ['PROFILE_PATCH', 'HOME_PATCH', 'OVERLAY', 'MANIFEST', 'BUNDLES', 'RUNTIME'].includes(c.target));
     if (dom.healthRepairCard) {
       dom.healthRepairCard.hidden = repairableBad.length === 0;
     }
+    if (dom.healthRepairHint) {
+      dom.healthRepairHint.textContent = '先确认配置调整，再请求原生层执行并重启；受理不等于成功，解包可能需要几分钟';
+    }
     if (repairableBad.length && dom.healthLevels) {
-      renderRepairLevels(data.level || 'L1');
+      renderRepairLevels(data.level || 'L1', data.target, repairableBad);
     }
 
     // ── 上次修复记录 ──────────────────────────────────────
@@ -2970,35 +3056,42 @@
     }
   }
 
-  /**
-   * 渲染三档修复按钮。
-   *
-   * 推荐档由后端给（`data.level`）：后端看的是「哪一项坏了」，
-   * 运行时坏了才推荐 L3，配置坏了推荐 L1。前端不重复这套判断。
-   *
-   * 三档都始终可点（除了 L3 需二次确认），因为用户可能知道后端不知道
-   * 的事 —— 比如刚装了某个插件想整体回退。但推荐档必须显眼。
-   */
-  function renderRepairLevels(recommended) {
+  const TARGET_META = {
+    PROFILE_PATCH: { title: '修复 profile 补丁', desc: '只备份并移走写坏的 profile 补丁；主题、模型等这层配置会回到默认。' },
+    HOME_PATCH: { title: '修复 home 补丁', desc: '只备份并移走写坏的 home 补丁，这层配置会回到默认。' },
+    OVERLAY: { title: '重建宿主覆盖层', desc: '只恢复原生生成的覆盖层，不调整用户补丁或插件列表。' },
+    MANIFEST: { title: '修复 profile 清单', desc: '备份坏清单并重建最小清单，插件列表可能恢复为核心三项。' },
+    BUNDLES: { title: '修复 bundle 列表', desc: '只恢复核心 bundle 列表，第三方 bundle 会停用；保留依赖和补丁。' },
+    RUNTIME: { title: '离线重解运行时', desc: '从 APK 重新解压内置运行时，不联网、不重建 profile 插件目录，保留用户配置与会话。解包可能需要几分钟。' }
+  };
+
+  /** 定向动作按确切 BAD 证据展示；L3 仍是联网重建 profile modules。 */
+  function renderRepairLevels(recommended, recommendedTarget, checks) {
     dom.healthLevels.innerHTML = '';
-    ['L1', 'L2', 'L3'].forEach(level => {
-      const meta = LEVEL_META[level];
+    const actions = checks.map(c => ({ level: 'L1', target: c.target, meta: TARGET_META[c.target] }));
+    // 更强的旧档仅作为明确的配置操作，不作为 RUNTIME 的修复建议。
+    if (checks.some(c => c.target !== 'RUNTIME')) {
+      ['L2', 'L3'].forEach(level => actions.push({ level, meta: LEVEL_META[level] }));
+    }
+    actions.forEach(({ level, target, meta }) => {
+      const isRecommended = level === recommended && target === recommendedTarget;
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'repair-level'
-        + (level === recommended ? ' recommended' : '')
+        + (isRecommended ? ' recommended' : '')
         + (meta.className ? ` ${meta.className}` : '');
       btn.innerHTML = `
-        <span class="repair-level-badge">${level}</span>
+        <span class="repair-level-badge">${target === 'RUNTIME' ? '离线' : level}</span>
         <span class="repair-level-text">
-          <span class="repair-level-title">${escapeHtml(meta.title)}${level === recommended ? ' · 推荐' : ''}</span>
+          <span class="repair-level-title">${escapeHtml(meta.title)}${isRecommended ? ' · 推荐' : ''}</span>
           <span class="repair-level-desc">${escapeHtml(meta.desc)}</span>
         </span>
         <svg class="repair-level-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <path d="M9 5L16 12L9 19" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
       `;
-      btn.addEventListener('click', () => requestRecovery(level));
+      btn.disabled = recoveryPending;
+      btn.addEventListener('click', () => requestRecovery(level, target));
       dom.healthLevels.appendChild(btn);
     });
   }
@@ -3013,122 +3106,115 @@
    * 为什么不在引擎里直接修：修复要移文件、重写清单、重启自身进程 ——
    * 一个进程没法体面地重启自己，而且引擎正在被修的目录里跑着。
    */
-  async function requestRecovery(level) {
+  async function requestRecovery(level, target) {
     if (recoveryPending) {
       showToast('上一次修复还在进行中', 'warning');
       return;
     }
-
-    // L3 会重建 node_modules（联网 + 耗时长），必须二次确认。
-    if (level === 'L3') {
-      const ok = await confirmDialog({
-        title: 'L3 深度修复',
-        desc: '将备份并重建插件目录，需要联网重新下载依赖，可能需要几分钟。\n会话记录与工作区文件不受影响。',
-        stats: [{ label: '预计耗时', value: '数分钟' }, { label: '需要联网', value: '是' }],
-        tone: 'warning',
-        okText: '开始修复',
-      });
-      if (!ok) return;
-    }
+    const undo = level === 'UNDO';
+    const meta = undo
+      ? { title: '撤销上次修复', desc: '会把移走的配置文件放回去、恢复原来的插件列表。如果原配置是坏的，撤销后引擎可能再次起不来。' }
+      : (TARGET_META[target] || LEVEL_META[level]);
+    if (!meta) return;
+    const ok = await confirmDialog({
+      title: meta.title,
+      desc: meta.desc + '\n此操作会调整上述配置或运行时并重启引擎，正在运行的任务会中断。会话记录与工作区文件不受影响。',
+      stats: [{ label: '需要联网', value: level === 'L3' ? '是' : '否' },
+        { label: '预计耗时', value: target === 'RUNTIME' || level === 'L3' ? '数分钟' : '最多数分钟' }],
+      tone: 'warning',
+      okText: undo ? '撤销并重启' : '修复并重启',
+    });
+    if (!ok || recoveryPending) return;
 
     recoveryPending = true;
-    setHealthBusy(true, `正在执行 ${level} 修复…`, '引擎会重启，完成后页面自动刷新');
-
+    setHealthBusy(true, '正在提交请求…', '原生层受理后才会执行并重启；这还不是修复成功');
     try {
-      await apiPost('/kxxy/api/recovery', { level, headline: lastHealth ? lastHealth.headline : '' });
-      showToast(`${level} 修复已下发，引擎正在重启`, 'success');
-      // 引擎重启需要时间：轮询等它回来，回来后重新体检一次确认效果
-      pollAfterRecovery();
-    } catch {
+      const accepted = await apiPost('/kxxy/api/recovery', {
+        level, ...(target ? { target } : {}), headline: lastHealth ? lastHealth.headline : ''
+      });
+      // 202 只表示请求落盘；缺本次关联 ID 时不得拿历史结果冒充成功。
+      if (accepted.accepted !== true || !Number.isSafeInteger(accepted.requestedAt) || accepted.requestedAt <= 0) {
+        throw new Error('请求可能已受理，但缺少本次 requestedAt，无法确认执行结果；请从原生救援入口查看');
+      }
+      showToast('请求已受理，正在等待本次执行结果（尚未成功）', 'warning');
+      setHealthBusy(true, '等待原生层执行并重启…', target === 'RUNTIME'
+        ? '运行时解包可能需要几分钟；若页面连不上，请返回 App 启动页的原生救援入口查看进度'
+        : '启动健康检查最多 120 秒，请等待；长时间连不上可返回 App 启动页的原生救援入口');
+      pollAfterRecovery(accepted.requestedAt, target, level);
+    } catch (err) {
       recoveryPending = false;
       setHealthBusy(false);
+      // apiPost 已报告 HTTP 错误，这里补充受理响应缺少关联 ID 的情况。
+      if (!/^HTTP /.test(err.message || '')) showToast(err.message || '无法确认请求，请查看原生救援入口', 'warning');
     }
   }
 
-  /**
-   * 修复后等待引擎恢复。
-   *
-   * 引擎重启期间所有 API 都会失败（连接被拒），所以这里不能用 apiGet
-   * （它会弹一堆「获取数据失败」的 toast）。改用裸 fetch + 吞掉异常，
-   * 直到 /api/health 能返回 200 为止。
-   *
-   * 最多等 90 秒（引擎启动 + 健康检查超时是 45 秒，留一倍余量），
-   * 超时就明确告诉用户「没等到」，而不是无限转圈。
-   */
-  function pollAfterRecovery() {
-    const deadline = Date.now() + 90_000;
+  /** 有界、静默的读取，避免重启时卡住一个 fetch 或反复弹错。 */
+  async function recoveryGet(url, timeoutMs) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let timer;
+    try {
+      return await Promise.race([
+        (async () => {
+          const res = await fetch(url, { cache: 'no-store', ...(controller ? { signal: controller.signal } : {}) });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return await res.json();
+        })(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            if (controller) controller.abort();
+            reject(new Error('读取超时'));
+          }, timeoutMs);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** 必须同时收到本次成功结果与成功体检。旧 result、仅 200/202 都不算完成。 */
+  function pollAfterRecovery(requestedAt, target, level) {
+    // 原生启动预算 120s + 余量；离线解包/联网重建另留数分钟。
+    const deadline = Date.now() + (target === 'RUNTIME' || level === 'L3' ? 600_000 : 180_000);
+    const finish = (message, tone) => {
+      recoveryPending = false;
+      setHealthBusy(false);
+      showToast(message, tone);
+    };
     const tick = async () => {
-      if (Date.now() > deadline) {
-        recoveryPending = false;
-        setHealthBusy(false);
-        showToast('引擎重启耗时较长，请点概览页的刷新按钮重试', 'warning');
+      if (Date.now() >= deadline) {
+        finish('尚未确认本次修复成功，启动或解包可能仍在进行；请返回 App 启动页的原生救援入口查看结果，再刷新概览', 'warning');
         return;
       }
       try {
-        const res = await fetch('/kxxy/api/health', { cache: 'no-store' });
-        if (res.ok) {
-          const data = await res.json();
-          lastHealth = data;
-          renderHealth(data);
-          recoveryPending = false;
-          setHealthBusy(false);
-          if (data.ok) {
-            showToast('修复完成，配置已恢复正常', 'success');
-          } else {
-            // 修复完还有红项：可能是 L1 解不了的问题，让用户看到真实结论
-            showToast('引擎已恢复，但仍有问题项，请查看下方结论', 'warning');
+        const data = await recoveryGet('/kxxy/api/recovery/result', Math.min(10_000, deadline - Date.now()));
+        const result = data && data.result;
+        if (result && result.requestedAt === requestedAt) {
+          if (result.ok === false) {
+            finish(`本次修复未完成：${result.error || result.detail || '请查看原生救援入口的执行详情'}`, 'error');
+            return;
           }
-          // 修复结果文件读一次，把「修了什么」补进页面
-          fetchRecoveryResult();
-          return;
+          if (result.ok === true && Date.now() < deadline) {
+            const health = await recoveryGet('/kxxy/api/health', Math.min(10_000, deadline - Date.now()));
+            lastHealth = health;
+            renderHealth(health);
+            if (health.ok === true) {
+              finish(level === 'UNDO' ? '撤销完成，引擎与体检已恢复正常' : '本次修复完成，引擎与体检已恢复正常', 'success');
+              return;
+            }
+            setHealthBusy(true, '执行结果已返回，但体检尚未通过', '尚未确认修复成功，请查看问题项；必要时返回 App 启动页的原生救援入口');
+          }
         }
       } catch {
-        // 引擎还没起来，正常
+        // 重启/解包时读不到是正常情况；只在总 deadline 到期时给出未确认说明。
       }
-      setTimeout(tick, 2000);
+      setTimeout(tick, Math.min(2000, Math.max(0, deadline - Date.now())));
     };
     setTimeout(tick, 3000);
   }
 
-  /**
-   * 读原生层写的修复结果（recovery-result.json）。
-   *
-   * 与 /api/health 里的 lastRecovery 有重叠但不等价：lastRecovery 读的是
-   * 备份目录里的 manifest.json（持久、跨重启有效），result 是原生层刚写完
-   * 的那一次（可能包含失败原因）。两者都读，页面上以 lastRecovery 为准，
-   * 失败原因用 result 补充。
-   */
-  async function fetchRecoveryResult() {
-    try {
-      const data = await apiGet('/kxxy/api/recovery/result');
-      const result = data && data.result;
-      if (result && result.ok === false && result.error) {
-        showToast(`修复未完成：${result.error}`, 'error');
-      }
-    } catch {
-      // 读不到就算了，不影响主流程
-    }
-  }
-
   async function undoLastRecovery() {
-    const ok = await confirmDialog({
-      title: '撤销上次修复',
-      desc: '会把移走的配置文件放回去、恢复原来的插件列表，然后重启引擎。\n如果原来的配置本来就是坏的，撤销后引擎会再次起不来。',
-      tone: 'warning',
-      okText: '撤销并重启',
-    });
-    if (!ok) {
-      return;
-    }
-    setHealthBusy(true, '正在撤销…', '引擎会重启，完成后页面自动刷新');
-    try {
-      // 撤销同样是「请原生层动手」：引擎自己搬不动正在用的文件。
-      await apiPost('/kxxy/api/recovery', { level: 'UNDO' });
-      showToast('撤销已下发，引擎正在重启', 'success');
-      pollAfterRecovery();
-    } catch {
-      setHealthBusy(false);
-    }
+    await requestRecovery('UNDO');
   }
 
   function setHealthBusy(busy, title, desc) {
@@ -3136,6 +3222,7 @@
     if (busy && title && dom.healthBusyTitle) dom.healthBusyTitle.textContent = title;
     if (busy && desc && dom.healthBusyDesc) dom.healthBusyDesc.textContent = desc;
     // 修复期间禁用按钮，避免连点下发多次
+    if (dom.btnHealthUndo) dom.btnHealthUndo.disabled = busy;
     if (dom.healthLevels) {
       dom.healthLevels.querySelectorAll('.repair-level').forEach(b => {
         b.disabled = busy;
@@ -3226,15 +3313,7 @@
   function renderPluginsError(message) {
     if (!dom.pluginList) return;
     dom.pluginList.innerHTML = '';
-    const row = el(`
-      <div class="setting-row">
-        <div class="setting-info">
-          <span class="setting-title">读不到插件清单</span>
-          <span class="setting-desc">${escapeHtml(message)}</span>
-        </div>
-      </div>
-    `);
-    dom.pluginList.appendChild(row);
+    dom.pluginList.appendChild(el(`<div class="empty-state">读不到插件清单：${escapeHtml(message)}</div>`));
     // 清单读不出来时，「一键停用」无从下手，必须禁用（否则点了只会报错）
     if (dom.btnPluginDisableBroken) dom.btnPluginDisableBroken.disabled = true;
     if (dom.pluginAlert) dom.pluginAlert.style.display = 'none';
@@ -3286,35 +3365,83 @@
       }
     }
 
+    /* ── 插件页 2.0：搜索 + 状态筛选（只影响卡片列表；告警永远看全量） ── */
+    const query = pluginQuery.trim().toLowerCase();
+    const matchFilter = (p) => {
+      if (pluginFilter === 'enabled' && !p.enabled) return false;
+      if (pluginFilter === 'disabled' && p.enabled) return false;
+      if (pluginFilter === 'failed' && !p.failed) return false;
+      return true;
+    };
+    const visible = list.filter(
+      (p) => matchFilter(p) && (!query || `${p.name} ${p.description || ''}`.toLowerCase().includes(query)),
+    );
+
+    // 顶部小计永远报全量：筛选是「找东西」的视图，不能让计数跟着视图变
+    const thirdAll = list.filter((p) => !p.protected);
+    const failedCount = list.filter((p) => p.failed).length;
+    if (dom.pluginListMeta) {
+      dom.pluginListMeta.textContent = `共 ${list.length} 个插件 · 第三方 ${thirdAll.length} · 异常 ${failedCount}`;
+      // init 期有子步骤抛错时显性标出来（定位「按钮没反应」这类连带问题）
+      if (Array.isArray(window.__kxxyInitErrors) && window.__kxxyInitErrors.length) {
+        dom.pluginListMeta.textContent += ` · ⚠ 初始化异常 ${window.__kxxyInitErrors.length} 项`;
+        dom.pluginListMeta.title = window.__kxxyInitErrors.join('\n');
+      }
+    }
+
+    // 核心组件收进折叠组：它们没有开关（受保护），画成卡片只会让人想去点
+    const protectedList = list.filter((p) => p.protected);
+    if (dom.pluginCoreBox && dom.pluginCoreList && dom.pluginCoreCount) {
+      if (protectedList.length) {
+        dom.pluginCoreBox.hidden = false;
+        dom.pluginCoreCount.textContent = ` ${protectedList.length} 项`;
+        dom.pluginCoreList.innerHTML = protectedList
+          .map(
+            (p) => `
+          <div class="plugin-core-item">
+            <span>${escapeHtml(p.name)}</span>
+            <span class="ver">${p.version ? `v${escapeHtml(p.version)}` : ''}${p.failed ? ' · 异常' : ''}</span>
+          </div>`,
+          )
+          .join('');
+      } else {
+        dom.pluginCoreBox.hidden = true;
+      }
+    }
+
     dom.pluginList.innerHTML = '';
-    if (!list.length) {
+    if (!visible.length) {
+      const filtered = query || pluginFilter !== 'all';
       dom.pluginList.innerHTML = `
-        <div class="setting-row">
-          <div class="setting-info">
-            <span class="setting-title">清单里还没有第三方插件</span>
-            <span class="setting-desc">装插件请到对话页侧栏 →「插件」→「+ 添加插件」</span>
-          </div>
-        </div>`;
+        <div class="empty-state">${filtered ? '没有符合条件的插件' : '清单里还没有第三方插件'}</div>
+        ${filtered ? '' : '<p class="plugin-scope-note">用上方「本地安装」装 .tgz 插件包；在线安装走对话页侧栏 →「插件」→「＋ 添加插件」。</p>'}`;
+      updatePluginFoot();
       return;
     }
 
-    list.forEach((p) => {
-      const row = document.createElement('div');
-      row.className = 'setting-row plugin-row';
-      if (!p.enabled) row.classList.add('plugin-row-off');
+    visible.forEach((p) => {
+      const row = document.createElement('article');
+      row.className = 'plugin-card';
+
+      const initials = (p.name.replace(/^@/, '').split('/').pop() || 'PL').slice(0, 2).toUpperCase();
+      const meta = [p.version ? `v${p.version}` : '', p.description || ''].filter(Boolean).join(' · ');
 
       const badges = [];
       if (p.failed) badges.push('<span class="badge badge-danger">加载失败</span>');
       if (!p.enabled) badges.push('<span class="badge badge-subtle">已停用</span>');
       if (p.missing) badges.push('<span class="badge badge-warn">未装全</span>');
-      if (p.protected) badges.push('<span class="badge badge-accent">受保护</span>');
 
-      const meta = [p.version ? `v${p.version}` : '', p.description || ''].filter(Boolean).join(' · ');
       row.innerHTML = `
-        <div class="setting-info">
-          <span class="setting-title">${escapeHtml(p.name)} ${badges.join(' ')}</span>
-          <span class="setting-desc">${escapeHtml(meta || '（无描述）')}</span>
-          ${p.failed && p.reason ? `<span class="setting-desc plugin-reason">${escapeHtml(p.reason)}</span>` : ''}
+        <div class="plugin-card-top">
+          <div class="plugin-ico${p.failed ? ' failed' : ''}" aria-hidden="true">${escapeHtml(initials)}</div>
+          <div class="plugin-info">
+            <div class="plugin-name">${escapeHtml(p.name)}</div>
+            <div class="plugin-pkg">${escapeHtml(meta || '（无描述）')}</div>
+          </div>
+        </div>
+        ${p.failed && p.reason ? `<div class="plugin-reason">${escapeHtml(p.reason)}</div>` : ''}
+        <div class="plugin-card-foot">
+          <span class="plugin-foot-meta">${badges.join(' ')}<span>${p.enabled ? '已加入启动清单' : '未在启动清单'}</span></span>
         </div>
       `;
 
@@ -3327,7 +3454,7 @@
         `;
         const input = label.querySelector('input');
         input.addEventListener('change', () => togglePlugin(p.name, input.checked, input));
-        row.appendChild(label);
+        row.querySelector('.plugin-card-top').appendChild(label);
       }
       dom.pluginList.appendChild(row);
     });
@@ -3358,6 +3485,8 @@
   /** 底部按钮：有没有待生效的改动。 */
   function updatePluginFoot() {
     if (!dom.btnPluginRestart) return;
+    // 吸底「待生效」条跟随同一个计数：没改动就藏起来，不占屏幕
+    if (dom.pluginPending) dom.pluginPending.hidden = pluginsDirty <= 0;
     if (pluginsDirty > 0) {
       dom.btnPluginRestart.disabled = false;
       dom.btnPluginRestart.textContent = `应用并重启引擎（${pluginsDirty} 项待生效）`;
@@ -3413,6 +3542,251 @@
     }
   }
 
+  // ==========================================
+  // 7.x 插件页 2.0：搜索 / 筛选 + 本地安装流
+  // ==========================================
+  /** 状态筛选（'all' | 'enabled' | 'disabled' | 'failed'），renderPlugins 消费。 */
+  let pluginFilter = 'all';
+  /** 搜索词（名称 + 描述，大小写不敏感）。 */
+  let pluginQuery = '';
+  /** 当前上传会话：{ uploadId, report }。关弹层即丢弃（服务端删临时文件）。 */
+  let piUpload = null;
+  /** 弹层当前 tab：'local' | 'online'。 */
+  let piMethod = 'local';
+
+  const PI_STEPS = ['select', 'online', 'review', 'progress', 'result'];
+
+  function piEl(id) {
+    return document.getElementById(id);
+  }
+
+  function showPiStep(name) {
+    PI_STEPS.forEach((s) => {
+      const node = piEl(`pi-step-${s}`);
+      if (node) node.hidden = s !== name;
+    });
+  }
+
+  function setPiProgress(label, pct) {
+    const text = piEl('pi-progress-label');
+    const fill = piEl('pi-progress-fill');
+    if (text) text.textContent = label;
+    if (fill) fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  }
+
+  function formatBytes(n) {
+    if (!Number.isFinite(n) || n <= 0) return '0 B';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  /** 关弹层时把上传会话清掉（fire-and-forget：失败只多留一份给 TTL 收）。 */
+  function discardPiUpload() {
+    if (!piUpload) return;
+    const id = piUpload.uploadId;
+    piUpload = null;
+    try {
+      window.fetch('/kxxy/api/plugins/local-discard', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-kxxy-nonce': KXXY_NONCE },
+        body: JSON.stringify({ uploadId: id }),
+      }).catch(() => {});
+    } catch {
+      // 忽略：TTL 会兜底清理
+    }
+  }
+
+  function openInstallSheet(method) {
+    try {
+      piMethod = method === 'online' ? 'online' : 'local';
+      piUpload = null;
+      piEl('pi-tab-local').setAttribute('aria-selected', String(piMethod === 'local'));
+      piEl('pi-tab-online').setAttribute('aria-selected', String(piMethod === 'online'));
+      const fileInput = piEl('pi-file-input');
+      if (fileInput) fileInput.value = '';
+      piEl('pi-enable').checked = true;
+      piEl('pi-overwrite').checked = false;
+      if (dom.pluginInstallSheet) dom.pluginInstallSheet.hidden = false;
+      document.body.style.overflow = 'hidden';
+      showPiStep(piMethod === 'local' ? 'select' : 'online');
+    } catch (e) {
+      // 弹层打不开绝不能静默 —— 给 toast，并把可能的半开状态收干净
+      showToast(`安装面板打开失败：${e && e.message ? e.message : e}`, 'error');
+      try {
+        if (dom.pluginInstallSheet) dom.pluginInstallSheet.hidden = true;
+        document.body.style.overflow = '';
+      } catch { /* 尽力而为 */ }
+    }
+  }
+
+  function closeInstallSheet() {
+    if (dom.pluginInstallSheet) dom.pluginInstallSheet.hidden = true;
+    document.body.style.overflow = '';
+    discardPiUpload();
+  }
+
+  /** 服务端静态检查报告 → 确认页。依赖缺失 / 冲突时给明确的行为约束。 */
+  function renderPiReview(report) {
+    const box = piEl('pi-report');
+    const v = (t, cls = '') => `<span class="v${cls ? ` ${cls}` : ''}">${t}</span>`;
+    const rows = [
+      `<div class="pi-row"><span class="k">插件</span>${v(`${escapeHtml(report.name)}${report.version ? ` v${escapeHtml(report.version)}` : ''}`)}</div>`,
+      '<div class="pi-row"><span class="k">来源</span>' + v('本地 .tgz 插件包') + '</div>',
+      `<div class="pi-row"><span class="k">清单与入口</span>${report.entryDeclared ? v('可识别（main/exports）', 'ok') : v('未声明入口', 'bad')}</div>`,
+      `<div class="pi-row"><span class="k">归档检查</span>${v(`${report.entryCount} 个条目 · 解压约 ${formatBytes(report.uncompressedBytes)}`, 'ok')}</div>`,
+      `<div class="pi-row"><span class="k">依赖</span>${report.depsMissing.length ? v(`缺 ${report.depsMissing.length} 项：${escapeHtml(report.depsMissing.join('、'))}`, 'bad') : v(report.deps.length ? '已满足' : '无外部依赖', 'ok')}</div>`,
+    ];
+    if (report.conflict) {
+      rows.push(`<div class="pi-row"><span class="k">同名插件</span>${v(`已安装${report.existingVersion ? ` v${escapeHtml(report.existingVersion)}` : ''}`, 'bad')}</div>`);
+    }
+    box.innerHTML = rows.join('');
+    if (report.depsMissing.length) {
+      box.insertAdjacentHTML('beforeend', '<div class="pi-error-box">缺少依赖，装上也会加载失败。请先在对话页在线安装这些依赖，再回来本地安装。</div>');
+    } else if (report.conflict) {
+      box.insertAdjacentHTML('beforeend', '<div class="pi-error-box">已存在同名插件。要替换请勾选下方「覆盖同名插件」。</div>');
+    }
+
+    const overwriteRow = piEl('pi-overwrite-row');
+    overwriteRow.hidden = !report.conflict;
+    updatePiConfirmState(report);
+  }
+
+  /** 确认按钮的可用性：有缺失依赖、入口未声明、或（冲突且未勾覆盖）时禁用。 */
+  function updatePiConfirmState(report) {
+    const btn = piEl('pi-confirm');
+    if (!btn) return;
+    const blocked = !report.entryDeclared ||
+      report.depsMissing.length > 0 ||
+      (report.conflict && !piEl('pi-overwrite').checked);
+    btn.disabled = blocked;
+  }
+
+  /** XHR 上传（fetch 包装不覆盖 XHR，nonce 必须显式带 —— 见文件头注释）。 */
+  function uploadPluginPackage(file) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/kxxy/api/plugins/local-inspect', true);
+      xhr.setRequestHeader('x-kxxy-nonce', KXXY_NONCE);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) setPiProgress('正在上传…', Math.round((e.loaded / e.total) * 100));
+      };
+      xhr.onload = () => {
+        let body = {};
+        try { body = JSON.parse(xhr.responseText || '{}'); } catch { /* 非 JSON 响应 */ }
+        if (xhr.status >= 200 && xhr.status < 300 && body.ok === true) resolve(body);
+        else reject(new Error(body.detail || body.error || `HTTP ${xhr.status}`));
+      };
+      xhr.onerror = () => reject(new Error('网络错误，上传失败'));
+      xhr.send(file);
+    });
+  }
+
+  async function uploadAndInspect(file) {
+    if (!file) return;
+    if (!/\.tgz$/i.test(file.name) && !/gzip/i.test(file.type || '')) {
+      showToast('请选择 .tgz 插件包（npm pack 产物）', 'warning');
+      return;
+    }
+    if (file.size > 90 * 1024 * 1024) {
+      showToast('插件包超过 90 MB 上限', 'error');
+      return;
+    }
+    showPiStep('progress');
+    setPiProgress('正在上传…', 0);
+    try {
+      const report = await uploadPluginPackage(file);
+      piUpload = { uploadId: report.uploadId, report };
+      renderPiReview(report);
+      showPiStep('review');
+    } catch (err) {
+      piUpload = null;
+      showPiStep('select');
+      showToast(err.message || '检查未通过', 'error');
+    }
+  }
+
+  async function confirmInstall() {
+    if (!piUpload) return;
+    const btn = piEl('pi-confirm');
+    btn.disabled = true;
+    showPiStep('progress');
+    // 安装本身是秒级事务（解包 + 写清单），进度条给个中段值即可
+    setPiProgress('正在安装（解包落位 + 写清单）…', 60);
+    try {
+      const result = await apiPost('/kxxy/api/plugins/local-install', {
+        uploadId: piUpload.uploadId,
+        enable: piEl('pi-enable').checked,
+        overwrite: piEl('pi-overwrite').checked,
+      });
+      piUpload = null;
+      const icon = piEl('pi-step-result').querySelector('.pi-result-icon');
+      if (icon) icon.classList.remove('fail');
+      piEl('pi-result-text').innerHTML = `
+        <strong style="display:block;font-size:16px;color:var(--text-primary);margin-bottom:6px;">${escapeHtml(result.name)}${result.version ? ` v${escapeHtml(result.version)}` : ''} 安装完成</strong>
+        ${escapeHtml(result.note || '')}<br>变更已计入待生效，重启引擎后加载。`;
+      // 清单动了（dependencies / bundles），与启停一样计入待生效
+      pluginsDirty += 1;
+      showPiStep('result');
+      updatePluginFoot();
+      fetchPlugins();
+    } catch (err) {
+      // apiPost 已 toast 原因（多为 conflict：没勾覆盖）。回确认页让用户改选项重试
+      showPiStep('review');
+    } finally {
+      btn.disabled = false;
+      if (piUpload && piUpload.report) updatePiConfirmState(piUpload.report);
+    }
+  }
+
+  function initPluginInstallSheet() {
+    // 入口按钮已在模块求值期绑定过（双保险），这里幂等兜底
+    bindPluginEntryButtons();
+    const close = () => closeInstallSheet();
+    if (piEl('pi-close')) piEl('pi-close').addEventListener('click', close);
+    if (piEl('pi-cancel')) piEl('pi-cancel').addEventListener('click', close);
+    if (piEl('pi-done')) piEl('pi-done').addEventListener('click', close);
+    if (dom.pluginInstallSheet) {
+      // 点遮罩空白处关闭（点 sheet 本身不关）
+      dom.pluginInstallSheet.addEventListener('click', (e) => {
+        if (e.target === dom.pluginInstallSheet) close();
+      });
+    }
+    const tabLocal = piEl('pi-tab-local');
+    const tabOnline = piEl('pi-tab-online');
+    if (tabLocal) {
+      tabLocal.addEventListener('click', () => {
+        piMethod = 'local';
+        tabLocal.setAttribute('aria-selected', 'true');
+        tabOnline.setAttribute('aria-selected', 'false');
+        showPiStep(piUpload ? 'review' : 'select');
+      });
+    }
+    if (tabOnline) {
+      tabOnline.addEventListener('click', () => {
+        piMethod = 'online';
+        tabLocal.setAttribute('aria-selected', 'false');
+        tabOnline.setAttribute('aria-selected', 'true');
+        showPiStep('online');
+      });
+    }
+    const fileInput = piEl('pi-file-input');
+    if (fileInput) {
+      fileInput.addEventListener('change', () => {
+        const file = fileInput.files && fileInput.files[0];
+        uploadAndInspect(file);
+        fileInput.value = '';
+      });
+    }
+    if (piEl('pi-overwrite')) {
+      piEl('pi-overwrite').addEventListener('change', () => {
+        if (piUpload && piUpload.report) updatePiConfirmState(piUpload.report);
+      });
+    }
+    if (piEl('pi-confirm')) piEl('pi-confirm').addEventListener('click', confirmInstall);
+  }
+
   function initPlugins() {
     if (dom.btnPluginRestart) {
       dom.btnPluginRestart.addEventListener('click', restartForPlugins);
@@ -3424,6 +3798,34 @@
     if (dom.btnOpenPlugins) {
       dom.btnOpenPlugins.addEventListener('click', () => goToView('plugins'));
     }
+
+    // —— 插件页 2.0：搜索 / 筛选 / 刷新 / 本地安装 ——
+    const chips = document.querySelectorAll('[data-plugin-filter]');
+    chips.forEach((chip) => {
+      chip.addEventListener('click', () => {
+        pluginFilter = chip.getAttribute('data-plugin-filter') || 'all';
+        chips.forEach((c) => c.classList.toggle('active', c === chip));
+        if (pluginsCache) renderPlugins(pluginsCache);
+      });
+    });
+    if (dom.pluginSearchInput) {
+      dom.pluginSearchInput.addEventListener('input', () => {
+        pluginQuery = dom.pluginSearchInput.value || '';
+        if (pluginsCache) renderPlugins(pluginsCache);
+      });
+    }
+    if (dom.btnPluginsRefresh) {
+      dom.btnPluginsRefresh.addEventListener('click', async () => {
+        dom.btnPluginsRefresh.classList.add('spin');
+        try {
+          await fetchPlugins();
+        } finally {
+          dom.btnPluginsRefresh.classList.remove('spin');
+        }
+      });
+    }
+    initPluginInstallSheet();
+
     updatePluginFoot();
   }
 
@@ -3470,15 +3872,30 @@
     if (darkQuery.addEventListener) darkQuery.addEventListener('change', applyTheme);
     else if (darkQuery.addListener) darkQuery.addListener(applyTheme);
 
-    initTabSwitch();
-    initCategoryFilter();
-    initActionButtons();
-    initAboutDialog();
-    initBatchActions();
-    initHealth();
-    initPlugins();
-    initLifecycle();
-    initRemote();
+    // 每个子步骤独立容错：任何一步抛错只记账，不连带杀掉后面的绑定。
+    // （真机表现过「列表正常、插件页全部按钮没反应」——goToView→fetchPlugins
+    // 不依赖 init 完成态，所以页面看起来是好的，绑定却一个都没发生。）
+    window.__kxxyInitErrors = window.__kxxyInitErrors || [];
+    const initSteps = [
+      ['tab-switch', initTabSwitch],
+      ['category-filter', initCategoryFilter],
+      ['action-buttons', initActionButtons],
+      ['about-dialog', initAboutDialog],
+      ['batch-actions', initBatchActions],
+      ['health', initHealth],
+      ['plugins', initPlugins],
+      ['lifecycle', initLifecycle],
+      ['remote', initRemote],
+    ];
+    for (const [label, fn] of initSteps) {
+      try {
+        fn();
+      } catch (e) {
+        const msg = `${label}: ${e && e.message ? e.message : e}`;
+        console.error(`[kxxy] init ${msg}`, e);
+        window.__kxxyInitErrors.push(msg);
+      }
+    }
 
     // 启动初始拉取
     startPolling();

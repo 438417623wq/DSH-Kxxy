@@ -39,6 +39,7 @@ import { randomBytes } from 'node:crypto'
 
 import { authDetail } from './auth.mjs'
 import { HELPER_DIR_REL, HELPERS } from './ghraw.mjs'
+import { runPythonSelftest } from './python-selftest.mjs'
 
 /** 单条外部命令的上限。`yarn --version` 正常 200ms 内返回，8s 已经极宽。 */
 export const CMD_TIMEOUT_MS = 8000
@@ -56,7 +57,7 @@ export const Level = {
 
 /**
  * 一条自检结果。
- * @typedef {{id: string, title: string, status: string, detail: string, hint?: string}} Item
+ * @typedef {{id: string, title: string, status: string, detail: string, hint?: string, evidence?: object}} Item
  */
 
 function item(id, title, status, detail, hint) {
@@ -347,8 +348,8 @@ export function judgeRaw(r) {
  *   ② `VIMRUNTIME` 没设或指错 —— 能启动，但一开文件就
  *      `E484: Can't open file …/com.termux/files/usr/share/nvim/syntax/syntax.vim`
  *      （prefix 是编译期写死的 Termux 路径）。⇒ 重启引擎，`buildEnv` 会补。
- *   ③ 载荷没带 treesitter parser —— 打开 .md 报 `E5113`，**不影响读写**，
- *      只是噪音。这一条插件侧无解，如实说明比让用户以为是坏的强。
+ *   ③ runtime parser 不可见 —— .md / .lua / :help / query 可能报 `E5113`，
+ *      **不影响读写**。先用「修复命令链接」补视图；数量不能证明载荷缺失或 ABI 兼容。
  *
  * @param {{installed?: boolean, execPath?: string|null, execOk?: boolean,
  *          runtime?: string|null, runtimeOk?: boolean, parserCount?: number}} r
@@ -383,16 +384,17 @@ export function judgeNvim(r) {
       'NVIM',
       '编辑器命令（nvim）',
       Level.WARN,
-      '可运行、运行时目录正常；但载荷没带 treesitter parser',
-      '打开 .md / .lua 等文件会提示 `E5113: Parser could not be created`。' +
-        '**不影响编辑与保存**，只是噪音：parser 是扩展载荷里就没有的，插件侧补不了。',
+      '可运行、运行时目录正常；但 runtime 中没有可见的 treesitter parser',
+      '打开 .md / .lua / :help / query 时可能提示 `E5113: Parser could not be created`。' +
+        '**不影响编辑与保存**。点「修复命令链接」可补齐已装扩展的 parser 视图；' +
+        '若扩展本身缺文件则需要修复载荷。目录检查不等于 parser 加载或 ABI 验证。',
     )
   }
   return item(
     'NVIM',
     '编辑器命令（nvim）',
     Level.PASS,
-    `NVIM 可运行、运行时目录正常（${r.parserCount} 个 parser）`,
+    `NVIM 可运行、运行时目录正常（${r.parserCount} 个可见 parser；未验证加载/ABI）`,
   )
 }
 
@@ -485,7 +487,8 @@ function probeWritable(file) {
 }
 
 /**
- * 采集 nvim 的三层证据。
+ * 采集 nvim 的 wrapper、运行时与 parser 目录可见性证据。
+ * parser 文件数量不验证动态加载、语言覆盖或 ABI 兼容性。
  *
  * `runtimeOk` 只看**环境变量那一份**：`<root>/share/nvim/runtime` 里有文件
  * 不等于 nvim 找得到 —— 它认的是 `$VIMRUNTIME`，没设就仍然去读编译期写死的
@@ -515,7 +518,8 @@ function collectNvim(root, deps, exists, countParsers) {
  *
  * @param {{home?: string, pathEnv?: string, exec?: Function, lookup?: Function,
  *          exists?: Function, canExec?: Function, probe?: Function, now?: Function,
- *          root?: string, vimruntime?: string, countParsers?: Function}} [deps]
+ *          root?: string, vimruntime?: string, countParsers?: Function, platform?: string,
+ *          env?: object, pythonSpawn?: Function, pythonNow?: Function}} [deps]
  * @returns {Promise<{at: number, ok: boolean, verdict: string, counts: object, items: Item[], note: string}>}
  */
 export async function runSelftest(deps = {}) {
@@ -537,7 +541,7 @@ export async function runSelftest(deps = {}) {
     try {
       return readdirSync(dir).filter((n) => n.endsWith('.so')).length
     } catch {
-      // parser 目录不存在 —— 载荷没带，见 judgeNvim 的第三层
+      // 目录不存在或不可读，只能报告不可见，不能推断载荷缺失
       return -1
     }
   })
@@ -609,12 +613,20 @@ export async function runSelftest(deps = {}) {
   // ⑦ nvim（缺陷 EI）：wrapper 的 exec 目标、VIMRUNTIME、treesitter parser 三层。
   // 追加在最后而不是插在 YARN 后面 —— 前六项的顺序在文档与截图里都用过，
   // 打乱会让人对不上号；新项放末尾，老的读法不变。
-  const root = deps.root ?? process.env.KXXY_ENGINE_ROOT ?? process.env.PREFIX ?? ''
+  const env = deps.env ?? process.env
+  const root = deps.root ?? env.KXXY_ENGINE_ROOT ?? env.PREFIX ?? ''
   if (!root) {
     items.push(item('NVIM', '编辑器命令（nvim）', Level.SKIP, '拿不到引擎根（KXXY_ENGINE_ROOT），无法判定'))
   } else {
     items.push(collectNvim(root, deps, exists, countParsers))
   }
+
+  // ⑧ 内置 Python：只读的功能探针与 pip check，保留前七项的编号和顺序。
+  // 与 yarn 的 shell runner 分开注入，避免把路径/参数拼进 sh -c；构建机绝不
+  // 自动回落到宿主 Python。NumPy/psutil 的标签告警和功能失败也不能混判。
+  items.push(...runPythonSelftest({
+    root, platform, env, exists, spawn: deps.pythonSpawn, now: deps.pythonNow,
+  }))
 
   const counts = { pass: 0, warn: 0, fail: 0, skip: 0 }
   for (const it of items) {

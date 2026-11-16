@@ -1,0 +1,32 @@
+{
+  "name": "dsh-codex-sidebar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex 独立对话侧栏：模型选择、工作区操作、审批与文件差异。",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5 || ~4.1.0",
+    "@deepseek-ai/dsh-client-ui-sidebar-right": "0.2.1-rc.5 || >=0.2.2-rc.1 <0.3.0-0",
+    "kxxy-host": "0.1.0",
+    "react": "^18.2.0"
+  }
+}

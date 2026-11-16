@@ -1,0 +1,4 @@
+# Codex is optional: a missing executable must never prevent DSH from starting.
+- insert:
+    - id: dsh-codex-sidebar
+      name: dsh-codex-sidebar

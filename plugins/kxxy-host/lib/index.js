@@ -47,11 +47,13 @@ import { randomBytes } from 'node:crypto'
 import { join, dirname, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import * as defaultModel from './default-model.mjs'
 import * as extinstall from './extinstall.mjs'
 import * as ghraw from './ghraw.mjs'
 import * as health from './health.mjs'
 import * as mirror from './mirror.mjs'
 import * as netdiag from './netdiag.mjs'
+import * as localinstall from './localinstall.mjs'
 import * as plugins from './plugins.mjs'
 import * as selftest from './selftest.mjs'
 import { tarGzSync } from './tar.mjs'
@@ -985,26 +987,31 @@ let lastSelftest = null
  *   · [extinstall.ensureLibexecView] 补 `<root>/libexec/<name>` —— 扩展的
  *     `bin/<cmd>` 是个 sh wrapper，最后一行 exec 那个路径，而安装期漏摊了
  *     `libexec/`（缺陷 EI，真机症状 `…/libexec/nvim/nvim: not found`）。
+ *   · [extinstall.ensureNvimParsers] 补 runtime/parser 的实体副本 —— 旧池丢掉
+ *     指向 lib/tree_sitter 的目录链接，四个 ftplugin 因而报 E5113。
  *
  * 与 `relinkAll` 的区别：那个按 `.links.json` 重建**引擎侧**的接入点，只在
  * runtime 升级后跑；这个修的是扩展自己目录里/清单外的缺口，任何时候都能跑，
  * 而且幂等（修好后再跑 repaired 为 0）。
  *
  * @param {string} root
- * @returns {{scanned: number, repaired: number, items: Array<object>, libexec?: object}}
+ * @returns {{scanned: number, repaired: number, items: Array<object>, libexec?: object, parsers?: object}}
  */
 function runHeal(root) {
   let result = { scanned: 0, repaired: 0, items: [] }
   let libexec = { added: 0, items: [] }
+  let parsers = { added: 0, items: [] }
   try {
     result = extinstall.healExtensions(root)
     // libexec 视图与上一条同属「装完了链接不全」，一起跑、一起报 ——
     // 用户点一次「修复命令链接」就该把 nvim 这类 wrapper 一起修好。
     libexec = extinstall.ensureLibexecView(root)
-    if (libexec.added > 0) {
-      result.repaired += libexec.added
+    parsers = extinstall.ensureNvimParsers(root)
+    for (const fixed of [libexec, parsers]) {
+      if (fixed.added === 0) continue
+      result.repaired += fixed.added
       const room = Math.max(0, 12 - result.items.length)
-      result.items.push(...libexec.items.slice(0, room))
+      result.items.push(...fixed.items.slice(0, room))
     }
   } catch (e) {
     lastHeal = { at: Date.now(), scanned: 0, repaired: 0, items: [], error: String(e?.message ?? e) }
@@ -1012,7 +1019,7 @@ function runHeal(root) {
   }
   // 只在有修复时更新 at，否则每次启动都会把「上次修复时间」刷成现在
   if (result.repaired > 0 || !lastHeal) {
-    lastHeal = { at: Date.now(), ...result, libexec }
+    lastHeal = { at: Date.now(), ...result, libexec, parsers }
   } else {
     lastHeal = { ...lastHeal, scanned: result.scanned }
   }
@@ -1076,8 +1083,7 @@ export function apply(ctx) {
     //   · `bin/<cmd>` 最后一行 exec `<root>/libexec/<name>/<name>`，而早先
     //     buildViews 只摊了 etc / share / opt / sbin / var，**漏了 libexec**
     //     ⇒ `…/engine/libexec/nvim/nvim: not found`（载荷本身是好的）。
-    // 两件事都只补链接、不重装（rust 250 MB、texlive 1600 个文件，为几条软链
-    // 重解一遍不可接受），都幂等，几十毫秒。
+    // 这些修复都不重装，parser 复用载荷里已有的库，且重复运行不改用户文件。
     //
     // 代价：每个扩展的 bin/ 走一遍 stat（TeX Live 1600 多个条目）。修完的结果
     // 进 /state，控制台能看到到底修了哪几条。
@@ -1089,6 +1095,30 @@ export function apply(ctx) {
           .join(', ')}）`,
       )
     }
+
+    // ── 默认模型自愈（缺陷：重置后默认落在没有凭据的官方 API 路由）──────
+    //
+    // 上游 base 把 `agent-default-model` 写死成 `deepseek-official/deepseek-flash`，
+    // 而那条路由只认凭据库里的 `DEEPSEEK_API_KEY`，读不到就直接抛
+    // `MISSING_CREDENTIAL`（不会回落到账号登录）。$DSH_HOME 一旦是新建/重置的，
+    // 用户第一句话必然报「no API key for provider route "deepseek-official"」，
+    // 哪怕他已经配好了别的 provider 和可用的 key —— 只是默认选择没指过去。
+    //
+    // 这里在引擎起步后自检一次：当前选择不可用就换成第一条真能用的路由，并经官方
+    // `agentDefaultModel.saveSelection()` 写回 profile 补丁（与用户手动选模型
+    // 落点一致，只发生一次）。详细取舍见 lib/default-model.mjs 文件头。
+    //
+    // 后台跑、不 await：它要等 provider 注册完成（最多 30 s），不能拖住启动。
+    void defaultModel
+      .ensureUsableDefaultModel(ctx)
+      .then((result) => {
+        if (result?.unresolvable === true) {
+          ctx.logger?.warn?.('[kxxy-host] 默认模型自检：当前没有任何可用路由，请先在「模型」页配置')
+        }
+      })
+      .catch((error) => {
+        ctx.logger?.warn?.(`[kxxy-host] 默认模型自检失败：${String(error?.message ?? error)}`)
+      })
 
     // ── GitHub 直链的绕行助手（缺陷 EH 的方案 C）────────────────────────
     //
@@ -1315,6 +1345,28 @@ export function apply(ctx) {
         const path = String(req.url ?? '').split('?')[0]
 
         try {
+          /*
+           * ── 本地插件安装：二进制上传端点（先于 JSON 写守卫）────────────
+           *
+           * 为什么不能走下面的统一守卫：checkWriteRequest 硬性要求
+           * application/json，而插件包是二进制，会被 415 挡死（缺陷 EB 同款
+           * 「新端点忘带 nonce」在这里的反面 —— 新端点忘带的是『绕开
+           * content-type 的理由』）。这里做**端点级**豁免：只放开
+           * content-type 一道，认证（上面 authVerdict）、跨站检查（更上面）、
+           * nonce（下面照验）一道不少 —— nonce 才是不靠浏览器自觉的
+           * CSRF 层。
+           */
+          if (req.method === 'POST' && path === '/kxxy/api/plugins/local-inspect') {
+            const nonce = checkNonce(req, acceptedNonces())
+            if (!nonce.ok) {
+              sendJson(res, nonce.status, { error: nonce.error })
+              return
+            }
+            const report = await localinstall.handleInspectRequest(req, extinstall.engineRoot())
+            sendJson(res, report.ok ? 200 : 400, report)
+            return
+          }
+
           // 写操作再验一层 CSRF 语义（缺陷 EA）：同源 JSON 才放行。
           // 放在这里而不是各 handler 里，是因为新增端点时最容易忘的就是这一步。
           if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -1493,6 +1545,46 @@ export function apply(ctx) {
               // 绝不返回「成功」让用户以为已经停用了
               sendJson(res, 400, { error: String(e?.message ?? e) })
             }
+            return
+          }
+
+          // ── 本地插件安装（JSON 端点：安装提交 / 丢弃上传会话）──────────
+          // 包体已在 local-inspect 阶段落盘并完成静态检查，这里只做事务提交。
+          if (path === '/kxxy/api/plugins/local-install' && req.method === 'POST') {
+            const raw = await readBody(req)
+            let payload
+            try {
+              payload = JSON.parse(raw || '{}')
+            } catch {
+              sendJson(res, 400, { error: 'invalid json' })
+              return
+            }
+            try {
+              const result = localinstall.installFromUpload({
+                id: String(payload.uploadId ?? ''),
+                enable: payload.enable !== false,
+                overwrite: payload.overwrite === true,
+              })
+              ctx.logger?.info?.(
+                `[kxxy-host] local install ${result.name ?? '(?)'} -> ${result.ok ? 'ok' : `fail: ${result.error}`}`,
+              )
+              sendJson(res, result.ok ? 200 : 400, result)
+            } catch (e) {
+              sendJson(res, 500, { error: String(e?.message ?? e) })
+            }
+            return
+          }
+
+          if (path === '/kxxy/api/plugins/local-discard' && req.method === 'POST') {
+            const raw = await readBody(req)
+            let payload = {}
+            try {
+              payload = JSON.parse(raw || '{}')
+            } catch {
+              // 丢弃是清理动作，body 坏了也照常返回成功（最坏只是多留一份临时文件给 TTL 收）
+            }
+            localinstall.discardUpload(String(payload.uploadId ?? ''))
+            sendJson(res, 200, { ok: true })
             return
           }
 
@@ -1750,6 +1842,20 @@ export function apply(ctx) {
               sendJson(res, 400, { error: 'invalid json' })
               return
             }
+            if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+              sendJson(res, 400, { error: 'invalid payload' })
+              return
+            }
+            // target 可省略以兼容旧调用；给出时必须是精确的 enum 字符串，
+            // 不做大小写/空白/类型转换，避免错误归因触发配置变更。
+            const target = payload.target
+            if (target !== undefined && ![
+              'PROFILE_PATCH', 'HOME_PATCH', 'OVERLAY', 'MANIFEST', 'BUNDLES',
+              'RUNTIME', 'RETRY', 'ENVIRONMENT', 'UNKNOWN',
+            ].includes(target)) {
+              sendJson(res, 400, { error: 'invalid target' })
+              return
+            }
             const level = String(payload.level ?? 'L1').toUpperCase()
             // UNDO 走同一条通道：撤销同样是「请原生层动手」——它要搬回
             // 文件、恢复 bundle 列表、重启引擎，引擎自己做不到。
@@ -1762,13 +1868,15 @@ export function apply(ctx) {
               sendJson(res, 500, { error: 'engine root unknown' })
               return
             }
+            const requestedAt = Date.now()
             try {
               writeFileSync(
                 join(root, 'recovery.request'),
                 `${JSON.stringify({
                   level,
+                  ...(target === undefined ? {} : { target }),
                   headline: String(payload.headline ?? ''),
-                  requestedAt: Date.now(),
+                  requestedAt,
                 }, null, 2)}\n`,
               )
             } catch (e) {
@@ -1779,7 +1887,9 @@ export function apply(ctx) {
             sendJson(res, 202, {
               accepted: true,
               level,
-              note: '已请求原生层修复，引擎会重启',
+              ...(target === undefined ? {} : { target }),
+              requestedAt,
+              note: '请求已受理，尚未执行完成；原生层处理后引擎会重启',
             })
             return
           }
