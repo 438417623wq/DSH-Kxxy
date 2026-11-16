@@ -3003,8 +3003,14 @@ class RuntimeInstaller(private val ctx: Context) {
          * 改动 patches.mjs 里任何补丁、或增删补丁时，必须同步递增此编号。
          * 同理，**自有插件（kxxy-host）的前端资源有实质改动**也要 +1 —— 那些
          * 文件同样在 runtime.zip 里，标记不变就等于「新 APK 装了个旧设置页」。
+         *
+         * 26 就是这条的极端情形（2026-11-16，控制台五页改版）：`host.css` 追加了
+         * 1065 行组件层，而它**不在** `PythonRuntimeRepair.HOST_WEB_FILES` 的受管
+         * 名单里 —— 增量修复只换了 `index.html` 与 `host.js`，样式留在 0.9.58，
+         * 于是新结构跑在旧 CSS 上：底栏中央那个 `.dsl-fab` 失去 54px 圆框约束，
+         * 按 SVG 默认的 300×150 被撑成一只盖住半屏的紫色气泡。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@25"
+        private const val PATCHSET_MARKER = "kxxy-patchset@26"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**

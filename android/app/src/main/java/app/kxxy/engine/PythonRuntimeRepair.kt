@@ -688,7 +688,27 @@ internal class PythonRuntimeRepair(
         private const val MANIFEST_SCHEMA = 2L
         private val PYTHON_PREFIXES = listOf("cffi/", "cffi-2.0.0.dist-info/", "pycparser/", "pycparser-2.23.dist-info/").map { SITE + it }
         private val HOST_FILES = setOf("selftest.mjs", "python-selftest.mjs", "python-probe.py", "index.js", ".fingerprint")
-        private val HOST_WEB_FILES = setOf("lib/node_modules/kxxy-host/web/index.html", "lib/node_modules/kxxy-host/web/host.js")
+        /**
+         * `kxxy-host/web/` 里随增量修复一起下发的资源。
+         *
+         * 原来只有 `index.html` 与 `host.js` 两个 —— 那是「当前这次修复正好动了这两
+         * 个」留下的痕迹，而不是一条规则。0.9.60 因此翻车：控制台改版同时改了
+         * `host.css`，装机后 index.html / host.js 是新的、样式表留在上一版，
+         * 设备上表现为「结构全对、视觉全丢」（底栏 FAB 没有圆框，被 SVG 默认的
+         * 300×150 撑成盖住半屏的紫色气泡）。
+         *
+         * 判据改成一条规则：**控制台要用的 web 资源全部纳入**，样式表、主题、
+         * 兼容层一个不落。新增 `web/` 下的文件时，记得同时加进
+         * `tools/lib/python-runtime.mjs` 的 `PYTHON_HOST_FILES`（两处必须同名）。
+         */
+        private val HOST_WEB_FILES = setOf(
+            "lib/node_modules/kxxy-host/web/index.html",
+            "lib/node_modules/kxxy-host/web/host.js",
+            "lib/node_modules/kxxy-host/web/host.css",
+            "lib/node_modules/kxxy-host/web/theme.css",
+            "lib/node_modules/kxxy-host/web/compat.js",
+            "lib/node_modules/kxxy-host/web/modern.js",
+        )
         private val REQUIRED_FILES = setOf(BACKEND, SITE + "cffi/__init__.py", SITE + "cffi-2.0.0.dist-info/METADATA", SITE + "pycparser/__init__.py", SITE + "pycparser-2.23.dist-info/METADATA", PYTHON_MARKER)
         private fun refuse(message: String): Nothing = throw Refused(message)
         private fun cancelled() { if (Thread.currentThread().isInterrupted) throw InterruptedException("Python repair cancelled") }
