@@ -25,12 +25,13 @@
 
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 
 import {
 	applyPlaceholders,
 	buildViews,
 	ensureLibexecView,
+	ensurePhpIni,
 	healExtensions,
 	placeholderMap,
 	poolSignature,
@@ -674,6 +675,92 @@ try {
 		equal('指向扩展外的悬空链不计入修复', third.repaired, 0);
 		check('也不改动它（原样留着交给占位符回填）', readlinkSync(outLink) === before, `now=${readlinkSync(outLink)}`);
 	}
+	// -----------------------------------------------------------------------
+	console.log('[EJ] 包内 bin/<cmd> 副本换回软链（mvn 的 ClassNotFoundException）');
+	// -----------------------------------------------------------------------
+	//
+	// 真机现场：
+	//   $ mvn -v
+	//   Error: Could not find or load main class …classworlds.launcher.Launcher
+	// 而 `extensions/maven/opt/maven/bin/mvn` 正常。Termux 的 maven 包里
+	// `usr/bin/mvn` 是 `-> ../opt/maven/bin/mvn` 的软链接，poolextract 把它
+	// 物化成实体副本，于是脚本 `dirname "$0"/..` 反推出的 MAVEN_HOME 是
+	// `extensions/maven` —— 那里没有 `boot/plexus-classworlds-*.jar`。
+	{
+		const root = join(workdir, 'r-ej');
+		const ext = makeExt(root, 'maven', {
+			'bin/mvn': '#!/bin/sh\nMAVEN_HOME=`dirname "$0"`/..\n',
+			'opt/maven/bin/mvn': '#!/bin/sh\nMAVEN_HOME=`dirname "$0"`/..\n',
+			'opt/maven/boot/plexus-classworlds-2.12.1.jar': 'JAR',
+			// 同名但内容不同：不是同一份文件，不许换
+			'bin/mvnDebug': '#!/bin/sh\necho debug\n',
+			'opt/maven/bin/mvnDebug': '#!/bin/sh\necho other\n',
+		});
+
+		const first = healExtensions(root);
+		equal('换回 1 条软链', first.repaired, 1);
+		const link = join(ext, 'bin', 'mvn');
+		const real = join(ext, 'opt', 'maven', 'bin', 'mvn');
+		let resolved = '';
+		try { resolved = resolve(dirname(link), readlinkSync(link)); } catch { resolved = ''; }
+		check('bin/mvn 已是指向真身的软链', lstatSync(link).isSymbolicLink() && resolved === real, `now=${resolved}`);
+		check('真身旁边确实有 boot/（这正是副本反推不到的东西）',
+			existsSync(join(ext, 'opt', 'maven', 'boot', 'plexus-classworlds-2.12.1.jar')));
+		check('同名不同内容的条目不动', lstatSync(join(ext, 'bin', 'mvnDebug')).isFile());
+
+		const second = healExtensions(root);
+		equal('再跑一遍不再动（幂等）', second.repaired, 0);
+
+		// 安装期也要走同一条规则 —— 不能只有「自愈」才修好新装的扩展
+		const root2 = join(workdir, 'r-ej2');
+		const ext2 = makeExt(root2, 'maven', {
+			'bin/mvn': '#!/bin/sh\necho mvn\n',
+			'opt/maven/bin/mvn': '#!/bin/sh\necho mvn\n',
+			'opt/maven/boot/x.jar': 'JAR',
+		});
+		buildViews(root2, 'maven', ext2);
+		let resolved2 = '';
+		try { resolved2 = resolve(dirname(join(ext2, 'bin', 'mvn')), readlinkSync(join(ext2, 'bin', 'mvn'))); } catch { resolved2 = ''; }
+		check('安装期就把副本换成了软链', resolved2 === join(ext2, 'opt', 'maven', 'bin', 'mvn'), `now=${resolved2}`);
+	}
+
+	// -----------------------------------------------------------------------
+	console.log('[EK] php 的 ini 重定向（php-cgi 的 opcache 锁目录）');
+	// -----------------------------------------------------------------------
+	//
+	// 真机现场：php 好了，php-cgi 仍旧
+	//   Fatal Error Unable to create opcache lock file in
+	//     /data/data/com.termux/files/usr/tmp: No such file or directory
+	// Termux 把 opcache.lockfile_path 编译期钉成 $PREFIX/tmp；这条路径不走
+	// libkxxy_exec 的前缀重写，所以只能靠 PHPRC 加载一份重定向 ini。
+	{
+		const root = join(workdir, 'r-ek');
+		// ensurePhpIni 看的是引擎根 `<root>/bin/php`（collectBins 展平后的接入点）
+		mkdirSync(join(root, 'bin'), { recursive: true });
+		writeFileSync(join(root, 'bin', 'php'), 'ELF');
+		const tmpDir = join(workdir, 'r-ek-tmp');
+		mkdirSync(tmpDir, { recursive: true });
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = tmpDir;
+
+		const first = ensurePhpIni(root);
+		check('写出一份 ini', first.written === true, JSON.stringify(first));
+		const ini = readFileSync(join(root, 'etc', 'php', 'php.ini'), 'utf8');
+		check('opcache 锁目录指到真实 tmp', ini.includes(`opcache.lockfile_path=${tmpDir}`), ini);
+		check('sys_temp_dir 一并重定向', ini.includes(`sys_temp_dir=${tmpDir}`));
+
+		const second = ensurePhpIni(root);
+		equal('内容一致就不重写（幂等）', second.written, false);
+
+		// 没装 php 的引擎根不该长出 etc/php
+		const bare = join(workdir, 'r-ek-bare');
+		mkdirSync(bare, { recursive: true });
+		equal('没装 php 时不写', ensurePhpIni(bare).written, false);
+		check('也没建目录', !existsSync(join(bare, 'etc', 'php', 'php.ini')));
+
+		if (saved === void 0) delete process.env.TMPDIR; else process.env.TMPDIR = saved;
+	}
+
 	// -----------------------------------------------------------------------
 	console.log('[EI] 已装扩展的 libexec 视图（ensureLibexecView，nvim 那条 not found）');
 	// -----------------------------------------------------------------------

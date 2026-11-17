@@ -31,6 +31,7 @@
  */
 
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   lstatSync,
@@ -460,6 +461,10 @@ export function buildViews(root, id, extDir) {
 
   const extBin = join(extDir, 'bin')
   if (existsSync(extBin)) {
+    // 先把「包内 bin/<cmd> → opt/<pkg>/bin/<cmd> 的物化副本」换回软链（缺陷 EJ），
+    // 再接进 <root>/bin —— 否则 <root>/bin/mvn 这条链的第二跳仍是副本，
+    // 启动脚本反推的 MAVEN_HOME 还是 extensions/maven。
+    for (const file of walkBinTree(extBin, 0)) relinkShadowedLauncher(file, extDir)
     // used 用来避免同一扩展内部展平后重名（不同子目录里同名命令）
     const used = new Set()
     collectBins(extBin, '', engineBin, used, bins, views)
@@ -798,6 +803,179 @@ function repairWrapperRefs(binPath, extDir) {
     }
   }
   return firstFix
+}
+
+/**
+ * 修「启动脚本被物化成实体副本，于是自己反推 home 反推错」这一类布局（缺陷 EJ）。
+ *
+ * ── 症状 ────────────────────────────────────────────────────────────────
+ *
+ *     $ mvn -v
+ *     Error: Could not find or load main class
+ *            org.codehaus.plexus.classworlds.launcher.Launcher
+ *     Caused by: java.lang.ClassNotFoundException: …Launcher
+ *
+ * 而 `…/extensions/maven/opt/maven/bin/mvn` 跑得好好的。
+ *
+ * ── 根因 ────────────────────────────────────────────────────────────────
+ *
+ * Termux 的 maven 包把 `bin/mvn` 装成 `-> ../opt/maven/bin/mvn` 的**符号链接**，
+ * 而 `tools/lib/poolextract.py` 会把包内链接物化成实体副本（缺陷 BN/BR 的同一课），
+ * 于是 `extensions/maven/bin/mvn` 是一份真文件。Apache 的启动脚本这样定位自己：
+ *
+ *     while [ -h "$PRG" ] ; do  …解析链接… done
+ *     MAVEN_HOME=`dirname "$PRG"`/..          →  extensions/maven
+ *     CLASSWORLDS_JAR="${MAVEN_HOME}"/boot/plexus-classworlds-*.jar
+ *
+ * `extensions/maven/boot/` 根本不存在（boot/conf/lib 都在 `opt/maven/` 下），
+ * 通配符匹配不到东西，字面量 `*.jar` 原样进了 `-classpath`，于是 java 找不到
+ * 启动类。同一形状的还有 gradle / kotlin（`opt/<pkg>/bin/<cmd>` 与 `bin/<cmd>`
+ * 两份），只是它们缺的是 `lib/`。
+ *
+ * 为什么 PATH 前置 `opt/<pkg>/bin`（EngineConfig 的缺陷 BN 修正）不算修好：
+ * 那只在「`opt/` 视图已经被 mergeViews 摊出来」且「调用方按我们的 PATH 走」时
+ * 成立。`<root>/bin/mvn` 这条链接链、用户自己拼的 PATH、扩展刚装好而视图还没
+ * 合并的窗口期，仍然会命中副本。
+ *
+ * ── 做法 ────────────────────────────────────────────────────────────────
+ *
+ * 把副本换回**相对软链**：`bin/<cmd> -> ../opt/<pkg>/bin/<cmd>`。启动脚本的
+ * `[ -h ]` 解析链因此能走到真身，`MAVEN_HOME` 自然落在 `opt/maven` 上。
+ *
+ * 三条保守边界，宁可不修也不猜：
+ *   · 只在 `<ext>/bin/<name>` 与 `<ext>/opt/<pkg>/bin/<name>` **同大小**时动手，
+ *     4 MiB 以下再比一遍内容 —— 同名同大小但内容不同，说明它们本来就不是一份；
+ *   · 只动普通文件（副本形态）；已经是软链的原样放过；
+ *   · 建链失败就当场把内容写回去并恢复权限，不留下一个空位。
+ *
+ * @param {string} entry `<ext>/bin/<name>` 的绝对路径
+ * @param {string} extDir 扩展根目录
+ * @returns {string | null} 换成的真身路径；不动时 null
+ */
+function relinkShadowedLauncher(entry, extDir) {
+  let st
+  try {
+    st = lstatSync(entry)
+  } catch {
+    return null
+  }
+  if (!st.isFile()) return null
+
+  const name = basename(entry)
+  let pkgs = []
+  try {
+    pkgs = readdirSync(join(extDir, 'opt'))
+  } catch {
+    return null
+  }
+
+  for (const pkg of pkgs) {
+    const real = join(extDir, 'opt', pkg, 'bin', name)
+    let rst
+    try {
+      rst = statSync(real)
+    } catch {
+      continue
+    }
+    if (!rst.isFile() || rst.size !== st.size) continue
+    if (!sameBytes(entry, real, st.size)) continue
+    try {
+      const linkTarget = relative(dirname(entry), real)
+      unlinkSync(entry)
+      symlinkSync(linkTarget, entry)
+      return real
+    } catch {
+      // 换了链却建不回去会让命令直接消失：把内容写回去，下个版本再试
+      try {
+        copyFileSync(real, entry)
+        chmodSync(entry, st.mode & 0o777)
+      } catch { /* 还原失败只能认了 */ }
+      return null
+    }
+  }
+  return null
+}
+
+/**
+ * 两份文件是否同内容。只对 4 MiB 以下的比内容（启动脚本都是几 KB 的文本），
+ * 更大的只信调用方已经比过的「同大小」—— 读一遍几十 MB 的 ELF 不值得。
+ *
+ * @param {string} a
+ * @param {string} b
+ * @param {number} size
+ * @returns {boolean}
+ */
+function sameBytes(a, b, size) {
+  if (size > 4 * 1024 * 1024) return true
+  try {
+    return readFileSync(a).equals(readFileSync(b))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 给已装的 php 补一份 `etc/php/php.ini`（清单第 3 项的第二半，缺陷 EK）。
+ *
+ * ── 症状 ────────────────────────────────────────────────────────────────
+ *
+ *     $ php -v
+ *     PHP 8.5.12 (cli) ...                        ← 好的
+ *     $ php-cgi -v
+ *     Fatal Error Unable to create opcache lock file in
+ *       /data/data/com.termux/files/usr/tmp: No such file or directory (2)
+ *
+ * ── 根因 ────────────────────────────────────────────────────────────────
+ *
+ * Termux 编译 php 时 `--with-config-file-path=$PREFIX/etc/php`，而 opcache 的
+ * `lockfile_path` 默认也是 `$PREFIX/tmp`。两个路径在 Android 上都不存在：
+ *
+ *   · `$PREFIX` 是 `/data/data/com.termux/files/usr`，本 App 下没有这个前缀；
+ *   · 这条路径**不走** `libkxxy_exec` 的前缀重写（那个只接管 exec 的参数），
+ *     所以把 ini 放到 `<root>/etc/php/` 也不会被自动读到（真机实测：
+ *     `php --ini` 仍报 Loaded Configuration File: (none)）。
+ *
+ * `php`(cli) 不碰那把锁，所以只有 CGI SAPI 与 phpdbg 会当场退出 —— 表现为
+ * 「php 好了、php-cgi 还是不行」，很容易被当成 ICU 修复没生效。
+ *
+ * ── 做法 ────────────────────────────────────────────────────────────────
+ *
+ * 写一份只含三条重定向的 ini，由 EngineConfig 的 `PHPRC=<root>/etc/php`
+ * 加载（那是唯一能让它生效的开关）。tmp 用**当前进程的真实值**，不用占位符 ——
+ * 这文件按设备生成、不进运行时包，也就没有构建期回填的问题。
+ *
+ * 幂等：内容一致就不重写，避免每次启动都动 mtime。php 没装时直接返回。
+ *
+ * @param {string} root 引擎根
+ * @returns {{written: boolean, file?: string, reason?: string}}
+ */
+export function ensurePhpIni(root) {
+  if (!root) return { written: false, reason: 'root 未知' }
+  if (!existsSync(join(root, 'bin', 'php'))) return { written: false, reason: 'php 未安装' }
+  const tmp = process.env.TMPDIR || process.env.TMP || ''
+  if (!tmp || !existsSync(tmp)) return { written: false, reason: 'TMPDIR 不可用' }
+
+  const file = join(root, 'etc', 'php', 'php.ini')
+  const body = [
+    '; 由 kxxy-host 的 ensurePhpIni 生成，重启引擎会按当前 tmp 重写。',
+    ';',
+    '; Termux 的 php 把 ini 目录与 opcache.lockfile_path 都钉在 $PREFIX 下，',
+    '; 那个前缀在本 App 里不存在 —— php-cgi / phpdbg 会因为建不了锁文件当场退出。',
+    '; EngineConfig 用 PHPRC=<root>/etc/php 加载本文件，把两处都挪到 App 自己的目录。',
+    `opcache.lockfile_path=${tmp}`,
+    `sys_temp_dir=${tmp}`,
+    `upload_tmp_dir=${tmp}`,
+    '',
+  ].join('\n')
+
+  try {
+    if (existsSync(file) && readFileSync(file, 'utf8') === body) return { written: false }
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, body)
+    return { written: true, file }
+  } catch (e) {
+    return { written: false, reason: String(e?.message ?? e) }
+  }
 }
 
 /**
@@ -1151,6 +1329,10 @@ function healBinEntry(entry, extDir) {
   }
 
   if (!st.isFile()) return null
+  // 物化副本换回软链（缺陷 EJ）优先于 wrapper 兄弟文件修复：前者修好了，
+  // 后者要补的那些「兄弟文件」本来就在真身旁边。
+  const relinked = relinkShadowedLauncher(entry, extDir)
+  if (relinked !== null) return relinked
   return repairWrapperRefs(entry, extDir)
 }
 

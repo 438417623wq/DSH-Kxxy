@@ -1002,27 +1002,32 @@ function runHeal(root) {
   let result = { scanned: 0, repaired: 0, items: [] }
   let libexec = { added: 0, items: [] }
   let parsers = { added: 0, items: [] }
+  let phpIni = { written: false }
   try {
     result = extinstall.healExtensions(root)
     // libexec 视图与上一条同属「装完了链接不全」，一起跑、一起报 ——
     // 用户点一次「修复命令链接」就该把 nvim 这类 wrapper 一起修好。
     libexec = extinstall.ensureLibexecView(root)
     parsers = extinstall.ensureNvimParsers(root)
+    // php 那份 ini（缺陷 EK）：php-cgi/phpdbg 的 opcache 锁目录指向 Termux 前缀，
+    // 写一份只做重定向的 ini，由 EngineConfig 的 PHPRC 加载。
+    phpIni = extinstall.ensurePhpIni(root)
     for (const fixed of [libexec, parsers]) {
       if (fixed.added === 0) continue
       result.repaired += fixed.added
       const room = Math.max(0, 12 - result.items.length)
       result.items.push(...fixed.items.slice(0, room))
     }
+    if (phpIni.written) result.repaired += 1
   } catch (e) {
     lastHeal = { at: Date.now(), scanned: 0, repaired: 0, items: [], error: String(e?.message ?? e) }
     return lastHeal
   }
   // 只在有修复时更新 at，否则每次启动都会把「上次修复时间」刷成现在
   if (result.repaired > 0 || !lastHeal) {
-    lastHeal = { at: Date.now(), ...result, libexec, parsers }
+    lastHeal = { at: Date.now(), ...result, libexec, parsers, phpIni }
   } else {
-    lastHeal = { ...lastHeal, scanned: result.scanned }
+    lastHeal = { ...lastHeal, scanned: result.scanned, phpIni }
   }
   return lastHeal
 }
