@@ -39,6 +39,14 @@ export const TERMUX_REPO = "https://packages.termux.dev/apt/termux-main";
  */
 export const SEED_VERSION_PINS = {
   python: "3.14.8",
+  // libffi 同理，而且更隐蔽：它不带版本号痕迹，只会让 `build-runtime` 在
+  // `verifyPythonInputs` 处报
+  //     Error: Python 构件的编译输入已变化，必须重新构建：include/ffi.h
+  // 真事故（2026-11-17）：索引把 3.8.0 推到 3.8.1，`include/ffi.h` 与
+  // `lib/libffi.so` 摘要双双变化，而 `tools/prebuilt/python-android-cp314/`
+  // 里那份 cffi 是用 **3.8.0** 的头编出来的（manifest 的 runtimeInputs 逐字
+  // 记着 3e34056b… / e118d741…）。补丁级升级对 cffi 零收益，却要 NDK 重编。
+  libffi: "3.8.0",
 };
 
 /** ④ 档种子：基线 22 包 + G0–G9 十组。 */
@@ -89,6 +97,18 @@ export const SEED_PACKAGES = [
   // 这里** —— 它们没有 deb，靠 `pip install` 即可（pip 与环境变量里的清华源都在）。
   // 补上 lxml/Pillow 之后这些 pip 安装全是纯 wheel 落地，几秒完成。
   "python-lxml", "python-pillow", "python-pandas",
+  // 绘图库（问题清单【9】里唯一还没着落的那项）。
+  //
+  // 为什么必须是 Termux 的 `matplotlib` 而不是 `pip install matplotlib`：
+  //   · PyPI 的 aarch64 轮子是 **manylinux**（glibc）链接，Android 的 bionic
+  //     加载器直接拒绝（`dlopen failed: library "libstdc++.so.6" not found`）；
+  //   · pip 在 Termux 上不做 manylinux 标签匹配，于是回落到源码包，
+  //     现场编译要 freetype/qhull 头 + meson/ninja + 完整 NDK，手机上必败。
+  // Termux 这份 3.11.2 是 bionic 交叉编译的，边际闭包只有 4 包 / 5.53 MiB
+  // （`qhull` `python-contourpy` `python-kiwisolver` + 本体），
+  // freetype/libraqm/ninja/patchelf 早已被 imagemagick 那条链带进来。
+  // 装完 `import matplotlib.pyplot` 即可用（后端由 EngineConfig 钉成 Agg）。
+  "matplotlib",
   // cryptography deb 的 postinst 会再用 pip 装 cffi；离线解包不运行维护脚本。
   // cffi>=2 + pycparser 由 build-python-deps.py 的 Android 构件显式补齐，
   // build-runtime 默认使用已验证构件（可用 --python-deps 指定）并核对 ABI/摘要，

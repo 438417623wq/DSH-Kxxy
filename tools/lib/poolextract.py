@@ -79,6 +79,7 @@ POOL_MANIFEST = ".pool-manifest.json"
 #   · ELF（魔数 \x7fELF）—— 路径串也出现在里面（DT_RUNPATH / strings），
 #     但占位符比原串短，改动长度会让节偏移与重定位表整体错位；
 #     而且 RUNPATH 的优先级低于 LD_LIBRARY_PATH，留着那条无效路径无害。
+#     **唯一例外**是「等长」的编译期 shell 路径改写，见 patch_elf_shell_path()。
 #   · ar 静态库（!<arch>\n）—— 成员偏移与符号索引都按字节算，同理不能动。
 #   · 任何含 NUL 字节的数据 —— 文本配置/脚本不会有 NUL，有就是二进制。
 ELF_MAGIC = b"\x7fELF"
@@ -112,6 +113,72 @@ def is_pruned(path):
     )
 
 
+# ── ELF 里「编译期 shell 路径」的等长原位修补（问题清单【8】的根因）──────
+#
+# 为什么这条规则**必须**破例动 ELF：
+#
+#   Perl 把 `Configure -Dsh=…` 的结果编译进 `PL_sh_path`，位置在 `.rodata` 的一个
+#   字符串常量表里（`lib/libperl.so` 偏移 550029 处，上下文是
+#   `"…9ABCDEF\0/data/data/com.termux/files/usr/bin/sh\0\x05,\0`!\"#…"`）。
+#   反引号 / `system("命令串")` 只要是**需要 shell 解析**的形态（带引号、管道、
+#   重定向组合），perl 就走 `execv(PL_sh_path, ["sh","-c",cmd])`；这条路径
+#   **不回落到 PATH**，`$Config{sh}` 也改不了它（我们早已把 Config.pm 的前缀
+#   改写成引擎根，但那是运行时读的哈希表，与这个常量无关）。
+#
+#   真机症状（0.9.62 + perl/exiftool 扩展）：
+#     `perl -e 'my $o = `"echo" hi 2>&1`'`   → 输出空，$? = -1
+#     `perl -e 'my $o = `echo hi 2>&1`'`     → 正常（perl 自己 split 后直接 exec）
+#   ExtUtils::MakeMaker 的 `find_perl()` 恰好用带引号的形态探测版本
+#   （`"$file" -e 'print $]'`），于是版本号取到空串 → `PERL = ""` →
+#   `make install` 的第一条 `$(ABSPERLRUN) -MModule ...` 展开成裸目录名 →
+#   `sh: 1: <cwd>: Permission denied`。**cpan 因此装不了任何模块**，
+#   而报错文案（Permission denied on a directory）离真正的原因有十万八千里。
+#
+#   为什么可以做「等长替换」：占位符方案（`@DSH_ROOT@`）比原串短 14 字节，
+#   改动长度会让后续节的偏移与重定位整体错位 —— 这是上面 ELF 短路的正当理由。
+#   但**本条不同**：目标串是 `/data/data/com.termux/files/usr/bin/sh`（36 字节），
+#   替换成 `/system/bin/sh`（14 字节）后剩 22 字节用 NUL 填满，**总长不变**。
+#   原串后面本来就紧跟一个 NUL，所以填完仍然是一个合法的 C 字符串，指针不变、
+#   布局不变、对 ELF 结构零影响。
+#
+#   为什么选 `/system/bin/sh`（Android 自带的 mksh）而不是引擎里的 `bin/sh`：
+#     · 引擎根在设备上是变量（`/data/user/<uid>/…`、多用户/wework 不同），
+#       而 ELF 里的字符串必须在**构建期**就定稿；
+#     · `/system/bin/sh` 是 bionic 平台上唯一保证存在、且 POSIX 语义完整的
+#       shell，Termux 自己也用它做兜底；
+#     · make / MakeMaker / cpan 用到的都是 POSIX 语法，mksh 足够。
+#
+#   只认「后面紧跟 NUL」的出现位置：说明它是独立字符串，不会截断更长的字面量。
+TERMUX_SH_PATH = b"/data/data/com.termux/files/usr/bin/sh"
+ANDROID_SH_PATH = b"/system/bin/sh"
+
+
+def patch_elf_shell_path(data):
+    """把 ELF 里编译期的 termux `sh` 路径等长改写成 `/system/bin/sh`。
+
+    @returns (new_bytes, changed) —— 非 ELF / 未命中时原样返回。
+    """
+    if data[:4] != ELF_MAGIC:
+        return data, False
+    filler = b"\x00" * (len(TERMUX_SH_PATH) - len(ANDROID_SH_PATH))
+    out = data
+    start = 0
+    changed = False
+    while True:
+        i = out.find(TERMUX_SH_PATH, start)
+        if i < 0:
+            break
+        end = i + len(TERMUX_SH_PATH)
+        # 后面不是 NUL ⇒ 它是更长字符串的前缀（理论上不会有，防御性跳过）。
+        if out[end:end + 1] != b"\x00":
+            start = end
+            continue
+        out = out[:i] + ANDROID_SH_PATH + filler + out[end:]
+        changed = True
+        start = i + len(TERMUX_SH_PATH)
+    return (out, True) if changed else (data, False)
+
+
 def rewrite_prefixes(data):
     """把内容里的 Termux 前缀换成占位符。
 
@@ -119,7 +186,10 @@ def rewrite_prefixes(data):
     """
     if not data:
         return data, False
-    if data[:4] == ELF_MAGIC or data[:8] == AR_MAGIC:
+    if data[:4] == ELF_MAGIC:
+        # ELF 只有这一条**等长**改写是安全的，见 patch_elf_shell_path。
+        return patch_elf_shell_path(data)
+    if data[:8] == AR_MAGIC:
         return data, False
     # NUL 字节 = 二进制（PNG/JPEG/加密数据/编译产物…）。文本配置里出现 NUL
     # 的唯一情形是编码异常，此时改动字节只会让它更坏。
@@ -525,7 +595,9 @@ def main():
                     total_bytes += len(data)
                     continue
                 data, changed = rewrite_prefixes(data)
-                if changed:
+                # ELF 的改写只有 patch_elf_shell_path 那一条等长替换，产物里
+                # **不含**占位符，不需要设备端回填 —— 不进 placeholders 清单。
+                if changed and data[:4] != ELF_MAGIC:
                     placeholder_paths.append(path)
                 # jar 内的 jansi native 剥离（缺陷 BM）：只对 .jar 试，且只
                 # 命中 `org/fusesource/jansi/internal/native/` 前缀的条目。

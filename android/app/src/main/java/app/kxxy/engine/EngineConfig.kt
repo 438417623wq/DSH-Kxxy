@@ -1077,6 +1077,24 @@ object EngineConfig {
             // 刻意**不**设 `PYTHONDONTWRITEBYTECODE=1` —— 那只是「不写」，
             // 于是每次启动都要重新编译全部 53 个文件，等于把慢速固化下来。
             "PYTHONPYCACHEPREFIX=${File(tmp, "pycache").absolutePath}",
+            // matplotlib 的两个变量（问题清单【9】的最后一项）。
+            //
+            // 后端：Android 上没有 Tk/Qt/GTK，`import matplotlib.pyplot` 默认会
+            // 依次试 tkagg → qtagg → gtk3agg，每个都在 import 期抛 ImportError，
+            // 最后才落到 `agg`（能画但会往 stderr 刷一串 fallback 警告）。
+            // 直接 `MPLBACKEND=Agg` 让它在 import 期就选定非交互后端：
+            //   · 保存 `savefig()` 出来的 PNG/SVG/PDF 完全不受影响；
+            //   · 不静默掉"需要交互窗口"的错 —— `plt.show()` 是明确的 no-op，
+            //     与无头服务器上的行为一致。
+            //
+            // 缓存目录：首次 import 要扫 `share/fonts` 下 700+ 个字体建
+            // `fontlist-v390.json`（真机约 3–6 s），默认写到 `$MPLCONFIGDIR`
+            // 或 `$HOME/.cache/matplotlib`。HOME 可写，但把它钉在
+            // `$HOME/.cache/matplotlib` 下有两个好处：tmp 被系统清掉也不会让
+            // 缓存丢失（否则每次冷启动都要重扫一遍），且与其它工具的
+            // XDG 缓存同级、便于用户一次性清理。
+            "MPLBACKEND=Agg",
+            "MPLCONFIGDIR=${File(home, ".cache/matplotlib").absolutePath}",
             // Ruby 的 gem 装到用户目录（Termux 前缀只读/不存在）
             "GEM_HOME=${File(home, ".gem").absolutePath}",
             "GEM_PATH=${File(home, ".gem").absolutePath}",
