@@ -37,8 +37,15 @@ import { join } from 'node:path'
  *   `ImportError: Unable to import required dependency dateutil`。
  *   pytz/tzdata 是 pandas 的时区配套（3.x 起 pytz 变成可选，但 `tz_localize`
  *   的老代码仍会 import 它，纯 Python 几百 KB，一并装上）。
+ *
+ * v3（同日）：补 matplotlib 的四个纯 Python 依赖 —— `packaging` / `cycler` /
+ *   `fonttools` / `pyparsing`。Termux 的 `matplotlib` deb 的 Depends 只写了
+ *   `freetype libc++ libraqm patchelf qhull ninja python python-contourpy
+ *   python-kiwisolver python-numpy python-pillow python-pip`，而这四个它既不带
+ *   也不声明（Termux 仓库里也都没有），真机 `import matplotlib` 第一步就死在
+ *   `ModuleNotFoundError: No module named 'packaging'`（matplotlib/__init__.py:157）。
  */
-const REVISION = 'pydeps@2'
+const REVISION = 'pydeps@3'
 
 /**
  * 要装的包。刻意**不带版本号**：这些库互相之间的兼容窗口很宽，钉死版本反而
@@ -58,16 +65,28 @@ const PACKAGES = [
   'six', // dateutil 的依赖
   'pytz',
   'tzdata',
+  // matplotlib 的运行时依赖（Termux 的 matplotlib deb 同样没带）
+  'packaging',
+  'cycler',
+  'fonttools',
+  'pyparsing',
 ]
 
 /**
  * 探针：必须**全部**导入成功才算就位。
  *
- * pandas 一定要在这里试 —— 它是唯一「装好了但缺 dateutil 就 import 失败」
- * 的包，只探 docx/openpyxl/pptx/requests 会让 v1 的坏状态被判成 ok，
- * 之后再也不会重跑（真机踩过）。
+ * 两条都必须实测 —— 它们是「装好了但缺一个依赖就 import 失败」的典型：
+ *   · pandas：缺 dateutil（v1 只探 docx/openpyxl/pptx/requests，把这种坏状态
+ *     判成 ok，之后再也不重跑，真机踩过）；
+ *   · matplotlib：缺 packaging（v2 踩过，报错在 matplotlib/__init__.py:157）。
+ * `use('Agg')` 是必须的：Android 没有 Tk/Qt，默认后端探测会抛 ImportError。
  */
-const PROBE = 'import docx, openpyxl, pptx, requests, dateutil, pytz; import pandas; print("ok")'
+const PROBE = [
+  'import docx, openpyxl, pptx, requests, dateutil, pytz',
+  'import pandas',
+  'import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot',
+  'print("ok")',
+].join('; ')
 
 /** pip 单次最多跑这么久：手机网络差时 150 s 足够下载这几 MB 的纯 wheel。 */
 const PIP_TIMEOUT_MS = 150_000
