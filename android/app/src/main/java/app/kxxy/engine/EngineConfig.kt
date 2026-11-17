@@ -1095,6 +1095,42 @@ object EngineConfig {
             // XDG 缓存同级、便于用户一次性清理。
             "MPLBACKEND=Agg",
             "MPLCONFIGDIR=${File(home, ".cache/matplotlib").absolutePath}",
+            // PHP 的 ini 目录（清单第 3 项的收尾）。
+            //
+            // Termux 的 php 是 `--with-config-file-path=$PREFIX/etc/php` 编的，而
+            // 这个前缀在设备上不存在 —— 于是 `php --ini` 报
+            //     Configuration File (php.ini) Path: "/data/data/com.termux/files/usr/etc/php"
+            //     Loaded Configuration File:         (none)
+            // 平时无害（默认值够用），但 opcache 的 `lockfile_path` 编译期默认值
+            // 是 `$PREFIX/tmp`，**同样不存在**，于是 CGI/phpdbg 一启动就：
+            //     Fatal Error Unable to create opcache lock file in
+            //     /data/data/com.termux/files/usr/tmp: No such file or directory
+            // `php`(cli) 不碰那把锁，所以只有 `php-cgi` 会当场死 —— 缺陷表现为
+            // 「php 好了、php-cgi 还是不行」。
+            //
+            // 这条路径**不保证**能被 libkxxy_exec 的前缀重写兜住（那个主要接管
+            // exec 的参数），所以把 ini 放到 `<root>/etc/php/php.ini` 之后还要
+            // 用 `PHPRC` 显式指过去；`PHP_INI_SCAN_DIR` 不能替代（它只管 conf.d）。
+            // 文件本身由 kxxy-host 的 `ensurePhpIni` 在启动自愈里按真实 tmp 生成。
+            //
+            // 真机 A/B（2026-11-17，删/留 ini + 有/无 PHPRC 四组）：**根因修复是 ini
+            // 文件本身** —— 删掉它立刻复现上面那条 Fatal，放回来就好，与 PHPRC 无关。
+            // PHPRC 是**不依赖 preload 的显式寻址**：带 `LD_PRELOAD` 时
+            // `libkxxy_exec.so` 会把 `$PREFIX/etc/php/php.ini` 这次 open 重写到
+            // `<root>/etc/php/`，所以不设也能读到（`php --ini` 里报的仍是 Termux
+            // 路径，正是「靠重写找到」的证据）；去掉 preload 就只有 PHPRC 能救。
+            // 留着它，是为了让 ini 的生效不依赖任何一层的拦截是否在场。
+            "PHPRC=${File(root, "etc/php").absolutePath}",
+            // tesseract 的语言包目录（清单第 4 项的另一半）。
+            //
+            // tesseract 的默认 datapath 同样编译期钉成 `$PREFIX/share/tessdata`
+            // —— 设备上没有这个前缀，于是任何一次真实 OCR 都是
+            //     Error opening data file
+            //     /data/data/com.termux/files/usr/share/tessdata/eng.traineddata
+            // 而 `--list-langs` 也一样（命令行 OCR 就此不可用，虽然库能加载）。
+            // 语言包已经由扩展池摊到 `<root>/share/tessdata`（chi_sim + eng），
+            // 这里只要把前缀指过去。
+            "TESSDATA_PREFIX=${File(root, "share/tessdata").absolutePath}",
             // Ruby 的 gem 装到用户目录（Termux 前缀只读/不存在）
             "GEM_HOME=${File(home, ".gem").absolutePath}",
             "GEM_PATH=${File(home, ".gem").absolutePath}",
