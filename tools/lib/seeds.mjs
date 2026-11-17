@@ -47,6 +47,13 @@ export const SEED_VERSION_PINS = {
   // 里那份 cffi 是用 **3.8.0** 的头编出来的（manifest 的 runtimeInputs 逐字
   // 记着 3e34056b… / e118d741…）。补丁级升级对 cffi 零收益，却要 NDK 重编。
   libffi: "3.8.0",
+  // numpy 不是 cffi 的编译输入，但 `build-runtime` 的 verifyPythonRuntime 会
+  // 核 `site-packages/numpy-<ver>.dist-info/WHEEL` 的平台标签（Termux 这份还是
+  // 旧的 `android_aarch64` 标签，要留在 warnings 里而不是消失）。真事故
+  // （2026-11-17 当天第二次）：索引把 2.5.4 推到 2.5.5，断言直接报
+  // 「Python 运行时缺少 lib/python3.14/site-packages/numpy-2.5.4.dist-info/WHEEL」。
+  // 补丁级升级对本项目零收益，钉住即可（缓存里有 2.5.4）。
+  "python-numpy": "2.5.4",
 };
 
 /** ④ 档种子：基线 22 包 + G0–G9 十组。 */

@@ -1213,21 +1213,39 @@ async function bundleMobilePlugin(asarPart) {
    *
    * 版本一律从闭包里读，不读插件自己的 `dependencies`：闭包才是最终装到
    * 设备上的那份。
+   *
+   * ⚠️ 「闭包里没有」**不等于**不兼容（v0.9.63 修正）：
+   *   首版把所有 `@deepseek-ai/dsh-client*` 缺失都当失败，结果 0.2.2-rc.3 这份
+   *   引擎直接被拦下 —— 它**压根不发布** `dsh-client-ui-primitives` /
+   *   `dsh-client-ui-slots` 这两个包（整份 asar 里搜不到，不是被裁剪掉的），
+   *   而同一份引擎 + 同一个插件在真机 0.9.62 上跑得好好的（engine.log 的
+   *   `skipping` 计数为 0，移动端 UI 正常）。也就是说这两个名字属于「这一代引擎
+   *   把导出并进 dsh-client-ui-layout」的历史遗留，插件在客户端 bundle 里能自己
+   *   解析掉。把它们当失败判据只会得到「永远打不出包」。
+   *
+   *   所以判据收成两条：
+   *     ① 闭包里**有**的 peer → 版本必须在区间内（这才是 rc.5 那次的真信号：
+   *        `dsh-client-locale` 存在且是 0.2.1-rc.5）；
+   *     ② 锚点包 `dsh-client-locale` **必须存在** —— 它是引擎 client 层的下限，
+   *        缺了说明拿错了引擎（或换了命名规则），此时仍然硬失败。
+   *   其余缺失项只打一行提示，留在构建日志里供事后对照。
    */
   const peers = pkgJson.peerDependencies ?? {};
   const peerProblems = [];
+  const absentPeers = [];
   const found = new Map();
   for (const [path, entry] of asarPart) {
     const m = /^lib\/node_modules\/(@deepseek-ai\/dsh-[^/]+)\/package\.json$/.exec(path);
     if (m !== null && entry.data !== undefined) found.set(m[1], entry.data);
   }
+  const PEER_ANCHOR = "@deepseek-ai/dsh-client-locale";
   for (const [name, range] of Object.entries(peers)) {
     const raw = found.get(name);
     if (raw === undefined) {
-      // 只对 `dsh-client-*` 硬失败：它们在闭包里一定有。其余 peer 可能确实
-      // 由引擎在运行期注入，缺了不该拦构建。
-      if (name.startsWith("@deepseek-ai/dsh-client")) {
-        peerProblems.push(`${name}：闭包里没有（要求 ${range}）`);
+      if (name === PEER_ANCHOR) {
+        peerProblems.push(`${name}：闭包里没有（要求 ${range}；它是引擎 client 层的锚点包）`);
+      } else {
+        absentPeers.push(name);
       }
       continue;
     }
@@ -1235,6 +1253,9 @@ async function bundleMobilePlugin(asarPart) {
     if (!satisfiesRange(actual, range)) {
       peerProblems.push(`${name}：闭包是 ${actual}，插件要 ${range}`);
     }
+  }
+  if (absentPeers.length > 0) {
+    console.log(`      · 插件声明但该代引擎不单独发包：${absentPeers.join(", ")}（不拦，见注释）`);
   }
   if (peerProblems.length > 0) {
     throw new Error(
@@ -1244,7 +1265,7 @@ async function bundleMobilePlugin(asarPart) {
         `\n换一份版本对得上的 app.asar（--asar）重建，或给 dsh-web-mobile 降版本。`,
     );
   }
-  const probe = found.get("@deepseek-ai/dsh-client-locale");
+  const probe = found.get(PEER_ANCHOR);
   const engineVersion =
     probe === undefined ? "?" : JSON.parse(probe.toString("utf8")).version;
   console.log(
