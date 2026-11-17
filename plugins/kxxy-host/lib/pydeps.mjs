@@ -130,9 +130,13 @@ export async function ensurePythonLibs() {
   if (!root || !existsSync(py)) return { status: 'skipped', detail: 'engine python3 不存在' }
 
   const marker = readMarker()
-  if (marker?.revision === REVISION) return { status: 'skipped', detail: '已就位' }
-  // 今天已经试过（且失败过）：不再重试，避免每次启动都等一次 pip 超时。
-  if (marker?.day === today()) return { status: 'skipped', detail: '今日已尝试，留待明天' }
+  // `ok` 才表示这批包真的能 import；`failed` 只表示「今天试过了」，明天还能再来。
+  if (marker?.revision === REVISION && marker?.status === 'ok') {
+    return { status: 'skipped', detail: '已就位' }
+  }
+  if (marker?.status === 'failed' && marker?.day === today()) {
+    return { status: 'skipped', detail: '今日已尝试，留待明天' }
+  }
 
   // 先探一下：能 import 就只写标记，不碰网络（用户可能自己装过）。
   const probe = await run(
@@ -140,7 +144,7 @@ export async function ensurePythonLibs() {
     20_000,
   )
   if (probe.code === 0) {
-    writeMarker({ revision: REVISION, day: today(), installedAt: new Date().toISOString(), mode: 'preexisting' })
+    writeMarker({ revision: REVISION, status: 'ok', day: today(), installedAt: new Date().toISOString(), mode: 'preexisting' })
     return { status: 'skipped', detail: '四个库已可 import' }
   }
 
@@ -153,17 +157,18 @@ export async function ensurePythonLibs() {
     PIP_TIMEOUT_MS,
   )
   if (result.code !== 0) {
-    writeMarker({ revision: REVISION, day: today(), failedAt: new Date().toISOString() })
+    writeMarker({ revision: REVISION, status: 'failed', day: today(), failedAt: new Date().toISOString() })
     return { status: 'failed', detail: result.text.slice(-400) }
   }
   // pip 说装好了不代表真能 import（镜像给错 wheel、user site 不在 sys.path 都会这样）。
   const verify = await run([py, '-c', 'import docx, openpyxl, pptx, requests'], 20_000)
   if (verify.code !== 0) {
-    writeMarker({ revision: REVISION, day: today(), failedAt: new Date().toISOString() })
+    writeMarker({ revision: REVISION, status: 'failed', day: today(), failedAt: new Date().toISOString() })
     return { status: 'failed', detail: `装上但 import 失败：${verify.text.slice(-300)}` }
   }
   writeMarker({
     revision: REVISION,
+    status: 'ok',
     day: today(),
     installedAt: new Date().toISOString(),
     packages: PACKAGES,

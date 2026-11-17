@@ -1591,7 +1591,20 @@ export function patchFrontendLenientBoot(ctx) {
   const labels = form.structured ? 'o$' : 'yx';
   clientAnchor(text, `${state}={PENDING:0,LOADING:1,ACTIVE:2,FAILED:3,DISPOSED:4,UNLOADING:5}`, '前端 boot 状态枚举');
   clientAnchor(text, `${labels}={[${state}.PENDING]:"pending",[${state}.LOADING]:"loading",[${state}.ACTIVE]:"active",[${state}.FAILED]:"failed",[${state}.DISPOSED]:"disposed",[${state}.UNLOADING]:"unloading"}`, '前端 boot 状态映射');
-  clientAnchor(text, `await n.await(),await ${form.audit}(t,e.modules)`, '前端 boot 审计调用与等待顺序');
+  // 审计函数的**调用点**：rc.2/rc.3 的收集器是 async，调用点写作
+  // `await n.await(),await <collector>(t,e.modules)`；而 **rc.5 又改回同步**
+  // （`function IZ(e,t){…}`，调用点 `await n.await(),IZ(t,e.modules)`，没有第二个
+  // await）。早期版本这里把 `await ` 写死在锚点里，于是在 rc.5 上恒报
+  // 「未找到锚点」，整条构建链在 [5/8] 就断掉。
+  //
+  // 两种写法都接受：按「收集器名前面有没有 await」各试一次，必须**恰好命中一次**
+  // 且只命中一种（同一次构建里出现两种形态说明前端结构未知，宁可失败）。
+  const callAnchors = [
+    `await n.await(),await ${form.audit}(t,e.modules)`,
+    `await n.await(),${form.audit}(t,e.modules)`,
+  ].filter((anchor) => text.includes(anchor));
+  must(callAnchors.length === 1, `前端 boot 审计调用与等待顺序 —— 未找到锚点（命中 ${callAnchors.length} 种写法）`);
+  clientAnchor(text, callAnchors[0], '前端 boot 审计调用与等待顺序');
   if (form.structured) {
     clientAnchor(text, `async function ${form.reason}(e){try{await e.await()}catch(t){return\`failed: \${String(t)}\`}return"failed"}`, '前端 boot 异步激活失败原因');
     const required = ['dsh-client-modules', 'dsh-api-session-controller', 'dsh-client-ui-renderer', 'dsh-client-ui-layout', 'dsh-client-ui-session', 'dsh-client-ui-chat', 'dsh-client-ui-sidebar'].map(name => `@deepseek-ai/${name}`);

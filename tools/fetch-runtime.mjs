@@ -11,29 +11,58 @@
  *
  * 用法: node fetch-runtime.mjs
  */
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
   fetchBuffer, downloadTo, parsePackagesIndex, resolveClosure, sha256Hex, human,
 } from "./lib/registry.mjs";
-import { SEED_PACKAGES, TERMUX_REPO } from "./lib/seeds.mjs";
+import { SEED_PACKAGES, SEED_VERSION_PINS, TERMUX_REPO } from "./lib/seeds.mjs";
 
 // 向后兼容：种子表与仓库常量已抽到 lib/seeds.mjs（fetch-extensions.mjs 与本脚本
 // 必须用同一份清单求交；直接 import 本文件会连 main() 一起跑），这里原样再导出。
-export { SEED_PACKAGES, TERMUX_REPO };
+export { SEED_PACKAGES, SEED_VERSION_PINS, TERMUX_REPO };
 
 /**
  * 种子包清单已抽到 tools/lib/seeds.mjs（④ 全能精选档：基线 22 包 + G0–G9，
  * 分组理由见该文件的逐条注释）。
  */
 
+/**
+ * 版本钉住（见 seeds.mjs 的 SEED_VERSION_PINS）。
+ *
+ * 返回 `null` 表示「不钉」，调用方按索引最新版正常下载；返回对象表示缓存里
+ * 已有该版本的 deb，直接用它、不走网络、也不再比对索引里的 sha256（那是新版
+ * 的摘要）。摘要改为**现算缓存文件**，保证清单里的值描述的是真实文件。
+ */
+function applyVersionPin(name, pkg, cacheDir) {
+  const pin = SEED_VERSION_PINS[name];
+  if (!pin) return null;
+  const file = safeName(`${name}_${pin}_${pkg.arch}.deb`);
+  const dest = join(cacheDir, file);
+  if (!existsSync(dest)) return null;
+  return {
+    version: pin,
+    arch: pkg.arch,
+    filename: pkg.filename,
+    file,
+    size: statSync(dest).size,
+    sha256: sha256Hex(readFileSync(dest)),
+    depends: pkg.depends,
+    pinned: true,
+  };
+}
+
+/**
+ * Windows 文件名不允许 ':'，而 Debian 版本号带 epoch（如 `1:3.6.5`）会原样带进来
+ * —— 直接用作文件名会 EINVAL。统一把非法字符替换为 '_'。
+ *
+ * 提到模块作用域是因为 applyVersionPin() 也要用它拼缓存文件名。
+ */
+const safeName = (s) => s.replace(/[:*?"<>|\\/]/g, "_");
+
 async function main() {
   const cacheDir = process.env.KXXY_CACHE ?? join(process.cwd(), ".cache", "debs");
   mkdirSync(cacheDir, { recursive: true });
-
-  // Windows 文件名不允许 ':'，而 Debian 版本号带 epoch（如 `1:3.6.5`）会原样
-  // 带进来 —— 直接用作文件名会 EINVAL。统一把非法字符替换为 '_'。
-  const safeName = (s) => s.replace(/[:*?"<>|\\/]/g, "_");
 
   console.log(`[1/3] 拉取 Termux 索引 ${TERMUX_REPO} ...`);
   const indexUrl = `${TERMUX_REPO}/dists/stable/main/binary-aarch64/Packages`;
@@ -76,9 +105,12 @@ async function main() {
   };
 
   for (const name of pkgs) {
-    const pkg = index.get(name);
+    const fromIndex = index.get(name);
+    const pin = applyVersionPin(name, fromIndex, cacheDir);
+    const pkg = pin ?? fromIndex;
     const dest = join(cacheDir, safeName(`${name}_${pkg.version}_${pkg.arch}.deb`));
-    const good = await tryDownload(name, pkg, dest);
+    // 钉住的包在用缓存：不下载、不比对索引摘要（索引里根本没有这个版本了）。
+    const good = pin ? true : await tryDownload(name, pkg, dest);
     if (!good) {
       failed.push([name, pkg, dest]);
       process.exitCode = 1;
@@ -87,6 +119,7 @@ async function main() {
       continue;
     }
     done += 1;
+    if (pin) console.log(`      ⏸ ${name}: 按 SEED_VERSION_PINS 停在 ${pin.version}（用缓存）`);
     manifest.push({
       name, version: pkg.version, arch: pkg.arch,
       file: dest.split(/[\\/]/).pop(), size: pkg.size, sha256: pkg.sha256,

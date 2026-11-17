@@ -12,6 +12,35 @@
 /** Termux 主仓库（预装与包池共用；镜像切换只影响 npm 源，不影响构建期）。 */
 export const TERMUX_REPO = "https://packages.termux.dev/apt/termux-main";
 
+/**
+ * 版本钉住：这些包**不跟索引走**，必须停在指定版本。
+ *
+ * 为什么需要它（2026-11-17 真事故）：
+ *   Termux 把 `python` 从 3.14.8 推到 3.14.10 之后，`fetch-runtime` 照索引取了
+ *   新版，于是 `build-runtime` 在 `verifyPythonInputs` 处直接失败：
+ *
+ *       Error: Python 构件的编译输入已变化，必须重新构建：
+ *              include/python3.14/cpython/code.h
+ *
+ *   这是**正确**的失败 —— `tools/prebuilt/python-android-cp314/` 里那份 cffi
+ *   wheel 是用 3.14.8 的头编出来的，`PYTHON_TARGET.version` 也钉着 3.14.8。
+ *   重编 cffi 要 NDK + 一个**已经被 SHA256 钉死的 0.9.41 运行时 zip**，那条路
+ *   在常规迭代里根本走不通。所以正确做法是让 python 停在 3.14.8：
+ *
+ *   · 3.14.8 → 3.14.10 是补丁级更新，功能上零收益；
+ *   · 而它会让整个 Python 侧（cffi / cryptography / numpy 的 ABI 面）失去
+ *     已验证的构建证明。
+ *
+ * 机制：`resolveClosure` 仍按索引解析（依赖关系取自新版条目，通常无变化），
+ * 真正取包时如果缓存里已有 `<name>_<pin>_<arch>.deb`，就用缓存那份并把清单里
+ * 的 version/size/sha256 换成实际值 —— 老版本 deb 早已从索引里下架，联网拿
+ * 不到，所以这个钉只在「构建机缓存还在」时生效（缓存没了就按最新版走，并会在
+ * build-runtime 的 CFFI 校验处立刻报错，而不是产出坏包）。
+ */
+export const SEED_VERSION_PINS = {
+  python: "3.14.8",
+};
+
 /** ④ 档种子：基线 22 包 + G0–G9 十组。 */
 export const SEED_PACKAGES = [
   // ── 基线：让 DSH 引擎本身跑起来（22 个，缺一不可）──────────────────

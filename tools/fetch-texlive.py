@@ -397,11 +397,20 @@ def make_hyphenation_minimal(dest: str) -> tuple[str, int]:
     def pattern_exists(pattern: str) -> bool:
         if not pattern or pattern.startswith("="):
             return True  # `=alias` 不落文件，永远可用
+        # `language.def` 里的模式名有两种写法：`language.dat` 风格带全名
+        # （`hyphen.tex`），以及 `\addlanguage` 风格的**裸名**（`{hyphen}`、
+        # 甚至 `{loadhyph-af}`）。TeX 自己会给裸名补 `.tex`，这里必须同样处理，
+        # 否则第一条 `\addlanguage {USenglish}{hyphen}{}{2}{3}` 会被判成“文件不存在”
+        # 而被删掉 —— 那条按约定**必须是第一条**，删掉等于把断言打成废纸。
+        names = [pattern]
+        if not pattern.endswith(".tex"):
+            names.append(pattern + ".tex")
         for base in ("texmf-dist/tex/generic/hyph-utf8/patterns/tex",
                      "texmf-dist/tex/generic/hyphen",
                      "texmf-dist/tex/generic/dehyph"):
-            if os.path.exists(os.path.join(dest, base, pattern)):
-                return True
+            for name in names:
+                if os.path.exists(os.path.join(dest, base, name)):
+                    return True
         return False
 
     for rel in (
@@ -414,16 +423,28 @@ def make_hyphenation_minimal(dest: str) -> tuple[str, int]:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
         out: list[str] = []
+        # `language.dat` 里的 `=alias` 行是**上一条**语言条目的别名（`=british`
+        # 依附于 `english hyph-en-gb`）。父条目被删了还留着别名，等于让
+        # `=german-x-latest` 去指 english 的断词表 —— 语言用错了却不报错，
+        # 比缺语言更难查。所以别名跟着父条目的去留走。
+        anchor_kept = True
         for line in lines:
             s = line.strip()
             # 空行、注释、以及一切非条目的 TeX 控制流：原样保留。
             if not s or s.startswith("%"):
                 out.append(line)
                 continue
+            if s.startswith("="):
+                if anchor_kept:
+                    out.append(line)
+                else:
+                    dropped += 1
+                continue
             m = ADD_LANGUAGE.match(s)
             if m is not None:
                 pattern = m.group(1).strip()
-                if pattern_exists(pattern):
+                anchor_kept = pattern_exists(pattern)
+                if anchor_kept:
                     out.append(line)
                     kept.append(s)
                 else:
@@ -439,7 +460,8 @@ def make_hyphenation_minimal(dest: str) -> tuple[str, int]:
                 out.append(line)
                 continue
             pattern = parts[1]
-            if pattern_exists(pattern):
+            anchor_kept = pattern_exists(pattern)
+            if anchor_kept:
                 out.append(line)
                 kept.append(s)
             else:

@@ -1331,6 +1331,40 @@ async function bundleTexliveMacros(asarPart) {
     }
     console.log(`      language.dat 已收窄（${entries} 条）`);
   }
+  /*
+   * `language.def` 与 `language.dat` 形态完全不同，判据也不同（v0.9.62 回归）。
+   *
+   * 它是 **e-TeX 源码**，不是纯条目表：首行 `% e-TeX V2.6` 是建格式时的版本探针，
+   * 后面还有 `\ifx`/`\else`/`\fi` 控制流，`\addlanguage{<lang>}{<pattern>}` 才是
+   * 条目。早期 `make_hyphenation_minimal` 会「重新生成文件、只写认出来的条目」，
+   * 于是它被压成 82 字节的单行中文注释；`pdftex -ini` 读到头部不符就进
+   * `\@sk {Use fallback?}` 交互分支 → stdin 是 /dev/null → Emergency stop →
+   * 一个 .fmt 都落不了盘。**行数少不代表对**，必须逐项验头部与条目。
+   */
+  const langDef = join(root, "texmf-dist", "tex", "generic", "config", "language.def");
+  if (!existsSync(langDef)) {
+    throw new Error(`宏包树缺 language.def：${langDef}`);
+  }
+  const defText = readFileSync(langDef, "utf8");
+  const defHead = (defText.split(/\r?\n/).find((l) => l.trim()) ?? "").trim();
+  // 上游首行是 `%% e-TeX V2.0;2`（两个百分号，TeX Live 原样），所以用 `%+`。
+  if (!/^%+\s*e-TeX\s*V/i.test(defHead)) {
+    throw new Error(
+      `language.def 头部被破坏（首行应为 "% e-TeX V…"，实际：${JSON.stringify(defHead.slice(0, 60))}）\n` +
+        `它是 e-TeX 建格式的版本探针；不符时 pdftex -ini 会进交互式 fallback，` +
+        `在 /dev/null 下 Emergency stop，pdflatex.fmt 生成不出来。\n` +
+        `重跑 python tools/fetch-texlive.py（make_hyphenation_minimal 现在逐行过滤，保住头部）。`,
+    );
+  }
+  const defEntries = defText.split(/\r?\n/).filter((l) => /^\\addlanguage\s*\{/.test(l.trim())).length;
+  if (defEntries < 1) {
+    throw new Error(
+      `language.def 里一条 \\addlanguage 都没有（${langDef}）\n` +
+        `hyphen.cfg 靠它建语言表，空的等于所有语言都缺断词模式。\n` +
+        `重跑 python tools/fetch-texlive.py。`,
+    );
+  }
+  console.log(`      language.def 头部完好，断词条目 ${defEntries} 条`);
   console.log(`      ls-R ${human(statSync(lsR).size)}`);
 
   /*
