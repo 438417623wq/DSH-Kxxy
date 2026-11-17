@@ -56,6 +56,37 @@ export const SEED_VERSION_PINS = {
   "python-numpy": "2.5.4",
 };
 
+/**
+ * 兼容包：**同一软件包的第二个 major** 也要一起装（与 SEED_VERSION_PINS 相反）。
+ *
+ * 为什么需要（2026-11-17 真事故，清单第 2/3/4 项）：
+ *   Termux 把 `libicu` 从 78.3 推到 79.1，但**索引里那一批包仍是按 78 编译的**：
+ *
+ *       php / php-cgi / phpdbg      → CANNOT LINK: "libicuio.so.78" not found
+ *       xelatex / xetex / bibtexu / upmendex / libharfbuzz-icu.so → "libicuuc.so.78"
+ *       tesseract 的 libpango_training.so / libunicharset_training.so → 同
+ *
+ *   而基线里的 `nodejs-lts` 是按 79 编译的。ICU 每个 major 都把导出符号重命名
+ *   （`u_strlen_78` / `u_strlen_79`），所以「把 78 的 soname 指到 79」不是可行解
+ *   —— 只能让两个 major 的文件同时存在于 `<root>/lib`。
+ *
+ * 为什么不用 SEED_VERSION_PINS：pin 是「换成老版本」，而这里**新旧都要**。
+ * 顺序有语义：`debextract.py` 按 packages 顺序解包、同名路径**后者覆盖**，
+ * 所以兼容包排在清单最前 —— 当前版本继续占住 `libicuuc.so` 这种不带版本号的
+ * 开发链接与 `include/unicode/*` 头文件，兼容包只净增 `.so.78` 那一族。
+ *
+ * 体积代价：libicu 78.3 的 deb 10.2 MiB（解开 44 MiB，几乎全是 libicudata）。
+ * 这是唯一能让 php 与 xetex 同时可用的办法 —— 除非上游把 php/texlive 重编到 79。
+ * 一旦索引里那批包改链 79，这一项就该删掉（症状是「多了一份没人用的 .so.78」）。
+ */
+export const SEED_COMPAT_PACKAGES = [
+  {
+    name: "libicu",
+    version: "78.3",
+    why: "php / xetex / tesseract 训练库按 ICU 78 链接，nodejs-lts 需要 ICU 79",
+  },
+];
+
 /** ④ 档种子：基线 22 包 + G0–G9 十组。 */
 export const SEED_PACKAGES = [
   // ── 基线：让 DSH 引擎本身跑起来（22 个，缺一不可）──────────────────

@@ -16,11 +16,11 @@ import { join } from "node:path";
 import {
   fetchBuffer, downloadTo, parsePackagesIndex, resolveClosure, sha256Hex, human,
 } from "./lib/registry.mjs";
-import { SEED_PACKAGES, SEED_VERSION_PINS, TERMUX_REPO } from "./lib/seeds.mjs";
+import { SEED_COMPAT_PACKAGES, SEED_PACKAGES, SEED_VERSION_PINS, TERMUX_REPO } from "./lib/seeds.mjs";
 
 // 向后兼容：种子表与仓库常量已抽到 lib/seeds.mjs（fetch-extensions.mjs 与本脚本
 // 必须用同一份清单求交；直接 import 本文件会连 main() 一起跑），这里原样再导出。
-export { SEED_PACKAGES, SEED_VERSION_PINS, TERMUX_REPO };
+export { SEED_COMPAT_PACKAGES, SEED_PACKAGES, SEED_VERSION_PINS, TERMUX_REPO };
 
 /**
  * 种子包清单已抽到 tools/lib/seeds.mjs（④ 全能精选档：基线 22 包 + G0–G9，
@@ -152,6 +152,38 @@ async function main() {
   if (manifest.length !== pkgs.length) {
     throw new Error(`Termux 包下载不完整（${manifest.length}/${pkgs.length}），保留原 manifest，不发布残缺依赖清单`);
   }
+
+  // 兼容包（见 seeds.mjs 的 SEED_COMPAT_PACKAGES）：同一软件包的第二个 major
+  // 也要进运行时 —— ICU 78 之于 php/xetex，ICU 79 之于 nodejs-lts。
+  //
+  // 这里必须**unshift**：debextract 按 packages 顺序解、同名路径后者覆盖，
+  // 兼容包排最后会把 `libicuuc.so` / `include/unicode/*` 抢走，整个运行时就会
+  // 用 78 的头与开发链接（python/node 的 C 扩展再编译时就会踩）。
+  const compat = [];
+  for (const c of SEED_COMPAT_PACKAGES) {
+    const arch = index.get(c.name)?.arch ?? "aarch64";
+    const file = safeName(`${c.name}_${c.version}_${arch}.deb`);
+    const dest = join(cacheDir, file);
+    if (!existsSync(dest)) {
+      // 老版本 deb 早从索引下架，联网拿不到；只能指望构建机缓存。
+      throw new Error(
+        `兼容包 ${c.name} ${c.version} 不在缓存里（缺 ${file}）——` +
+        `需要先有一份该版本的 deb 放进 ${cacheDir}`,
+      );
+    }
+    compat.push({
+      name: c.name,
+      version: c.version,
+      arch,
+      file,
+      size: statSync(dest).size,
+      sha256: sha256Hex(readFileSync(dest)),
+      depends: [],
+      compat: true,
+    });
+    console.log(`      ⇄ ${c.name} ${c.version}（兼容包）：${c.why}`);
+  }
+
   process.exitCode = 0;
   const manifestPath = join(cacheDir, "manifest.json");
   writeFileSync(manifestPath, JSON.stringify({
@@ -159,9 +191,14 @@ async function main() {
     arch: "aarch64",
     generatedAt: new Date().toISOString(),
     seeds: SEED_PACKAGES,
-    packages: manifest,
+    compatPackages: compat.map((c) => `${c.name}_${c.version}`),
+    packages: [...compat, ...manifest],
   }, null, 2));
-  console.log(`\n完成：${manifest.length} 个 deb，清单写入 ${manifestPath}`);
+  console.log(
+    `\n完成：${manifest.length} 个 deb` +
+    (compat.length ? ` + ${compat.length} 个兼容包` : "") +
+    `，清单写入 ${manifestPath}`,
+  );
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });
