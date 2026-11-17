@@ -58,6 +58,7 @@ import { readZipEntries } from "./lib/zipread.mjs";
 import { ZipWriter } from "./lib/zipwrite.mjs";
 import { stampCodexPlugin, attachCodexRuntime } from "./lib/codex.mjs";
 import { stampHostPluginFingerprint } from "./lib/host-fingerprint.mjs";
+import { satisfiesRange } from "./lib/semver-lite.mjs";
 import { themeCssFromAsarFiles } from "./lib/theme-css.mjs";
 import { PYTHON_REVISION, PYTHON_HOST_FILES, loadPythonDependencies, verifyPythonInputs, verifyPythonRuntime, createPythonRepairAssets } from "./lib/python-runtime.mjs";
 
@@ -1160,6 +1161,12 @@ async function bundleOfficeAssets(asarPart) {
  * runtime 可以忽略；而裁剪 `lib/types/` 或 `src/` 会在插件升级、或有人用
  * `exports` 的 `types` 条件做校验时变成难查的缺文件。**npm 装什么，这里就装
  * 什么**，语义最清楚。
+ *
+ * peer 核对：`asarPart` 是「stage + 上游 app.asar 闭包」的合并结果，正好
+ * 就是最终装到设备上的那份引擎。插件的 `peerDependencies` 必须由它满足 ——
+ * 引擎版本比插件下限还旧时，dsh 在设备上只会往 engine.log 写一行
+ * `skipping profile bundle` 然后把插件静默跳过，界面上表现为「UI 出来了、
+ * 工作区永远空」。这种事必须在构建期炸掉，见 semver-lite。
  */
 async function bundleMobilePlugin(asarPart) {
   console.log("[6.6/8] 打包移动端 UI 插件 dsh-web-mobile");
@@ -1194,6 +1201,56 @@ async function bundleMobilePlugin(asarPart) {
   if (pkgJson.dsh?.client?.platform !== "web") {
     throw new Error(`移动端插件未声明 dsh.client.platform === "web"：${JSON.stringify(pkgJson.dsh)}`);
   }
+
+  /*
+   * peer 区间核对（真机事故 v0.9.62）。
+   *
+   * `dsh-web-mobile@3.3.5` 要 `@deepseek-ai/dsh-client-* >=0.2.2-rc.1 <0.3.0-0`。
+   * 那次 `.cache/app.asar` 里躺的是引擎 `0.2.1-rc.5`（比 rc.3 还旧），构建
+   * 全部通过、装机后引擎只在 engine.log 留一行 `skipping profile bundle`，
+   * 然后把**整个移动端 UI 插件**跳掉 —— 手机上是空的。补这道断言，让它在
+   * 构建期以退出码非 0 的形式暴露。
+   *
+   * 版本一律从闭包里读，不读插件自己的 `dependencies`：闭包才是最终装到
+   * 设备上的那份。
+   */
+  const peers = pkgJson.peerDependencies ?? {};
+  const peerProblems = [];
+  const found = new Map();
+  for (const [path, entry] of asarPart) {
+    const m = /^lib\/node_modules\/(@deepseek-ai\/dsh-[^/]+)\/package\.json$/.exec(path);
+    if (m !== null && entry.data !== undefined) found.set(m[1], entry.data);
+  }
+  for (const [name, range] of Object.entries(peers)) {
+    const raw = found.get(name);
+    if (raw === undefined) {
+      // 只对 `dsh-client-*` 硬失败：它们在闭包里一定有。其余 peer 可能确实
+      // 由引擎在运行期注入，缺了不该拦构建。
+      if (name.startsWith("@deepseek-ai/dsh-client")) {
+        peerProblems.push(`${name}：闭包里没有（要求 ${range}）`);
+      }
+      continue;
+    }
+    const actual = JSON.parse(raw.toString("utf8")).version;
+    if (!satisfiesRange(actual, range)) {
+      peerProblems.push(`${name}：闭包是 ${actual}，插件要 ${range}`);
+    }
+  }
+  if (peerProblems.length > 0) {
+    throw new Error(
+      `移动端插件 ${pkgJson.name}@${pkgJson.version} 与闭包里的引擎版本不兼容` +
+        `（设备上会被静默跳过，UI 空白）：\n  ` +
+        peerProblems.join("\n  ") +
+        `\n换一份版本对得上的 app.asar（--asar）重建，或给 dsh-web-mobile 降版本。`,
+    );
+  }
+  const probe = found.get("@deepseek-ai/dsh-client-locale");
+  const engineVersion =
+    probe === undefined ? "?" : JSON.parse(probe.toString("utf8")).version;
+  console.log(
+    `      peer 核对通过（${Object.keys(peers).length} 项，闭包引擎 ${engineVersion}）`,
+  );
+
   const clientRel = pkgJson.exports?.["./client"];
   const clientPath = typeof clientRel === "string" ? clientRel : clientRel?.default;
   if (typeof clientPath !== "string") {
