@@ -618,10 +618,10 @@ object EngineConfig {
             // 它们下面还有一层版本目录。
             for (sub in listOf("site_ruby", "vendor_ruby")) {
                 val holder = File(base, sub)
-                if (!holder.isDirectory) {
-                    dirs += holder
-                    continue
-                }
+                // 只收**真实存在**的目录：往里塞不存在的路径会让 `$LOAD_PATH`
+                // 长出一串死条目，排查时和「编译期 Termux 前缀」混在一起分不清
+                // 谁是谁（真机就踩过这个混淆，见下方「旧前缀不等于没修好」）。
+                if (!holder.isDirectory) continue
                 dirs += holder
                 val versions = holder.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }
                     ?: continue
@@ -642,9 +642,31 @@ object EngineConfig {
             // `gems/` 是 `gem install` 的落地根，RubyGems 靠 `GEM_HOME` 找它，
             // 但 `gem` 自己的 `rubygems/*.rb` 在版本目录里，不需要 `gems/`。
         }
-        if (dirs.isEmpty()) return File(root, "lib/ruby").absolutePath
+        // 一条都没扫到就返回空串：调用方据此**不注入** RUBYLIB，而不是塞一条
+        // 不存在的路径进去充数。
         return dirs.joinToString(":") { it.absolutePath }
     }
+
+    /**
+     * `RUBYLIB` 里是否真的能找到 `rubygems.rb`。
+     *
+     * 只服务于一个判断：要不要注入 `RUBYOPT=-rrubygems`。
+     *
+     * ── 为什么必须判过再注入 ────────────────────────────────────────────────
+     *
+     * `RUBYOPT` 的 `-r` 是**启动即执行**：找不到文件时 ruby 直接在加载任何脚本
+     * 之前 `abort`，连 `ruby -e 'puts 1'` 都跑不了。真机症状就是这个 ——
+     * `$LOAD_PATH` 只剩编译期写死的 `/data/data/com.termux/files/usr/lib/ruby/4.0.0`
+     * （libruby 里的 ELF 字符串，`rewrite_prefixes` 跳过 ELF，所以一个都不存在），
+     * `-rrubygems` 加载失败，于是 `ruby`/`gem`/`bundle`/`irb` **全废**，
+     * 连「Ruby 能不能跑」都测不出来。
+     *
+     * 反过来，RUBYLIB 里确实有 `rubygems.rb` 时，`-rrubygems` 才是纯收益
+     * （Termux 的 ruby 没开 `--enable-rubygems` 自动加载，不给它 `defined?(Gem)`
+     * 就是 nil）。这两件事必须分开判断，不能捆在一起赌。
+     */
+    private fun rubyRubygemsReachable(rubyLib: String): Boolean =
+        rubyLib.split(':').any { it.isNotEmpty() && File(it, "rubygems.rb").isFile }
 
     /**
      * kpathsea 的配置文件搜索路径（问题.txt【4】）。
@@ -836,6 +858,22 @@ object EngineConfig {
             .filter { it.isDirectory }
             .joinToString(":") { it.absolutePath }
 
+        // Ruby 的两条通道必须分开算：
+        //   · RUBYLIB —— 只放**磁盘上真实存在**的库目录（见 [rubyLibPath]）；
+        //   · RUBYOPT  —— 只有 RUBYLIB 里真的能 require 到 rubygems 时才给
+        //                  （见 [rubyRubygemsReachable]）。
+        // 捆在一起赌的代价是真机上 ruby/gem/bundle/irb 一起报废，而且连
+        // 「ruby 本身能不能跑」都测不出来。
+        val rubyLib = rubyLibPath(root)
+        val rubyGems = rubyRubygemsReachable(rubyLib)
+
+        // 系统时区 ID（`Asia/Shanghai` 这类 Olson 名）。`TZ` 与 `-Duser.timezone`
+        // 共用这一份取值，避免两处算出不一样的值。取不到才回落 UTC。
+        val tzId = runCatching { java.util.TimeZone.getDefault().id }
+            .getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: "UTC"
+
         val env = mutableListOf(
             "PATH=$path",
             "LD_LIBRARY_PATH=$ldPath",            // 链接期库搜索路径（问题.txt【5】）。
@@ -942,7 +980,7 @@ object EngineConfig {
             // ruby 的 $LOAD_PATH 修复（缺陷 BS）。没有它，`ruby` 本身能跑，
             // 但任何 `require` 都失败 —— `gem`、`bundle`、`irb` 全部不可用。
             // 详见 [rubyLibPath] 的注释。
-            "RUBYLIB=${rubyLibPath(root)}",
+            "RUBYLIB=$rubyLib",
             // kpathsea 的 texmf.cnf 定位（问题.txt【4】）。没有它，pdftex 会去
             // 可执行文件所在目录上下级找 texmf.cnf、遍寻不获后回落到编译期前缀，
             // 最终 `I can't find the format file 'pdftex.fmt'!`。
@@ -1212,7 +1250,10 @@ object EngineConfig {
             // 的自动加载，靠 `RUBYOPT=-rrubygems` 显式 require 即可（真机实测：
             // 加上后 `defined?(Gem)` → constant，`gem list` 正常列出
             // `bundler (default: 4.0.20)`）。
-            "RUBYOPT=-rrubygems",
+            //
+            // ⚠️ 但它**不能无条件注入**：`-r` 在 ruby 启动时执行，找不到文件就
+            // 直接 abort —— 连 `ruby -e 'puts 1'` 都会失败。所以这条移到下面
+            // 按 [rubyRubygemsReachable] 的结果决定，见 `if (rubyGems)`。
             // git 的三条编译期路径（问题清单 P5）。
             //
             // 真机症状链：`git clone https://…` 先报
@@ -1236,6 +1277,28 @@ object EngineConfig {
 
         // JAVA_HOME：kotlinc 与 gradle 都优先读它，比 PATH 更硬。
         if (javaHome != null) env += "JAVA_HOME=${javaHome.absolutePath}"
+
+        // RUBYOPT 只在「RUBYLIB 里真能 require 到 rubygems」时给。
+        // 见 [rubyRubygemsReachable]：无条件给会让路径没修好的设备上
+        // `ruby` 本体也一起起不来。
+        if (rubyGems) env += "RUBYOPT=-rrubygems"
+
+        // 时区（问题清单【7】）。
+        //
+        // 真机症状：`mvn -v` 报 `Java version: …, time zone: GMT`，与系统 CST(+8)
+        // 差 8 小时；日志时间、`Date` 输出、构建产物时间戳全歪。
+        //
+        // 根因是三缺：`LANG`/`LC_ALL` 为空、`/etc/localtime` 在 Android 上不存在、
+        // `TZ` 未设置 —— JVM 拿不到任何线索就回落 GMT。**`LANG` 不是解药**：
+        // Java 的时区只认 `TZ` 或 `-Duser.timezone`，与语言环境无关（那是
+        // `user.language`/`user.country` 的输入）。所以两条一起给：
+        //   · `TZ` —— 给 libc 系工具（date/ls/rsync/git log）；
+        //   · `-Duser.timezone` —— 给 JVM，见下面的 jvmOpts。
+        //
+        // 取值用**系统当前时区 ID**（`Asia/Shanghai` 这类 Olson 名），不写死
+        // `GMT+8`：写死偏移在夏令时地区是错的，而 Olson 名 bionic 与 JVM 都认。
+        // 用户改系统时区后需要重启引擎进程才会生效（env 是 execve 的一次性快照）。
+        env += "TZ=$tzId"
 
         // GOROOT / GOPATH / GOCACHE（缺陷 BI）。
         //
@@ -1426,6 +1489,10 @@ object EngineConfig {
         val jvmOpts = buildList {
             add("-Djava.io.tmpdir=${tmp.absolutePath}")
             add("-Duser.home=${home.absolutePath}")
+            // 时区（问题清单【7】）。JVM 不读 LANG/LC_ALL，也不看 /etc/localtime
+            // （Android 上根本没有这个文件），唯一可靠入口就是这条 —— 与上面
+            // 的 `TZ` 取同一个 ID。缺了它 `mvn -v` 会报 `time zone: GMT`。
+            add("-Duser.timezone=$tzId")
             // jansi 的 native 库在 bionic 上必然 dlopen 失败（缺陷 BM）。
             //
             // 字节码级取证（jansi 2.4.0，打进 kotlin-compiler.jar 与 gradle 里）：
@@ -1884,10 +1951,16 @@ object EngineConfig {
      * 引擎拉起的终端本来就有这条（见 [buildEnv]），这里兜的是"shell 不是引擎
      * 拉起"以及用户 unset 之后的情况；判据同 GYP_DEFINES —— 已有就不覆盖。
      *
+     * `# kxxy-shell@6` 修 Guile 自愈的两个判据缺陷：① 判「目录存在」改为
+     * 「关键 `.go` 真实存在」—— 合并视图目录建好了但内容是空的（relink 只建了
+     * 父目录）时，旧判据会把一条坏路径信以为真；② 补 `.scm` 与 `.go` 的
+     * **mtime 比较**。guile 靠 mtime 决定用不用 `.go`，扩展重装会刷新 `.scm`，
+     * 于是目录在、文件也在，gdb 仍然每次现场重编 `system/repl`（真机 137 秒）。
+     *
      * @see buildEnv
      */
     private fun userShellInitContent(): String = """
-        # kxxy-shell@5
+        # kxxy-shell@6
         # [dsh-kxxy] 官方终端在 Android 上的默认交互式 shell 初始化。
         #
         # 上游以 `bash --rcfile <临时文件> -i` 启动终端，那个临时 rcfile 的第一行是
@@ -1904,26 +1977,114 @@ object EngineConfig {
         # `system/repl` 下的 .scm。引擎进程的 GUILE_LOAD_COMPILED_PATH 在启动时
         # 就算好，若那一刻合并视图还不存在就会固化坏值；这里按目录真实存在与否
         # 重新挑一次，优先合并视图、回落扩展树。
-        if [ ! -d "${'$'}{GUILE_LOAD_COMPILED_PATH:-/nonexistent}" ]; then
+        #
+        # ⚠️ 只判「目录存在」是不够的：扩展重装会把 .scm 的 mtime 刷到比 .go 新，
+        # 而 guile 判 .go 可用性的依据是 **mtime 比较**，不是内容哈希 —— 于是
+        # 目录在、文件也都在，仍然每次现场重编。真机 A/B（同一设备同一份 gdb）：
+        #   touch 全部 .scm → `gdb --version` rc=124，137 秒超时；
+        #   再 touch 全部 .go → rc=0，0 秒。
+        # 所以这里补两条判据：① 关键 .go 必须真实存在（不只看目录）；
+        # ② .scm 比 .go 新就把 .go 的 mtime 提上去。全量 344 个 .go 的遍历放在
+        # 原生层的 ensureGuileCcacheFresh（安装/自愈时跑），shell 里只处理
+        # `boot-9` 与 `system/repl` —— 它们正是那 141 秒的来源，常数级开销。
+        if [ ! -f "${'$'}{GUILE_LOAD_COMPILED_PATH:-/nonexistent}/ice-9/boot-9.go" ]; then
             for _gc in "${'$'}KXXY_ENGINE_ROOT/lib/guile/3.0/ccache" \
                        "${'$'}KXXY_ENGINE_ROOT/extensions/gdb/lib/guile/3.0/ccache"; do
-                if [ -d "${'$'}_gc" ]; then
+                if [ -f "${'$'}_gc/ice-9/boot-9.go" ]; then
                     export GUILE_LOAD_COMPILED_PATH="${'$'}_gc"
                     break
                 fi
             done
             unset _gc
         fi
-        if [ ! -d "${'$'}{GUILE_LOAD_PATH:-/nonexistent}" ]; then
+        if [ ! -f "${'$'}{GUILE_LOAD_PATH:-/nonexistent}/ice-9/boot-9.scm" ]; then
             for _gl in "${'$'}KXXY_ENGINE_ROOT/share/guile/3.0" \
                        "${'$'}KXXY_ENGINE_ROOT/extensions/gdb/share/guile/3.0"; do
-                if [ -d "${'$'}_gl" ]; then
+                if [ -f "${'$'}_gl/ice-9/boot-9.scm" ]; then
                     export GUILE_LOAD_PATH="${'$'}_gl"
                     break
                 fi
             done
             unset _gl
         fi
+        if [ -n "${'$'}{GUILE_LOAD_COMPILED_PATH:-}" ] && [ -n "${'$'}{GUILE_LOAD_PATH:-}" ]; then
+            for _rel in ice-9/boot-9 system/repl/command system/repl/repl \
+                        system/repl/describe system/repl/common; do
+                _gd="${'$'}GUILE_LOAD_COMPILED_PATH/${'$'}_rel.go"
+                _sd="${'$'}GUILE_LOAD_PATH/${'$'}_rel.scm"
+                if [ -f "${'$'}_gd" ] && [ -f "${'$'}_sd" ] && \
+                   [ "${'$'}_sd" -nt "${'$'}_gd" ]; then
+                    touch "${'$'}_gd" 2>/dev/null
+                fi
+            done
+            unset _rel _gd _sd
+        fi
+
+        # ── Ruby 的 ${'$'}LOAD_PATH 自愈（缺陷 BS 的第二层）──────────────────────
+        # [buildEnv] 里的 RUBYLIB 是**引擎进程启动时**算好的一份快照。而 ruby 是
+        # 扩展包池里的一项 —— 用户装完 ruby 扩展之后再开终端，环境里那条 RUBYLIB
+        # 还是「装之前」算的，于是 libruby 编译期写死的 Termux 前缀
+        #     /data/data/com.termux/files/usr/lib/ruby/4.0.0
+        # 成为唯一搜索路径（一个都不存在），`require 'rubygems'` 必然失败。
+        # 再叠加 `RUBYOPT=-rrubygems`，ruby 在跑任何脚本之前就 abort ——
+        # `ruby`/`gem`/`bundle`/`irb` 全废，连 `ruby -e 'puts 1'` 都测不了。
+        #
+        # 所以这里按磁盘现状重算一次。判据是「RUBYLIB 里**有没有任何一条**目录
+        # 能提供 rubygems.rb」，不是「变量是否为空」——变量非空但全是死路径
+        # 同样要重算；而只看第一条会误判（`site_ruby` 通常排在版本目录前面，
+        # 它下面没有 rubygems.rb）。
+        #
+        # RUBYOPT 也在这里按同一判据收尾：加载不到 rubygems 时**必须摘掉**
+        # `-rrubygems`，否则 ruby 连 `-e` 都起不来；能加载时才补上。
+        _rg=
+        for _d in ${'$'}{RUBYLIB//:/ }; do
+            if [ -f "${'$'}_d/rubygems.rb" ]; then _rg=1; break; fi
+        done
+        unset _d
+        if [ -z "${'$'}_rg" ]; then
+            _rl=
+            for _base in "${'$'}KXXY_ENGINE_ROOT/lib/ruby" \
+                         "${'$'}KXXY_ENGINE_ROOT"/extensions/*/lib/ruby; do
+                [ -d "${'$'}_base" ] || continue
+                for _sub in site_ruby vendor_ruby; do
+                    if [ -d "${'$'}_base/${'$'}_sub" ]; then
+                        _rl="${'$'}_rl:${'$'}_base/${'$'}_sub"
+                        for _v in "${'$'}_base/${'$'}_sub"/*/; do
+                            [ -d "${'$'}_v" ] && _rl="${'$'}_rl:${'$'}{_v%/}"
+                        done
+                    fi
+                done
+                for _v in "${'$'}_base"/*/; do
+                    _v="${'$'}{_v%/}"
+                    case "${'$'}{_v##*/}" in gems|site_ruby|vendor_ruby) continue ;; esac
+                    [ -d "${'$'}_v" ] || continue
+                    _rl="${'$'}_rl:${'$'}_v"
+                    # 架构目录（`aarch64-linux-android`）里是 .so 扩展
+                    for _a in "${'$'}_v"/*/; do
+                        _a="${'$'}{_a%/}"
+                        case "${'$'}{_a##*/}" in *-*) _rl="${'$'}_rl:${'$'}_a" ;; esac
+                    done
+                done
+            done
+            if [ -n "${'$'}_rl" ]; then
+                export RUBYLIB="${'$'}{_rl#:}"
+                for _d in ${'$'}{RUBYLIB//:/ }; do
+                    if [ -f "${'$'}_d/rubygems.rb" ]; then _rg=1; break; fi
+                done
+                unset _d
+            fi
+            unset _rl _base _sub _v _a
+        fi
+        case "${'$'}{RUBYOPT:-}" in
+            *-rrubygems*)
+                [ -n "${'$'}_rg" ] || export RUBYOPT="${'$'}{RUBYOPT//-rrubygems/}"
+                ;;
+            *)
+                [ -n "${'$'}_rg" ] && \
+                    export RUBYOPT="-rrubygems${'$'}{RUBYOPT:+ ${'$'}RUBYOPT}"
+                ;;
+        esac
+        unset _rg
 
         # ── node-gyp 的 android_ndk_path（原生 addon 编译）──────────────────
         # Termux 的 node 是 android/arm64 构建，它的 common.gypi 无条件引用

@@ -223,6 +223,11 @@ class RuntimeInstaller(private val ctx: Context) {
             // 两者都是 5 次 stat 加一次小文件写入，留在关键路径上的开销可忽略。
             ensureNoShadowingStubs(root)
             ensureEmacsSiteLoad(root)
+            // Guile 的 .go 新鲜度必须**在 gdb 可能被启动之前**修好。
+            // 挂在 maintainAfterHealthy() 里太晚：那是引擎 Healthy 之后的异步
+            // 维护，用户在它跑完之前敲 gdb 就是 137 秒超时（真机实测）。成本是
+            // 344 次 stat（无写入），放在关键路径上比「偶发 2 分钟卡死」划算。
+            ensureGuileCcacheFresh(root)
             onProgress.onProgress(1f)
             return
         }
@@ -304,6 +309,9 @@ class RuntimeInstaller(private val ctx: Context) {
         }.onFailure { Log.w(TAG, "relink marker failed: ${it.message}") }
 
         Log.i(TAG, "runtime install complete")
+        // 全量安装刚把 lib/ 与 share/ 换过一遍，合并视图与扩展树的 mtime 关系
+        // 重新洗牌；这里顺手修一次，免得等 maintainAfterHealthy 的异步窗口。
+        ensureGuileCcacheFresh(root)
         onProgress.onProgress(1f)
 
     }
@@ -679,8 +687,45 @@ class RuntimeInstaller(private val ctx: Context) {
             }
         }
 
+        // 锚点：ensurepip 的随包 pip wheel 必须与 `_PIP_VERSION` 一致（问题清单 P6）。
+        //
+        // 与锚点 12–15 同型：这是**已有文件的内容变化** —— 不新增文件、不动
+        // RUNTIME_VERSION，所以老设备上前面所有锚点全部通过，`isComplete()` 判真、
+        // 跳过重装，设备继续带着 `pip-26.2.2` 而 `_PIP_VERSION` 要 `26.2.1`。
+        // 结果就是 `python3 -m venv` 永远 exit 1、建出的环境里没有 pip。
+        //
+        // 判据刻意**不用常量标记**，而是直接比对这两个文件：期望的 wheel 名由
+        // `ensurepip/__init__.py` 里的 `_PIP_VERSION` 现算。这样下次 python 包
+        // 再漂移时会自动判假，不需要人记得升标记 —— 这正是前几个锚点用常量
+        // 标记时反复踩的坑（标记忘了升 = 老设备永远拿不到新内容）。
+        if (!ensurepipWheelMatches(root)) {
+            Log.w(TAG, "runtime probe: ensurepip 的 pip wheel 与 _PIP_VERSION 不一致，强制重装")
+            return false
+        }
+
         return true
     }
+
+    /**
+     * `ensurepip` 的 bundled pip wheel 是否与 `_PIP_VERSION` 对得上。
+     *
+     * `ensurepip/__init__.py` 把 `_PIP_VERSION` 写成常量，`_bootstrap()` 按
+     * `pip-<ver>-py3-none-any.whl` 的**精确文件名**去 `_bundled/` 找；而那个
+     * wheel 来自**另一个包** `python-ensurepip-wheels`。两个包各自跟索引走，
+     * 一旦错位就 `python3 -m venv` exit 1 —— 报错落在 ensurepip 内部的断言上，
+     * 从「venv 没有 pip」这个现象很难反推到包版本。
+     *
+     * python 未安装（没有 `ensurepip/__init__.py`）时判真：那不是本锚点的事，
+     * 不该因此触发 780 MiB 重装。
+     */
+    private fun ensurepipWheelMatches(root: File): Boolean = runCatching {
+        val dir = File(root, PYTHON_ENSUREPIP_DIR)
+        val init = File(dir, "__init__.py")
+        if (!init.isFile) return@runCatching true
+        val version = ENSUREPIP_VERSION_RE.find(init.readText())?.groupValues?.get(1)
+            ?: return@runCatching true
+        File(dir, "_bundled/pip-$version-py3-none-any.whl").isFile
+    }.getOrDefault(true)
 
     /**
      * Office 轻量探针：清单原文和所有资源长度均绑定精确版本，源码/许可证不可省略。
@@ -1739,22 +1784,22 @@ class RuntimeInstaller(private val ctx: Context) {
      */
     private fun ensureGuileCcacheFresh(root: File) {
         runCatching {
-            // ccache 有两个候选位置：合并视图优先，回落扩展树（与 guileCompiledPath 同序）。
-            val ccache = listOf(
-                File(root, "lib/guile/3.0/ccache"),
-                File(EngineConfig.extensionsRoot(ctx), "gdb/lib/guile/3.0/ccache"),
-            ).firstOrNull { it.isDirectory } ?: return
-
-            // `.go` 的路径是 `ccache/ice-9/boot-9.go`，对应源码在
-            // `share/guile/3.0/ice-9/boot-9.scm`；两棵树的相对布局一致，
-            // 所以按相对路径去 share 侧找同名 `.scm` 即可。
-            val share = listOf(
-                File(root, "share/guile/3.0"),
-                File(EngineConfig.extensionsRoot(ctx), "gdb/share/guile/3.0"),
-            ).firstOrNull { it.isDirectory }
+            // ccache 与 share 必须**成对取自同一棵树**，不能各挑各的。
+            // 旧写法先 `firstOrNull { it.isDirectory }` 选 ccache、再独立选 share，
+            // 于是「合并视图的 lib/ 已建好、share/ 还没摊」这种中间态会拿合并视图
+            // 的 .go 去比扩展树的 .scm —— 比的是两批不同来源的资产，结论不可信。
+            val pairs = listOf(
+                File(root, "lib/guile/3.0/ccache") to File(root, "share/guile/3.0"),
+                File(EngineConfig.extensionsRoot(ctx), "gdb/lib/guile/3.0/ccache") to
+                    File(EngineConfig.extensionsRoot(ctx), "gdb/share/guile/3.0"),
+            )
+            val (ccache, share) = pairs.firstOrNull { (c, s) -> c.isDirectory && s.isDirectory }
+                ?: return
 
             var touched = 0
             var checked = 0
+            var orphan = 0
+            var failed = 0
             ccache.walkTopDown()
                 .maxDepth(MAX_SCAN_DEPTH)
                 .filter { it.isFile && it.name.endsWith(".go") }
@@ -1763,16 +1808,32 @@ class RuntimeInstaller(private val ctx: Context) {
                     val rel = go.relativeTo(ccache).path
                     val scmRel = rel.removeSuffix(".go") + ".scm"
                     // 源码可能在 share 侧，也可能就在 ccache 旁边（少数布局）。
-                    val scm = listOfNotNull(share?.let { File(it, scmRel) }, File(ccache, scmRel))
-                        .firstOrNull { it.isFile } ?: return@forEach
+                    val scm = listOfNotNull(File(share, scmRel), File(ccache, scmRel))
+                        .firstOrNull { it.isFile }
+                    if (scm == null) {
+                        // 上游有 17 个辅助 .scm 不预编译（被 include 进别的模块），
+                        // 它们本来就没有 .go；反过来有 .go 没 .scm 才是异常。
+                        orphan++
+                        return@forEach
+                    }
                     // 留 2 秒余量：同一次解包出来的文件 mtime 可能只差毫秒，
                     // 而 tar 的时间精度是秒，正好卡在边界上仍会被判「更新」。
                     val need = scm.lastModified() + 2_000L
                     if (go.lastModified() >= need) return@forEach
-                    if (go.setLastModified(need)) touched++
+                    if (!go.setLastModified(need)) failed++
+                    else touched++
                 }
             if (touched > 0) {
                 Log.i(TAG, "ensureGuileCcacheFresh: $touched/$checked .go re-dated（避免 gdb 每次重编 boot-9）")
+            }
+            // setLastModified 返回 false 是静默失败：文件系统只读、或该分区不支持
+            // 改 mtime。以前这种设备上「自愈日志一切正常但 gdb 依旧慢」，因为没人
+            // 记这个返回值。现在单独报一条，且带上路径便于直接取证。
+            if (failed > 0) {
+                Log.w(TAG, "ensureGuileCcacheFresh: $failed .go setLastModified 失败（ccache=${ccache.absolutePath}）")
+            }
+            if (orphan > 0) {
+                Log.w(TAG, "ensureGuileCcacheFresh: $orphan 个 .go 找不到对应 .scm（share=${share.absolutePath}）")
             }
         }.onFailure { Log.w(TAG, "ensureGuileCcacheFresh failed: ${it.message}") }
     }
@@ -2104,16 +2165,118 @@ class RuntimeInstaller(private val ctx: Context) {
         }
     }
 
-    /** 开发环境默认值（git 身份 / pip 镜像）——两处调用点共用这一层。 */
+    /** 开发环境默认值（git 身份 / pip 镜像 / pnpm 导入方式）——两处调用点共用这一层。 */
     private fun ensureDevEnvDefaults(root: File) {
         runCatching { ensureGitIdentity(ctx) }
             .onFailure { Log.w(TAG, "ensureGitIdentity crashed: ${it.message}") }
         runCatching { ensurePipConfig(ctx) }
             .onFailure { Log.w(TAG, "ensurePipConfig crashed: ${it.message}") }
+        runCatching { ensurePnpmImportMethod(ctx) }
+            .onFailure { Log.w(TAG, "ensurePnpmImportMethod crashed: ${it.message}") }
+        runCatching { ensurePandocCjkDefaults(ctx) }
+            .onFailure { Log.w(TAG, "ensurePandocCjkDefaults crashed: ${it.message}") }
         runCatching { ensureImageMagickTypes(root) }
             .onFailure { Log.w(TAG, "ensureImageMagickTypes crashed: ${it.message}") }
         runCatching { ensureNetConfig(root) }
             .onFailure { Log.w(TAG, "ensureNetConfig crashed: ${it.message}") }
+    }
+
+    /**
+     * pandoc 的「中文 PDF」默认参数集（问题清单第 5 项的收尾）。
+     *
+     * PDF 引擎本身不是重点 —— `pdflatex` / `xelatex` / `pandoc` 都随 texlive
+     * 扩展到齐之后，`pandoc in.md -o out.pdf` 对**纯英文**早就通了。真机上仍
+     * 然失败的只剩一种：**中文**。原因是 pandoc 的 LaTeX 模板默认 `mainfont`
+     * 是 lmroman，它没有任何 CJK 字形，于是每页都刷
+     *
+     *     [WARNING] Missing character: There is no 标 (U+6807) in font ...
+     *
+     * 且产出的 PDF 里那一行是空白。
+     *
+     * 修法不是加包、也不是换引擎，而是**把字体指到随包的那个 TTF**：
+     * `kxxy-host/fonts/NotoSansSC-Regular.ttf`（10 MiB 单文件，本来就是给
+     * office 预览准备的）。真机实测 `xelatex` + `fontspec` 直接引用它，
+     * 中文 0 缺字、rc=0。但让用户每次都手敲 `--pdf-engine=xelatex
+     * -V mainfont=...` 不现实，所以写一份 pandoc **defaults**：
+     *
+     *     pandoc -d kxxy-cjk in.md -o out.pdf
+     *
+     * pandoc 的 `-d <name>` 会在用户数据目录的 `defaults/<name>.yaml` 里找，
+     * 与项目目录无关，所以在 `$HOME/.local/share/pandoc/defaults/` 落一份即可。
+     *
+     * ⚠️ 为什么不用 `CJKmainfont`（配 `xeCJK`）：它要额外的宏包，而随包的
+     * TeX 树是精简档，`xeCJK` 不保证在。`mainfont` 换成含 CJK 的字体这一步
+     * 只需要 `fontspec`（xelatex 自带），依赖面最小。
+     */
+    private fun ensurePandocCjkDefaults(ctx: Context) {
+        val home = EngineConfig.dshHome(ctx)
+        val fonts = EngineConfig.officeFontsDir(ctx)
+        val font = File(fonts, "NotoSansSC-Regular.ttf")
+        if (!font.isFile) return // 字体没落地（旧运行时）就不要写一份必然失败的默认值
+        val body = buildString {
+            append("# generated by Kxxy RuntimeInstaller — do not edit\n")
+            append("# 用法：pandoc -d kxxy-cjk in.md -o out.pdf\n")
+            append("# 默认的 lmroman 没有 CJK 字形，中文会整段缺字；这里换成随包\n")
+            append("# 的 NotoSansSC，并用 Path= 直接引用文件（不依赖 fontconfig 缓存）。\n")
+            append("pdf-engine: xelatex\n")
+            append("variables:\n")
+            append("  mainfont: NotoSansSC-Regular.ttf\n")
+            append("  mainfontoptions: Path=${fonts.absolutePath}/\n")
+            append("  monofont: NotoSansSC-Regular.ttf\n")
+            append("  monofontoptions: Path=${fonts.absolutePath}/\n")
+        }
+        val target = File(home, ".local/share/pandoc/defaults/kxxy-cjk.yaml")
+        if (target.isFile && target.readText() == body) return
+        runCatching {
+            target.parentFile?.mkdirs()
+            target.writeText(body)
+            Log.i(TAG, "ensurePandocCjkDefaults: wrote ${target.path}")
+        }.onFailure { Log.w(TAG, "ensurePandocCjkDefaults failed: ${it.message}") }
+    }
+
+    /**
+     * 把 pnpm 的导入方式钉成 `copy`（问题清单【6】）。
+     *
+     * Android app 域建不了硬链接（SELinux 拒绝 `link`，真机 `ln` 报
+     * `Permission denied`）。pnpm 默认用 hardlink 从 store 导入，于是每次安装都
+     * 先失败一轮再降级 —— 结果是对的（copy），但**每次都要多花一次失败的系统
+     * 调用、并在输出里留一段看起来像真故障的报错**，用户第一反应就是「环境坏了」。
+     *
+     * 显式写 `package-import-method=copy` 有三个好处：① 不产生假故障信号；
+     * ② 行为确定，不依赖 pnpm 对所在文件系统的探测（f2fs 与 sdcardfs 的表现
+     * 并不一致）；③ 与 [extinstall][assemble] 归档里「硬链物化为副本」的取舍一致。
+     *
+     * 代价是磁盘占用变高（没有 inode 共享）—— 这在本平台上无解：`rsync
+     * --link-dest`、`cp -l`、`git worktree` 共享对象都走同一条 `link(2)`，全部
+     * 被拒。能做的只有「降级得干净」，不是「让它能硬链」。
+     *
+     * 只在用户没有自己设置该项时写一行，并且带管理边界标记 —— `~/.npmrc` 是
+     * 用户资产，和其它自愈一样不覆盖用户的显式选择。
+     */
+    private fun ensurePnpmImportMethod(ctx: Context) {
+        val home = EngineConfig.dshHome(ctx)
+        val begin = "# kxxy:pnpm-import begin"
+        val end = "# kxxy:pnpm-import end"
+        val block = "$begin\npackage-import-method=copy\n$end\n"
+        for (name in listOf(".npmrc", ".pnpmfile.npmrc")) {
+            val target = File(home, name)
+            if (name == ".pnpmfile.npmrc" && !target.isFile) continue
+            val existing = runCatching { if (target.isFile) target.readText() else "" }
+                .getOrDefault("")
+            // 用户已经显式设过（不管设成什么）就不动。
+            if (Regex("(?m)^\\s*package-import-method\\s*=").containsMatchIn(existing)) continue
+            val next = if (existing.contains(begin)) {
+                // 换掉我们上次写的那一块，保留上下文。
+                existing.replace(Regex("(?s)" + Regex.escape(begin) + ".*?" + Regex.escape(end) + "\\n?"), block)
+            } else {
+                (if (existing.isEmpty() || existing.endsWith("\n")) existing else "$existing\n") + block
+            }
+            runCatching {
+                target.parentFile?.mkdirs()
+                target.writeText(next)
+                Log.i(TAG, "ensurePnpmImportMethod: wrote ${target.path}")
+            }.onFailure { Log.w(TAG, "ensurePnpmImportMethod failed: ${it.message}") }
+        }
     }
 
     /** 由 [ensureNetConfig] 写进 `.gitconfig` 的管理块边界标记。 */
@@ -2340,6 +2503,14 @@ class RuntimeInstaller(private val ctx: Context) {
      *
      * 幂等：内容一致就不写。`bin/` 在 runtime 重装时会被删空重建，所以这条必须
      * 在快路径也跑一次，不能只在 extract 之后跑。
+     *
+     * ── `--expose-internals` 不能少 ─────────────────────────────────────────
+     *
+     * 运行时里的 `node-addon-require-builtin` 被换成了纯 JS shim，它 require
+     * `internal/modules/esm/loader` 之类的模块，**只有带该 flag 才可见**。
+     * App 主进程走 [EngineProcess.spawn]，那里一直带着；但这个包装脚本早期漏了，
+     * 于是终端里 `dsh web` / `dsh headless` / `dsh plugin` 全部 exit 1，
+     * 而 App 内一切正常 —— 这种「只在一侧坏」的症状很容易被当成环境问题。
      */
     private fun ensureDshWrapper(root: File) {
         val entry = File(root, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js")
@@ -2351,8 +2522,10 @@ class RuntimeInstaller(private val ctx: Context) {
             append("#!/system/bin/sh\n")
             append("# generated by Kxxy RuntimeInstaller — do not edit\n")
             append("# 缺陷 CI：npm 的 bin 软链只由 npm install 创建，runtime.zip 里没有它。\n")
+            append("# --expose-internals：node-addon-require-builtin 的纯 JS shim 依赖它\n")
+            append("# require internal/*；缺了终端里所有 dsh 子命令都是 exit 1。\n")
             append("d=\${0%/*}\n")
-            append("exec \"\$d/node\" \"\$d/../lib/node_modules/@deepseek-ai/dsh/lib/bin.js\" \"\$@\"\n")
+            append("exec \"\$d/node\" --expose-internals \"\$d/../lib/node_modules/@deepseek-ai/dsh/lib/bin.js\" \"\$@\"\n")
         }.toByteArray(Charsets.UTF_8)
 
         val target = File(root, "bin/dsh")
@@ -2610,8 +2783,22 @@ class RuntimeInstaller(private val ctx: Context) {
         var linked = 0
         for (name in TEX_LINK_NAMES) {
             RuntimeInstallIo.checkCancelled()
-            val source = File(extBin, name)
-            if (!source.isFile) continue
+            // 正常路径：`texlinks` 已经在扩展树里建好 `pdflatex -> pdftex` 这类
+            // 标准名，直接把它摊到 `<root>/bin/`。
+            //
+            // 兜底路径（真机「只有 tex/pdftex、没有 latex/pdflatex」的成因）：
+            // `texlinks` 是 shell 脚本，靠 `kpsewhich` 定位 `fmtutil.cnf`；重装
+            // 后 `bin/kpsewhich` 尚未由 relinkAll 建立、或 perl/环境有一处不对，
+            // 它就 rc!=0 且**一个标准名都没建**。此时旧实现的 `if (!source.isFile)
+            // continue` 会把四个名字全部跳过 —— 于是 PDF 链彻底断掉，而日志里
+            // 只有一行「仍缺 …」。
+            //
+            // 这些标准名本来就只是**同一个引擎二进制换个 argv[0]**（TeX 按
+            // argv[0] 的 basename 选格式），所以可以直接从引擎本体建链，不依赖
+            // texlinks 成功。
+            val source = File(extBin, name).takeIf { it.isFile }
+                ?: TEX_ENGINE_OF[name]?.let { File(extBin, it) }?.takeIf { it.isFile }
+                ?: continue
             val dest = File(bin, name)
             val present = runCatching {
                 Files.exists(dest.toPath(), LinkOption.NOFOLLOW_LINKS)
@@ -2622,7 +2809,12 @@ class RuntimeInstaller(private val ctx: Context) {
                 true
             }.onFailure { Log.w(TAG, "ensureTexLinks: symlink $name failed: ${it.message}") }
                 .getOrDefault(false)
-            if (ok) linked++
+            if (ok) {
+                linked++
+                if (!File(extBin, name).isFile) {
+                    Log.i(TAG, "ensureTexLinks: texlinks 未产出 $name，已直接从 ${source.name} 建链")
+                }
+            }
         }
         return linked
     }
@@ -3252,12 +3444,42 @@ class RuntimeInstaller(private val ctx: Context) {
         private val TEX_FORMATS = listOf("pdflatex", "latex", "xelatex", "lualatex")
 
         /**
+         * `ensurepip` 在运行时里的目录（见 [ensurepipWheelMatches]）。
+         *
+         * 版本号与 `tools/lib/python-runtime.mjs` 的 `PYTHON_TARGET.majorMinor`
+         * 同源（当前 3.14）。它**不随补丁版变化** —— 3.14.8 → 3.14.10 仍是
+         * `lib/python3.14/`，所以写死在这里不会成为漂移点；真正会变的是
+         * `_PIP_VERSION`，那个是运行时读出来的，不是常量。
+         */
+        private const val PYTHON_ENSUREPIP_DIR = "lib/python3.14/ensurepip"
+
+        /** `_PIP_VERSION = "26.2.1"` —— 注意源码里有空格，且用双引号。 */
+        private val ENSUREPIP_VERSION_RE =
+            Regex("^_PIP_VERSION\\s*=\\s*\"([^\"]+)\"", RegexOption.MULTILINE)
+
+        /**
          * `texlinks` 应当补出来的标准命令名（见 [ensureTexLinks]）。
          *
          * 只列用户真正会敲的四个 LaTeX 入口，不列全部 411 个引擎别名 ——
          * 判据只用来决定「要不要再跑一次 texlinks」，列全了反而更慢。
          */
         private val TEX_LINK_NAMES = listOf("pdflatex", "latex", "xelatex", "lualatex")
+
+        /**
+         * 每个标准 LaTeX 命令名背后真正的引擎二进制（与 `fmtutil.cnf` 的对应
+         * 关系一致，也与 [ensureTexFormats] 的 engine 选择同源）。
+         *
+         * 用途：`texlinks` 没跑通时直接从引擎本体建标准名（见
+         * [linkExtensionBinaries]）。TeX 是按 argv[0] 的 basename 决定读哪个
+         * `.fmt` 的，所以「软链名 = 格式名」这一步必须由文件名本身承担，
+         * 靠 `-fmt` 参数替代不了用户敲 `pdflatex x.tex` 的场景。
+         */
+        private val TEX_ENGINE_OF = mapOf(
+            "pdflatex" to "pdftex",
+            "latex" to "pdftex",
+            "xelatex" to "xetex",
+            "lualatex" to "luahbtex",
+        )
 
         /**
          * `.fmt` 的下限体积。
