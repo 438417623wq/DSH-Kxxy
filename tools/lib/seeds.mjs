@@ -453,4 +453,38 @@ export const POOL_ITEMS = [
     description: "交互式 shell（fish）、现代编辑器（nvim，语法高亮齐全）、GitHub 命令行客户端。",
     bins: ["fish", "nvim", "gh"],
   },
+
+  // ── M 组：npm 源的工具链（不是 deb，见 tools/lib/npm-pack.mjs）────────
+  //
+  // 为什么单列一组：这些包在 Termux 索引里根本不存在（前端工具链只发 npm），
+  // 而 `npm install` 在构建机上会按 **宿主** 平台过滤 `os:["android"]` 的可选
+  // 依赖 —— 所以打包时必须显式 `--os=android --cpu=arm64`，否则设备上「命令
+  // 在、二进制不在」。这正是 `assemble.mjs` 的 `declaresAndroid` 例外要放行的
+  // 那类包（`@esbuild/android-arm64`、`@rollup/rollup-android-arm64`）。
+  //
+  // 版本写范围而不是精确值：首次构建会把实际解析结果写进
+  // `tools/npm-tools.lock.json`，之后按锁文件装，产物可复现。
+  // 刻意不用 `latest`：TypeScript 7（原生编译器）与 ESLint 10 刚换代，先跟
+  // 稳定线（TS 5 / ESLint 9 / Vite 7），升大版本应当是独立一次改动。
+  {
+    id: "node-tools",
+    source: "npm",
+    seeds: [],
+    category: "devtools",
+    name: "前端与脚本工具链",
+    description:
+      "TypeScript / ESLint / Prettier / esbuild / Rollup / Vite，含 Android arm64 原生构件，" +
+      "离线可用（不依赖运行时 npm 安装）。",
+    bins: ["tsc", "tsserver", "eslint", "prettier", "esbuild", "rollup", "vite"],
+    npmPackages: {
+      typescript: "^5.9",
+      eslint: "^9",
+      prettier: "^3",
+      esbuild: "^0.28",
+      rollup: "^4",
+      vite: "^7",
+    },
+    // 少任何一个都说明 npm 按宿主平台装了 —— 构建期直接失败，别等上设备。
+    requiredPlatformPackages: ["@esbuild/android-arm64", "@rollup/rollup-android-arm64"],
+  },
 ];

@@ -163,6 +163,68 @@ function patchNodePty(ctx) {
 }
 
 /**
+ * sherpa-onnx-node：语音识别 / TTS / 说话人分离的 N-API 绑定。
+ *
+ * 上游 1.13.x 的 `optionalDependencies` 只有 darwin/linux/win 六个平台包，
+ * **没有 android**（`sherpa-onnx-linux-arm64` 是 glibc，bionic 上 dlopen 必拒），
+ * 所以设备上是「JS 全在、`.node` 没有」—— 调用到才炸，报错还停在
+ * `Could not find sherpa-onnx-node. Tried …`，看不出是平台不支持还是文件丢了。
+ *
+ * 两条路：
+ *   · `tools/prebuilt/sherpa-onnx-android/prebuilds/android-arm64/sherpa-onnx.node`
+ *     存在 → 直接注入（编译器就位后无需改代码）；
+ *   · 不存在 → 在 `addon.js` 顶部插一段守卫，抛带 `KXXY_SHERPA_UNAVAILABLE`
+ *     的错误说明「本构建没有 Android 绑定」，并把该目录的 README 指出来。
+ *
+ * 为什么守卫放在 `addon.js` 而不是删包：包的 JS 入口（`sherpa-onnx.js`）还可能
+ * 被上层「探测能力」时 require，删包会变成 `MODULE_NOT_FOUND`，比「能力不可用」
+ * 更难归因。守卫只在真正 require 原生绑定那一刻抛，语义最接近事实。
+ */
+function patchSherpaOnnx(ctx) {
+  if (!ctx.exists("sherpa-onnx-node")) return "跳过（依赖树无 sherpa-onnx-node）";
+
+  const rel = "sherpa-onnx-node/sherpa-onnx.node";
+  const prebuiltNode = join(
+    PREBUILT_ROOT,
+    "sherpa-onnx-android/prebuilds/android-arm64/sherpa-onnx.node",
+  );
+  if (existsSync(prebuiltNode)) {
+    ctx.copy(readFileSync(prebuiltNode), rel, 0o755);
+    return "sherpa-onnx-node → 注入 Android arm64 原生绑定";
+  }
+
+  const key = "lib/node_modules/sherpa-onnx-node/addon.js";
+  const entry = ctx.files.get(key);
+  if (!entry) return "跳过（依赖树无 sherpa-onnx-node/addon.js）";
+  const text = entry.data.toString("utf8");
+  if (text.includes("KXXY_SHERPA_UNAVAILABLE")) {
+    return "已打过（Android 原生绑定缺失的可读错误）";
+  }
+  const anchor = "const path = require('path');";
+  must(
+    text.includes(anchor),
+    "sherpa-onnx-node/addon.js 的 require('path') 锚点未命中（上游结构已变）",
+  );
+  const guard = `
+// [kxxy] Android：上游没有 Android 预编译绑定，这里把失败原因说清楚（构建期注入，勿手改）。
+// 与上游「找不到就 throw」的时机一致，只是错误信息可定位。
+if (process.platform === 'android' && !require('fs').existsSync(path.join(__dirname, 'sherpa-onnx.node'))) {
+  const err = new Error(
+    'sherpa-onnx 的 Android 原生绑定未随此构建提供（上游只发布 linux/darwin/win 预编译包）。' +
+    '语音识别 / TTS / 说话人分离暂不可用。' +
+    '要启用请按 tools/prebuilt/sherpa-onnx-android/README.md 交叉编译 sherpa-onnx.node 后重新打包。',
+  );
+  err.code = 'KXXY_SHERPA_UNAVAILABLE';
+  throw err;
+}
+`;
+  const out = text.replace(anchor, anchor + guard);
+  must(out !== text, "sherpa-onnx-node/addon.js 守卫注入未生效");
+  ctx.files.set(key, { data: Buffer.from(out, "utf8"), mode: entry.mode ?? 0o644 });
+  return "sherpa-onnx-node → Android 绑定缺失时给可读错误（KXXY_SHERPA_UNAVAILABLE）";
+}
+
+/**
  * dsh-subprocess-local 的 `createProcessInspector()` 只认 linux/darwin/win32，
  * 其余平台直接抛 `terminal inspection is unsupported on platform <p>`。
  * 而 Android 上 Node 的 `process.platform` 是 **"android"**（不是 "linux"），
@@ -1625,7 +1687,7 @@ export function patchFrontendLenientBoot(ctx) {
 export function applyAllPatches(root, termuxRead) {
   const ctx = createPatchContext(root);
   const steps = [
-    patchKoffi, patchSharp, patchNodePty, patchSubprocessInspector, patchFlock,
+    patchKoffi, patchSharp, patchNodePty, patchSherpaOnnx, patchSubprocessInspector, patchFlock,
     patchRequireBuiltin, patchSandboxLocal, patchSessionJsonl, patchSessionJsonlWorker,
     patchRipgrep, patchFsLocal, patchAttachmentLocal, patchNativeCommandAndroid,
     patchDocumentPreviewUnicodeSets, patchLibreOfficeKitPlatform, patchLibreOfficeKitFontFallbacks,

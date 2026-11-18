@@ -26,6 +26,7 @@ import {
   downloadTo, fetchBuffer, human, parsePackagesIndex, resolveClosure,
 } from "./lib/registry.mjs";
 import { POOL_ITEMS, SEED_PACKAGES, TERMUX_REPO } from "./lib/seeds.mjs";
+import { buildNpmPack, NPM_SOURCE } from "./lib/npm-pack.mjs";
 
 /**
  * 池内条目可能住在 Termux 的其他仓库：yt-dlp 在 root 仓库（termux-main 没有）。
@@ -91,6 +92,16 @@ const POOL_OUT = process.env.KXXY_POOL_OUT
   : join(PROJECT, "android", "app", "src", "main", "assets", "ext-pool");
 const CATALOG_OUT = join(PROJECT, "plugins", "kxxy-host", "extensions.json");
 const STAGE_DIR = join(CACHE, "stage");
+
+/**
+ * npm 源条目的版本锁。
+ *
+ * 它不是 npm 的 `package-lock.json`（那个记录整棵依赖树的 integrity），只记
+ * **顶层包实际解析到的版本** —— 够用来复现产物，又不会因为 npm 内部格式变化
+ * 而失效。删掉它即重新解析（`npmPackages` 里的范围兜底）。
+ */
+const NPM_LOCK = join(PROJECT, "tools", "npm-tools.lock.json");
+const NPM_STAGE = join(CACHE, "npm-stage");
 
 /** Windows 文件名安全化（与 fetch-runtime.mjs 一致）。 */
 const safeName = (s) => s.replace(/[:*?"<>|\\/]/g, "_");
@@ -183,8 +194,14 @@ async function main() {
   const spec = { generatedAt: new Date().toISOString(), items: [] };
   const missingAll = [];
   const failedItems = [];
+  // npm 源条目不进 deb 闭包（Termux 索引里根本没有这些包），单独在 [4.5/5] 打。
+  const npmItems = [];
   for (const item of POOL_ITEMS) {
     if (!wanted(item)) continue;
+    if (item.source === NPM_SOURCE) {
+      npmItems.push(item);
+      continue;
+    }
     const closure = resolveClosure(index, item.seeds);
     const marginal = closure.ordered.filter((n) => index.has(n) && !baselineNames.has(n));
     const missing = closure.missing.filter((n) => !index.has(n));
@@ -311,6 +328,45 @@ async function main() {
   }
   const report = JSON.parse(readFileSync(reportPath, "utf8"));
 
+  // ── [4.5/5] npm 源条目（前端工具链）──────────────────────────────────
+  //
+  // 与 deb 池的区别只有「怎么拿到文件」：这里交给 npm 按 `--os=android
+  // --cpu=arm64` 解析，再生成带占位符的包装器打成同一形态的 `.pool`。
+  // 设备端安装逻辑不需要任何新分支（见 tools/lib/npm-pack.mjs 顶部注释）。
+  if (npmItems.length) {
+    console.log(`[4.5/5] 打 npm 源池（${npmItems.map((i) => i.id).join(", ")}）...`);
+    const locked = (() => {
+      try {
+        return JSON.parse(readFileSync(NPM_LOCK, "utf8")).packages ?? {};
+      } catch {
+        return {};
+      }
+    })();
+    if (Object.keys(locked).length) {
+      console.log(
+        `      按锁文件装：${Object.entries(locked).map(([k, v]) => `${k}@${v}`).join(", ")}`,
+      );
+    } else {
+      console.log("      无锁文件，按 seeds 的范围解析（本次结果会写入 tools/npm-tools.lock.json）");
+    }
+    for (const item of npmItems) {
+      const res = await buildNpmPack(item, {
+        outDir: POOL_OUT,
+        stageDir: NPM_STAGE,
+        lockPath: NPM_LOCK,
+        lockedPackages: locked,
+      });
+      report.items.push({
+        id: res.id,
+        version: res.version,
+        files: res.files,
+        totalBytes: res.totalBytes,
+        placeholderFiles: res.ids ?? res.files,
+        platformPackages: res.platformPackages,
+      });
+    }
+  }
+
   console.log("[5/5] 生成扩展目录 extensions.json ...");
   const reportById = new Map(report.items.map((r) => [r.id, r]));
   // 增量模式下 spec 只含被点名的条目，直接覆盖会把其它条目从目录里抹掉。
@@ -344,7 +400,7 @@ async function main() {
       return {
         id: item.id,
         name: item.name,
-        version: spec.items.find((s) => s.id === item.id)?.version ?? "unknown",
+        version: spec.items.find((s) => s.id === item.id)?.version ?? r?.version ?? "unknown",
         category: item.category,
         description: item.description,
         bins: item.bins,
