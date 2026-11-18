@@ -1085,6 +1085,33 @@ object EngineConfig {
             "GS_LIB=${File(root, "share/ghostscript/Resource/Init").absolutePath}:" +
                 "${File(root, "share/ghostscript/lib").absolutePath}:" +
                 "${File(root, "share/ghostscript/Resource/Font").absolutePath}",
+            // Racket 的 collects（问题清单【9】新增扩展 lisp）。
+            //
+            // `racket` 从**自身路径**推前缀：`<root>/bin/racket` 是指向
+            // `extensions/lisp/bin/racket` 的软链，realpath 之后前缀成了扩展目录，
+            // 于是它去 `<ext>/lib/racket/collects` 找 collects —— 那里只有
+            // `compiled/` 与 `launchers.rktd`，collects 在 `<root>/share/racket/collects`。
+            // 真机症状：`racket -e …` 直接
+            //   standard-module-name-resolver: collection not found
+            //   for module path: (submod (lib "racket/init") configure-runtime)
+            // 连 `racket --version` 之后的任何求值都不可用。
+            //
+            // PLTCOLLECTS 是 racket 自己检查的变量，**末尾那个冒号不能省**：
+            // 它表示「再追加默认搜索路径」，去掉就只剩这一条，安装自带的
+            // `pkgs` 反而找不到。`raco` 是 racket 脚本，同一条变量一起救活。
+            "PLTCOLLECTS=${File(root, "share/racket/collects").absolutePath}:",
+            // Valgrind 的工具本体目录（问题清单【9】新增扩展 valgrind）。
+            //
+            // Termux 的 valgrind 用 `--libexecdir=$PREFIX/libexec` 编译，
+            // `memcheck-arm64-linux` 与一堆 `.xml` 因此落在
+            // `extensions/valgrind/libexec/valgrind`（合并视图已摊到
+            // `<root>/libexec/valgrind`），而**它不看 `$PREFIX`**：编译期把
+            // 绝对路径写进了二进制，`VALGRIND_LIB` 是唯一的覆盖手段
+            // （`--prefix=` 不行，实测无视）。
+            // 真机症状：`valgrind: failed to start tool 'memcheck' for platform
+            // 'arm64-linux': No such file or directory` —— 看着像没装引擎，
+            // 其实是找不到 memcheck 那个可执行。
+            "VALGRIND_LIB=${File(root, "libexec/valgrind").absolutePath}",
             // Termux 编译期 gitconfig 指向不存在的 Termux 前缀
             "GIT_CONFIG_NOSYSTEM=1",
             // 包管理器镜像（corepack/npm/pnpm 在 runtime 内无 .npmrc）
