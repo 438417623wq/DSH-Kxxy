@@ -39,6 +39,19 @@ export const TERMUX_REPO = "https://packages.termux.dev/apt/termux-main";
  */
 export const SEED_VERSION_PINS = {
   python: "3.14.8",
+  // `python-ensurepip-wheels` 必须与 python **同版本**，这不是洁癖而是硬约束：
+  // python 包的 `ensurepip/__init__.py` 里写着 `_PIP_VERSION`，`_bootstrap()`
+  // 按**精确文件名**去 `ensurepip/_bundled/` 找 `pip-<ver>-py3-none-any.whl`，
+  // 找不到就 `assert` 失败 —— `python -m venv` exit 1，建出来的环境没有 pip。
+  //
+  // 真事故（2026-11-17，问题清单 P6）：python 被钉在 3.14.8（`_PIP_VERSION`
+  // 要求 `pip-26.2.1-py3-none-any.whl`），而 ensurepip-wheels 跟着索引漂到
+  // 3.14.10，带的只有 `pip-26.2.2`。两个包必须成对；单钉 python 不够。
+  // 实测核对（解包 deb 的 data.tar.xz）：
+  //   python-ensurepip-wheels 3.14.8  → _bundled/pip-26.2.1-py3-none-any.whl
+  //   python-ensurepip-wheels 3.14.10 → _bundled/pip-26.2.2-py3-none-any.whl
+  // 3.14.8 的 deb 在构建机缓存里（2026-10-25），离线可用。
+  "python-ensurepip-wheels": "3.14.8",
   // libffi 同理，而且更隐蔽：它不带版本号痕迹，只会让 `build-runtime` 在
   // `verifyPythonInputs` 处报
   //     Error: Python 构件的编译输入已变化，必须重新构建：include/ffi.h

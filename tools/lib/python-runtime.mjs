@@ -255,6 +255,33 @@ export function verifyPythonRuntime(names, read) {
   need(read, PYTHON_SITE + 'numpy/__init__.py')
   need(read, PYTHON_SITE + 'psutil/__init__.py')
   need(read, 'bin/python3')
+  // ensurepip 与随包 pip wheel 的版本必须一致（问题清单 P6）。
+  //
+  // 这条校验补的是一个**跨包**的隐式契约：`ensurepip/__init__.py`（来自 python 包）
+  // 里 `_PIP_VERSION` 是个常量，`_bootstrap()` 到 `ensurepip/_bundled/` 按
+  // `pip-<ver>-py3-none-any.whl` **精确文件名**找轮子，找不到就 assert 失败。
+  // 而那个轮子来自**另一个包** `python-ensurepip-wheels`，两者各自跟索引走。
+  // 一旦漂开，症状是 `python3 -m venv` exit 1、建出的环境没有 pip，报错却在
+  // 第三层（`ensurepip` 内部断言），从「venv 没 pip」这个现象很难反推到包版本。
+  // 所以在出包阶段直接拦住 —— 比装到手机上再排查便宜得多。
+  const ensurepipDir = 'lib/python3.14/ensurepip/'
+  if (names.includes(`${ensurepipDir}__init__.py`)) {
+    const init = need(read, `${ensurepipDir}__init__.py`).toString('utf8')
+    const pipVersion = /^_PIP_VERSION\s*=\s*"([^"]+)"/m.exec(init)?.[1]
+    requireValue(pipVersion, 'ensurepip/__init__.py 里没有 _PIP_VERSION，无法校验随包 pip wheel')
+    const wheels = names.filter((path) => path.startsWith(`${ensurepipDir}_bundled/pip-`))
+    const expected = `pip-${pipVersion}-py3-none-any.whl`
+    requireValue(
+      wheels.some((path) => path === `${ensurepipDir}_bundled/${expected}`),
+      `ensurepip 需要 ${expected}，但 _bundled/ 里是 [${wheels.map((p) => p.split('/').pop()).join(', ') || '空'}]；` +
+      `python 与 python-ensurepip-wheels 的版本必须成对（见 tools/lib/seeds.mjs 的 SEED_VERSION_PINS）`,
+    )
+    // 名字对上还不够：轮子内部 METADATA 的版本才是真正的 pip 版本。
+    // zip 的中央目录把条目名按明文存，直接在字节里找即可（不需要再解一层 zip）。
+    const wheel = need(read, `${ensurepipDir}_bundled/${expected}`).toString('latin1')
+    requireValue(wheel.includes(`pip-${pipVersion}.dist-info/METADATA`), `${expected} 内部不是 pip ${pipVersion}（文件名与内容不一致）`)
+  }
+
   const warnings = []
   for (const [name, version] of [['numpy', '2.5.4'], ['psutil', '7.2.2']]) {
     const wheel = need(read, `${PYTHON_SITE}${name}-${version}.dist-info/WHEEL`).toString('utf8')

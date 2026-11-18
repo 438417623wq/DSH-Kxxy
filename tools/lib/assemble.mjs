@@ -8,11 +8,15 @@
  *   { path, type: "link", target }  zip 数据区留空 + 中央目录注释 "LINK:<target>"
  *   { path, type: "dir" }
  *
- * 为什么必须有 link 条目：Android app 域既禁硬链接（SELinux `avc: denied { link }`）
- * 也禁符号链接（能创建但 linker 不跟随），所以别名只能物化成实体副本。若在构建期
- * 就把别名写成完整副本，`bin/git` 的 149 个别名要 513 MiB、`bin/coreutils` 的
- * 100 个 applet 要 125 MiB。用 LINK 条目把「谁是本体」编码进 zip，App 侧解压完
- * 本体后统一复制，体积与磁盘占用各自最优。
+ * 为什么必须有 link 条目：Android app 域**禁硬链接**（SELinux 拒绝 `link`，
+ * 真机报 `ln: Permission denied`），但**软链接可用** —— 早期本文写作「既禁硬
+ * 链接也禁符号链接（能创建但 linker 不跟随）」，那是错的，已按
+ * `RuntimeInstaller` 的真机结论更正：`bin/pdflatex -> pdftex` 这类软链在设备上
+ * 正常工作，`collectBins` 也是用 `symlinkSync` 建链。真正不可用的是硬链接，
+ * 所以「共享 inode 省磁盘」这条路在 Android 上不存在（pnpm 因此必须走 copy）。
+ * 若在构建期就把别名写成完整副本，`bin/git` 的 149 个别名要 513 MiB、
+ * `bin/coreutils` 的 100 个 applet 要 125 MiB。用 LINK 条目把「谁是本体」编码进
+ * zip，App 侧解压完本体后统一复制，体积与磁盘占用各自最优。
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -35,11 +39,34 @@ const ZIP_NM = "lib/node_modules/";
  *
  * 注意 @deepseek-ai/dsh-win32-process **不声明** os/cpu（它是「功能包」而非
  * 「二进制包」），所以会被保留 —— 这是对的，它的调用点全部在 win32 分支内。
+ *
+ * 例外（见 [declaresAndroid]）：**明确声明 Android/bionic 目标**的包保留。
+ * 今天闭包里没有这种包 —— `sherpa-onnx` 只发布 `sherpa-onnx-linux-arm64`，
+ * 而 Linux arm64 是 glibc、在 bionic 上 dlopen 必失败，不能当替代品（问题清单
+ * 第 8 项）。但规则不能把将来的正解一起挡掉：等上游真的发了 android-arm64
+ * 预编译（或我们自己补构建），它必须能进包，而不是被这条硬规则静默丢弃。
  */
 export function isPlatformSpecific(pkgJson) {
   if (!pkgJson) return false;
   const has = (v) => Array.isArray(v) && v.length > 0;
-  return has(pkgJson.os) || has(pkgJson.cpu) || has(pkgJson.libc);
+  if (!has(pkgJson.os) && !has(pkgJson.cpu) && !has(pkgJson.libc)) return false;
+  if (declaresAndroid(pkgJson)) return false;
+  return true;
+}
+
+/**
+ * 包是否明确面向 Android / bionic。
+ *
+ * npm 生态没有 Android 的官方 `os` 约定，实际写法见过两种：`os: ["android"]`
+ * 与 `os: ["linux"]` + 包名后缀 `-android-arm64`。两种都认，宁可多留一个包
+ * （它自己会加载失败并被上层发现），也不要漏掉唯一可能在设备上跑起来的构件。
+ */
+export function declaresAndroid(pkgJson) {
+  if (!pkgJson) return false;
+  const fields = [...(pkgJson.os ?? []), ...(pkgJson.cpu ?? []), ...(pkgJson.libc ?? [])]
+    .map((v) => String(v).toLowerCase());
+  if (fields.some((v) => v === "android" || v === "bionic")) return true;
+  return /(^|[-_/])android([-_]|$)/i.test(String(pkgJson.name ?? ""));
 }
 
 // ------------------------------------------------------------------ Termux 侧
