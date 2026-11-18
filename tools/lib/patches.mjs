@@ -171,10 +171,16 @@ function patchNodePty(ctx) {
  * `Could not find sherpa-onnx-node. Tried …`，看不出是平台不支持还是文件丢了。
  *
  * 两条路：
- *   · `tools/prebuilt/sherpa-onnx-android/prebuilds/android-arm64/sherpa-onnx.node`
- *     存在 → 直接注入（编译器就位后无需改代码）；
+ *   · `tools/prebuilt/sherpa-onnx-android/prebuilds/android-arm64/` 里有
+ *     `sherpa-onnx.node` → 直接注入（连同两个 .so，见下）；
  *   · 不存在 → 在 `addon.js` 顶部插一段守卫，抛带 `KXXY_SHERPA_UNAVAILABLE`
  *     的错误说明「本构建没有 Android 绑定」，并把该目录的 README 指出来。
+ *
+ * ⚠️ 注入的是**三个文件**，不是过去以为的一个。绑定本身（`.node`）只是壳，
+ * 真正干活的是 `libsherpa-onnx-c-api.so` 与 `libonnxruntime.so`，编译期用
+ * `-Wl,-rpath,$ORIGIN` 钉成「同目录查找」。只放 `.node` 会在 dlopen 阶段报
+ * `library "libsherpa-onnx-c-api.so" not found`——看着像少了依赖包，
+ * 其实是注入时不完整。三个文件必须并列落进 `sherpa-onnx-node/`。
  *
  * 为什么守卫放在 `addon.js` 而不是删包：包的 JS 入口（`sherpa-onnx.js`）还可能
  * 被上层「探测能力」时 require，删包会变成 `MODULE_NOT_FOUND`，比「能力不可用」
@@ -183,14 +189,21 @@ function patchNodePty(ctx) {
 function patchSherpaOnnx(ctx) {
   if (!ctx.exists("sherpa-onnx-node")) return "跳过（依赖树无 sherpa-onnx-node）";
 
-  const rel = "sherpa-onnx-node/sherpa-onnx.node";
-  const prebuiltNode = join(
-    PREBUILT_ROOT,
-    "sherpa-onnx-android/prebuilds/android-arm64/sherpa-onnx.node",
-  );
+  const dir = join(PREBUILT_ROOT, "sherpa-onnx-android/prebuilds/android-arm64");
+  const prebuiltNode = join(dir, "sherpa-onnx.node");
   if (existsSync(prebuiltNode)) {
-    ctx.copy(readFileSync(prebuiltNode), rel, 0o755);
-    return "sherpa-onnx-node → 注入 Android arm64 原生绑定";
+    ctx.copy(readFileSync(prebuiltNode), "sherpa-onnx-node/sherpa-onnx.node", 0o755);
+    let injected = 1;
+    for (const so of ["libsherpa-onnx-c-api.so", "libonnxruntime.so"]) {
+      const p = join(dir, so);
+      must(
+        existsSync(p),
+        `sherpa 预编译目录缺 ${so}（.node 靠 $ORIGIN 找同目录的这两个库，缺一个就 dlopen 失败）`,
+      );
+      ctx.copy(readFileSync(p), `sherpa-onnx-node/${so}`, 0o644);
+      injected += 1;
+    }
+    return `sherpa-onnx-node → 注入 Android arm64 原生绑定（${injected} 个文件：绑定 + c-api + onnxruntime）`;
   }
 
   const key = "lib/node_modules/sherpa-onnx-node/addon.js";

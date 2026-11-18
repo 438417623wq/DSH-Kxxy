@@ -454,6 +454,63 @@ export const POOL_ITEMS = [
     bins: ["fish", "nvim", "gh"],
   },
 
+  // ── N 组：多语言运行时与系统级工具（问题清单 P9 的剩余部分）────────────
+  //
+  // 这些在 Termux 主仓里都有（所以只是「没进池」，不是「编译不出来」）。
+  // 逐个查过索引：julia / gfortran / perf / dotnet 主仓**没有**，那几项仍是
+  // 能力缺口，不要写进这里假装补上。
+  //
+  // 体积（deb 压缩后）：deno 27 MiB、valgrind 2.7 MiB、racket+sbcl 15 MiB。
+  //
+  // ⚠️ 有两个**打了池但没进包**的，理由不是体积，是真机装完用不起来：
+  //
+  //   · tcc（0.24 MiB）：`tcc` 的 CONFIG_TCCDIR 指 Termux 前缀还能靠重写层兜住，
+  //     但它没有自己的 libc —— 拿 bionic 头编任何带 `#include <stdio.h>` 的文件，
+  //     第一步就停在
+  //       sys/cdefs.h:365: #error Unversioned target triples are not supported!
+  //     因为 bionic 要求 `--target=aarch64-linux-androidNN` 这种带版本的三元组，
+  //     而 tcc 的预定义宏里没有 `__ANDROID_API__`。要修得给 tcc 打补丁或塞一份
+  //     裁剪过的 musl 头 —— 而引擎已经自带 clang 21（target 已是
+  //     aarch64-unknown-linux-android24），`tcc -run` 那点便利不值这个维护成本。
+  //   · nim（7.1 MiB）：编译器本体没问题（`nim --version` 报 2.4.2 arm64），
+  //     但它生成 C 之后要交给后端编译器，默认 `gcc` 在这个引擎里不存在，
+  //     显式 `--cc:clang --lib:<ext>/lib/nim/lib` 能过前几步、仍在生成 C 的
+  //     标准头阶段失败（`#include <string.h>` 找不到）。归因是 nim 的
+  //     `config/nim.cfg` 里那套 gcc/clang 选项假设了 Termux 的 `$PREFIX/bin/cc`。
+  //     要修得给每个版本维护一份 nim.cfg；同样属于「配好能用但没有验证过就不发」。
+  //
+  // 两个池仍可按需单独打（`KXXY_POOL_ONLY=tcc` / `=nim`），产物在
+  // `.cache/apk-assets-hold/ext-pool/`，装法与 node-tools 相同。
+  {
+    id: "deno", seeds: ["deno"], category: "devtools",
+    name: "Deno 运行时",
+    description:
+      "原生 TypeScript/JavaScript 运行时（自带权限沙箱、fmt/lint/test/bundle），" +
+      "不需要 node_modules 就能跑 .ts。",
+    bins: ["deno"],
+  },
+  // ⚠️ Zig **有意不进包**（体积换边际价值的账，不是编不出来）：
+  // `zig.pool` 解包 511 MiB、压完 145 MiB，是整套池子里最大的一项，会把 APK
+  // 顶到 2 GiB 以上；而引擎已预装 clang + NDK sysroot，`zig cc` 的边际价值
+  // 抵不上这个体积。需要时单独打池、本地推送即可：
+  //     KXXY_POOL_ONLY=zig node tools/fetch-extensions.mjs   # → .cache/opt-pools/zig.pool
+  // 再把 zig.pool 推进 files/engine/ext-pool/ 走一次 extinstall（与 node-tools 同法）。
+  {
+    id: "valgrind", seeds: ["valgrind"], category: "toolchain",
+    name: "Valgrind 内存调试",
+    description:
+      "memcheck / callgrind / massif：定位越界、未初始化读取、泄漏与热点，" +
+      "比在 gdb 里手搓断点快得多。",
+    bins: ["valgrind"],
+  },
+  {
+    id: "lisp", seeds: ["racket", "sbcl"], category: "devtools",
+    name: "Racket / SBCL",
+    description:
+      "两个 Lisp 系运行时：Racket（教学与脚本，含 raco）与 SBCL（Common Lisp 高性能实现）。",
+    bins: ["racket", "raco", "sbcl"],
+  },
+
   // ── M 组：npm 源的工具链（不是 deb，见 tools/lib/npm-pack.mjs）────────
   //
   // 为什么单列一组：这些包在 Termux 索引里根本不存在（前端工具链只发 npm），
