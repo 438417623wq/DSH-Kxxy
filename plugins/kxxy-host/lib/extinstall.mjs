@@ -449,6 +449,78 @@ export function applyPlaceholders(root, dir, manifestPath) {
  *
  * 导出仅供 tools/test-extinstall.mjs 直接测装配逻辑（真机路径是 runInstall）。
  */
+/**
+ * Fortran（flang）的**链接期件**补齐。
+ *
+ * 真机症状（v0.9.71 装机后复验，Redmi K60 Pro）：`flang --version` 正常，但
+ * 任何真实编译都在链接阶段崩：
+ *
+ *     ld.lld: error: cannot open crtbegin_dynamic.o: No such file or directory
+ *     ld.lld: error: cannot open …/lib/clang/21/lib/aarch64-unknown-linux-android24/
+ *                     libclang_rt.builtins.a: No such file or directory
+ *     ld.lld: error: unable to find library -l:libunwind.a
+ *
+ * 三件东西**引擎里都有**，只是 flang 按自身位置推路径：它以
+ * `<extend>/bin/flang` 为前缀算 resource-dir（`<extend>/lib/clang/<ver>`）与
+ * 默认库目录（`<extend>/lib`），而 Termux 的 flang deb 只装前端 —— 依赖里的
+ * `clang`/`libcompiler-rt`/`ndk-sysroot` 我们没解（池不解析 Depends）。
+ *
+ * 修法是纯软链，不改 flang 二进制、不加包装器：把引擎的 crt 对象与
+ * `libunwind.a` 链进 `<extend>/lib`，再把 compiler-rt builtins 按驱动期望的
+ * `<extend>/lib/clang/<ver>/lib/<triple>/libclang_rt.builtins.a` 链过去。
+ * 真机实测：补完之后裸 `flang -O2 a.f90 -o a` 直接出可执行文件并正确运行，
+ * CMake/autotools 用绝对路径调 flang 也一样能链（不是只对 PATH 生效）。
+ *
+ * triple 里的 minSdk 由 flang 二进制的编译期默认值决定（实测 `android24`），
+ * 这里把 21–36 全建一遍 —— 每条只是一个软链，代价可以忽略，换来换池/换 SDK
+ * 后不用再猜。
+ *
+ * 幂等：已存在的条目不覆盖（用户可能自己换过 libunwind）。
+ */
+export function ensureFortranToolchain(root, extDir) {
+  const engineLib = join(root, 'lib')
+  const clangRoot = join(engineLib, 'clang')
+  if (!existsSync(engineLib) || !existsSync(clangRoot)) return
+
+  let ver = ''
+  try {
+    const versions = readdirSync(clangRoot).filter((n) => /^\d+$/.test(n))
+    versions.sort((a, b) => Number(b) - Number(a))
+    ver = versions[0] ?? ''
+  } catch {
+    return
+  }
+  if (!ver) return
+
+  const extLib = join(extDir, 'lib')
+  try {
+    mkdirSync(extLib, { recursive: true })
+  } catch {
+    return
+  }
+
+  // ① crt 启动对象 + libunwind.a：驱动默认在 `<extend>/lib` 里找
+  for (const name of ['crtbegin_dynamic.o', 'crtbegin_so.o', 'crtend_android.o', 'crtend_so.o', 'libunwind.a']) {
+    const src = join(engineLib, name)
+    const dst = join(extLib, name)
+    if (!existsSync(src) || isPresent(dst)) continue
+    try { symlinkSync(src, dst) } catch { /* 只读或已存在，忽略 */ }
+  }
+
+  // ② compiler-rt builtins：驱动按 `<extend>/lib/clang/<ver>/lib/<triple>/` 找，
+  //    文件名必须是 `libclang_rt.builtins.a`（不带 target 后缀）
+  const builtins = join(engineLib, 'clang', ver, 'lib', 'linux', 'libclang_rt.builtins-aarch64-android.a')
+  if (!existsSync(builtins)) return
+  for (let sdk = 21; sdk <= 36; sdk++) {
+    const dst = join(extLib, 'clang', ver, 'lib', `aarch64-unknown-linux-android${sdk}`, 'libclang_rt.builtins.a')
+    if (isPresent(dst)) continue
+    try {
+      mkdirSync(dirname(dst), { recursive: true })
+      symlinkSync(builtins, dst)
+    } catch { /* 单个 triple 失败不阻断 */ }
+  }
+}
+
 export function buildViews(root, id, extDir) {
   const engineBin = join(root, 'bin')
   const engineLib = join(root, 'lib')
@@ -547,6 +619,14 @@ export function buildViews(root, id, extDir) {
 
   // share/nvim/runtime 可能刚被合并成自有目录链；parser 要有实体父目录。
   installNvimParsers(root, extDir, { libs, views })
+
+  // Fortran 池的链接期件（crt / compiler-rt / libunwind）见函数注释：
+  // 不补的话 `flang --version` 看得见、真编译全在 ld.lld 阶段失败。
+  if (id === 'fortran') {
+    try {
+      ensureFortranToolchain(root, extDir)
+    } catch { /* 补链失败不阻断安装，下次自愈再试 */ }
+  }
 
   // layout 戳在这里打，而不是在 runInstall 里补 —— 凡是走到 buildViews 的
   // 路径（安装、将来的重装配工具）写出的清单都自带版本，漏一个就会让
@@ -1618,6 +1698,12 @@ export function relinkAll(root) {
       if (!entry.isDirectory() || entry.name.endsWith('.tmp-install')) continue
       const extDir = join(extRoot, entry.name)
       const linksFile = join(extDir, '.links.json')
+      // Fortran 的链接期件不走 .links.json（它们是池内软链，不是扩展贡献的
+      // bin/lib 视图），所以必须在自愈里单独补一次 —— 否则 runtime 升级
+      // 整体替换 lib/ 之后，flang 又会退化成「只能 --version」。
+      if (entry.name === 'fortran') {
+        try { ensureFortranToolchain(root, extDir) } catch { /* 下次再试 */ }
+      }
       if (!existsSync(linksFile)) continue
       try {
         const links = JSON.parse(readFileSync(linksFile, 'utf8'))
