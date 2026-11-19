@@ -1540,6 +1540,42 @@ function reclaimViews(root, freed, skipId) {
 }
 
 /**
+ * 抽样判断「扩展视图是不是丢了」（不看 `.relink` 标记）。
+ *
+ * 每个已装扩展只看头三条 `bins` 的目标在不在：只要有任意一条缺失，就说明
+ * `bin/` 被整体换过而视图没重建。正常状态下几十次 `existsSync`，代价可以忽略；
+ * 只在 [relinkAll] 里、且标记不存在时才调用。
+ *
+ * @returns {boolean} true = 需要重建
+ */
+function viewsLookBroken(root) {
+  const extRoot = extensionsDir(root)
+  if (!existsSync(extRoot)) return false
+  let dirs = 0
+  try {
+    for (const entry of readdirSync(extRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.endsWith('.tmp-install')) continue
+      dirs += 1
+      const linksFile = join(extRoot, entry.name, '.links.json')
+      if (!existsSync(linksFile)) continue
+      let links
+      try {
+        links = JSON.parse(readFileSync(linksFile, 'utf8'))
+      } catch {
+        continue
+      }
+      for (const bin of (links.bins ?? []).slice(0, 3)) {
+        const target = bin?.target ?? (bin?.name ? join(root, 'bin', bin.name) : null)
+        if (target && !existsSync(target)) return true
+      }
+    }
+  } catch {
+    return false
+  }
+  return false
+}
+
+/**
  * 升级自愈：runtime 升级整体替换 bin/ lib/ 之后，按各扩展的 .links.json
  * 重建接入点。由插件启动时调用（extensions/.relink 标记由 RuntimeInstaller 写）。
  *
@@ -1548,9 +1584,23 @@ function reclaimViews(root, freed, skipId) {
 export function relinkAll(root) {
   if (!root) return 0
   const marker = join(extensionsDir(root), '.relink')
-  if (!existsSync(marker)) return 0
+  const hasMarker = existsSync(marker)
+  /*
+   * 标记之外的兜底（v0.9.69 真机踩到）。
+   *
+   * `.relink` 由 `RuntimeInstaller` 在**整个安装流程末尾**写（校验之后）。
+   * 于是「解压完成、但末尾那段验证判假」的半成品状态里，标记根本不会出现：
+   * 装是装上了，视图一条没建，而 `bin/ruby`、`bin/irb`、`bin/php` 全部消失，
+   * 界面上表现为「扩展装了但命令找不到」。更糟的是下一次启动 `isComplete()`
+   * 已经判真（文件都在），不会再装一遍，也就永远拿不到那个标记。
+   *
+   * 所以这里补一次**廉价的抽样检查**：每个已装扩展只看头三条 bin 目标在不在。
+   * 成本是每次启动几十次 stat，换来的是「视图丢了就能自愈」。
+   */
+  if (!hasMarker && !viewsLookBroken(root)) return 0
 
   let rebuilt = 0
+  let seen = 0
   try {
     const extRoot = extensionsDir(root)
     // 缺陷 BH 自愈：老设备上这些裸名库已经躺在 <root>/lib/ 里了（安装期
@@ -1622,11 +1672,22 @@ export function relinkAll(root) {
         }
         if (JSON.stringify(links) !== before) writeFileSync(linksFile, JSON.stringify(links, null, 2) + '\n')
         rebuilt += 1
+        seen += 1
       } catch {
         // 清单损坏等整体失败不阻断其他扩展
       }
     }
-    unlinkSync(marker)
+    // 只有「确实看到过扩展」才消费标记。
+    //
+    // 反例（真机踩过）：解压还在进行、`extensions/` 尚未落地时插件就起来了，
+    // 这一轮 `rebuilt` 必然是 0；若无条件删标记，下一次启动就再没有重建机会，
+    // 而 `isComplete()` 此时已经判真、安装也不会再跑 —— 视图永远缺。
+    //
+    // 没有标记时（走 viewsLookBroken 兜底）不需要删，也不能删 ——
+    // unlink 一个不存在的路径会抛错，被外层 catch 吞掉。
+    if (hasMarker && seen > 0) {
+      try { unlinkSync(marker) } catch { /* 已被别人删掉 */ }
+    }
   } catch {
     // 标记读不出来就留着，下次启动再试
   }
