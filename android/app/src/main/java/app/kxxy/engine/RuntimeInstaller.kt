@@ -674,6 +674,26 @@ class RuntimeInstaller(private val ctx: Context) {
                 }
             } else {
                 val head = readHead(f, COMPAT_MARKER_PROBE_BYTES)
+                // ③ 随包携带的**原生可执行**（v0.9.69 起）。
+                //
+                // `bin/pnpm` 现在是 Termux 那份 pnpm 本体：一个 54.7 MiB 的
+                // node SEA（单文件可执行，只 NEEDED `libdl.so`），既不是 sh
+                // 包装器、也不是 corepack 软链。上一版把它做成 corepack shim，
+                // 首次运行要下载 `pnpm@12.x` 整包到 `~/.cache/node/corepack`，
+                // 手机侧既不 EOF 也不超时 —— `dsh plugin … list` 卡到 124 就是
+                // 这么来的。换成真二进制之后这里必须放行，否则锚点判假、
+                // install 直接失败（真机报 `packaging wrapper is not a sh shim:
+                // bin/pnpm (␡ELF…)` + `APK runtime verification failed`）。
+                //
+                // 判据用 ELF 魔数 + 体积下限：只看魔数会让「截断的半截文件」
+                // 蒙混过关，而 pnpm SEA 绝不会小于几十 MB。
+                if (rel == BUNDLED_PNPM_WRAPPER && head.startsWith("\u007fELF")) {
+                    if (f.length() < MIN_BUNDLED_PNPM_BYTES) {
+                        Log.w(TAG, "runtime probe: bundled pnpm binary truncated: ${f.length()} B")
+                        return false
+                    }
+                    continue
+                }
                 if (!head.startsWith("#!" + "/system/bin/sh")) {
                     Log.w(TAG, "runtime probe: packaging wrapper is not a sh shim: $rel (${head.take(32)})")
                     return false
@@ -3220,7 +3240,18 @@ class RuntimeInstaller(private val ctx: Context) {
          * 于是新结构跑在旧 CSS 上：底栏中央那个 `.dsl-fab` 失去 54px 圆框约束，
          * 按 SVG 默认的 300×150 被撑成一只盖住半屏的紫色气泡。
          */
-        private const val PATCHSET_MARKER = "kxxy-patchset@26"
+        // 26 → 27（v0.9.68）：Termux 闭包加了 python-scipy / typst / ltrace，
+        // 同时把一度陈旧的 stage 重解，于是 runtime.zip 里多出 pandas / lxml /
+        // Pillow / matplotlib —— 全是**新增文件**，十六条锚点一条都看不见。
+        // 不涨这个编号，0.9.67 升上来的设备会认为运行时完好、跳过解压，
+        // site-packages 里照旧没有 pandas（用户报的回归就是这么发生的）。
+        //
+        // 27 → 28（v0.9.69）：site-packages 又加了一批纯 Python 依赖（dateutil /
+        // packaging / cycler / pyparsing / fontTools / pytz / tzdata / sympy /
+        // mpmath / six），同时 bin/ln 的**内容**换成 `--coreutils-prog=ln`
+        // 并带复制降级。前者是纯新增文件、后者是既有文件改内容 —— 十六条锚点
+        // 一条都判不出来，只能再借这个编号让老设备重解一次。
+        private const val PATCHSET_MARKER = "kxxy-patchset@30"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**
@@ -3334,6 +3365,18 @@ class RuntimeInstaller(private val ctx: Context) {
             "bin/npx",
             "bin/pnpm",
         )
+
+        /**
+         * 允许以「原生 ELF 可执行」形态出现的包装器（v0.9.69 起）。
+         *
+         * `bin/pnpm` 换成了 Termux 那份 pnpm 本体（node SEA，54.7 MiB，只依赖
+         * `libdl.so`）—— 只有它的体积换来了「离线、秒回」。其它四个仍是 sh
+         * 包装器，一旦变成 ELF 说明有人替换了它，按缺陷处理。
+         */
+        private const val BUNDLED_PNPM_WRAPPER = "bin/pnpm"
+
+        /** 原生 pnpm 的体积下限（40 MiB）。截断的文件会被这条挡住。 */
+        private const val MIN_BUNDLED_PNPM_BYTES = 40L * 1024 * 1024
 
         /**
          * android.jar 的下限体积。

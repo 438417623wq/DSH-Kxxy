@@ -1118,6 +1118,13 @@ object EngineConfig {
             "COREPACK_NPM_REGISTRY=https://registry.npmmirror.com",
             "npm_config_registry=https://registry.npmmirror.com",
             "NPM_CONFIG_REGISTRY=https://registry.npmmirror.com",
+            // pnpm 默认 `package-import-method=auto`：先试 clone，再试 **hardlink**，
+            // 最后才 copy。而这台设备的 SELinux 把 `link(2)` 拒成 EACCES
+            // （取证见 `build-runtime.mjs` 的 hardlinkWrappers 注释），
+            // pnpm 的 hardlink 探测会把整条安装流程拖进 EACCES 分支重试。
+            // 直接钉成 copy：少一次注定失败的探测，代价是 node_modules 多占一份空间
+            // —— 在「硬链接根本不存在」的平台上没有别的选择。
+            "npm_config_package_import_method=copy",
             // pip 镜像（缺陷 EF）：此前只做了 npm 半边，pip 直连 pypi.org/simple，
             // 大索引十几秒都下不完。pip.conf 由 RuntimeInstaller.ensurePipConfig
             // 写（持久），这里再给一份环境变量 —— 有些脚本用 `env -i` 清环境，
@@ -1196,9 +1203,21 @@ object EngineConfig {
             // 语言包已经由扩展池摊到 `<root>/share/tessdata`（chi_sim + eng），
             // 这里只要把前缀指过去。
             "TESSDATA_PREFIX=${File(root, "share/tessdata").absolutePath}",
-            // Ruby 的 gem 装到用户目录（Termux 前缀只读/不存在）
+            // Ruby 的 gem 装到用户目录（Termux 前缀只读/不存在）。
+            //
+            // ⚠️ `GEM_PATH` 必须**同时**含运行时的 gem 根，只给 `$HOME/.gem`
+            // 就是 v0.9.67 之前 `irb` 报
+            //     Gem::GemNotFoundException: can't find gem irb (>= 0.a)
+            // 的全部原因：`irb` / `debug` / `reline` 这些「默认 gem」是
+            // **ruby deb 自己带进来的**，落在 `<root>/lib/ruby/gems/4.0.0/`
+            // 下（`specifications/irb-1.16.0.gemspec` 就在那里）。RubyGems
+            // 的 `Gem.path` 只由 `GEM_PATH` 决定（有它就不再追加默认目录），
+            // 于是 `gem list` 与 `Gem.bin_path('irb', …)` 都扫不到任何东西
+            // —— 而 `ruby -e` 本身照跑，症状因此看起来像「irb 没打包」。
+            // 真实文件一直在：`lib/ruby/gems/4.0.0/gems/irb-1.16.0/`。
+            // 顺序有意义：用户目录在前（`gem install` 的落地优先于内置版本）。
             "GEM_HOME=${File(home, ".gem").absolutePath}",
-            "GEM_PATH=${File(home, ".gem").absolutePath}",
+            "GEM_PATH=${listOf(File(home, ".gem"), File(root, "lib/ruby/gems/4.0.0")).joinToString(":") { it.absolutePath }}",
             // kxxy-host 插件靠这两个变量定位宿主资源：KXXY_ENGINE_ROOT 用于
             // collectRuntimeState 的七项探针（有 PREFIX 兜底，但显式给出更稳），
             // KXXY_STATE_FILE 用于 collectEngineState 读取原生层写入的
@@ -2112,6 +2131,23 @@ object EngineConfig {
                 ;;
         esac
         unset _rg
+
+        # ── GEM_PATH：ruby 的 gem 根同样要按磁盘现状补齐 ──────────────────
+        # 同 RUBYLIB 的理由：`GEM_PATH` 是引擎进程启动时算的**快照**，而 ruby
+        # 是扩展池里的一项 —— 用户装完 ruby 再开终端时，环境里那条 GEM_PATH
+        # 只含 `${'$'}HOME/.gem`，`Gem.path` 因此完全看不到运行时的 gem 根。
+        # 症状就是 `irb` 报
+        #     Gem::GemNotFoundException: can't find gem irb (>= 0.a)
+        # 而文件明明在 `<root>/lib/ruby/gems/4.0.0/gems/irb-1.16.0/` 下 ——
+        # `bin/irb` 是 ruby deb 自带的默认 gem（`debug` / `reline` 同理）。
+        for _gd in "${'$'}KXXY_ENGINE_ROOT"/lib/ruby/gems/*; do
+            [ -d "${'$'}_gd" ] || continue
+            case ":${'$'}{GEM_PATH:-}:" in
+                *":${'$'}_gd:"*) ;;
+                *) export GEM_PATH="${'$'}_gd${'$'}{GEM_PATH:+:${'$'}GEM_PATH}" ;;
+            esac
+        done
+        unset _gd
 
         # ── node-gyp 的 android_ndk_path（原生 addon 编译）──────────────────
         # Termux 的 node 是 android/arm64 构建，它的 common.gypi 无条件引用
