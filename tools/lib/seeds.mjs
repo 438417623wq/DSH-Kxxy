@@ -256,6 +256,39 @@ export const SEED_PACKAGES = [
   // ncdu 只有 40 KiB 却能救磁盘满的现场，zsh 1.9 MiB、vim 6.7 MiB
   // （报告明确点了 vim/nvim 都没有，而现有只有 nano/emacs）。
   "mandoc", "manpages", "libtool", "ncdu", "zsh", "vim",
+
+  // ── G11 科学计算与排版（真机反馈第 10 项，v0.9.68）─────────────────────
+  //
+  // ① `python-scipy` —— numpy 已在预装，但 `scipy` 一直没进来，于是
+  //    `import scipy` / `from scipy import stats` 一律 ModuleNotFoundError。
+  //    Termux 侧是 cp314 + aarch64 的预编译件，边际只有 2 包 / 12.0 MiB
+  //    （本体 + libandroid-complex-math），是所有科学计算包里最划算的一项。
+  //    它同时把 `numpy.linalg` 之外的 `scipy.linalg` / `optimize` / `signal`
+  //    / `sparse` 全部打通 —— sklearn 那类纯 Python 上层库随后 `pip install`
+  //    就能落地（它们只依赖 numpy/scipy 的 ABI）。
+  //
+  // ② `typst` —— 现代排版引擎（单二进制 13.7 MiB，无运行时依赖）。
+  //    `typst compile x.typ` 与 `typst watch` 开箱即用，比 texlive 那条
+  //    700 MiB 的链轻两个数量级；两者面向的场景不同，不冲突。
+  //
+  // ③ `ltrace` —— 跟踪库调用（`ltrace -e malloc ./prog`）。0.1 MiB，
+  //    与已预装的 strace 成对：strace 看系统调用，ltrace 看 so 调用。
+  "python-scipy", "typst", "ltrace",
+
+  // ── G12 包管理器：pnpm 必须**离线可用**（真机反馈第 10 项）──────────────
+  //
+  // `dsh plugin …` 子命令与 `pnpm` 本身在手机上会卡死到超时（`exit 124`，
+  // 单跑 `pnpm --version` 也 150 s 不返回）。原因不是网络慢，而是 `bin/pnpm`
+  // 当时指向 **corepack shim**：corepack 首次运行要把 `packageManager` 字段
+  // 指定的 `pnpm@12.21.0` 整包下载并解到 `~/.cache/node/corepack`，手机侧
+  // 既慢又常被 CDN 挂住。
+  //
+  // 为什么取 Termux 的 `pnpm` 而不是 npm 上的同名包：pnpm 官方 12.x 发行物
+  // 是**原生可执行文件**（`@pnpm/exe.*`，只有 glibc/musl 两种 linux 目标，
+  // 没有 bionic），npm 包里只剩一个「找不到就去 registry 现下载」的 shim，
+  // 装到设备上第一次运行照样要联网。Termux 这份是源码编的纯 JS 版本，
+  // 直接跑在引擎自带的 node 上。`Depends: git` 由基线里的 git 满足。
+  "pnpm",
 ];
 
 /**
@@ -489,12 +522,67 @@ export const POOL_ITEMS = [
       "不需要 node_modules 就能跑 .ts。",
     bins: ["deno"],
   },
-  // ⚠️ Zig **有意不进包**（体积换边际价值的账，不是编不出来）：
-  // `zig.pool` 解包 511 MiB、压完 145 MiB，是整套池子里最大的一项，会把 APK
-  // 顶到 2 GiB 以上；而引擎已预装 clang + NDK sysroot，`zig cc` 的边际价值
-  // 抵不上这个体积。需要时单独打池、本地推送即可：
-  //     KXXY_POOL_ONLY=zig node tools/fetch-extensions.mjs   # → .cache/opt-pools/zig.pool
-  // 再把 zig.pool 推进 files/engine/ext-pool/ 走一次 extinstall（与 node-tools 同法）。
+  // ⚠️ Zig 从 v0.9.68 起**进池**（此前"有意不进包"的结论被真机反馈推翻）：
+  // 解包 511 MiB、压完 ~145 MiB，是整套池子里最大的一项，会把 APK 顶到
+  // 2.4 GiB 以上。之所以改主意：`zig cc` 自带 libc/头文件与增量缓存，
+  // 手机上是少数**不需要 ndk-sysroot 也能独立编出 aarch64 产物**的工具链，
+  // 而引擎里的 clang 一旦离开 NDK 头就编不动。代价可控（池子 +12%），
+  // 收益是「用户点名要的东西真的有」。
+  // 需要单独重打某几个池（不重跑全量）时：
+  //     KXXY_POOL_ONLY=zig,dotnet node tools/fetch-extensions.mjs
+  {
+    id: "zig", seeds: ["zig"], category: "toolchain",
+    name: "Zig 工具链",
+    description:
+      "zig 0.17（自带 libc 头与链接器）：`zig cc` 当 C 交叉编译器用，" +
+      "`zig build-exe` 直接出 aarch64 可执行文件，不依赖 NDK。体积较大（约 511 MiB）。",
+    bins: ["zig"],
+  },
+  {
+    id: "fortran", seeds: ["lfortran", "flang"], category: "toolchain",
+    name: "Fortran 编译器 (flang + LFortran)",
+    description:
+      "Termux 主仓**没有 gfortran**（GCC 的 Fortran 前端没打包，`gcc`/`gfortran` 索引零命中），" +
+      "改由两个真编译器顶上：LLVM 的 `flang`（21.x，Fortran 2018 + OpenMP，`flang -O2 a.f90 -o a`）" +
+      "与 `lfortran`（轻量、可直接解释）。" +
+      "`-ffixed-form` 之类 GNU 方言扩展到不了位时，仍需要外部 gfortran 工具链。",
+    bins: ["flang", "flang-new", "lfortran"],
+  },
+  // ⚠️ dotnet **不发包**（v0.9.69 实测后撤下）：Termux 侧的 dotnet 闭包缺宿主。
+  //
+  // `dotnet-sdk-8.0` / `dotnet-runtime-8.0` / `dotnet-targeting-pack-8.0` 的全部文件
+  // 都落在 `lib/dotnet/` 里（SDK、运行时、模板、targeting pack 一样不缺，解包
+  // 116 MiB），但**没有任何一个 deb 提供 `dotnet` 宿主可执行文件** ——
+  // 逐个 deb 扫过 basename 为 `dotnet` 的条目（含符号链接/硬链）零命中，
+  // 而 `dotnet-host_10.0_aarch64.deb` 只有 **700 字节**、内容只有一个 `.` 目录项，
+  // 是个空壳。于是 `bin/dotnet` 无从生成，SDK 那一大坨 DLL 永远跑不起来。
+  //
+  // 要真正可用得自己编 host（`dotnet/runtime` 的 native host，交叉编 bionic），
+  // 或者在扩展池里塞一份 linux-arm64 的 host（glibc，跑不起来）。两条都不成立，
+  // 与其塞 116 MiB 死重，不如不装、并在文档里写清。
+  //
+  // 需要时的替代：C# 脚本类需求用 `mono`（Termux 也没有）、或走 `dotnet` 官方
+  // 的 wasm/容器方案 —— 都属于「换工具链」，不在本包范围内。
+  {
+    // C#：Termux 的 dotnet 闭包缺宿主（见上方 dotnet 注释），能真正用的是 Mono 6.14 ——
+    // 自带 C# 编译器（`m` + `cs` 两个字母那条命令、以及 `csc`）、`mono` 运行时与
+    // `csharp` 交互式 shell，覆盖 .NET Framework 时代的类库子集。
+    // 新式 `dotnet new/build`、NuGet 还原、`net8.0` 目标框架都用不了。
+    id: "csharp", seeds: ["mono"], category: "devtools",
+    name: "C# 编译器与运行时 (Mono)",
+    description:
+      "Mono 6.14：mcs / csc 编译、mono 运行、csharp 交互式。支持 C# 7 语法与 .NET " +
+      "Framework 类库子集；dotnet SDK 在 Termux 下缺宿主可执行，不可用。",
+    bins: ["mono", "mcs", "csc", "csharp"],
+  },
+  {
+    id: "torch", seeds: ["python-torch"], category: "devtools",
+    name: "PyTorch",
+    description:
+      "python-torch 2.x（Termux 预编译，cp314 + aarch64）。CPU 推理与训练，" +
+      "`import torch` 即用；需要视觉扩展时另装 torchvision（未随包，体积换边际收益不值）。",
+    bins: [],
+  },
   {
     id: "valgrind", seeds: ["valgrind"], category: "toolchain",
     name: "Valgrind 内存调试",
@@ -530,9 +618,9 @@ export const POOL_ITEMS = [
     category: "devtools",
     name: "前端与脚本工具链",
     description:
-      "TypeScript / ESLint / Prettier / esbuild / Rollup / Vite，含 Android arm64 原生构件，" +
+      "TypeScript / ESLint / Prettier / esbuild / Rollup / Vite / Webpack，含 Android arm64 原生构件，" +
       "离线可用（不依赖运行时 npm 安装）。",
-    bins: ["tsc", "tsserver", "eslint", "prettier", "esbuild", "rollup", "vite"],
+    bins: ["tsc", "tsserver", "eslint", "prettier", "esbuild", "rollup", "vite", "webpack", "webpack-cli"],
     npmPackages: {
       typescript: "^5.9",
       eslint: "^9",
@@ -540,6 +628,11 @@ export const POOL_ITEMS = [
       esbuild: "^0.28",
       rollup: "^4",
       vite: "^7",
+      // webpack 本体 + CLI（v6 起 CLI 拆成独立包，只有本体时 `webpack` 命令不存在）。
+      // 纯 JS，无原生构件；`webpack --version` 与 webpack.config.js 全流程已在
+      // 真机验证（v0.9.68）。
+      webpack: "^5",
+      "webpack-cli": "^6",
     },
     // 少任何一个都说明 npm 按宿主平台装了 —— 构建期直接失败，别等上设备。
     requiredPlatformPackages: ["@esbuild/android-arm64", "@rollup/rollup-android-arm64"],

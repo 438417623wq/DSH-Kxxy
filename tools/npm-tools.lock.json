@@ -1,11 +1,13 @@
 {
-  "generatedAt": "2026-11-18T10:24:21.583Z",
+  "generatedAt": "2026-11-18T16:43:11.960Z",
   "packages": {
     "typescript": "5.9.3",
     "eslint": "9.39.5",
     "prettier": "3.10.1",
     "esbuild": "0.28.2",
     "rollup": "4.68.6",
-    "vite": "7.3.8"
+    "vite": "7.3.8",
+    "webpack": "5.112.2",
+    "webpack-cli": "6.0.1"
   }
 }
