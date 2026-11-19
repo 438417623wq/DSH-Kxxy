@@ -582,26 +582,32 @@ function corepackWrappers(bundledPnpm) {
 }
 
 /**
- * `bin/ln` 包装器：硬链接被 SELinux 拒时退化为独立副本。
+ * `bin/ln` 包装器：硬链接被 SELinux 拒时改建成**符号链接**（不是复制）。
  *
- * 为什么不修 SELinux 而是退化（2026-11-18 真机取证，Redmi K60 Pro / Android 13）：
- *   · 在 app 私有目录里 `ln a b` → `Permission denied`；
- *   · 换成 `/system/bin/ln`（toybox）同样失败；
- *   · `/data/local/tmp` 下以 `shell` 身份也失败；
- *   · Python 里直接 `libc.link()` → **errno 13 (EACCES)**。
- * `EACCES` 而不是 `EPERM/ENOTSUP`，说明不是 f2fs 的能力问题（`mount` 里 /data
- * 也没有任何限制性挂载选项），而是 LSM 拒绝 —— 这台 ROM 的 sepolicy 把
- * `link` 从 `runas_app` / `shell` 等域的 `app_data_file` 权限里摘掉了。
- * 改 sepolicy 需要 root（`setenforce`/`magisk` 那一层），不是 APK 能做的事。
+ * 为什么硬链接本身修不了（2026-11-19 真机取证，Redmi K60 Pro / Android 13）：
+ *   · App 私有目录内、同一父目录、同一文件系统（`stat.dev` 相同）都失败；
+ *   · 调用者 uid 10398 与源文件 owner 10398 一致，文件 mode 666，目录 owner 也是自己
+ *     —— DAC 全通过，排除 `fs.protected_hardlinks`（那条只会回 EPERM）；
+ *   · 用 `ctypes` 直接打 `link(2)` / `linkat(2)`，两者都返回
+ *     **errno 13 (EACCES)**，同一进程里 `symlink(2)` 与 `open(O_CREAT)` 都成功；
+ *   · `ps -Z` 显示进程域是 `u:r:untrusted_app_27:s0`，`/data` 挂载带 `seclabel`。
+ * 结论：LSM（SELinux）把 `file link` 从 untrusted_app 域的 `app_data_file`
+ * 权限里摘掉了。**这是内核策略，用户态无解** —— 改 sepolicy 要 root。
  *
- * 所以这里只解决「脚本不再因为一条 ln 而整条挂掉」：先按原样调多调用入口
- * （`bin/coreutils --coreutils-prog=ln`，见下方注释里那条调用形式的坑），
- * 失败且 stderr 明确是
- * `Permission denied` 时，改用 `cp -a` 落一份独立副本，并在 stderr 说明。
- * 语义差异（之后改其中一个不会同步另一个）由 `KXXY_LN_STRICT=1` 关掉退化。
+ * 但「去重」这个目的不必靠硬链接达成：`symlink(2)` 是另一个权限，从来可用。
+ * 所以退化目标是**符号链接**而不是副本：
+ *   · 同一份数据只有一份，不额外占空间（`cp -a` 是两份，且之后不同步 ——
+ *     那才是会把用户坑到的语义）；
+ *   · 改一处两处都变，与硬链接的可观察行为一致。
+ * 差别只剩 `st_ino` 与 `st_nlink`（不是同一 inode），以及原文件被删后符号链接
+ * 会悬空 —— 脚本场景里这是可以接受的取舍。
+ *
+ * `KXXY_LN_STRATEGY=copy` 可退回「独立副本」（需要能独立修改副本时用）；
+ * `KXXY_LN_STRICT=1` 直接失败而不退化（要确认「真的建不了硬链接」时用）；
+ * `KXXY_LN_QUIET=1` 关掉那行说明。
  *
  * `ln -s` 一律原样透传：软链在 SELinux 里是另一个权限（`untrusted_app` 有），
- * 从来不受这条限制影响，包内 `lib/ruby`、`bin/ln` 自己都是软链。
+ * 从来不受这条限制影响，包内 `lib/ruby`、`bin/pnpx` 自己也都是软链。
  */
 function hardlinkWrappers() {
   const script = [
@@ -621,14 +627,11 @@ function hardlinkWrappers() {
     // （POSIX 规定无 else 的 if 复合命令以 0 退出），拿它当退出码会让
     // 「严格模式」在最该报错的地方静默成功。
     //
-    // 调用形式是 `--coreutils-prog=ln`，**不是** `coreutils ln`（缺陷 DB）。
-    // Termux 的 coreutils 是「单二进制 + 按 argv[0] 分发」，它支持的
-    // 是 `--coreutils-prog=PROG` 这种显式形式；`coreutils ln a b` 会把 `ln`
-    // 当成非法参数，真机只回一句
+    // 调用形式是 `--coreutils-prog=ln`，**不是** `coreutils ln`（缺陷 DB）：
+    // Termux 的 coreutils 是「单二进制 + 按 argv[0] 分发」，`coreutils ln a b`
+    // 会把 `ln` 当成非法参数，真机只回一句
     //     Try '<root>/bin/coreutils --help' for more information.
-    // （rc=1，且 stderr 里**没有** Permission denied）—— 于是包装器认为
-    // 「不是 SELinux 那种可退化的错误」，把这条帮助提示原样吐给用户，
-    // 硬链接照旧建不出来，退化逻辑等于没生效。
+    // （rc=1，stderr 里**没有** Permission denied）—— 退化分支永远进不去。
     'err=$("$real" --coreutils-prog=ln "$@" 2>&1)',
     "rc=$?",
     '[ "$rc" -eq 0 ] && exit 0',
@@ -636,32 +639,89 @@ function hardlinkWrappers() {
     '  *"Permission denied"*) ;;',
     '  *) printf "%s\\n" "$err" >&2; exit "$rc" ;;',
     "esac",
-    '[ "${KXXY_LN_STRICT:-0}" = "1" ] && { printf "%s\\n" "$err" >&2; exit "$rc"; }',
+    '[ "${KXXY_LN_STRICT:-0}" = "1" ] && {',
+    '  printf "%s\\n" "$err" >&2',
+    '  printf "ln: 本机 SELinux 拒绝 link(2)（EACCES），硬链接无法建立。\\n" >&2',
+    '  printf "    去掉 KXXY_LN_STRICT 会用符号链接等价去重；KXXY_LN_STRATEGY=copy 则退化为独立副本。\\n" >&2',
+    '  exit "$rc"',
+    "}",
     'n=$#; [ "$n" -ge 2 ] || { printf "%s\\n" "$err" >&2; exit "$rc"; }',
-    'dst=""; i=0',
+    // 收集参数：最后一个非选项是目标，其余是源；顺带取 -f / -T
+    'force=0; notarget=0; dst=""',
     'for a in "$@"; do',
-    "  i=$((i+1))",
-    '  [ "$i" -eq "$n" ] && { dst=$a; continue; }',
-    "  case \"$a\" in -*) continue ;; esac",
-    // 源不存在时绝不能退化：否则「找不到文件」会被伪装成一次成功的复制。
-    '  [ -e "$a" ] || { printf "%s\\n" "$err" >&2; exit "$rc"; }',
+    '  case "$a" in',
+    '    -f|--force) force=1; continue ;;',
+    '    -T|--no-target-directory) notarget=1; continue ;;',
+    "    -*) continue ;;",
+    "  esac",
+    '  dst=$a',
     "done",
-    'case "$dst" in -*) printf "%s\\n" "$err" >&2; exit "$rc" ;; esac',
+    'case "$dst" in ""|-*) printf "%s\\n" "$err" >&2; exit "$rc" ;; esac',
     "if [ \"$n\" -gt 2 ] && [ ! -d \"$dst\" ]; then",
     '  printf "%s\\n" "$err" >&2; exit "$rc"',
     "fi",
-    'printf "ln: 本机 SELinux 禁止硬链接（link(2) -> EACCES），已退化为独立副本：%s\\n" "$dst" >&2',
-    'i=0',
+    'strat=${KXXY_LN_STRATEGY:-symlink}',
+    'i=0; fail=0',
     'for a in "$@"; do',
     "  i=$((i+1))",
     '  [ "$i" -eq "$n" ] && break',
-    "  case \"$a\" in -*) continue ;; esac",
-    '  if [ -d "$dst" ]; then cp -a "$a" "$dst/"; else cp -a "$a" "$dst"; fi',
+    '  case "$a" in -*) continue ;; esac',
+    // 源不存在时绝不能退化：否则「找不到文件」会被伪装成一次成功。
+    '  [ -e "$a" ] || { printf "%s\\n" "$err" >&2; exit "$rc"; }',
+    // 目标路径：两参且 dst 是目录时，落 dst/<basename>
+    '  if [ "$notarget" = "0" ] && [ -d "$dst" ]; then tgt="$dst/${a##*/}"; else tgt="$dst"; fi',
+    '  if [ "$strat" = "copy" ]; then',
+    '    [ "${KXXY_LN_QUIET:-0}" = "1" ] || printf "ln: SELinux 禁硬链接，已建独立副本（改一处不会同步）：%s\\n" "$tgt" >&2',
+    '    if [ -d "$dst" ] && [ "$notarget" = "0" ]; then cp -a "$a" "$dst/" || fail=1; else cp -a "$a" "$tgt" || fail=1; fi',
+    "    continue",
+    "  fi",
+    // 符号链接必须用**绝对路径**：相对源经 ln -s 会变成相对链接，
+    // 落点变了就悬空（`ln ../x dir/y` 是典型例子）。
+    '  case "$a" in',
+    '    /*) abs=$a ;;',
+    '    *) ad=${a%/*}; [ "$ad" = "$a" ] && ad=.; ad=$(cd "$ad" 2>/dev/null && pwd) || { printf "%s\\n" "$err" >&2; exit "$rc"; }; abs=$ad/${a##*/} ;;',
+    "  esac",
+    '  [ "$force" = "1" ] && rm -f "$tgt"',
+    '  [ "${KXXY_LN_QUIET:-0}" = "1" ] || printf "ln: SELinux 禁硬链接（link(2) -> EACCES），已建符号链接（同一份数据，不额外占空间）：%s\\n" "$tgt" >&2',
+    '  "$real" --coreutils-prog=ln -s "$abs" "$tgt" || fail=1',
     "done",
-    "exit 0",
+    '[ "$fail" -eq 0 ] && exit 0',
+    "exit 1",
     "",
   ].join("\n");
   return [{ path: "bin/ln", data: Buffer.from(script, "utf8"), mode: 0o755 }];
+}
+
+/**
+ * `bin/gfortran` 前端：转发到 flang。
+ *
+ * Termux 主仓没有 gfortran（GCC 的 Fortran 前端没打包），而大量科学计算项目的
+ * `./configure`、Makefile、CMake 工具链文件里都硬写 `gfortran`，命令名不存在就
+ * 直接判「没有 Fortran 编译器」。这里给 flang 挂一个 gfortran 名字。
+ *
+ * 真机实测 flang 21.1.8 对 gfortran 的常用命令行完全兼容（不需要做参数改写）：
+ *   `-c -o -O2 -g -fPIC -shared -I -L -l -J -cpp -std=f2018
+ *    -ffree-form -ffixed-form -fopenmp` 全部接受，且 `-J dir` 真的把 `.mod`
+ *    写进 `dir`（编译 + 链接 + 运行多文件模块程序得到正确结果）。
+ *
+ * 仍然是「前端」而不是 GNU gfortran：GNU 方言扩展（`-fdec`、部分 `-std=legacy`
+ * 行为、`-fcheck=all` 的细节）到不了位，报错文案也不同。别把它宣传成 gfortran。
+ */
+function fortranWrappers() {
+  const script = [
+    "#!/system/bin/sh",
+    "# generated by dsh-kxxy build-runtime.mjs — do not edit",
+    'd=${0%/*}',
+    'real="$d/flang"',
+    '[ -x "$real" ] || {',
+    '  printf "gfortran: 找不到 %s\\n" "$real" >&2',
+    '  printf "          Fortran 编译器在 fortran 扩展池里，先在控制台「扩展」安装该池。\\n" >&2',
+    "  exit 127",
+    "}",
+    'exec "$real" "$@"',
+    "",
+  ].join("\n");
+  return [{ path: "bin/gfortran", data: Buffer.from(script, "utf8"), mode: 0o755 }];
 }
 
 /**
@@ -878,7 +938,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  *  2. `bin/ln` 的**内容**改了（`coreutils ln` → `coreutils --coreutils-prog=ln`，
  *     外加复制降级）。锚点只判「文件在不在」，内容换了同样看不见。
  */
-const PATCHSET_MARKER = "kxxy-patchset@30";
+const PATCHSET_MARKER = "kxxy-patchset@31";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**
@@ -2048,7 +2108,7 @@ async function main() {
   } else {
     console.warn("      ⚠️ stage 里没有 bin/pnpm —— 会退回 corepack shim（首次运行要联网下载）");
   }
-  for (const w of [...corepackWrappers(bundledPnpm), ...hardlinkWrappers()]) {
+  for (const w of [...corepackWrappers(bundledPnpm), ...hardlinkWrappers(), ...fortranWrappers()]) {
     // 同名 stage 条目必须让位：`bin/corepack` 在 stage 里是一条符号链接
     // （`→ ../lib/node_modules/corepack/dist/corepack.js`），它会以 LINK 条目
     // 进入 deduped.links，随后与这里的包装器在 mergeEntries 里撞名而抛错。

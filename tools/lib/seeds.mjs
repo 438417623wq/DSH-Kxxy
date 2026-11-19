@@ -540,12 +540,16 @@ export const POOL_ITEMS = [
   },
   {
     id: "fortran", seeds: ["lfortran", "flang"], category: "toolchain",
-    name: "Fortran 编译器 (flang + LFortran)",
+    name: "Fortran 编译器 (flang + LFortran + gfortran 前端)",
     description:
       "Termux 主仓**没有 gfortran**（GCC 的 Fortran 前端没打包，`gcc`/`gfortran` 索引零命中），" +
-      "改由两个真编译器顶上：LLVM 的 `flang`（21.x，Fortran 2018 + OpenMP，`flang -O2 a.f90 -o a`）" +
-      "与 `lfortran`（轻量、可直接解释）。" +
-      "`-ffixed-form` 之类 GNU 方言扩展到不了位时，仍需要外部 gfortran 工具链。",
+      "改由 LLVM 的 `flang`（21.x，Fortran 2018 + OpenMP）与 `lfortran`（轻量、可直接解释）顶上，" +
+      "并由引擎补一个 `gfortran` 前端转发到 flang —— `./configure`、Makefile、CMake 工具链里" +
+      "硬写 `gfortran` 的项目因此能直接跑（`-c -o -O2 -fPIC -shared -I -L -l -J -cpp -std=` " +
+      "以及 `-ffree-form`/`-ffixed-form`/`-fopenmp` 实测全部接受）。" +
+      "注意它仍是前端：GNU 方言扩展（`-fdec`、部分 legacy 行为）到不了位。" +
+      "池内会自动把引擎的 crt 对象、compiler-rt builtins、libunwind.a 链进来，" +
+      "否则 `flang` 只能 `--version`、真编译全在 ld.lld 阶段失败。",
     bins: ["flang", "flang-new", "lfortran"],
   },
   // ⚠️ dotnet **不发包**（v0.9.69 实测后撤下）：Termux 侧的 dotnet 闭包缺宿主。
