@@ -562,8 +562,9 @@ export const POOL_ITEMS = [
   // 是个空壳。于是 `bin/dotnet` 无从生成，SDK 那一大坨 DLL 永远跑不起来。
   //
   // 要真正可用得自己编 host（`dotnet/runtime` 的 native host，交叉编 bionic），
-  // 或者在扩展池里塞一份 linux-arm64 的 host（glibc，跑不起来）。两条都不成立，
-  // 与其塞 116 MiB 死重，不如不装、并在文档里写清。
+  // 或者在扩展池里塞一份 linux-arm64 的 host —— 后者**现在可以了**：
+  // 见下方 `glibc` 条目，`kxxy-glibc` 里 `apt install dotnet-sdk-8.0` 即可，
+  // 代价是要过一层 proot（慢，但功能是全的）。本条目仍保留 Mono 这一档。
   //
   // 需要时的替代：C# 脚本类需求用 `mono`（Termux 也没有）、或走 `dotnet` 官方
   // 的 wasm/容器方案 —— 都属于「换工具链」，不在本包范围内。
@@ -578,6 +579,61 @@ export const POOL_ITEMS = [
       "Mono 6.14：mcs / csc 编译、mono 运行、csharp 交互式。支持 C# 7 语法与 .NET " +
       "Framework 类库子集；dotnet SDK 在 Termux 下缺宿主可执行，不可用。",
     bins: ["mono", "mcs", "csc", "csharp"],
+  },
+  // ── glibc 用户态：bionic 装不下的那一整类工具的解 ────────────────────────
+  //
+  // 起因是四条一直补不上的缺口（julia / dotnet / wkhtmltopdf / glibc 轮子），
+  // 它们不是「Termux 忘了打包」，而是**根本没有 bionic 构件**：
+  //   · julia 只发 linux-x86_64 / linux-aarch64（glibc）；
+  //   · dotnet 的宿主是 glibc 链接（Termux 闭包里连宿主都没有，见上）；
+  //   · wkhtmltopdf 依赖打包好的 Qt/WebKit（glibc）；
+  //   · PyPI 的 manylinux 轮子（sklearn/cv2 之类）同理 —— 见 MEMORY 里
+  //     「glibc 轮子在 bionic 上不可能可用」那条：垫片方案最后必然卡在
+  //     `ld-linux-aarch64.so.1 is not accessible for the namespace`。
+  //
+  // 唯一走得通的路是**换一个完整的 glibc 用户态**：proot + 一份 Ubuntu base
+  // rootfs。proot 本身已在预装闭包里（`<root>/bin/proot` + `libexec/proot/loader`），
+  // 这一项只带 rootfs 与一个 `kxxy-glibc` 入口。
+  //
+  // 真机实测（Redmi K60 Pro，patchset 31 之后的验证）：
+  //   `kxxy-glibc -c 'apt-get update'` → apt 2.7 MB/s；
+  //   `apt install python3-pip` 后 `pip install scikit-learn opencv-python-headless`
+  //   → numpy 2.5.5 / sklearn 1.9.1 / cv2 5.1.0，`LinearRegression` 真拟合 coef=2.0。
+  //
+  // 为什么进池而不预装：rootfs 种子 29.8 MB（解出来 80 MB），加上用户 apt 装的
+  // 东西很容易上 GB，塞进 APK 对「不用 glibc」的人是纯负担；而且它是**有状态**的
+  // （用户在里面装包），放池里按需解包、数据落在 `<files>/glibc/` 才不会被
+  // runtime 重装清掉。
+  //
+  // 为什么 seed 是一整块 tar.gz 而不是解开的文件树：池解包器会跳过符号链接，
+  // 而这份 rootfs 有 194 条软链 —— 详见 `tools/lib/asset-pack.mjs` 顶部注释。
+  {
+    id: "glibc", source: "asset", category: "toolchain",
+    version: "24.04.3",
+    name: "glibc 用户态（Ubuntu 24.04 + proot）",
+    description:
+      "在 proot 里跑一份**未改动的 Ubuntu 24.04 base**：`kxxy-glibc` 进容器，" +
+      "`kxxy-glibc -c 'apt-get update'` 直接装包。所有只有 glibc 构件的工具都能用了 —— " +
+      "julia、dotnet-sdk、wkhtmltopdf、PyPI 的 manylinux 轮子（sklearn/cv2）都在这一类。" +
+      "无需 root、不改系统，代价是每条系统调用多一层 ptrace 转发（比原生慢 2–5 倍）。" +
+      "首次运行解包 rootfs 约 1 分钟；之后 apt 装的东西都留在 <files>/glibc/rootfs，" +
+      "重装扩展或升级 APK 都不会丢。",
+    // 用户能看到/点到的命令：入口只有 kxxy-glibc 一个（`apt`/`julia` 都在容器里）
+    bins: ["kxxy-glibc"],
+    assets: [
+      {
+        // Ubuntu Base 24.04.3（arm64）：29 865 086 字节，与 sha256 一起钉死。
+        // 24.04 的 `release/` 目录会随点版本滚动（现在指向 24.04.5），
+        // 所以固定到 24.04.3 自己的目录，避免某天产物悄悄换掉。
+        from: ".cache/glibc/ubuntu-base-24.04.3-base-arm64.tar.gz",
+        url: "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.3/release/ubuntu-base-24.04.3-base-arm64.tar.gz",
+        sha256: "7b2dced6dd56ad5e4a813fa25c8de307b655fdabc6ea9213175a92c48dabb048",
+        to: "rootfs/ubuntu-base.tgz",
+        // 归档里有两条硬链（perl5.38.2 / uncompress），应用域建不出来 → 构建期改写
+        dereference: true,
+      },
+    ],
+    wrappers: ["kxxy-glibc"],
   },
   {
     id: "torch", seeds: ["python-torch"], category: "devtools",

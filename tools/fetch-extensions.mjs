@@ -27,6 +27,7 @@ import {
 } from "./lib/registry.mjs";
 import { POOL_ITEMS, SEED_PACKAGES, TERMUX_REPO } from "./lib/seeds.mjs";
 import { buildNpmPack, NPM_SOURCE } from "./lib/npm-pack.mjs";
+import { ASSET_SOURCE, buildAssetPack, findPython } from "./lib/asset-pack.mjs";
 
 /**
  * 池内条目可能住在 Termux 的其他仓库：yt-dlp 在 root 仓库（termux-main 没有）。
@@ -195,11 +196,17 @@ async function main() {
   const missingAll = [];
   const failedItems = [];
   // npm 源条目不进 deb 闭包（Termux 索引里根本没有这些包），单独在 [4.5/5] 打。
+  // asset 源同理（整块资产，没有依赖图），比如 glibc 的 Ubuntu rootfs。
   const npmItems = [];
+  const assetItems = [];
   for (const item of POOL_ITEMS) {
     if (!wanted(item)) continue;
     if (item.source === NPM_SOURCE) {
       npmItems.push(item);
+      continue;
+    }
+    if (item.source === ASSET_SOURCE) {
+      assetItems.push(item);
       continue;
     }
     const closure = resolveClosure(index, item.seeds);
@@ -289,25 +296,11 @@ async function main() {
   console.log("[4/5] 解 deb → 物化符号链接 → 重打 tar.gz（poolextract.py）...");
   const reportPath = join(CACHE, "pool-report.json");
   // 本机常有「装了 Python 但不在 PATH」的情况（Windows 商店版/自定义安装），
-  // 按候选逐个探测；KXXY_PYTHON 始终最高优先。
-  const PY_CANDIDATES = [
-    process.env.KXXY_PYTHON,
-    "python",
-    "python3",
-    join(process.env.LOCALAPPDATA ?? "", "Programs", "Python", "Python312", "python.exe"),
-    "C:\\Python312\\python.exe",
-  ].filter(Boolean);
-  let py = null;
-  for (const cand of PY_CANDIDATES) {
-    const probe = spawnSync(cand, ["--version"], { stdio: "ignore" });
-    if (probe.status === 0 || !probe.error) {
-      py = cand;
-      break;
-    }
-  }
+  // 候选表与探测逻辑同 `asset-pack.mjs` 的 findPython（一处维护）。
+  const py = findPython();
   if (py === null) {
     throw new Error(
-      `找不到 Python 解释器（试过：${PY_CANDIDATES.join(", ")}）。` +
+      "找不到 Python 解释器（KXXY_PYTHON / python / python3 / Python312 都试过）。" +
       "poolextract.py 依赖 Python 标准库解 data.tar.xz（Node 无 xz）。",
     );
   }
@@ -363,6 +356,25 @@ async function main() {
         totalBytes: res.totalBytes,
         placeholderFiles: res.ids ?? res.files,
         platformPackages: res.platformPackages,
+      });
+    }
+  }
+
+  // ── [4.6/5] asset 源条目（整块资产，如 glibc 的 Ubuntu rootfs）─────────
+  //
+  // 这类条目没有依赖图也没有包索引：资产按 seeds 里钉死的 url + sha256 取，
+  // 需要时先在构建期去硬链（应用域建不出硬链，见 tools/lib/tarderef.py），
+  // 再与生成的包装器一起打成同一形态的 `.pool`。
+  if (assetItems.length) {
+    console.log(`[4.6/5] 打 asset 源池（${assetItems.map((i) => i.id).join(", ")}）...`);
+    for (const item of assetItems) {
+      const res = await buildAssetPack(item, { outDir: POOL_OUT, project: PROJECT });
+      report.items.push({
+        id: res.id,
+        version: res.version,
+        files: res.files,
+        totalBytes: res.totalBytes,
+        assets: res.assets,
       });
     }
   }
