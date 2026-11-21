@@ -107,6 +107,8 @@ dsh-kxxy/
 
 ## 三、构建
 
+> **运行时能力修复（2026-11-21）**：默认 Python 独立 glibc 路由、真实硬链接/rsync 语义、perf 失败诊断与设备验收边界，见 [修复与验收说明](docs/runtime-capabilities-2026-11-21.md)。源码/本地测试通过不等于设备内核权限已解除。
+
 > **Python 依赖修复（0.9.42）**：默认装配 `tools/prebuilt/python-android-cp314/` 中已验证的 CFFI 2.0.0 与 pycparser 2.23，核对目标 Python/原生库摘要后才能出包。不再依赖 deb 的联网 postinst。新解释器/库版本须重建匹配构件，不能直接复用。维护区“一键验收（含 Python）”可做实际功能检查；NumPy/psutil 的旧平台标签仍如实报告。详见 [Python 修复与验证边界](docs/python-runtime-repair-0.9.42.md)。
 
 前置：JDK 17、Android SDK（platforms 36 / build-tools 36 / ndk 28.2 / cmake 3.22.1）。

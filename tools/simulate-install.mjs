@@ -34,7 +34,10 @@ import {
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { inflateRawSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { readZipDirectory } from "./lib/zipread.mjs";
+import { PYTHON_DEFAULT_PATHS, pythonDefaultWrappers } from "./lib/python-default.mjs";
+import { installedPlaceholderRules, rewriteInstalledBytes, verifyInstalledPythonRoutes } from "./test-runtime-installed-routes.mjs";
 import { officeDirectoryReader, verifyOfficeAssets, OFFICE_LAYER_MARKER } from "./lib/office-assets.mjs";
 
 /** 本脚本所在目录（`tools/`）。静态检查 Kotlin 源码时要用绝对路径。 */
@@ -132,7 +135,12 @@ const HOST_PLUGIN_FINGERPRINT = (() => {
  * 表现是「手机上仍是官方桌面布局」——不报错、不留日志。标记由
  * build-runtime.mjs 写成包根目录下的 `plugin.version`。
  */
-const MOBILE_PLUGIN_MARKER = "kxxy-mobile-plugin@1";
+const MOBILE_PLUGIN_MARKER = (() => {
+  const kt = readFileSync(join(HERE, "..", "android/app/src/main/java/app/kxxy/engine/RuntimeInstaller.kt"), "utf8");
+  const match = kt.match(/private const val MOBILE_PLUGIN_MARKER\s*=\s*"([^"]+)"/);
+  if (!match) throw new Error("RuntimeInstaller.kt 未定义 MOBILE_PLUGIN_MARKER");
+  return match[1];
+})();
 const MOBILE_PLUGIN_ENTRY = "lib/node_modules/dsh-web-mobile/package.json";
 const MOBILE_PLUGIN_CLIENT = "lib/node_modules/dsh-web-mobile/lib/client.js";
 const MOBILE_PLUGIN_MARKER_FILE = "lib/node_modules/dsh-web-mobile/plugin.version";
@@ -332,6 +340,25 @@ function readEntryData(name, e) {
   return e.method === 0 ? raw : inflateRawSync(raw);
 }
 
+// Keep native interpreter bytes before any installation/rewrite touches disk.
+const nativePythonSource = (() => {
+  const seen = new Set();
+  let path = "bin/python3";
+  while (linkTargets.has(path)) {
+    if (seen.has(path)) throw new Error(`Python LINK 循环：${path}`);
+    seen.add(path);
+    path = linkTargets.get(path);
+  }
+  const entry = index.get(path);
+  if (!entry) throw new Error(`原生 Python 本体缺失：${path}`);
+  if (manifest.placeholderPaths?.some((rel) => rel === path || rel === "bin/python" || rel === "bin/python3")) {
+    throw new Error("原生 Python ELF 不得参加占位符重写");
+  }
+  const bytes = readEntryData(path, entry);
+  if (!bytes.subarray(0, 4).equals(Buffer.from([127, 69, 76, 70]))) throw new Error("原生 Python 本体不是 ELF");
+  return { path, bytes, sha256: createHash("sha256").update(bytes).digest("hex") };
+})();
+
 // ---------------------------------------------------------------- extract
 if (existsSync(target)) throw new Error(`模拟目标已出现，拒绝覆盖：${target}`);
 mkdirSync(target);
@@ -417,6 +444,7 @@ if (copiedLinks) {
 
 // ---------------------------------------------------------------- rewriteRootPlaceholder
 const placeholders = manifest.placeholderPaths ?? [];
+const placeholderRules = installedPlaceholderRules(canonicalRoot, manifest);
 let rewritten = 0;
 const stillHasTermux = [];
 for (const rel of placeholders) {
@@ -425,20 +453,25 @@ for (const rel of placeholders) {
     fail(`placeholderPaths 指向不存在的文件：${rel}`);
     continue;
   }
-  const text = readFileSync(f).toString("latin1");
-  if (!text.includes(ROOT_PLACEHOLDER)) {
-    fail(`placeholderPaths 声明的文件里没有占位符：${rel}`);
+  const data = readFileSync(f);
+  const text = data.toString("latin1");
+  if (!placeholderRules.some(([token]) => text.includes(token))) {
+    fail(`placeholderPaths 声明的文件里没有五条占位符中的任一条：${rel}`);
     continue;
   }
-  writeFileSync(f, Buffer.from(text.split(ROOT_PLACEHOLDER).join(canonicalRoot), "latin1"));
+  const installed = rewriteInstalledBytes(data, placeholderRules);
+  writeFileSync(f, installed);
   rewritten += 1;
+  if (/@DSH_(?:ROOT|HOME|TMP|FILES|DATA)@/.test(installed.toString("latin1"))) {
+    fail(`占位符回填后仍有未解析路径：${rel}`);
+  }
   // *.dist-info/METADATA 是 PyPI 长描述（README 原文），proot-distro 的示例
   // 命令里带着 /data/data/com.termux 字样 —— 纯文档，python 从不执行它，
   // 不算残留；真正的脚本残留仍然要吵出来。
   if (rel.endsWith("/METADATA")) continue;
-  if (readFileSync(f).toString("latin1").includes("com.termux")) stillHasTermux.push(rel);
+  if (installed.toString("latin1").includes("com.termux")) stillHasTermux.push(rel);
 }
-console.log(`[3] rewriteRootPlaceholder：改写 ${rewritten}/${placeholders.length} 个脚本`);
+console.log(`[3] rewriteRootPlaceholder：五条规则改写 ${rewritten}/${placeholders.length} 个脚本`);
 if (stillHasTermux.length) fail(`改写后仍含 com.termux：${stillHasTermux.slice(0, 5).join(", ")}`);
 else ok("改写后无残留 com.termux");
 
@@ -512,18 +545,37 @@ for (const full of walk(target)) {
   // 没有它 Gradle 起不了 daemon（缺陷 AW），而 `java -version` 一切正常，
   // 所以这条漏了几乎是无声的。
   if (
-    (isElf || isScript) &&
-    (rel.startsWith("bin/") ||
-      rel.startsWith("usr/bin/") ||
-      rel.startsWith("libexec/") ||
-      (rel.startsWith("lib/jvm/") && (rel.includes("/bin/") || !base.includes("."))) ||
-      EXECUTABLE_NAMES.has(base))
+    rel.startsWith("bin/") ||
+    rel.startsWith("usr/bin/") ||
+    rel.startsWith("libexec/") ||
+    ((isElf || isScript) &&
+      ((rel.startsWith("lib/jvm/") && (rel.includes("/bin/") || !base.includes("."))) ||
+        (rel.startsWith("lib/node_modules/") && (rel.includes("/bin/") || EXECUTABLE_NAMES.has(base)))))
   ) {
     chmodSync(full, 0o755);
     chmodded.push(rel);
   }
 }
 console.log(`[5] restoreExecBits：${chmodded.length} 个可执行文件置 0755`);
+
+// Installed defaults must be independent files, source-exact after all five
+// substitutions, and selected for executable restoration (Windows is mock-mode).
+try {
+  for (const expected of pythonDefaultWrappers()) {
+    const entry = index.get(expected.path);
+    if (!entry || entry.comment.startsWith(LINK_PREFIX)) throw new Error(`路由条目缺失或是 LINK：${expected.path}`);
+    if (!readEntryData(expected.path, entry).equals(expected.data)) throw new Error(`路由与当前源码不一致：${expected.path}`);
+  }
+  const checked = verifyInstalledPythonRoutes(target, manifest, { chmodded, nativeBytes: nativePythonSource.bytes });
+  const installedNative = readFileSync(join(target, nativePythonSource.path));
+  if (createHash("sha256").update(installedNative).digest("hex") !== nativePythonSource.sha256) {
+    throw new Error(`原生 Python 本体发生字节变化：${nativePythonSource.path}`);
+  }
+  ok(`默认 Python ${checked.routes}/${PYTHON_DEFAULT_PATHS.length} 条安装后路由完整，原生 ELF SHA-256 ${nativePythonSource.sha256}`);
+  if (!checked.modeVerified) console.log("    Windows mock-mode：已验证 chmod 调用合同，未验证 POSIX exec 位或 Android 执行。");
+} catch (error) {
+  fail(`默认 Python 安装合同：${error.message}`);
+}
 
 /*
  * lib/jspawnhelper 必须真的被置位（缺陷 AW 的回归断言）。
@@ -756,7 +808,22 @@ for (const [label, f] of anchors) {
       } else ok(`锚点 15 ${rel} 是 corepack dist 软链（${link}）`);
       continue;
     }
-    const head = readFileSync(f, "utf8").slice(0, 256);
+    // Kotlin probes a bounded header; do not UTF-8-decode the 54 MiB pnpm SEA.
+    const fd = openSync(f, "r");
+    const probe = Buffer.alloc(256);
+    let probeLength;
+    try { probeLength = readSync(fd, probe, 0, probe.length, 0); }
+    finally { closeSync(fd); }
+    const bytes = probe.subarray(0, probeLength);
+    const head = bytes.toString("latin1");
+    if (rel === "bin/pnpm" && head.startsWith("\x7fELF")) {
+      if (statSync(f).size < 40 * 1024 * 1024) {
+        fail(`锚点 15 ${rel} 原生 SEA 被截断（不足 40 MiB）`);
+      } else if (bytes.length < 20 || bytes[4] !== 2 || bytes[5] !== 1 || bytes.readUInt16LE(18) !== 183) {
+        fail(`锚点 15 ${rel} 不是 ARM64 ELF64`);
+      } else ok(`锚点 15 ${rel} 是完整 ARM64 原生 SEA`);
+      continue;
+    }
     if (!head.startsWith("#!/system/bin/sh")) {
       fail(`锚点 15 ${rel} 首行不是 #!/system/bin/sh（${head.slice(0, 24)}）`);
     } else if (head.includes("lib/corepack.cjs")) {

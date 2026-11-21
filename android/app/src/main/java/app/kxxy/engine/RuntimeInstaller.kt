@@ -718,6 +718,25 @@ class RuntimeInstaller(private val ctx: Context) {
         // `ensurepip/__init__.py` 里的 `_PIP_VERSION` 现算。这样下次 python 包
         // 再漂移时会自动判假，不需要人记得升标记 —— 这正是前几个锚点用常量
         // 标记时反复踩的坑（标记忘了升 = 老设备永远拿不到新内容）。
+        // 默认 Python 路由必须与原生 ELF 分开；标记在位不等于脚本已完整解出。
+        for (rel in PYTHON_DEFAULT_FILES) {
+            RuntimeInstallIo.checkCancelled()
+            val f = File(root, rel)
+            if (!f.isFile || f.length() == 0L || Files.isSymbolicLink(f.toPath())) {
+                Log.w(TAG, "runtime probe: default Python route missing/invalid: $rel")
+                return false
+            }
+            val head = readHead(f, COMPAT_MARKER_PROBE_BYTES)
+            if (head.contains("@DSH_")) {
+                Log.w(TAG, "runtime probe: default Python route has unresolved paths: $rel")
+                return false
+            }
+            if (rel != "libexec/python-default/python-default.py") {
+                if (!head.startsWith("#!/system/bin/sh")) return false
+                if (!f.canExecute() && !f.setExecutable(true, false)) return false
+            }
+        }
+
         if (!ensurepipWheelMatches(root)) {
             Log.w(TAG, "runtime probe: ensurepip 的 pip wheel 与 _PIP_VERSION 不一致，强制重装")
             return false
@@ -3251,8 +3270,17 @@ class RuntimeInstaller(private val ctx: Context) {
         // mpmath / six），同时 bin/ln 的**内容**换成 `--coreutils-prog=ln`
         // 并带复制降级。前者是纯新增文件、后者是既有文件改内容 —— 十六条锚点
         // 一条都判不出来，只能再借这个编号让老设备重解一次。
-        private const val PATCHSET_MARKER = "kxxy-patchset@32"
+        // 32 → 33：默认 Python 独立 glibc 路由、原生 ln 语义及 perf 失败诊断。
+        private const val PATCHSET_MARKER = "kxxy-patchset@34"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
+        private val PYTHON_DEFAULT_FILES = listOf(
+            "libexec/python-default/python-default.py",
+            "libexec/python-default/kxxy-glibc",
+            "libexec/python-default/bin/python",
+            "libexec/python-default/bin/python3",
+            "libexec/python-default/bin/pip",
+            "libexec/python-default/bin/pip3",
+        )
 
         /**
          * Tesseract 简体中文语言包标记（锚点 12）。

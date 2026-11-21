@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 """kxxy-perf —— 直接调用 perf_event_open 的极简 perf。
 
-为什么不是 simpleperf：NDK 的 simpleperf 在 app uid 下有两处硬限制
-（`-- cmd` 直接拒；`record` 启动时要 SetProperty debug.perf_event_max_sample_rate，
-应用域改不了系统属性，即使外面已经 setprop 也照样失败）。而内核本身是允许的
-—— `perf_event_paranoid=-1`，perf_event_open 对 SW/HW 事件都返回正常 fd。
-所以这里绕开 simpleperf，自己开事件、自己读环形缓冲。
+为什么不是 simpleperf：NDK 的 simpleperf 在部分 app uid 环境下有额外限制
+（例如 `-- cmd` 或 `record` 的系统属性设置）。这里绕开 simpleperf，直接开事件、
+读环形缓冲，但不绕过内核权限检查：事件可用性仍取决于当前内核、PMU、
+perf_event_paranoid、SELinux/seccomp 与进程身份，以现场系统调用结果为准。
 
 子命令：
   perf list                       支持的计数器
@@ -17,6 +16,7 @@
 只依赖 CPython 标准库（ctypes/struct/mmap），可以在 bionic 上原生跑。
 """
 
+import errno
 import os
 import struct
 import sys
@@ -134,6 +134,48 @@ def perf_open(attr, pid=0, cpu=-1, group_fd=-1, flags=0):
     return fd
 
 
+def perf_open_failure(command, spec, attr, ex, pid=0, cpu=-1, flags=0):
+    """保留每次失败调用的参数与 errno，不从错误码推断具体策略来源。"""
+    etype, _size, config = struct.unpack_from("<IIQ", attr)
+    attr_flags = struct.unpack_from("<Q", attr, 40)[0]
+    ek = int(bool(attr_flags & (1 << B_EXCL_KERNEL)))
+    name = errno.errorcode.get(ex.errno, "UNKNOWN")
+    return (f"perf {command}: {spec}: perf_event_open failed: "
+            f"errno={ex.errno} ({name}: {ex.strerror}); "
+            f"type={etype} config={config} pid={pid} cpu={cpu} "
+            f"attr_flags=0x{attr_flags:x} exclude_kernel={ek} flags=0x{flags:x}\n")
+
+
+def current_domain():
+    if not os.path.exists("/proc/self/attr/current"):
+        return "unknown"
+    try:
+        with open("/proc/self/attr/current", "r") as f:
+            return f.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def policy_hint(errnos):
+    """按 errno + 当前 SELinux 域给一条可行动的提示；只陈述对照实测，
+    不从错误码单独断言具体是哪条策略。读不到域（非 Linux 环境等）不出提示。"""
+    dom = current_domain()
+    if dom == "unknown" or not errnos:
+        return []
+    out = []
+    if 13 in errnos and dom.startswith("u:r:untrusted_app"):
+        out.append(
+            f"  提示：当前进程域 {dom} 下 perf_event_open 返回 EACCES"
+            f"（perf_event_paranoid=-1 时，普通应用统计自身事件本不应被 paranoid 拒绝）。\n"
+            "  对照实测：同一台设备上，adb run-as 域（u:r:runas_app）同一命令可用：\n"
+            "      adb shell run-as app.kxxy env LD_LIBRARY_PATH=files/engine/lib \\\n"
+            "          files/engine/bin/perf stat -- <cmd>\n"
+            "  差异指向本 ROM 对应用域的策略限制；应用内无法绕过。\n")
+    elif 1 in errnos:
+        out.append("  提示：EPERM 常见于 seccomp 过滤或 perf_event_paranoid 限制。\n")
+    return out
+
+
 def ev_name(spec):
     return spec.split(":", 1)[0].strip()
 
@@ -223,7 +265,8 @@ def cmd_stat(argv):
             i += 1
             pid = int(argv[i])
         elif a in ("-a", "--all-cpus"):
-            pass  # 应用域只能看自己，接受但忽略
+            sys.stderr.write(f"perf stat: 不支持的选项 {a}（未实现系统范围计数）\n")
+            return 2
         elif a in ("-r", "--repeat"):
             i += 1
         elif a.startswith("-"):
@@ -262,6 +305,7 @@ def cmd_stat(argv):
     fds = []
     used = []
     exclude_kernel = 0
+    failed_errnos = []
     for spec in events:
         try:
             t, cfg = ev_resolve(spec)
@@ -269,24 +313,26 @@ def cmd_stat(argv):
             sys.stderr.write(f"perf stat: 未知事件 {spec}（perf list 看可选）\n")
             continue
         opened = False
-        for ek in (0, 1):  # 先按 perf 默认（含内核），被拒再退到只算用户态
+        failures = []
+        for ek in (0, 1):  # 先按 perf 默认（含内核），失败再试只算用户态
             bits = [B_DISABLED]
             if ek:
                 bits.append(B_EXCL_KERNEL)
+            blob = attr_blob(t, cfg, bits=bits)
             try:
-                fd = perf_open(attr_blob(t, cfg, bits=bits), pid=target)
+                fd = perf_open(blob, pid=target)
             except OSError as ex:
-                if ek == 0:
-                    continue
-                if verbose:
-                    sys.stderr.write(f"  {spec}: 开不了（{ex.strerror}）\n")
-                break
+                failures.append(perf_open_failure("stat", spec, blob, ex, pid=target))
+                failed_errnos.append(ex.errno)
+                continue
             ev_ioctl(fd, PERF_IOC_ENABLE)
             fds.append((fd, spec))
             used.append(spec)
             exclude_kernel = ek
             opened = True
             break
+        if not opened or verbose:
+            sys.stderr.writelines(failures)
         if not opened and verbose:
             sys.stderr.write(f"  {spec}: 跳过\n")
 
@@ -315,7 +361,9 @@ def cmd_stat(argv):
         os.close(fd)
 
     if not rows:
-        sys.stderr.write("perf stat: 一个计数器都没开起来（内核/sepolicy 拒绝）\n")
+        sys.stderr.write("perf stat: 没有可用计数器；事件打开失败详情见上\n")
+        for line in policy_hint(failed_errnos):
+            sys.stderr.write(line)
         return 1
 
     print(f"\n Performance counter stats for {label!r}"
@@ -462,26 +510,30 @@ def cmd_record(argv):
     # 不能带 B_INHERIT：内核 perf_mmap() 对「per-task 且 inherit」直接 EINVAL
     # （所有子进程共用一个环会串数据）。代价是 record 只采样目标进程本身。
 
-    def try_open(ek):
+    fd = None
+    failures = []
+    failed_errnos = []
+    for ek in (0, 1):
         b = list(bits) + ([B_EXCL_KERNEL] if ek else [])
         if period:
             blob = attr_blob(t, cfg, sample_period=period, sample_type=stype, bits=b)
         else:
             blob = attr_blob(t, cfg, sample_period=freq, sample_type=stype,
                              bits=b, freq=True)
-        return perf_open(blob, pid=target)
-
-    fd = None
-    for ek in (0, 1):
         try:
-            fd = try_open(ek)
+            fd = perf_open(blob, pid=target)
             break
         except OSError as ex:
-            if ek == 1:
-                sys.stderr.write(f"perf record: {event} 开不了（{ex.strerror}）\n")
-                if child:
-                    kill_child(child)
-                return 1
+            failures.append(perf_open_failure("record", event, blob, ex, pid=target))
+            failed_errnos.append(ex.errno)
+    sys.stderr.writelines(failures)
+    if fd is None:
+        sys.stderr.write("perf record: 没有可用采样事件；事件打开失败详情见上\n")
+        for line in policy_hint(failed_errnos):
+            sys.stderr.write(line)
+        if child is not None:
+            kill_child(child)
+        return 1
 
     ring = Ring(fd)
     ev_ioctl(fd, PERF_IOC_ENABLE)

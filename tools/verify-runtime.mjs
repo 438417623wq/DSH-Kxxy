@@ -14,6 +14,9 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CODEX_PIN } from "./lib/codex.mjs";
 import { verifyPythonRuntime } from "./lib/python-runtime.mjs";
+import { pythonDefaultWrappers, PYTHON_DEFAULT_PATHS } from "./lib/python-default.mjs";
+import { hardlinkWrappers, rsyncWrappers } from "./lib/hardlink-wrappers.mjs";
+import { verifySoname, verifyBundledPnpm, rubyEnvironmentIsWired } from "./lib/runtime-tool-contracts.mjs";
 import { readZipDirectory } from "./lib/zipread.mjs";
 import { verifyOfficeAssets, OFFICE_LAYER_MARKER } from "./lib/office-assets.mjs";
 
@@ -235,7 +238,7 @@ for (const e of terminfoLinks.slice(0, 3)) console.log(`  ${e.name} → ${e.comm
 const NEED = [
   "bin/node", "bin/bash", "bin/rg", "bin/git", "bin/pnpm", "bin/npm", "bin/npx",
   "bin/sh", "bin/coreutils", "lib/libreadline.so.8", "lib/libreadline.so.8.3",
-  "lib/libz.so.1", "lib/libz.so.1.3.2", "lib/libc++_shared.so",
+  "lib/libz.so.1", "lib/libc++_shared.so",
   "lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
   "lib/node_modules/@deepseek-ai/dsh-base/cordis.patch.yml",
   "lib/node_modules/@deepseek-ai/dsh-web-app/cordis.patch.yml",
@@ -304,6 +307,13 @@ for (const n of NEED) {
   if (!e) { console.log(`  ✗ ${n}`); missing += 1; continue; }
   const kind = e.comment.startsWith("LINK:") ? `LINK→${e.comment.slice(5)}` : `${e.usize}B`;
   console.log(`  ✓ ${n}  ${kind}`);
+}
+try {
+  const target = verifySoname("lib/libz.so.1", byName, readLocal);
+  console.log(`  ✓ zlib SONAME resolves to native ELF: ${target}`);
+} catch (error) {
+  missing += 1;
+  console.log(`  ✗ zlib SONAME: ${error.message}`);
 }
 
 /*
@@ -1542,8 +1552,8 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
   if (!/fun rubyLibPath\(root: File\): String/.test(kt)) {
     problems.push("EngineConfig.kt 没有 rubyLibPath（ruby 的 $LOAD_PATH 补不上）");
   }
-  if (!/"RUBYLIB=\$\{rubyLibPath\(root\)\}"/.test(kt)) {
-    problems.push("EngineConfig.kt 没有把 rubyLibPath 注入 RUBYLIB（缺陷 BS）");
+  if (!rubyEnvironmentIsWired(kt)) {
+    problems.push("EngineConfig.kt 没有把 rubyLibPath 的结果注入 RUBYLIB（缺陷 BS）");
   }
 
   if (problems.length === 0) {
@@ -1566,7 +1576,7 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
 // 只有 `corepack` 这一个漏了，所以症状是「npm 好用、corepack 坏」。
 //
 // 这里的断言是**双向**的，缺一不可：
-//   ① 四个 corepack 系入口都必须是 `#!/system/bin/sh` 包装器、mode 0755、LF 换行；
+//   ① corepack/npm/npx 是 sh 包装器；pnpm 也可为安装器支持的 ARM64 原生 SEA；
 //   ② `bin/corepack` **不许**再是 `dist/corepack.js` 的副本。
 // 只断言 ① 会漏掉「包装器生成了，但 stage 里的同名符号链接没摘掉、最终写进 zip
 // 的还是副本」这种半修复 —— 那正是 build-runtime 第 6 步「摘掉 stage 同名条目」
@@ -1593,7 +1603,12 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
     const e = byName.get(name);
     if (!e) { problems.push(`缺 ${name}`); continue; }
     if (e.comment.startsWith("LINK:")) { problems.push(`${name} 是 LINK 条目（应为实体包装器）`); continue; }
-    const text = readLocal(e).toString("utf8");
+    const raw = readLocal(e);
+    if (name === "bin/pnpm" && raw.subarray(0, 4).equals(Buffer.from([127, 69, 76, 70]))) {
+      try { verifyBundledPnpm(raw, modeOf(e)); } catch (error) { problems.push(error.message); }
+      continue;
+    }
+    const text = raw.toString("utf8");
     if (!text.startsWith("#!/system/bin/sh\n")) problems.push(`${name} 首行不是 #!/system/bin/sh`);
     if (text.includes("\r")) problems.push(`${name} 含 CR（必须 LF 换行）`);
     if (!text.includes('exec "$d/node"')) problems.push(`${name} 没有 exec "$d/node"`);
@@ -1661,7 +1676,7 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
   }
 
   if (problems.length === 0) {
-    console.log("\n打包工具包装器：✓ corepack/npm/npx/pnpm + bundletool + zipalign（0755 / LF / 实体非 LINK）");
+    console.log("\n打包工具包装器：✓ corepack/npm/npx + bundletool + zipalign（0755 / LF）；pnpm（sh 包装器或 owner-executable ARM64 SEA）");
   } else {
     console.log("\n打包工具包装器：✗");
     for (const p of problems) console.log(`  ${p}`);
@@ -1781,6 +1796,29 @@ for (const e of files) {
 }
 console.log(`\n残留扫描：检查 ${scanned} 个候选（跳过 ELF ${elfSkipped}），文本里仍含 com.termux 的 ${leftover.length} 个`);
 for (const r of leftover) console.log(`  ! ${r.path}\n      ${r.line}`);
+
+// 默认路由只核对打包合同；功能结果仍必须来自设备上的裸 python3。
+try {
+  const generated = [...pythonDefaultWrappers(), ...hardlinkWrappers(), ...rsyncWrappers()];
+  for (const expected of generated) {
+    const entry = byName.get(expected.path);
+    if (!entry || entry.comment.startsWith("LINK:")) throw new Error(`路由条目缺失/形态错误：${expected.path}`);
+    const raw = readLocal(entry);
+    if (!raw.equals(expected.data)) throw new Error(`路由未与当前源码同步：${expected.path}`);
+    if ((expected.mode & 0o111) && !((entry.externalAttr >>> 16) & 0o111)) throw new Error(`路由缺执行位：${expected.path}`);
+    if (/@DSH_(?:ROOT|HOME|TMP|FILES|DATA)@/.test(raw.toString("utf8"))
+        && !manifest.placeholderPaths?.includes(expected.path)) throw new Error(`路由未声明占位符回填：${expected.path}`);
+  }
+  for (const name of ["perf.py", "kxxy-rsync.py"]) {
+    const entry = byName.get(`libexec/kxxy-tools/${name}`);
+    const source = readFileSync(join(HERE, "prebuilt", "kxxy-tools", name));
+    if (!entry || !readLocal(entry).equals(source)) throw new Error(`原生工具脚本未同步：${name}`);
+  }
+  console.log(`\n默认 Python：${PYTHON_DEFAULT_PATHS.length} 个独立路由条目通过；原生 ln/rsync/perf 脚本与源码一致`);
+} catch (error) {
+  missing += 1;
+  console.log(`\n默认 Python/原生工具：✗ ${error.message}`);
+}
 
 // Python 专项：安装包和声明完整还不够，须核对原生后端、RECORD 与动态库闭包。
 try {

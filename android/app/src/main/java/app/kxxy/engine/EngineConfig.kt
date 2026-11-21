@@ -774,6 +774,8 @@ object EngineConfig {
             // 把扩展的 `share/` 摊到引擎根），所以把它排在 `<root>/bin` 之前即可。
             val yarnBin = File(root, "share/yarn/bin")
             if (yarnBin.isDirectory) add(yarnBin.absolutePath)
+            // Only python/python3/pip/pip3 live here; su/shz still resolve to engine/bin.
+            add(File(root, "libexec/python-default/bin").absolutePath)
             add(File(root, "bin").absolutePath)
             // `$HOME/.kxxy/bin`：我们自己的命令放宽（目前是 ghraw / raw2api，
             // 见 plugins/kxxy-host/lib/ghraw.mjs）。放在 `<root>/bin` 之后：

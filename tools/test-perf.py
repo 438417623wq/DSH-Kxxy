@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Mock-only perf regressions; run python -I tools/test-perf.py. No real perf syscalls."""
+import contextlib
+import ctypes
+import errno
+import importlib.util
+import io
+import os
+from pathlib import Path
+import struct
+import sys
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+
+MODULE_PATH = Path(__file__).resolve().parent / "prebuilt" / "kxxy-tools" / "perf.py"
+SPEC = importlib.util.spec_from_file_location("perf_under_test", MODULE_PATH)
+perf = importlib.util.module_from_spec(SPEC)
+# The target is Android/Linux; supply just its import-time platform values on Windows.
+with mock.patch.object(os, "uname", return_value=SimpleNamespace(machine="aarch64"), create=True), \
+        mock.patch.object(os, "sysconf", return_value=4096, create=True):
+    previous = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        SPEC.loader.exec_module(perf)
+    finally:
+        sys.dont_write_bytecode = previous
+
+
+class PerfDiagnosticsTests(unittest.TestCase):
+    def invoke(self, command, argv, errors):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            patches = {
+                "perf_open": mock.Mock(side_effect=errors),
+                "ev_ioctl": mock.Mock(),
+                "spawn_stopped": mock.Mock(return_value=1234),
+                "resume": mock.Mock(),
+                "reap": mock.Mock(return_value=0),
+                "kill_child": mock.Mock(),
+                "Ring": mock.Mock(),
+            }
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(perf, name, value))
+            patches["sleep"] = stack.enter_context(mock.patch.object(perf.time, "sleep"))
+            patches["read"] = stack.enter_context(mock.patch.object(perf.os, "read", return_value=struct.pack("<Q", 42)))
+            patches["close"] = stack.enter_context(mock.patch.object(perf.os, "close"))
+            patches["open"] = stack.enter_context(mock.patch("builtins.open"))
+            result = getattr(perf, "cmd_" + command)(argv)
+        return result, stdout.getvalue(), stderr.getvalue(), patches
+
+    def assert_failure(self, line, command, event, error, etype, config, pid, attr_flags):
+        self.assertIn(f"perf {command}: {event}: perf_event_open failed:", line)
+        self.assertIn(f"errno={error.errno} ({errno.errorcode[error.errno]}: {error.strerror})", line)
+        self.assertIn(f"type={etype} config={config} pid={pid} cpu=-1", line)
+        self.assertIn(f"attr_flags=0x{attr_flags:x}", line)
+        self.assertIn(f"exclude_kernel={int(bool(attr_flags & (1 << perf.B_EXCL_KERNEL)))} flags=0x0", line)
+
+    def test_libc_keeps_use_errno_and_immediate_errno_capture(self):
+        error = errno.EACCES
+        syscall = mock.Mock(side_effect=lambda *args: ctypes.set_errno(error) or -1)
+        lib = SimpleNamespace(syscall=syscall)
+        blob = perf.attr_blob(perf.SW, 1, bits=[perf.B_DISABLED])
+        with mock.patch.object(ctypes, "CDLL", return_value=lib) as loader:
+            ctypes.set_errno(errno.EINVAL)
+            with self.assertRaises(OSError) as caught:
+                perf.perf_open(blob, pid=1234)
+        loader.assert_called_once_with("libc.so", use_errno=True)
+        self.assertEqual(caught.exception.errno, error)
+        self.assertEqual(caught.exception.strerror, os.strerror(error))
+        self.assertIs(syscall.restype, ctypes.c_long)
+        self.assertEqual(len(syscall.argtypes), 6)
+
+    def test_stat_reports_both_failures_without_verbose(self):
+        for codes in ((errno.EPERM, errno.EACCES), (errno.EINVAL, errno.ENOSYS), (errno.ESRCH, errno.EOPNOTSUPP)):
+            with self.subTest(codes=codes):
+                errors = [OSError(code, os.strerror(code)) for code in codes]
+                result, stdout, stderr, calls = self.invoke("stat", ["-e", "task-clock", "-p", "4321"], errors)
+                self.assertEqual(result, 1)
+                self.assertEqual(stdout, "")
+                lines = stderr.splitlines()
+                self.assertEqual(len(lines), 3)
+                self.assert_failure(lines[0], "stat", "task-clock", errors[0], perf.SW, 1, 4321, 1)
+                self.assert_failure(lines[1], "stat", "task-clock", errors[1], perf.SW, 1, 4321, 33)
+                self.assertIn("没有可用计数器", lines[2])
+                self.assertNotIn("内核/sepolicy 拒绝", stderr)
+                self.assertEqual(calls["perf_open"].call_count, 2)
+                calls["sleep"].assert_called_once_with(3.0)
+
+    def test_stat_multiple_failed_events_keep_each_context(self):
+        errors = [OSError(errno.EINVAL, "first invalid"), OSError(errno.EPERM, "second denied")] * 2
+        result, _, stderr, _ = self.invoke("stat", ["-e", "cycles,instructions", "-p", "4321"], errors)
+        self.assertEqual(result, 1)
+        lines = stderr.splitlines()
+        self.assert_failure(lines[0], "stat", "cycles", errors[0], perf.HW, 0, 4321, 1)
+        self.assert_failure(lines[1], "stat", "cycles", errors[1], perf.HW, 0, 4321, 33)
+        self.assert_failure(lines[2], "stat", "instructions", errors[2], perf.HW, 1, 4321, 1)
+        self.assert_failure(lines[3], "stat", "instructions", errors[3], perf.HW, 1, 4321, 33)
+
+    def test_stat_failed_child_still_resumes_and_reaps(self):
+        errors = [OSError(errno.EPERM, "denied"), OSError(errno.EACCES, "denied again")]
+        result, _, stderr, calls = self.invoke("stat", ["-e", "cycles", "--", "true"], errors)
+        self.assertEqual(result, 1)
+        self.assertIn("pid=1234 cpu=-1", stderr)
+        calls["spawn_stopped"].assert_called_once_with(["true"])
+        calls["resume"].assert_called_once_with(1234)
+        calls["reap"].assert_called_once_with(1234)
+        calls["kill_child"].assert_not_called()
+
+    def test_stat_all_cpus_is_rejected_before_any_spawn(self):
+        for option in ("-a", "--all-cpus"):
+            with self.subTest(option=option):
+                result, stdout, stderr, calls = self.invoke("stat", [option, "--", "true"], [])
+                self.assertEqual(result, 2)
+                self.assertEqual(stdout, "")
+                self.assertIn(option, stderr)
+                self.assertIn("未实现系统范围计数", stderr)
+                calls["spawn_stopped"].assert_not_called()
+                calls["perf_open"].assert_not_called()
+
+    def test_stat_user_only_fallback_succeeds_and_verbose_keeps_first_failure(self):
+        error = OSError(errno.EPERM, "denied kernel")
+        result, stdout, stderr, calls = self.invoke("stat", ["-v", "-e", "task-clock", "-p", "4321"], [error, 17])
+        self.assertEqual(result, 0)
+        self.assertIn("不含内核态", stdout)
+        self.assert_failure(stderr.strip(), "stat", "task-clock", error, perf.SW, 1, 4321, 1)
+        self.assertEqual(calls["perf_open"].call_count, 2)
+        calls["read"].assert_called_once_with(17, 8)
+        calls["close"].assert_called_once_with(17)
+
+    def test_stat_nonverbose_success_is_quiet_and_closes_default_counters(self):
+        fds = list(range(20, 20 + len(perf.DEFAULT_STAT)))
+        result, stdout, stderr, calls = self.invoke("stat", ["--", "true"], fds)
+        self.assertEqual(result, 0)
+        self.assertIn("Performance counter stats", stdout)
+        self.assertEqual(stderr, "")
+        self.assertEqual(calls["close"].call_args_list, [mock.call(fd) for fd in fds])
+        calls["resume"].assert_called_once_with(1234)
+        calls["reap"].assert_called_once_with(1234)
+
+    def test_stat_partial_success_still_reports_unavailable_event(self):
+        errors = [OSError(errno.EINVAL, "invalid"), OSError(errno.ENOSYS, "unavailable")]
+        result, stdout, stderr, calls = self.invoke("stat", ["-e", "cycles,task-clock", "-p", "4321"], errors + [18])
+        self.assertEqual(result, 0)
+        self.assertIn("task-clock", stdout)
+        self.assertNotIn("没有可用计数器", stderr)
+        self.assertEqual(stderr.count("perf_event_open failed"), 2)
+        calls["close"].assert_called_once_with(18)
+
+    def test_record_reports_both_frequency_attempts_and_cleans_child(self):
+        errors = [OSError(errno.EINVAL, "unsupported attribute"), OSError(errno.EPERM, "not permitted")]
+        result, stdout, stderr, calls = self.invoke("record", ["-F", "99", "-g", "--", "true"], errors)
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout, "")
+        lines = stderr.splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assert_failure(lines[0], "record", "cpu-clock", errors[0], perf.SW, 0, 1234, 9985)
+        self.assert_failure(lines[1], "record", "cpu-clock", errors[1], perf.SW, 0, 1234, 10017)
+        for call in calls["perf_open"].call_args_list:
+            attr = call.args[0]
+            self.assertEqual(struct.unpack_from("<Q", attr, 16)[0], 99)
+            self.assertEqual(struct.unpack_from("<Q", attr, 24)[0], 39)
+        calls["kill_child"].assert_called_once_with(1234)
+        calls["resume"].assert_not_called()
+        calls["Ring"].assert_not_called()
+        calls["open"].assert_not_called()
+        self.assertIn("没有可用采样事件", lines[2])
+        self.assertNotIn("内核/sepolicy 拒绝", stderr)
+
+    def test_record_period_failure_has_no_frequency_bit_and_does_not_kill_attached_pid(self):
+        errors = [OSError(errno.EACCES, "access denied"), OSError(errno.ENOSYS, "no syscall")]
+        result, _, stderr, calls = self.invoke("record", ["-c", "7", "-e", "instructions", "-p", "4321"], errors)
+        self.assertEqual(result, 1)
+        lines = stderr.splitlines()
+        self.assert_failure(lines[0], "record", "instructions", errors[0], perf.HW, 1, 4321, 8961)
+        self.assert_failure(lines[1], "record", "instructions", errors[1], perf.HW, 1, 4321, 8993)
+        for call in calls["perf_open"].call_args_list:
+            self.assertEqual(struct.unpack_from("<Q", call.args[0], 16)[0], 7)
+        calls["kill_child"].assert_not_called()
+        calls["spawn_stopped"].assert_not_called()
+        calls["open"].assert_not_called()
+
+    def test_record_successful_fallback_preserves_first_failure_and_closes_counter(self):
+        error = OSError(errno.EPERM, "denied kernel")
+        ring = mock.Mock()
+        output = mock.mock_open()
+        def files(name, *args, **kwargs):
+            if str(name).startswith("/proc/"):
+                raise FileNotFoundError(name)
+            return output(name, *args, **kwargs)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            opener = stack.enter_context(mock.patch.object(perf, "perf_open", side_effect=[error, 19]))
+            stack.enter_context(mock.patch.object(perf, "Ring", return_value=ring))
+            ioctl = stack.enter_context(mock.patch.object(perf, "ev_ioctl"))
+            closer = stack.enter_context(mock.patch.object(perf.os, "close"))
+            stack.enter_context(mock.patch.object(perf.time, "time", side_effect=[0.0, 1.0, 1.0]))
+            stack.enter_context(mock.patch("builtins.open", side_effect=files))
+            result = perf.cmd_record(["-p", "4321", "--duration", "0.01"])
+        self.assertEqual(result, 0)
+        self.assertEqual(opener.call_count, 2)
+        self.assert_failure(stderr.getvalue().splitlines()[0], "record", "cpu-clock", error, perf.SW, 0, 4321, 9985)
+        self.assertIn("0 个样本", stderr.getvalue())
+        self.assertEqual(ioctl.call_args_list, [mock.call(19, perf.PERF_IOC_ENABLE), mock.call(19, perf.PERF_IOC_DISABLE)])
+        ring.close.assert_called_once_with()
+        closer.assert_called_once_with(19)
+        output.assert_called_once_with("perf.data", "w", encoding="utf-8")
+
+    def test_kill_child_uses_sigkill_and_waitpid(self):
+        import signal
+        with mock.patch.object(signal, "SIGKILL", 9, create=True), \
+                mock.patch.object(perf.os, "kill") as kill, \
+                mock.patch.object(perf.os, "waitpid", create=True) as wait:
+            perf.kill_child(1234)
+        kill.assert_called_once_with(1234, 9)
+        wait.assert_called_once_with(1234, 0)
+
+    def test_header_does_not_guarantee_counter_availability(self):
+        self.assertNotIn("SW/HW 事件都返回正常 fd", perf.__doc__)
+        self.assertIn("以现场系统调用结果为准", perf.__doc__)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

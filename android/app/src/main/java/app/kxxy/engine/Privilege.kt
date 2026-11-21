@@ -2,6 +2,7 @@ package app.kxxy.engine
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -40,7 +41,8 @@ enum class PrivMode(val id: String) {
  *    用 `id` 作探针会把「不经 shell 直接 exec」的 su 形式误判为可用
  *    （因为 id 是真二进制，不需要 shell）；改成 `cd / && true` 又因为没有
  *    输出而无法确认，导致所有 su 形式判失败。
- *    正解：`cd / && echo uid=0`，既经 shell 又有可校验输出。
+ *    正解：经 shell 调用 `/system/bin/id -u` 确认实际 uid，再输出独立哨兵行；
+ *    同时必须检查真实退出码，不能用 echo 假造身份或仅匹配输出子串。
  *
  * 3. **execve 不搜索 PATH**
  *    启动 su 时必须用绝对路径。子进程已 chdir 到工作区，那里没有 su，
@@ -51,6 +53,8 @@ object Privilege {
     private const val TAG = "KxxyPrivilege"
     private const val PREFS = "kxxy_priv"
     private const val KEY_MODE = "priv_mode"
+    private const val ROOT_PROBE_SENTINEL = "KXXY_ROOT_PROBE_OK"
+    private const val ROOT_PROBE_COMMAND = "cd / && [ \"$(/system/bin/id -u)\" = 0 ] && printf 'KXXY_ROOT_PROBE_OK\\n'"
 
     /**
      * su 候选路径。
@@ -110,7 +114,7 @@ object Privilege {
      */
     fun probeRoot(): Boolean {
         for (f in SU_ARG_FORMS) {
-            if (trySuPrefix(f, "cd / && echo uid=0")) {
+            if (trySuPrefix(f)) {
                 Log.i(TAG, "root probe succeeded with form: su ${f.joinToString(" ")}")
                 return true
             }
@@ -129,31 +133,25 @@ object Privilege {
      *
      * 两条硬约束（都来自参考项目的回归事故）：
      *   ① 只有经 shell 解释才能成功（探针必须让 shell 执行，而非直接 exec 二进制）
-     *   ② 输出必须含 `uid=0`（否则无法区分「su 成功但没输出」和「su 失败」）
+     *   ② 实际 uid 必须为 0、退出码为 0，且输出包含完整的独立哨兵行。
      */
     fun usableSuPrefix(): List<String>? {
         val suBin = findSu() ?: return null
         for (f in SU_ARG_FORMS) {
-            if (trySuPrefix(f, "cd / && echo uid=0")) {
+            if (trySuPrefix(f)) {
                 return listOf(suBin) + f
             }
         }
         return null
     }
 
-    private fun trySuPrefix(args: List<String>, command: String): Boolean {
+    private fun trySuPrefix(args: List<String>): Boolean {
         return try {
             val suBin = findSu() ?: return false
-            val argv = (listOf(suBin) + args + command).toTypedArray()
-            val p = ProcessBuilder(*argv).redirectErrorStream(true).start()
-            val finished = p.waitFor(2, TimeUnit.SECONDS)
-            if (!finished) {
-                p.destroy()
-                false
-            } else {
-                val out = p.inputStream.bufferedReader().readText()
-                out.contains("uid=0")
+            val out = runBlocking {
+                RecoveryProcessRunner.run(ProcessBuilder(listOf(suBin) + args + ROOT_PROBE_COMMAND).redirectErrorStream(true), 2_000L, 16 * 1024)
             }
+            out.ok && !out.truncated && out.text.lineSequence().any { it == ROOT_PROBE_SENTINEL }
         } catch (e: Exception) {
             Log.w(TAG, "trySuPrefix(${args.joinToString(" ")}) failed: ${e.message}")
             false
