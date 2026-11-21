@@ -609,17 +609,20 @@ export const POOL_ITEMS = [
   // 而这份 rootfs 有 194 条软链 —— 详见 `tools/lib/asset-pack.mjs` 顶部注释。
   {
     id: "glibc", source: "asset", category: "toolchain",
-    version: "24.04.3",
+    version: "24.04.3-r2",
     name: "glibc 用户态（Ubuntu 24.04 + proot）",
     description:
       "在 proot 里跑一份**未改动的 Ubuntu 24.04 base**：`kxxy-glibc` 进容器，" +
       "`kxxy-glibc -c 'apt-get update'` 直接装包。所有只有 glibc 构件的工具都能用了 —— " +
       "julia、dotnet-sdk、wkhtmltopdf、PyPI 的 manylinux 轮子（sklearn/cv2）都在这一类。" +
+      "装完扩展还多出四条**普通命令**：`julia`、`dotnet`、`wkhtmltopdf`、`kxxy-py`，" +
+      "首次运行时各自在容器里预置（要联网，之后一直复用），所以不必记容器用法。" +
       "无需 root、不改系统，代价是每条系统调用多一层 ptrace 转发（比原生慢 2–5 倍）。" +
       "首次运行解包 rootfs 约 1 分钟；之后 apt 装的东西都留在 <files>/glibc/rootfs，" +
       "重装扩展或升级 APK 都不会丢。",
-    // 用户能看到/点到的命令：入口只有 kxxy-glibc 一个（`apt`/`julia` 都在容器里）
-    bins: ["kxxy-glibc"],
+    // 用户能看到/点到的命令。`kxxy-glibc` 是入口，四条工具命令是垫片（首次自动预置），
+    // `kxxy-glibc-provision` 用于手动补/重做预置。
+    bins: ["kxxy-glibc", "kxxy-glibc-provision", "julia", "dotnet", "wkhtmltopdf", "kxxy-py"],
     assets: [
       {
         // Ubuntu Base 24.04.3（arm64）：29 865 086 字节，与 sha256 一起钉死。
@@ -633,7 +636,29 @@ export const POOL_ITEMS = [
         dereference: true,
       },
     ],
-    wrappers: ["kxxy-glibc"],
+    wrappers: ["kxxy-glibc", "kxxy-glibc-provision"],
+    // 垫片：模板 `glibc-tool.sh` 渲染，`exe` 是容器内的绝对路径。
+    // 之所以要垫片：容器里的程序直接 exec 会 `CANNOT LINK EXECUTABLE`，必须过 proot；
+    // 顺带把「首次预置」也收进来，用户拿到的就是一条普通命令。
+    toolTemplate: "glibc-tool",
+    tools: [
+      {
+        name: "julia", exe: "/opt/julia-1.11.7/bin/julia", group: "julia",
+        label: "Julia 1.11.7", hint: "官方 aarch64 包约 285 MiB",
+      },
+      {
+        name: "dotnet", exe: "/usr/bin/dotnet", group: "dotnet",
+        label: ".NET SDK 8.0", hint: "apt 包约 200 MiB",
+      },
+      {
+        name: "wkhtmltopdf", exe: "/usr/bin/wkhtmltopdf", group: "wkhtmltopdf",
+        label: "wkhtmltopdf 0.12.6", hint: "apt 包约 30 MiB",
+      },
+      {
+        name: "kxxy-py", exe: "/usr/bin/python3", group: "python-ml",
+        label: "容器内 Python 3.12 + numpy/scikit-learn/cv2", hint: "pip manylinux 轮子约 120 MiB",
+      },
+    ],
   },
   {
     id: "torch", seeds: ["python-torch"], category: "devtools",

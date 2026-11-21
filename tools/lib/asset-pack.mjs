@@ -36,8 +36,9 @@
  *
  *   <id>.pool                  tar.gz，路径相对扩展目录
  *   bin/<cmd>                  包装器（含 @DSH_ROOT@ 等占位符，装完回填）
+ *   bin/<tool>                 工具垫片：同一个 `glibc-tool.sh` 模板按 `tools[]` 渲染
  *   rootfs/<name>.tgz          整块资产
- *   .pool-manifest.json        列出待回填的文本文件（只有包装器）
+ *   .pool-manifest.json        列出待回填的文本文件（包装器与垫片）
  */
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -176,6 +177,36 @@ function wrapperBody(name, extId) {
 }
 
 /**
+ * 生成「工具垫片」：`glibc-tool.sh` 这一个模板 + 条目里的 `tools[]` 描述，
+ * 产出 `bin/<name>`。不用每个工具抄一份脚本 —— 以后加工具只改 seeds 表。
+ *
+ * 取代的 token 必须**全部**出现，否则模板写错会静默产出半成品垫片
+ * （比如 `EXE=` 空着，运行时报一个莫名其妙的 127）。
+ */
+function toolBody(tool, extId, templateName = 'glibc-tool') {
+  const tpl = join(WRAPPER_DIR, `${templateName}.sh`)
+  if (!existsSync(tpl)) throw new Error(`缺垫片模板：${tpl}`)
+  const fields = {
+    __EXT_ID__: extId,
+    __NAME__: tool.name,
+    __LABEL__: tool.label ?? tool.name,
+    __EXE__: tool.exe,
+    __GROUP__: tool.group ?? tool.name,
+    __HINT__: tool.hint ?? '首次要下载',
+  }
+  let body = readFileSync(tpl, 'utf8')
+  for (const [token, value] of Object.entries(fields)) {
+    if (!value) throw new Error(`${extId}.${tool.name}: 垫片字段 ${token} 为空`)
+    body = body.split(token).join(value)
+  }
+  const left = body.match(/__[A-Z_]+__/g)
+  if (left) {
+    throw new Error(`${extId}.${tool.name}: 垫片模板还有未替换的 token ${[...new Set(left)].join(', ')}`)
+  }
+  return body
+}
+
+/**
  * 构建一个 asset 源池条目。
  *
  * @param {object} item `POOL_ITEMS` 里的条目（`source: 'asset'`）
@@ -212,8 +243,16 @@ export async function buildAssetPack(item, opts) {
     log(`${item.id}: bin/${name}（${human(Buffer.byteLength(body))}）`)
   }
 
+  // ── 工具垫片：同一个模板按 tools[] 逐个渲染 ─────────────────────────
+  const tools = item.tools ?? []
+  for (const tool of tools) {
+    const body = toolBody(tool, item.id, item.toolTemplate)
+    entries.push({ name: `bin/${tool.name}`, data: Buffer.from(body, 'utf8'), mode: 0o755, mtimeSec: 0 })
+    log(`${item.id}: bin/${tool.name} → ${tool.exe}（${tool.group ?? tool.name}）`)
+  }
+
   // 声明的命令必须都产出了（与 npm 源同一道校验，避免「卡片说有、装完没有」）
-  const produced = new Set(wrapperNames)
+  const produced = new Set([...wrapperNames, ...tools.map((t) => t.name)])
   const missing = (item.bins ?? []).filter((b) => !produced.has(b))
   if (missing.length) {
     throw new Error(`${item.id}: 缺命令 ${missing.join(', ')}（实际产出 ${[...produced].join(', ')}）`)
@@ -228,7 +267,7 @@ export async function buildAssetPack(item, opts) {
       '@DSH_FILES@': 'files',
       '@DSH_DATA@': 'data',
     },
-    files: wrapperNames.map((n) => `bin/${n}`),
+    files: [...wrapperNames, ...tools.map((t) => t.name)].map((n) => `bin/${n}`),
   }
   entries.push({
     name: '.pool-manifest.json',

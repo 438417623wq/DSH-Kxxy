@@ -200,10 +200,37 @@ try {
             Write-Host "      moved: $item"
         }
     }
+    # ── 池目录：按文件合并，不能整目录替换（缺陷 EA，2026-11-21 真事故）──
+    #
+    # 原来是无条件 `Move-Item -Force $poolSrc (Join-Path $hold "ext-pool")`。
+    # PowerShell 对「目录 → 已存在的目录」的 `Move-Item -Force` 语义是**替换目标**，
+    # 不是合并：目标里原有内容整批消失（实测 33 个池只剩 1 个）。
+    #
+    # 事故链：`node tools/fetch-extensions.mjs` 默认输出到 `assets/ext-pool`，
+    # 单条目重打（`KXXY_POOL_ONLY=glibc`）之后 assets 里就只剩那一个池；下次打包
+    # 把它移进 hold 时，hold 里上一轮剩下的 32 个池被一起删掉，于是打出 1.04 GiB
+    # 的「只有 glibc 扩展」瘦包 —— 而体积断言（占 hold 的 98%）照样通过，
+    # 因为它算的就是被删空之后的 hold。恢复只能从上一版成品 APK 里把
+    # `assets/ext-pool/*.pool` 解出来。
+    #
+    # 现在改成逐个文件搬：同名覆盖、其余保留。「增量重打一个池再打包」于是安全，
+    # 而这正是 fetch-extensions 单条目模式的常规用法。
     $poolSrc = Join-Path $assets "ext-pool"
     if (Test-Path $poolSrc) {
-        Move-Item -Force $poolSrc (Join-Path $hold "ext-pool")
-        Write-Host "      moved: ext-pool/"
+        $poolDst = Join-Path $hold "ext-pool"
+        if (-not (Test-Path $poolDst)) {
+            Move-Item -Force $poolSrc $poolDst
+            Write-Host "      moved: ext-pool/"
+        } else {
+            $moved = 0
+            foreach ($f in @(Get-ChildItem $poolSrc -File)) {
+                Move-Item -Force $f.FullName (Join-Path $poolDst $f.Name)
+                $moved++
+            }
+            $left = @(Get-ChildItem $poolSrc -Recurse -File -ErrorAction SilentlyContinue)
+            if ($left.Count -eq 0) { [IO.Directory]::Delete($poolSrc, $false) }
+            Write-Host ("      merged: ext-pool/（搬 {0} 个，hold 现有 {1} 个池）" -f $moved, @(Get-ChildItem $poolDst -File).Count)
+        }
     }
 
     # ── 2) 清干净产物（AGP 增量打包 append-only，会残留孤儿数据）──────────
