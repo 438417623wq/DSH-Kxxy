@@ -3251,7 +3251,7 @@ class RuntimeInstaller(private val ctx: Context) {
         // mpmath / six），同时 bin/ln 的**内容**换成 `--coreutils-prog=ln`
         // 并带复制降级。前者是纯新增文件、后者是既有文件改内容 —— 十六条锚点
         // 一条都判不出来，只能再借这个编号让老设备重解一次。
-        private const val PATCHSET_MARKER = "kxxy-patchset@31"
+        private const val PATCHSET_MARKER = "kxxy-patchset@32"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
 
         /**
