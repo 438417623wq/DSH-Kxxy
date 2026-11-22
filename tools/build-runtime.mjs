@@ -912,7 +912,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  *  2. `bin/ln` 的**内容**改了（`coreutils ln` → `coreutils --coreutils-prog=ln`，
  *     外加复制降级）。锚点只判「文件在不在」，内容换了同样看不见。
  */
-const PATCHSET_MARKER = "kxxy-patchset@35";
+const PATCHSET_MARKER = "kxxy-patchset@36";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

@@ -446,8 +446,8 @@ class GuardTests(unittest.TestCase):
         ):
             (directory / name).write_bytes(payload)
             os.utime(directory / name, (1700000000, 1700000000))
-        replaced, kept = guard.dedup_symlink(str(self.basis), str(self.dest))
-        self.assertEqual((replaced, kept), (1, 1))
+        replaced, kept, saved = guard.dedup_symlink(str(self.basis), str(self.dest))
+        self.assertEqual((replaced, kept, saved), (1, 1, 100))
         self.assertTrue((self.dest / "same.txt").is_symlink())
         # stat 跟随链接 → 与基准同 inode；lstat 仍能看出是软链
         self.assertEqual((self.dest / "same.txt").stat().st_ino,
@@ -458,8 +458,8 @@ class GuardTests(unittest.TestCase):
     def test_dedup_never_recreates_files_missing_from_destination(self):
         (self.basis / "removed.txt").write_bytes(b"gone")
         (self.basis / "excluded").write_bytes(b"private")
-        replaced, kept = guard.dedup_symlink(str(self.basis), str(self.dest))
-        self.assertEqual((replaced, kept), (0, 0))
+        replaced, kept, saved = guard.dedup_symlink(str(self.basis), str(self.dest))
+        self.assertEqual((replaced, kept, saved), (0, 0, 0))
         self.assertEqual(sorted(p.name for p in self.dest.iterdir()), [])
 
     def test_dedup_copies_then_linkifies_and_skips_exec(self):
@@ -496,6 +496,42 @@ class GuardTests(unittest.TestCase):
                                         probe=(True, None))
         execv.assert_called_once()
         self.assertNotIn("去重完成", err)
+
+    def test_link_required_alias_and_invalid_dedup_reject_before_transfer(self):
+        rc, stderr, execute = self.run_guard(
+            env={"KXXY_RSYNC_LINK_REQUIRED": "1"}, probe=(False, "EACCES"))
+        self.assertEqual(rc, 1)
+        self.assertIn("strict/required", stderr)
+        execute.assert_not_called()
+
+        for value in ("hardlink", "copy", "SYMLINK2"):
+            with self.subTest(value=value):
+                rc, stderr, execute = self.run_guard(
+                    env={"KXXY_RSYNC_DEDUP": value}, probe=(False, "EACCES"))
+                self.assertEqual(rc, 2)
+                self.assertIn("unsupported KXXY_RSYNC_DEDUP", stderr)
+                execute.assert_not_called()
+                execute.prober.assert_not_called()
+
+    def test_dedup_symlink_or_replace_failure_keeps_original_file(self):
+        for failing in ("symlink", "replace"):
+            with self.subTest(failing=failing):
+                payload = b"must survive"
+                (self.basis / "f.txt").write_bytes(payload)
+                (self.dest / "f.txt").write_bytes(payload)
+                os.utime(self.basis / "f.txt", (1700000000, 1700000000))
+                os.utime(self.dest / "f.txt", (1700000000, 1700000000))
+                patches = {"symlink": patch.object(
+                    guard.os, "symlink", side_effect=PermissionError(errno.EACCES, "denied")),
+                    "replace": patch.object(
+                    guard.os, "replace", side_effect=PermissionError(errno.EACCES, "denied"))}
+                with patches[failing]:
+                    replaced, kept, saved = guard.dedup_symlink(
+                        str(self.basis), str(self.dest))
+                self.assertEqual((replaced, kept, saved), (0, 1, 0))
+                self.assertFalse((self.dest / "f.txt").is_symlink())
+                self.assertEqual((self.dest / "f.txt").read_bytes(), payload)
+                self.assertEqual(sorted(p.name for p in self.dest.iterdir()), ["f.txt"])
 
     def test_failed_transfer_does_not_linkify(self):
         def fake_call(argv):

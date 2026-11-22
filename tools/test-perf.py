@@ -275,6 +275,63 @@ class PerfDiagnosticsTests(unittest.TestCase):
         self.assertEqual(perf.MACHINE, "aarch64")
         self.assertEqual(perf._pc_index(), 32)      # user_pt_regs.pc 在 32*8
 
+    def test_stat_fallback_explicit_hardware_only_returns_failure(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(perf, "proc_cpu", return_value=(1.0, 0.5, 3, 1)), \
+                mock.patch.object(perf, "proc_switches", return_value={"voluntary_ctxt_switches": 2}), \
+                mock.patch.object(perf.time, "sleep"), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            result = perf.stat_fallback(None, 4321, 0.1, "pid 4321", [],
+                                        attempted=False, requested=["cycles"])
+        self.assertEqual(result, 1)
+        self.assertIn("需要 PMU", err.getvalue())
+        self.assertIn("cycles", err.getvalue())
+        self.assertNotIn("task-clock", out.getvalue())
+
+    def test_stat_fallback_partial_explicit_reports_only_available(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(perf, "proc_cpu", return_value=(1.0, 0.5, 3, 1)), \
+                mock.patch.object(perf, "proc_switches", return_value={"voluntary_ctxt_switches": 2}), \
+                mock.patch.object(perf.time, "sleep"), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            result = perf.stat_fallback(None, 4321, 0.1, "pid 4321", [],
+                                        attempted=False,
+                                        requested=["cycles", "task-clock", "major-faults"])
+        self.assertEqual(result, 0)
+        self.assertIn("task-clock", out.getvalue())
+        self.assertIn("major-faults", out.getvalue())
+        self.assertNotIn("page-faults", out.getvalue())
+        self.assertIn("cycles", err.getvalue())
+
+    def test_list_separates_pmu_failure_from_fallback_capability(self):
+        out = io.StringIO()
+        denied = OSError(errno.EACCES, "denied")
+        with mock.patch.object(perf, "perf_open", side_effect=denied), \
+                mock.patch.object(perf, "current_domain", return_value="u:r:untrusted_app_27:s0"), \
+                contextlib.redirect_stdout(out):
+            result = perf.cmd_list([])
+        text = out.getvalue()
+        self.assertEqual(result, 0)
+        self.assertIn("✗ EACCES", text)
+        self.assertIn("stat:rusage//proc", text)
+        self.assertIn("record:ptrace", text)
+        self.assertIn("PMU 全部 ✗ 只表示", text)
+        self.assertIn("untrusted_app_27", text)
+
+    def test_record_exit_status_preserves_target_and_pid_zero_sample_semantics(self):
+        with mock.patch.multiple(
+                perf.os,
+                WIFSIGNALED=mock.Mock(side_effect=lambda s: s == 9),
+                WTERMSIG=mock.Mock(return_value=9),
+                WIFEXITED=mock.Mock(side_effect=lambda s: s != 9),
+                WEXITSTATUS=mock.Mock(side_effect=lambda s: s >> 8),
+                create=True):
+            self.assertEqual(perf.sampled_exit_status(0, False, True), 0)
+            self.assertEqual(perf.sampled_exit_status(7 << 8, True, True), 7)
+            self.assertEqual(perf.sampled_exit_status(9, False, True), 128 + 9)
+            self.assertEqual(perf.sampled_exit_status(None, True, False), 0)
+            self.assertEqual(perf.sampled_exit_status(None, False, False), 1)
+
     def test_report_prints_fallback_mode_header(self):
         data = "\n".join([
             "#kxxy-perf 1",

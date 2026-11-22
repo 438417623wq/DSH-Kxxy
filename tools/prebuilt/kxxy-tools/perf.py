@@ -8,7 +8,7 @@
 perf_event_paranoid、SELinux/seccomp 与进程身份，以现场系统调用结果为准。
 
 子命令：
-  perf list                       支持的计数器
+  perf list                       每个事件的 PMU/降级能力矩阵
   perf stat [-e ev,ev] [-p PID] [--] cmd...     计数器汇总
   perf record [-F 999] [-g] [-o f] [-p PID] [--] cmd...    采样
   perf report [-i f] [--stack]                  符号化汇总
@@ -83,6 +83,18 @@ DEFAULT_STAT = [
     "cycles", "instructions", "branches", "branch-misses",
 ]
 DEFAULT_RECORD_EVENT = "cpu-clock"
+
+# stat 降级路径实际能提供的计数及其来源。硬件事件不在此表里：没有 PMU 时
+# 不能把 task-clock 乘一个系数冒充 cycles，也不能把软链/模拟计数当硬件结果。
+FALLBACK_STAT_SOURCES = {
+    "task-clock": "rusage//proc",
+    "cpu-clock": "rusage//proc",
+    "page-faults": "rusage//proc",
+    "minor-faults": "rusage//proc",
+    "major-faults": "rusage//proc",
+    "context-switches": "rusage//proc",
+}
+FALLBACK_RECORD_EVENTS = frozenset(("cpu-clock",))
 
 
 def _libc():
@@ -238,8 +250,13 @@ def read_maps(pid):
     return maps
 
 
-def stat_fallback(child, pid, duration, label, failed_errnos, attempted=True):
-    """无 PMU 计数时用 rusage / /proc 记账，输出 CPU 时间、缺页、上下文切换。"""
+def stat_fallback(child, pid, duration, label, failed_errnos, attempted=True,
+                  requested=None):
+    """无 PMU 计数时用 rusage / /proc 记账，输出 CPU 时间、缺页、上下文切换。
+
+    requested 为显式 -e 列表时，只输出确实能由 rusage//proc 得到的项；全部都是
+    硬件计数则返回 1，避免 `perf stat -e cycles` 用 task-clock 冒充成功。
+    """
     util_note = ""
     if child is not None:
         resume(child)
@@ -268,25 +285,47 @@ def stat_fallback(child, pid, duration, label, failed_errnos, attempted=True):
         csw = max(0, sw1 - sw0)
         util_note = "（-p 模式按 /proc 增量估算）"
 
+    names = None
+    unsupported = []
+    if requested is not None:
+        names = {ev_name(item) for item in requested}
+        unsupported = sorted(n for n in names if n not in FALLBACK_STAT_SOURCES)
+        names &= set(FALLBACK_STAT_SOURCES)
+
     used = cpu / elapsed if elapsed > 0 else 0.0
     print(f"\n Performance counter stats（降级模式：本域无 PMU 计数）"
           f"for {label!r}:\n")
-    print(f"  {cpu * 1e3:14.6f}  msec  task-clock                "
-          f"# {used:.2f} CPUs utilized")
-    print(f"  {human(minflt + majflt):>14}  page-faults")
-    print(f"  {human(csw):>14}  context-switches")
+    if names is None or names & {"task-clock", "cpu-clock"}:
+        shown = "task-clock" if names is None or "task-clock" in names else "cpu-clock"
+        print(f"  {cpu * 1e3:14.6f}  msec  {shown:<25} "
+              f"# {used:.2f} CPUs utilized")
+    if names is None or "page-faults" in names:
+        print(f"  {human(minflt + majflt):>14}  page-faults")
+    if names is not None and "minor-faults" in names:
+        print(f"  {human(minflt):>14}  minor-faults")
+    if names is not None and "major-faults" in names:
+        print(f"  {human(majflt):>14}  major-faults")
+    if names is None or "context-switches" in names:
+        print(f"  {human(csw):>14}  context-switches")
     print(f"\n  {elapsed:10.6f} seconds time elapsed{util_note}\n")
+
     if attempted:
         sys.stderr.write(
             "  降级原因：perf_event_open 未能打开任何事件（详见上方 errno）。\n")
     else:
         sys.stderr.write(
             "  降级原因：KXXY_PERF_MODE=fallback，未尝试 PMU 计数。\n")
+    if unsupported:
+        sys.stderr.write(
+            "  以下显式请求的事件需要 PMU，降级路径不提供："
+            + ", ".join(unsupported) + "\n")
     sys.stderr.write(
         "  以上来自 rusage / /proc，不含 cycles / instructions / branches 等硬件计数。\n"
         "  想要硬件计数可设 KXXY_PERF_MODE=pmu，或在允许的域执行（见下方对照命令）。\n")
     for line in policy_hint(failed_errnos):
         sys.stderr.write(line)
+    if requested is not None and not names:
+        return 1
     return 0
 
 
@@ -390,6 +429,7 @@ def record_fallback(child, pid, freq, duration, label, out, failed_errnos,
 
     samples = []
     exited = False
+    target_status = None
     last_maps = time.time()
     t0 = time.time()
     try:
@@ -406,6 +446,7 @@ def record_fallback(child, pid, freq, duration, label, out, failed_errnos,
                 break
             if os.WIFEXITED(status) or os.WIFSIGNALED(status):
                 exited = True
+                target_status = status
                 break
             pc = read_pc(ptrace, ctypes, target, index)
             if pc:
@@ -426,13 +467,9 @@ def record_fallback(child, pid, freq, duration, label, out, failed_errnos,
             except OSError:
                 pass
             try:
-                os.waitpid(target, 0)
+                _, target_status = os.waitpid(target, 0)
             except (ChildProcessError, KeyboardInterrupt):
                 pass
-
-    if not samples:
-        sys.stderr.write("perf record: 降级采样没抓到样本（目标执行太快？）\n")
-        return 1
 
     with open(out, "w", encoding="utf-8") as f:
         f.write("#kxxy-perf 1\n")
@@ -449,12 +486,26 @@ def record_fallback(child, pid, freq, duration, label, out, failed_errnos,
             f.write("S %x %d %d %s\n" % (ip, rpid, rtid,
                                          " ".join("%x" % x for x in chain)))
 
-    sys.stderr.write(
-        f"perf record: 降级模式（ptrace 每 {interval * 1000:.1f} ms 抓一次 PC，"
-        f"仅主线程、无调用链）{len(samples)} 个样本 → {out}\n")
+    if samples:
+        sys.stderr.write(
+            f"perf record: 降级模式（ptrace 每 {interval * 1000:.1f} ms 抓一次 PC，"
+            f"仅主线程、无调用链）{len(samples)} 个样本 → {out}\n")
+    else:
+        sys.stderr.write(
+            f"perf record: 降级模式未抓到样本（目标可能很快退出），"
+            f"已写出合法的空采样文件 → {out}\n")
     for line in policy_hint(failed_errnos):
         sys.stderr.write(line)
-    return 0
+    return sampled_exit_status(target_status, bool(samples), child is not None)
+
+
+def sampled_exit_status(target_status, have_samples, attached_child):
+    """record 的退出码：保留目标结果；-p 模式只在采到样本时算成功。"""
+    if target_status is not None and os.WIFSIGNALED(target_status):
+        return 128 + os.WTERMSIG(target_status)
+    if target_status is not None and os.WIFEXITED(target_status):
+        return os.WEXITSTATUS(target_status)
+    return 0 if have_samples or attached_child else 1
 
 
 def ev_name(spec):
@@ -529,6 +580,7 @@ def kill_child(pid):
 # ── stat ───────────────────────────────────────────────────────────────────
 def cmd_stat(argv):
     events = None
+    explicit_events = False
     pid = None
     duration = None
     verbose = False
@@ -542,6 +594,7 @@ def cmd_stat(argv):
         elif a in ("-e", "--event"):
             i += 1
             events = [x for x in argv[i].replace(",", " ").split() if x]
+            explicit_events = True
         elif a in ("-p", "--pid"):
             i += 1
             pid = int(argv[i])
@@ -557,6 +610,7 @@ def cmd_stat(argv):
                 events = (events or []) + ["cache-references", "cache-misses",
                                            "stalled-cycles-frontend",
                                            "stalled-cycles-backend"]
+                explicit_events = True
             else:
                 sys.stderr.write(f"perf stat: 不支持的选项 {a}\n")
                 return 2
@@ -586,7 +640,8 @@ def cmd_stat(argv):
     mode = perf_mode()
     if mode == "fallback":
         return stat_fallback(child, None if child is not None else target,
-                             duration, label, [], attempted=False)
+                             duration, label, [], attempted=False,
+                             requested=events if explicit_events else None)
 
     fds = []
     used = []
@@ -625,8 +680,10 @@ def cmd_stat(argv):
     if not fds and mode != "pmu":
         # 一个计数器都没开起来（应用域 EACCES 等）——子进程还停在 exec 前，
         # 此时改用 rusage 记账，拿到 CPU 时间/缺页/切换次数而不是直接失败。
+        sys.stderr.write("perf stat: PMU 不可用，切换到 rusage//proc 降级统计。\n")
         return stat_fallback(child, None if child is not None else target,
-                             duration, label, failed_errnos)
+                             duration, label, failed_errnos,
+                             requested=events if explicit_events else None)
 
     t0 = time.time()
     if child is not None:
@@ -826,6 +883,8 @@ def cmd_record(argv):
     if fd is None:
         if perf_mode() != "pmu":
             # 应用域里 PMU 事件被策略拒绝——改用 ptrace 抓 PC，采样本身不需要 PMU
+            sys.stderr.write(
+                "perf record: PMU 路径不可用，切换到 ptrace 降级采样。\n")
             return record_fallback(child, None if child is not None else target,
                                    freq, duration, label, out, failed_errnos,
                                    cmd=cmd)
@@ -1216,23 +1275,35 @@ def cmd_report(argv):
 
 
 def cmd_list(argv):
-    print("List of supported events（每个都现场试开一次）:\n")
+    print("Events: PMU 列来自现场 perf_event_open；降级列不依赖 PMU。\n")
     groups = {}
     for name, (t, cfg, desc) in sorted(EVENTS.items()):
         kind = "hardware" if t == HW else "software"
         groups.setdefault(kind, []).append((name, cfg, desc))
     for kind, items in groups.items():
         print(f"  {kind}:")
+        print(f"    {'PMU':<10} {'event':<26} {'fallback':<20} description")
         for name, cfg, desc in items:
-            ok = "✓"
+            pmu = "✓"
             try:
                 fd = perf_open(attr_blob(0 if kind == "hardware" else 1, cfg,
                                          bits=[B_DISABLED]))
                 os.close(fd)
-            except OSError:
-                ok = "✗"
-            print(f"    {ok} {name:<26} {desc}")
+            except OSError as ex:
+                code = errno.errorcode.get(ex.errno, str(ex.errno))
+                pmu = "✗ " + code
+            sources = []
+            if name in FALLBACK_STAT_SOURCES:
+                sources.append("stat:" + FALLBACK_STAT_SOURCES[name])
+            if name in FALLBACK_RECORD_EVENTS:
+                sources.append("record:ptrace")
+            print(f"    {pmu:<10} {name:<26} {', '.join(sources) or '—':<20} {desc}")
         print()
+
+    dom = current_domain()
+    print(f"  当前域：{dom} · KXXY_PERF_MODE={perf_mode()}")
+    print("  PMU 全部 ✗ 只表示硬件/内核计数不可用；stat/record 仍可能走 fallback。")
+    print("  真 PMU 需要允许 perf_event_open 的域（如 adb run-as 或特权 helper）。")
     return 0
 
 
@@ -1241,7 +1312,7 @@ def main(argv):
         print(__doc__.strip())
         return 0
     if argv[0] in ("--version", "-v", "version"):
-        print("kxxy-perf 1.0（perf_event_open 直连，不含 simpleperf）")
+        print("kxxy-perf 1.1（perf_event_open 直连；无 PMU 时 rusage/ptrace 降级）")
         return 0
     cmd, rest = argv[0], argv[1:]
     table = {"stat": cmd_stat, "record": cmd_record, "report": cmd_report,

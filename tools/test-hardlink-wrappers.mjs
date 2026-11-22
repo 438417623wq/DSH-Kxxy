@@ -110,9 +110,13 @@ await test('rsync guard keeps default path exec-only and gates dedup behind an o
   assert.ok(gate > 0, 'explicit dedup gate missing');
   assert.ok(gate < exec, 'dedup gate must precede the native exec');
   assert.ok(script.includes('KXXY_RSYNC_DEDUP'));
+  assert.ok(script.includes('KXXY_RSYNC_LINK_REQUIRED'));
   // 去重只在原生 rsync 成功返回之后发生
   const transfer = script.indexOf('subprocess.call([real] + argv)');
   const linkify = script.indexOf('dedup_symlink(basis, destination, verify=verify)');
   assert.ok(transfer > 0 && linkify > transfer, 'linkify must run after a successful transfer');
   assert.ok(script.includes('if status != 0:'));
+  // 替换必须是临时软链 + 原子 rename，不能先删目标再建链接。
+  assert.ok(script.includes('os.replace(temporary, path)'));
+  assert.ok(!script.includes('os.unlink(path)\n                os.symlink'));
 });

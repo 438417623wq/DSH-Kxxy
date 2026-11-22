@@ -264,6 +264,7 @@ def dedup_symlink(basis, destination, verify=False):
     """
     replaced = 0
     skipped = 0
+    saved = 0
     for root, _dirs, files in os.walk(destination):
         for name in files:
             path = os.path.join(root, name)
@@ -290,13 +291,22 @@ def dedup_symlink(basis, destination, verify=False):
             elif verify and not same_bytes(path, source):
                 skipped += 1
                 continue
+            temporary = os.path.join(
+                root, ".kxxy-dedup-" + secrets.token_hex(12))
             try:
-                os.unlink(path)
-                os.symlink(os.path.relpath(source, root), path)
+                os.symlink(os.path.relpath(source, root), temporary)
+                # 先在同目录建临时软链，再用原子 rename 替换；symlink 失败或
+                # rename 失败都不会先删掉目标文件，避免中途抛错造成数据丢失。
+                os.replace(temporary, path)
                 replaced += 1
+                saved += here.st_size
             except OSError:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
                 skipped += 1
-    return replaced, skipped
+    return replaced, skipped, saved
 
 
 def same_bytes(left, right, chunk=1 << 20):
@@ -325,15 +335,17 @@ def run_with_dedup(real, argv, pairs, verify=False):
     status = subprocess.call([real] + argv)
     if status != 0:
         return status
-    replaced = kept = 0
+    replaced = kept = saved = 0
     for basis, destination in pairs:
         if not os.path.isdir(destination) or not os.path.isdir(basis):
             continue
-        r, s = dedup_symlink(basis, destination, verify=verify)
+        r, s, b = dedup_symlink(basis, destination, verify=verify)
         replaced += r
         kept += s
-    sys.stderr.write(f"kxxy-rsync: 去重完成：{replaced} 个文件改为符号链接，"
-                     f"{kept} 个保留独立副本。\n")
+        saved += b
+    sys.stderr.write(
+        f"kxxy-rsync: 去重完成：{replaced} 个文件改为符号链接，"
+        f"{kept} 个保留独立副本，目标侧释放约 {saved / 1024 / 1024:.2f} MiB。\n")
     return 0
 
 
@@ -343,7 +355,8 @@ def main(args=None):
         sys.stderr.write("kxxy-rsync: internal usage <real-rsync> [args...]\n")
         return 2
     real, argv = args[0], args[1:]
-    strict = os.environ.get("KXXY_RSYNC_LINK_STRICT", "0") == "1"
+    strict = (os.environ.get("KXXY_RSYNC_LINK_REQUIRED", "0") == "1"
+              or os.environ.get("KXXY_RSYNC_LINK_STRICT", "0") == "1")
     # Removed mode must fail even without --link-dest, before any filesystem work
     # or rsync execution. QUIET/mode/fallback must never override strict policy.
     if os.environ.get("KXXY_RSYNC_LINK_MODE", "warn") == "symlink":
@@ -354,7 +367,13 @@ def main(args=None):
         )
         return 1
 
-    dedup = os.environ.get("KXXY_RSYNC_DEDUP", "").strip().lower() == "symlink"
+    dedup_value = os.environ.get("KXXY_RSYNC_DEDUP", "").strip().lower()
+    if dedup_value and dedup_value != "symlink":
+        sys.stderr.write(
+            "kxxy-rsync: unsupported KXXY_RSYNC_DEDUP=" + dedup_value +
+            " (only 'symlink' is implemented); no transfer was run.\n")
+        return 2
+    dedup = dedup_value == "symlink"
     verify = os.environ.get("KXXY_RSYNC_DEDUP_VERIFY", "0") == "1"
 
     parsed = parse_arguments(argv)
@@ -374,7 +393,7 @@ def main(args=None):
             link_dest_unsupported = True
             if strict:
                 sys.stderr.write(
-                    "kxxy-rsync: strict --link-dest rejected: " + problem +
+                    "kxxy-rsync: strict/required --link-dest rejected: " + problem +
                     "; hard-link capability is unverified/unsupported. "
                     "No rsync transfer was run.\n"
                 )
