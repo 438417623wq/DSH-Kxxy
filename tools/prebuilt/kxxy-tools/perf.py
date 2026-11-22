@@ -23,15 +23,16 @@ import sys
 import time
 
 PAGE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+# 只在此处取一次 uname：测试会在 import 时替换它，运行期不再依赖该属性
+# （Windows 上的 CPython 没有 os.uname）。
+MACHINE = os.uname().machine if hasattr(os, "uname") else "unknown"
 
 SYS_PERF_EVENT_OPEN = {
     "aarch64": 241, "arm64": 241,
     "armv7l": 364, "armv8l": 364,
     "x86_64": 298, "amd64": 298,
     "i686": 336, "i386": 336,
-}[os.uname().machine] if os.uname().machine in (
-    "aarch64", "arm64", "armv7l", "armv8l", "x86_64", "amd64", "i686", "i386",
-) else 241
+}.get(MACHINE, 241)
 
 # ── perf_event_attr 位域 ────────────────────────────────────────────────────
 B_DISABLED, B_INHERIT, B_PINNED, B_EXCLUSIVE = 0, 1, 2, 3
@@ -176,6 +177,286 @@ def policy_hint(errnos):
     return out
 
 
+# ── 降级路径：PMU 打不开时仍给出可用数据 ────────────────────────────────────
+# 应用域（u:r:untrusted_app_27）里 perf_event_open 被设备策略拒绝，但统计和
+# 采样本身不一定要 PMU：stat 用 rusage//proc 记账，record 用 ptrace 定时抓 PC。
+# 两者都不绕过任何权限检查（ptrace 只针对自己 fork 的子进程或同 uid 进程），
+# 因此不受该策略影响，代价是没有 cycles/instructions 这类硬件计数。
+PTRACE_TRACEME, PTRACE_CONT, PTRACE_GETREGSET, PTRACE_DETACH = 0, 7, 0x4204, 17
+PTRACE_ATTACH = 16
+NT_PRSTATUS = 1
+
+
+def perf_mode():
+    mode = os.environ.get("KXXY_PERF_MODE", "auto").strip().lower()
+    return mode if mode in ("auto", "pmu", "fallback") else "auto"
+
+
+def proc_cpu(pid):
+    """(utime, stime, minflt, majflt) —— stat(5) 的第 14/15/10/12 项。"""
+    with open("/proc/%d/stat" % pid, "rb") as f:
+        raw = f.read()
+    fields = raw[raw.rfind(b")") + 2:].split()
+    try:
+        ticks = float(os.sysconf("SC_CLK_TCK"))
+    except (ValueError, OSError):
+        ticks = 100.0
+    return (int(fields[11]) / ticks, int(fields[12]) / ticks,
+            int(fields[7]), int(fields[9]))
+
+
+def proc_switches(pid):
+    out = {}
+    try:
+        with open("/proc/%d/status" % pid, "r") as f:
+            for line in f:
+                if line.startswith(("voluntary_ctxt_switches",
+                                    "nonvoluntary_ctxt_switches")):
+                    key, _, value = line.partition(":")
+                    out[key.strip()] = int(value)
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def read_maps(pid):
+    maps = []
+    try:
+        with open("/proc/%d/maps" % pid, "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 6 or "x" not in parts[1]:
+                    continue
+                try:
+                    start, end = (int(x, 16) for x in parts[0].split("-"))
+                    maps.append((start, end - start, int(parts[2], 16),
+                                 parts[5] or "[anon]"))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return maps
+
+
+def stat_fallback(child, pid, duration, label, failed_errnos, attempted=True):
+    """无 PMU 计数时用 rusage / /proc 记账，输出 CPU 时间、缺页、上下文切换。"""
+    util_note = ""
+    if child is not None:
+        resume(child)
+        t0 = time.time()
+        ru = None
+        try:
+            _, _status, ru = os.wait4(child, 0)
+        except (ChildProcessError, AttributeError):
+            pass
+        elapsed = time.time() - t0
+        cpu = (ru.ru_utime + ru.ru_stime) if ru else 0.0
+        minflt = ru.ru_minflt if ru else 0
+        majflt = ru.ru_majflt if ru else 0
+        csw = (ru.ru_nvcsw + ru.ru_nivcsw) if ru else 0
+    else:
+        before = proc_cpu(pid)
+        sw0 = sum(proc_switches(pid).values())
+        t0 = time.time()
+        time.sleep(duration if duration else 3.0)
+        elapsed = time.time() - t0
+        after = proc_cpu(pid)
+        sw1 = sum(proc_switches(pid).values())
+        cpu = max(0.0, (after[0] + after[1]) - (before[0] + before[1]))
+        minflt = max(0, after[2] - before[2])
+        majflt = max(0, after[3] - before[3])
+        csw = max(0, sw1 - sw0)
+        util_note = "（-p 模式按 /proc 增量估算）"
+
+    used = cpu / elapsed if elapsed > 0 else 0.0
+    print(f"\n Performance counter stats（降级模式：本域无 PMU 计数）"
+          f"for {label!r}:\n")
+    print(f"  {cpu * 1e3:14.6f}  msec  task-clock                "
+          f"# {used:.2f} CPUs utilized")
+    print(f"  {human(minflt + majflt):>14}  page-faults")
+    print(f"  {human(csw):>14}  context-switches")
+    print(f"\n  {elapsed:10.6f} seconds time elapsed{util_note}\n")
+    if attempted:
+        sys.stderr.write(
+            "  降级原因：perf_event_open 未能打开任何事件（详见上方 errno）。\n")
+    else:
+        sys.stderr.write(
+            "  降级原因：KXXY_PERF_MODE=fallback，未尝试 PMU 计数。\n")
+    sys.stderr.write(
+        "  以上来自 rusage / /proc，不含 cycles / instructions / branches 等硬件计数。\n"
+        "  想要硬件计数可设 KXXY_PERF_MODE=pmu，或在允许的域执行（见下方对照命令）。\n")
+    for line in policy_hint(failed_errnos):
+        sys.stderr.write(line)
+    return 0
+
+
+def _ptrace(lib, ctypes):
+    fn = lib.ptrace
+    fn.restype = ctypes.c_long
+    fn.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p,
+                   ctypes.c_void_p]
+    return fn
+
+
+def _pc_index():
+    machine = MACHINE
+    if machine in ("aarch64", "arm64"):
+        return 32          # user_pt_regs: regs[31] / sp / pc / pstate
+    if machine in ("x86_64", "amd64"):
+        return 16          # user_regs_struct.rip 在偏移 128 处
+    return None
+
+
+def read_pc(ptrace, ctypes, pid, index):
+    buf = (ctypes.c_ulonglong * 34)()
+
+    class IOVec(ctypes.Structure):
+        _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+    iov = IOVec(ctypes.cast(buf, ctypes.c_void_p), ctypes.sizeof(buf))
+    if ptrace(PTRACE_GETREGSET, pid, ctypes.c_void_p(NT_PRSTATUS),
+              ctypes.byref(iov)) != 0:
+        return 0
+    return int(buf[index])
+
+
+def spawn_traced(cmd):
+    """fork + PTRACE_TRACEME：子进程在 exec 处停住，父进程仍可读它的 PC。"""
+    lib, ctypes = _libc()
+    ptrace = _ptrace(lib, ctypes)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            ptrace(PTRACE_TRACEME, 0, None, None)
+            os.execvp(cmd[0], cmd)
+        except BaseException:
+            os._exit(127)
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    return pid
+
+
+def record_fallback(child, pid, freq, duration, label, out, failed_errnos,
+                    cmd=None):
+    """ptrace 定时抓 PC 的采样器；产出与 PMU 路径相同的 perf.data 文本格式。"""
+    import ctypes
+    import signal
+
+    index = _pc_index()
+    if index is None:
+        sys.stderr.write("perf record: 降级采样不支持 %s 架构\n" % MACHINE)
+        if child is not None:
+            kill_child(child)
+        return 1
+    if child is None and not pid:
+        sys.stderr.write("perf record: 需要 -- cmd 或 -p PID\n")
+        return 2
+
+    if child is not None and cmd:
+        # spawn_stopped 的孩子没有 PTRACE_TRACEME，换成被跟踪的实例重开
+        kill_child(child)
+        child = spawn_traced(cmd)
+
+    lib, ctypes = _libc()
+    ptrace = _ptrace(lib, ctypes)
+
+    if child is None:
+        if ptrace(PTRACE_ATTACH, pid, None, None) != 0:
+            sys.stderr.write("perf record: ptrace attach %d 失败（%s）\n"
+                             % (pid, os.strerror(ctypes.get_errno())))
+            return 1
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+    target = pid if pid else child
+
+    # SIGSTOP 往返一次毫秒级，采样频率按 200 Hz 封顶，否则会明显拖慢目标
+    hz = max(1, min(int(freq or 200), 200))
+    interval = 1.0 / hz
+    limit = duration if duration else 30.0
+
+    maps = read_maps(target)
+    comms = {}
+    try:
+        with open("/proc/%d/comm" % target, "r") as f:
+            comms[target] = f.read().strip()
+    except OSError:
+        comms[target] = str(target)
+
+    samples = []
+    exited = False
+    last_maps = time.time()
+    t0 = time.time()
+    try:
+        while time.time() - t0 < limit:
+            ptrace(PTRACE_CONT, target, None, None)
+            time.sleep(interval)
+            try:
+                os.kill(target, signal.SIGSTOP)
+            except OSError:
+                break
+            try:
+                _, status = os.waitpid(target, os.WUNTRACED)
+            except ChildProcessError:
+                break
+            if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                exited = True
+                break
+            pc = read_pc(ptrace, ctypes, target, index)
+            if pc:
+                # exec 停下时动态库还没加载完，映射要随采样刷新，否则样本落不进
+                # 任何模块、report 只能回 [unknown]。
+                if not any(start <= pc < start + ln for start, ln, _o, _n in maps) \
+                        and time.time() - last_maps > 0.2:
+                    maps = read_maps(target)
+                    last_maps = time.time()
+                samples.append((pc, target, target, [pc]))
+    finally:
+        # 采样结束不杀目标，但**任何**异常/中断都不能把它留在 SIGSTOP 里：
+        # 否则用户那条命令会永远停住（真机上确实这么残留过两个进程）。
+        if not exited:
+            try:
+                ptrace(PTRACE_DETACH, target, None,
+                       ctypes.c_void_p(int(signal.SIGCONT)))
+            except OSError:
+                pass
+            try:
+                os.waitpid(target, 0)
+            except (ChildProcessError, KeyboardInterrupt):
+                pass
+
+    if not samples:
+        sys.stderr.write("perf record: 降级采样没抓到样本（目标执行太快？）\n")
+        return 1
+
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("#kxxy-perf 1\n")
+        f.write(f"#label {label}\n")
+        f.write("#event cpu-clock\n")
+        f.write("#mode ptrace-fallback\n")
+        f.write(f"#elapsed {time.time() - t0:.3f}\n")
+        f.write(f"#freq {hz}\n")
+        for p, nm in sorted(comms.items()):
+            f.write(f"C {p} {nm}\n")
+        for addr, ln, pgoff, name in maps:
+            f.write(f"M {addr:x} {ln:x} {pgoff:x} {name or '[anon]'}\n")
+        for ip, rpid, rtid, chain in samples:
+            f.write("S %x %d %d %s\n" % (ip, rpid, rtid,
+                                         " ".join("%x" % x for x in chain)))
+
+    sys.stderr.write(
+        f"perf record: 降级模式（ptrace 每 {interval * 1000:.1f} ms 抓一次 PC，"
+        f"仅主线程、无调用链）{len(samples)} 个样本 → {out}\n")
+    for line in policy_hint(failed_errnos):
+        sys.stderr.write(line)
+    return 0
+
+
 def ev_name(spec):
     return spec.split(":", 1)[0].strip()
 
@@ -302,6 +583,11 @@ def cmd_stat(argv):
         sys.stderr.write("perf stat: 需要 -- cmd 或 -p PID\n")
         return 2
 
+    mode = perf_mode()
+    if mode == "fallback":
+        return stat_fallback(child, None if child is not None else target,
+                             duration, label, [], attempted=False)
+
     fds = []
     used = []
     exclude_kernel = 0
@@ -335,6 +621,12 @@ def cmd_stat(argv):
             sys.stderr.writelines(failures)
         if not opened and verbose:
             sys.stderr.write(f"  {spec}: 跳过\n")
+
+    if not fds and mode != "pmu":
+        # 一个计数器都没开起来（应用域 EACCES 等）——子进程还停在 exec 前，
+        # 此时改用 rusage 记账，拿到 CPU 时间/缺页/切换次数而不是直接失败。
+        return stat_fallback(child, None if child is not None else target,
+                             duration, label, failed_errnos)
 
     t0 = time.time()
     if child is not None:
@@ -490,7 +782,7 @@ def cmd_record(argv):
 
     child = None
     if cmd:
-        child = spawn_stopped(cmd)
+        child = spawn_traced(cmd) if perf_mode() == "fallback" else spawn_stopped(cmd)
         target = child
         label = " ".join(cmd)
         if duration is None:
@@ -510,6 +802,10 @@ def cmd_record(argv):
     # 不能带 B_INHERIT：内核 perf_mmap() 对「per-task 且 inherit」直接 EINVAL
     # （所有子进程共用一个环会串数据）。代价是 record 只采样目标进程本身。
 
+    if perf_mode() == "fallback":
+        return record_fallback(child, None if child is not None else target,
+                               freq, duration, label, out, [], cmd=cmd)
+
     fd = None
     failures = []
     failed_errnos = []
@@ -528,6 +824,11 @@ def cmd_record(argv):
             failed_errnos.append(ex.errno)
     sys.stderr.writelines(failures)
     if fd is None:
+        if perf_mode() != "pmu":
+            # 应用域里 PMU 事件被策略拒绝——改用 ptrace 抓 PC，采样本身不需要 PMU
+            return record_fallback(child, None if child is not None else target,
+                                   freq, duration, label, out, failed_errnos,
+                                   cmd=cmd)
         sys.stderr.write("perf record: 没有可用采样事件；事件打开失败详情见上\n")
         for line in policy_hint(failed_errnos):
             sys.stderr.write(line)
@@ -895,7 +1196,9 @@ def cmd_report(argv):
     if label:
         print(f"# 目标 {label} · {total} 个样本 · {elapsed:.2f}s · "
               f"{len(maps)} 个映射")
-    print(f"# 事件 {next((l[7:] for l in lines if l.startswith('#event ')), '?')}\n")
+    mode = next((l[6:] for l in lines if l.startswith("#mode ")), "")
+    print(f"# 事件 {next((l[7:] for l in lines if l.startswith('#event ')), '?')}"
+          f"{' · ' + mode if mode else ''}\n")
     print(f"{'Samples':>8}  {'Percent':>8}  Command        Symbol")
     print("-" * 78)
     dm = {} if show_stack else demangle_names({k[1] for k in agg})

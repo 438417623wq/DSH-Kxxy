@@ -609,7 +609,7 @@ export const POOL_ITEMS = [
   // 而这份 rootfs 有 194 条软链 —— 详见 `tools/lib/asset-pack.mjs` 顶部注释。
   {
     id: "glibc", source: "asset", category: "toolchain",
-    version: "24.04.3-r2",
+    version: "24.04.3-r3",
     name: "glibc 用户态（Ubuntu 24.04 + proot）",
     description:
       "在 proot 里跑一份**未改动的 Ubuntu 24.04 base**：`kxxy-glibc` 进容器，" +

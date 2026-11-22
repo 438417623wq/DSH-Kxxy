@@ -255,6 +255,88 @@ def probe_hardlinks(basis, destination):
     return supported, problem
 
 
+def dedup_symlink(basis, destination, verify=False):
+    """把 destination 下与 basis 相同的普通文件换成指向 basis 的相对符号链接。
+
+    只在 rsync 成功之后、只处理**两侧都已存在**的普通文件，因此不会复活已删除
+    或被排除的条目；dry-run 不走这里。判等先按 rsync 自己的 quick-check
+    （大小 + mtime），verify=True 时再逐字节比对。
+    """
+    replaced = 0
+    skipped = 0
+    for root, _dirs, files in os.walk(destination):
+        for name in files:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                continue
+            rel = os.path.relpath(path, destination)
+            source = os.path.join(basis, rel)
+            try:
+                if not stat.S_ISREG(os.lstat(source).st_mode):
+                    skipped += 1
+                    continue
+                here = os.lstat(path)
+                there = os.lstat(source)
+            except OSError:
+                skipped += 1
+                continue
+            if here.st_size != there.st_size:
+                skipped += 1
+                continue
+            if int(here.st_mtime) != int(there.st_mtime):
+                if not verify or not same_bytes(path, source):
+                    skipped += 1
+                    continue
+            elif verify and not same_bytes(path, source):
+                skipped += 1
+                continue
+            try:
+                os.unlink(path)
+                os.symlink(os.path.relpath(source, root), path)
+                replaced += 1
+            except OSError:
+                skipped += 1
+    return replaced, skipped
+
+
+def same_bytes(left, right, chunk=1 << 20):
+    try:
+        with open(left, "rb") as a, open(right, "rb") as b:
+            while True:
+                x = a.read(chunk)
+                y = b.read(chunk)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+    except OSError:
+        return False
+
+
+def run_with_dedup(real, argv, pairs, verify=False):
+    """先跑原生 rsync，再把与基准快照相同的文件换成相对符号链接（真正的空间去重）。"""
+    import subprocess
+
+    sys.stderr.write(
+        "kxxy-rsync: KXXY_RSYNC_DEDUP=symlink：本机无法建立硬链接，改为先正常复制、"
+        "再把与基准快照相同的文件替换为相对符号链接。\n"
+        "  注意：stat 跟随链接时 inode 与基准一致，但 lstat 是软链；删除基准快照会"
+        "使这些文件变成断链。\n")
+    status = subprocess.call([real] + argv)
+    if status != 0:
+        return status
+    replaced = kept = 0
+    for basis, destination in pairs:
+        if not os.path.isdir(destination) or not os.path.isdir(basis):
+            continue
+        r, s = dedup_symlink(basis, destination, verify=verify)
+        replaced += r
+        kept += s
+    sys.stderr.write(f"kxxy-rsync: 去重完成：{replaced} 个文件改为符号链接，"
+                     f"{kept} 个保留独立副本。\n")
+    return 0
+
+
 def main(args=None):
     args = sys.argv[1:] if args is None else args
     if not args:
@@ -267,14 +349,21 @@ def main(args=None):
     if os.environ.get("KXXY_RSYNC_LINK_MODE", "warn") == "symlink":
         sys.stderr.write(
             "kxxy-rsync: KXXY_RSYNC_LINK_MODE=symlink is disabled: symbolic links "
-            "do not preserve rsync --link-dest semantics; no transfer was run.\n"
+            "do not preserve rsync --link-dest semantics; no transfer was run. "
+            "Use KXXY_RSYNC_DEDUP=symlink for explicit post-transfer dedup.\n"
         )
         return 1
 
+    dedup = os.environ.get("KXXY_RSYNC_DEDUP", "").strip().lower() == "symlink"
+    verify = os.environ.get("KXXY_RSYNC_DEDUP_VERIFY", "0") == "1"
+
     parsed = parse_arguments(argv)
+    pairs = []
+    link_dest_unsupported = False
     if parsed.possible_link_dest:
         candidates, problem = local_candidates(parsed)
         if candidates is not None:
+            pairs = candidates
             for basis, destination in candidates:
                 supported, problem = probe_hardlinks(basis, destination)
                 if not supported:
@@ -282,6 +371,7 @@ def main(args=None):
             else:
                 problem = None
         if problem:
+            link_dest_unsupported = True
             if strict:
                 sys.stderr.write(
                     "kxxy-rsync: strict --link-dest rejected: " + problem +
@@ -295,6 +385,9 @@ def main(args=None):
                     "; --link-dest hard-link capability is unverified/unsupported. "
                     "Running native rsync unchanged; it may copy instead of linking.\n"
                 )
+
+    if dedup and link_dest_unsupported and pairs and not parsed.dry_run:
+        return run_with_dedup(real, argv, pairs, verify=verify)
     # exec inherits stdout/stderr, native status and signal handling. There is no
     # output capture, compare-dest substitution, linkify phase or postprocessing.
     try:

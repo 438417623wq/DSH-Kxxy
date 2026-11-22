@@ -10,6 +10,9 @@
 #   kxxy-glibc-provision dotnet          apt install dotnet-sdk-8.0
 #   kxxy-glibc-provision wkhtmltopdf     apt install wkhtmltopdf
 #   kxxy-glibc-provision python-ml       apt python3-pip + pip 装 numpy/sklearn/cv2
+#   kxxy-glibc-provision python-data     pip 装 pandas（约 12 MiB）
+#   kxxy-glibc-provision python-torch    pip 装 torch（aarch64 轮子约 485 MiB）
+#   kxxy-glibc-provision python-full     以上三者：让默认 python3 一个环境全都有
 #   kxxy-glibc-provision base            只做 apt update + ca-certificates/curl
 #   kxxy-glibc-provision all             以上全做
 #
@@ -27,6 +30,16 @@ mkdir -p "$STAMP" || { echo "kxxy-glibc-provision: 无法创建 $STAMP" >&2; exi
 
 # apt 在 fake root 下必须加这条：`_apt` 用户不存在，否则下载阶段 Permission denied
 APT='-o APT::Sandbox::User=root'
+
+# PyPI 在国内网络下经常几十 KB/s 且会反复重试；允许显式换镜像：
+#   KXXY_PIP_INDEX=https://mirrors.aliyun.com/pypi/simple kxxy-glibc-provision python-full
+PIP_INDEX="${KXXY_PIP_INDEX:-}"
+if [ -n "$PIP_INDEX" ]; then
+  echo "== pip 索引：$PIP_INDEX ==" >&2
+  PIP_OPT="-i $PIP_INDEX"
+else
+  PIP_OPT=""
+fi
 
 # 容器里跑一段脚本；失败时把日志尾巴打出来（否则用户只看到 exit 1）
 in_guest() {
@@ -84,15 +97,39 @@ prov_python() {
     return 0
   fi
   echo "== pip 安装 numpy / scikit-learn / opencv-python-headless（manylinux 轮子）==" >&2
-  in_guest 'python3 -m pip install --break-system-packages --no-cache-dir -q \
-    numpy scikit-learn opencv-python-headless' || return 1
+  in_guest "python3 -m pip install --break-system-packages --no-cache-dir -q $PIP_OPT \
+    numpy scikit-learn opencv-python-headless" || return 1
   in_guest 'python3 -c "import numpy,sklearn,cv2;print(\"numpy\",numpy.__version__,\"sklearn\",sklearn.__version__,\"cv2\",cv2.__version__)"' || return 1
   : > "$STAMP/python-ml"
 }
 
+# 数据栈：pandas（约 12 MiB）
+prov_pandas() {
+  in_guest 'python3 -c "import pandas" >/dev/null 2>&1' && { : > "$STAMP/pandas"; return 0; }
+  prov_python || return 1
+  echo "== pip 安装 pandas ==" >&2
+  in_guest "python3 -m pip install --break-system-packages --no-cache-dir -q $PIP_OPT pandas" || return 1
+  in_guest 'python3 -c "import pandas;print(\"pandas\",pandas.__version__)"' || return 1
+  : > "$STAMP/pandas"
+}
+
+# torch：必须用 PyTorch 官方 CPU 索引。
+# 坑：PyPI 上 torch 2.15 的 linux aarch64 轮子是 CUDA 链接版（170→485 MiB），
+# 装进去 `import torch` 直接 OSError: libcudart.so.13 —— 官方 CPU 索引的
+# 同名轮子是纯 CPU（约 171 MiB，torch.version.cuda is None），才在这个容器里能用。
+TORCH_INDEX="${KXXY_PIP_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
+prov_torch() {
+  in_guest 'python3 -c "import torch" >/dev/null 2>&1' && { : > "$STAMP/torch"; return 0; }
+  prov_python || return 1
+  echo "== pip 安装 torch（CPU 轮子约 171 MiB，索引 $TORCH_INDEX）==" >&2
+  in_guest "python3 -m pip install --break-system-packages --no-cache-dir -i $TORCH_INDEX torch" || return 1
+  in_guest 'python3 -c "import torch;print(\"torch\",torch.__version__)"' || return 1
+  : > "$STAMP/torch"
+}
+
 rc=0
 if [ "$#" -eq 0 ]; then
-  echo "用法：kxxy-glibc-provision <base|julia|dotnet|wkhtmltopdf|python-ml|all>" >&2
+  echo "用法：kxxy-glibc-provision <base|julia|dotnet|wkhtmltopdf|python-ml|python-data|python-torch|python-full|all>" >&2
   exit 2
 fi
 for want in "$@"; do
@@ -101,12 +138,23 @@ for want in "$@"; do
     julia) prov_julia ;;
     dotnet) prov_dotnet ;;
     wkhtmltopdf) prov_wkhtmltopdf ;;
-    python-ml|python) prov_python ;;
+    python-ml) prov_python ;;
+    python-data|pandas) prov_pandas ;;
+    python-torch|torch) prov_torch ;;
+    python-full|python)
+      prov_python; [ "$?" -eq 0 ] || rc=1
+      prov_pandas; [ "$?" -eq 0 ] || rc=1
+      prov_torch; [ "$?" -eq 0 ] || rc=1
+      if [ "$rc" -eq 0 ]; then
+        in_guest 'python3 -c "import numpy,scipy,sklearn,cv2,pandas,torch as t;print(\"numpy\",numpy.__version__,\"scipy\",scipy.__version__,\"sklearn\",sklearn.__version__,\"cv2\",cv2.__version__,\"pandas\",pandas.__version__,\"torch\",t.__version__)"'
+      fi ;;
     all)
       prov_julia
       prov_dotnet
       prov_wkhtmltopdf
       prov_python
+      prov_pandas
+      prov_torch
       ;;
     *) echo "kxxy-glibc-provision: 未知目标 $want" >&2; rc=2 ;;
   esac

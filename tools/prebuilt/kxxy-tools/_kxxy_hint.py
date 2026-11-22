@@ -34,11 +34,14 @@ class _GlibcOnlyFinder:
         raise ImportError(
             "%s 只有 glibc 的 manylinux 轮子，bionic 的原生 Python 装不了"
             "（不是没装，是装不上）。\n"
-            "  直接用：      kxxy-py -c 'import %s'\n"
-            "  装更多包：    kxxy-glibc -c 'pip install %s'\n"
-            "  进容器里做事：kxxy-glibc\n"
-            "（kxxy-py 跑在扩展中心装的 glibc 用户态里，numpy/scipy/torch 之外"
-            "还有 sklearn/cv2）" % (pkg, root, pkg)
+            "  用默认解释器：  python3 -c 'import %s'"
+            "   （默认 python3 就是容器里的 glibc Python 3.12，"
+            "numpy/scipy/sklearn/cv2/pandas/torch 同一个环境里全都有）\n"
+            "  补齐 Python 包：kxxy-glibc-provision python-full\n"
+            "  装单个包：      kxxy-glibc -c 'pip install %s'\n"
+            "  进容器里做事：  kxxy-glibc\n"
+            "  确实要 3.14：   python3.14 ...（bionic 原生，有 pandas/torch，"
+            "没有 sklearn/cv2）" % (pkg, root, pkg)
         )
 
 

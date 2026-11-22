@@ -29,11 +29,12 @@ with mock.patch.object(os, "uname", return_value=SimpleNamespace(machine="aarch6
 
 
 class PerfDiagnosticsTests(unittest.TestCase):
-    def invoke(self, command, argv, errors):
+    def invoke(self, command, argv, errors, mode="pmu"):
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(contextlib.redirect_stdout(stdout))
             stack.enter_context(contextlib.redirect_stderr(stderr))
+            stack.enter_context(mock.patch.dict(os.environ, {"KXXY_PERF_MODE": mode}))
             patches = {
                 "perf_open": mock.Mock(side_effect=errors),
                 "ev_ioctl": mock.Mock(),
@@ -223,6 +224,75 @@ class PerfDiagnosticsTests(unittest.TestCase):
     def test_header_does_not_guarantee_counter_availability(self):
         self.assertNotIn("SW/HW 事件都返回正常 fd", perf.__doc__)
         self.assertIn("以现场系统调用结果为准", perf.__doc__)
+
+    # ── 降级路径：应用域拿不到 PMU 时仍要有结果 ──────────────────────────
+    def test_stat_falls_back_to_rusage_when_policy_denies_every_event(self):
+        errors = [OSError(errno.EACCES, "denied"), OSError(errno.EACCES, "denied")]
+        with mock.patch.object(perf, "stat_fallback", return_value=0) as fallback:
+            result, _, _, calls = self.invoke("stat", ["-e", "cycles", "--", "true"],
+                                              errors, mode="auto")
+        self.assertEqual(result, 0)
+        fallback.assert_called_once()
+        self.assertEqual(fallback.call_args.args[0], 1234)      # 子进程交给降级路径
+        self.assertEqual(fallback.call_args.args[3], "true")
+        # 子进程必须由降级路径 resume+wait4，不能在这里被提前 reap 掉
+        calls["reap"].assert_not_called()
+        calls["resume"].assert_not_called()
+
+    def test_stat_explicit_fallback_mode_skips_perf_event_open(self):
+        with mock.patch.object(perf, "stat_fallback", return_value=0) as fallback:
+            result, _, _, calls = self.invoke("stat", ["--", "true"], [], mode="fallback")
+        self.assertEqual(result, 0)
+        calls["perf_open"].assert_not_called()
+        fallback.assert_called_once()
+
+    def test_stat_pmu_mode_still_fails_loudly(self):
+        errors = [OSError(errno.EACCES, "denied"), OSError(errno.EACCES, "denied")]
+        result, _, stderr, _ = self.invoke("stat", ["-e", "cycles", "--", "true"], errors)
+        self.assertEqual(result, 1)
+        self.assertIn("没有可用计数器", stderr)
+
+    def test_record_falls_back_to_ptrace_with_the_command(self):
+        errors = [OSError(errno.EACCES, "denied"), OSError(errno.EACCES, "denied")]
+        with mock.patch.object(perf, "record_fallback", return_value=0) as fallback:
+            result, _, _, calls = self.invoke("record", ["--", "true"], errors, mode="auto")
+        self.assertEqual(result, 0)
+        fallback.assert_called_once()
+        self.assertEqual(fallback.call_args.kwargs["cmd"], ["true"])
+        self.assertEqual(fallback.call_args.args[0], 1234)
+        calls["kill_child"].assert_not_called()
+
+    def test_record_explicit_fallback_mode_spawns_traced_child(self):
+        with mock.patch.object(perf, "record_fallback", return_value=0) as fallback, \
+                mock.patch.object(perf, "spawn_traced", return_value=777) as traced:
+            result, _, _, calls = self.invoke("record", ["--", "true"], [], mode="fallback")
+        self.assertEqual(result, 0)
+        traced.assert_called_once_with(["true"])
+        calls["spawn_stopped"].assert_not_called()
+        self.assertEqual(fallback.call_args.args[0], 777)
+
+    def test_pc_index_matches_import_architecture(self):
+        self.assertEqual(perf.MACHINE, "aarch64")
+        self.assertEqual(perf._pc_index(), 32)      # user_pt_regs.pc 在 32*8
+
+    def test_report_prints_fallback_mode_header(self):
+        data = "\n".join([
+            "#kxxy-perf 1",
+            "#label true",
+            "#event cpu-clock",
+            "#mode ptrace-fallback",
+            "#elapsed 0.100",
+            "C 1 true",
+            "M 400000 1000 0 /bin/true",
+            "S 400000 1 1 400000",
+        ]) + "\n"
+        with mock.patch("builtins.open", mock.mock_open(read_data=data)):
+            with mock.patch.object(perf, "symbolize", return_value=("main", 0, "/bin/true")):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    result = perf.cmd_report(["-i", "x"])
+        self.assertEqual(result, 0)
+        self.assertIn("ptrace-fallback", out.getvalue())
 
 
 if __name__ == "__main__":

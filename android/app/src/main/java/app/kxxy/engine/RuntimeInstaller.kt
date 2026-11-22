@@ -3271,7 +3271,7 @@ class RuntimeInstaller(private val ctx: Context) {
         // 并带复制降级。前者是纯新增文件、后者是既有文件改内容 —— 十六条锚点
         // 一条都判不出来，只能再借这个编号让老设备重解一次。
         // 32 → 33：默认 Python 独立 glibc 路由、原生 ln 语义及 perf 失败诊断。
-        private const val PATCHSET_MARKER = "kxxy-patchset@34"
+        private const val PATCHSET_MARKER = "kxxy-patchset@35"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
         private val PYTHON_DEFAULT_FILES = listOf(
             "libexec/python-default/python-default.py",

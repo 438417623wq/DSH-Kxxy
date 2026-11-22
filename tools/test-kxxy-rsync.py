@@ -436,6 +436,77 @@ class GuardTests(unittest.TestCase):
         self.assertEqual((self.dest / "included").read_bytes(), b"current")
         self.assertEqual(sorted(path.name for path in self.basis.iterdir()), ["deleted", "excluded"])
 
+    # ── 显式符号链接去重（KXXY_RSYNC_DEDUP=symlink）──────────────────────
+    def test_dedup_replaces_only_identical_files_and_keeps_basis_untouched(self):
+        for directory, name, payload in (
+            (self.basis, "same.txt", b"x" * 100),
+            (self.basis, "diff.txt", b"a" * 100),
+            (self.dest, "same.txt", b"x" * 100),
+            (self.dest, "diff.txt", b"b" * 101),
+        ):
+            (directory / name).write_bytes(payload)
+            os.utime(directory / name, (1700000000, 1700000000))
+        replaced, kept = guard.dedup_symlink(str(self.basis), str(self.dest))
+        self.assertEqual((replaced, kept), (1, 1))
+        self.assertTrue((self.dest / "same.txt").is_symlink())
+        # stat 跟随链接 → 与基准同 inode；lstat 仍能看出是软链
+        self.assertEqual((self.dest / "same.txt").stat().st_ino,
+                         (self.basis / "same.txt").stat().st_ino)
+        self.assertFalse((self.dest / "diff.txt").is_symlink())
+        self.assertFalse((self.basis / "same.txt").is_symlink())
+
+    def test_dedup_never_recreates_files_missing_from_destination(self):
+        (self.basis / "removed.txt").write_bytes(b"gone")
+        (self.basis / "excluded").write_bytes(b"private")
+        replaced, kept = guard.dedup_symlink(str(self.basis), str(self.dest))
+        self.assertEqual((replaced, kept), (0, 0))
+        self.assertEqual(sorted(p.name for p in self.dest.iterdir()), [])
+
+    def test_dedup_copies_then_linkifies_and_skips_exec(self):
+        (self.source / "f.txt").write_bytes(b"data")
+
+        def fake_call(argv):
+            (self.dest / "f.txt").write_bytes(b"data")
+            os.utime(self.dest / "f.txt", (1700000000, 1700000000))
+            (self.basis / "f.txt").write_bytes(b"data")
+            os.utime(self.basis / "f.txt", (1700000000, 1700000000))
+            return 0
+
+        with patch.object(subprocess, "call", side_effect=fake_call) as call:
+            rc, err, execv = self.run_guard(
+                env={"KXXY_RSYNC_DEDUP": "symlink"},
+                probe=(False, "native hard-link probe failed: denied"))
+        self.assertEqual(rc, 0)
+        self.assertIn("去重完成", err)
+        call.assert_called_once()
+        execv.assert_not_called()
+        self.assertTrue((self.dest / "f.txt").is_symlink())
+
+    def test_dedup_skipped_on_dry_run_and_keeps_native_exec(self):
+        rc, _, execv = self.run_guard(
+            args=["-a", "-n", "--link-dest", str(self.basis),
+                  str(self.source) + "/", str(self.dest)],
+            env={"KXXY_RSYNC_DEDUP": "symlink"},
+            probe=(False, "denied"))
+        execv.assert_called_once()
+        self.assertEqual(rc, 0)
+
+    def test_dedup_skipped_when_hardlinks_really_work(self):
+        rc, err, execv = self.run_guard(env={"KXXY_RSYNC_DEDUP": "symlink"},
+                                        probe=(True, None))
+        execv.assert_called_once()
+        self.assertNotIn("去重完成", err)
+
+    def test_failed_transfer_does_not_linkify(self):
+        def fake_call(argv):
+            return 23
+
+        with patch.object(subprocess, "call", side_effect=fake_call):
+            rc, err, _ = self.run_guard(env={"KXXY_RSYNC_DEDUP": "symlink"},
+                                        probe=(False, "denied"))
+        self.assertEqual(rc, 23)
+        self.assertNotIn("去重完成", err)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

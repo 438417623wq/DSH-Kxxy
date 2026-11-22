@@ -97,13 +97,22 @@ await test('rsync execution keeps separate operands and -- intact through runtim
   ]);
 }));
 
-await test('rsync guard contains no link-dest rewrite or linkify phase', () => {
+await test('rsync guard keeps default path exec-only and gates dedup behind an opt-in', () => {
   const script = readFileSync(new URL('./prebuilt/kxxy-tools/kxxy-rsync.py', import.meta.url), 'utf8');
   assert.ok(script.includes('os.execv(real, [real] + argv)'));
   assert.ok(script.includes('os.link(source, link)'));
   assert.ok(script.includes('os.lstat(source)'));
   assert.ok(script.includes('os.lstat(link)'));
-  assert.ok(!script.includes('os.symlink('));
   assert.ok(!script.includes('def linkify('));
-  assert.ok(!script.includes('subprocess.call('));
+  // 默认路径仍然原样 exec 原生 rsync；去重必须先过显式 opt-in 这道门
+  const gate = script.indexOf('if dedup and link_dest_unsupported and pairs and not parsed.dry_run:');
+  const exec = script.indexOf('os.execv(real, [real] + argv)');
+  assert.ok(gate > 0, 'explicit dedup gate missing');
+  assert.ok(gate < exec, 'dedup gate must precede the native exec');
+  assert.ok(script.includes('KXXY_RSYNC_DEDUP'));
+  // 去重只在原生 rsync 成功返回之后发生
+  const transfer = script.indexOf('subprocess.call([real] + argv)');
+  const linkify = script.indexOf('dedup_symlink(basis, destination, verify=verify)');
+  assert.ok(transfer > 0 && linkify > transfer, 'linkify must run after a successful transfer');
+  assert.ok(script.includes('if status != 0:'));
 });
