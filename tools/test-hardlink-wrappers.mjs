@@ -11,16 +11,24 @@ const rsync = rsyncWrappers()[0];
 const shell = process.env.KXXY_TEST_SH || (process.platform === 'win32' ? null : '/bin/sh');
 const posixNode = process.env.KXXY_TEST_POSIX_NODE || process.execPath;
 
-await test('ln builder only execs coreutils ln with untouched positional arguments', () => {
+await test('ln builder preserves native default and adds explicit root opt-in', () => {
   assert.equal(ln.path, 'bin/ln');
   assert.equal(ln.mode, 0o755);
   assert.ok(Buffer.isBuffer(ln.data));
   const lines = ln.data.toString('utf8').trimEnd().split('\n');
   assert.deepEqual(lines.filter(line => !line.startsWith('#')), [
     'd=${0%/*}',
-    'exec "$d/coreutils" --coreutils-prog=ln "$@"',
+    'case "${KXXY_LN_ROOT:-0}" in',
+    '  0) exec "$d/coreutils" --coreutils-prog=ln "$@" ;;',
+    '  1)',
+    '    case "$d" in /*) ;; *) d=$PWD/$d ;; esac',
+    '    root=$(cd "$d/.." 2>/dev/null && pwd) || exit 127',
+    '    exec "$root/bin/python" "$root/libexec/kxxy-tools/kxxy-root.py" ln "$@"',
+    '    ;;',
+    '  *) printf "ln: KXXY_LN_ROOT 只能是 0 或 1\\n" >&2; exit 2 ;;',
+    'esac',
   ]);
-  assert.ok(!ln.data.includes('KXXY_LN_'));
+  assert.ok(ln.data.includes('KXXY_LN_ROOT'));
   assert.ok(!ln.data.includes('2>&1'));
 });
 
@@ -32,7 +40,21 @@ await test('rsync builder always routes through runtime-owned Python and real rs
     'd=${0%/*}',
     'case "$d" in /*) ;; *) d=$PWD/$d ;; esac',
     'root=$(cd "$d/.." 2>/dev/null && pwd) || exit 127',
-    'exec "$root/bin/python" "$root/libexec/kxxy-tools/kxxy-rsync.py" "$root/bin/rsync" "$@"',
+    'case "${KXXY_RSYNC_ROOT:-0}" in',
+    '  0) exec "$root/bin/python" "$root/libexec/kxxy-tools/kxxy-rsync.py" "$root/bin/rsync" "$@" ;;',
+    '  1)',
+    '    if [ "${KXXY_RSYNC_LINK_MODE:-warn}" = symlink ]; then',
+    '      printf "kxxy-rsync: KXXY_RSYNC_LINK_MODE=symlink 已禁用；root 模式使用真实硬链接\\n" >&2',
+    '      exit 1',
+    '    fi',
+    '    if [ -n "${KXXY_RSYNC_DEDUP:-}" ]; then',
+    '      printf "kxxy-rsync: root 模式已是真实硬链接，不能同时指定 KXXY_RSYNC_DEDUP\\n" >&2',
+    '      exit 2',
+    '    fi',
+    '    exec "$root/bin/python" "$root/libexec/kxxy-tools/kxxy-root.py" rsync "$@"',
+    '    ;;',
+    '  *) printf "kxxy-rsync: KXXY_RSYNC_ROOT 只能是 0 或 1\\n" >&2; exit 2 ;;',
+    'esac',
   ]);
   assert.ok(!rsync.data.includes('--compare-dest'));
   assert.ok(!rsync.data.includes('py=python'));

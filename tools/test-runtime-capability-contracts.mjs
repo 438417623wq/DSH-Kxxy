@@ -16,7 +16,7 @@ const generated = [...pythonDefaultWrappers(), ...hardlinkWrappers(), ...rsyncWr
 
 await test('runtime and native installer share the new patchset contract', () => {
   const marker = (text) => /(?:const|val) PATCHSET_MARKER\s*=\s*"([^"]+)"/.exec(text)?.[1];
-  assert.equal(marker(build), 'kxxy-patchset@36');
+  assert.equal(marker(build), 'kxxy-patchset@37');
   assert.equal(marker(installer), marker(build));
 });
 await test('all independent Python routes have native completeness anchors', () => {
@@ -47,6 +47,19 @@ await test('native Python health contract still uses its original absolute execu
   const selftest = readFileSync(join(project, 'plugins/kxxy-host/lib/python-selftest.mjs'), 'utf8');
   assert.ok(selftest.includes("posix.join(root, 'bin', 'python3')"));
   assert.ok(selftest.includes("['-I', '-B', PROBE_FILE, executable]"));
+});
+await test('bundled native wheels exist, match their pinned sha256 and carry android tags', async () => {
+  const { NATIVE_ML } = await import('./lib/pydeps.mjs');
+  const { createHash } = await import('node:crypto');
+  assert.ok(NATIVE_ML.length >= 2, '原生包至少包含 scikit-learn 与 opencv');
+  const anchors = NATIVE_ML.map((item) => item.anchor);
+  assert.ok(anchors.includes('sklearn/__init__.py'));
+  assert.ok(anchors.includes('cv2/__init__.py'));
+  for (const item of NATIVE_ML) {
+    assert.match(item.file, /cp314-cp314-android_24_arm64_v8a\.whl$/, item.file);
+    const buf = readFileSync(join(project, 'tools/prebuilt/native-ml', item.file));
+    assert.equal(createHash('sha256').update(buf).digest('hex'), item.sha256, item.file);
+  }
 });
 await test('runtime route archive preserves bytes, permission bits and unique paths', async () => {
   const scratch = mkdtempSync(join(tmpdir(), 'kxxy-capability-contract-'));

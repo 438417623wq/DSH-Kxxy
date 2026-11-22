@@ -203,7 +203,7 @@ class PerfDiagnosticsTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(perf.time, "time", side_effect=[0.0, 1.0, 1.0]))
             stack.enter_context(mock.patch("builtins.open", side_effect=files))
             result = perf.cmd_record(["-p", "4321", "--duration", "0.01"])
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 1)  # -p 模式零样本不能报成功
         self.assertEqual(opener.call_count, 2)
         self.assert_failure(stderr.getvalue().splitlines()[0], "record", "cpu-clock", error, perf.SW, 0, 4321, 9985)
         self.assertIn("0 个样本", stderr.getvalue())
@@ -331,6 +331,16 @@ class PerfDiagnosticsTests(unittest.TestCase):
             self.assertEqual(perf.sampled_exit_status(9, False, True), 128 + 9)
             self.assertEqual(perf.sampled_exit_status(None, True, False), 0)
             self.assertEqual(perf.sampled_exit_status(None, False, False), 1)
+
+    def test_root_record_output_is_returned_to_app_owner(self):
+        chown = mock.Mock()
+        listing = mock.Mock(return_value=type("Stat", (), {"st_mode": 0o100644})())
+        with mock.patch.multiple(perf.os, geteuid=mock.Mock(return_value=0),
+                                 chown=chown, lstat=listing, create=True), \
+                mock.patch.dict(perf.os.environ, {"KXXY_ROOT_OWNER": "10398:10398"}):
+            perf.restore_record_owner([
+                "record", "-F", "100", "-o", "/tmp/a b.data", "--", "/system/bin/true"])
+        chown.assert_called_once_with("/tmp/a b.data", 10398, 10398, follow_symlinks=False)
 
     def test_report_prints_fallback_mode_header(self):
         data = "\n".join([

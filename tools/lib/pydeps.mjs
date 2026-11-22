@@ -64,6 +64,10 @@ export const PYDEPS = [
   // 而且等将来真有原生 sklearn 时不用再补一轮。
   { pypi: "joblib", version: "1.6.0" },
   { pypi: "threadpoolctl", version: "3.8.0" },
+  // 原生 scikit-learn 1.9 的导入期依赖：narwhals 由 sklearn 直接 import，
+  // cloudpickle 由 joblib 在 Parallel/序列化路径使用。两者都是 none-any。
+  { pypi: "narwhals", version: "2.29.0" },
+  { pypi: "cloudpickle", version: "3.1.3" },
 ];
 
 const LOCK = join(PROJECT_ROOT, "tools", "pydeps.lock.json");
@@ -120,7 +124,7 @@ function pickWheel(meta) {
 }
 
 /** 解 wheel（zip）为 Map<path, {data, mode}>，路径已加上 PY_SITE 前缀。 */
-function unzipToFiles(buf, prefix) {
+export function unzipToFiles(buf, prefix) {
   const files = new Map();
   let eocd = -1;
   for (let i = buf.length - 22; i >= 0 && i > buf.length - 70000; i--) {
@@ -215,4 +219,50 @@ export async function loadPyDeps({ log = () => {} } = {}) {
 
   writeFileSync(LOCK, JSON.stringify(lock, null, 2) + "\n");
   return { files, resolved };
+}
+
+const NATIVE_ML_DIR = join(PROJECT_ROOT, "tools", "prebuilt", "native-ml");
+
+/**
+ * 原生 bionic wheel（CPython 3.14 + Android arm64）。
+ *
+ * 这些不是 PyPI 的 manylinux 轮子：由 Termux 同源的 clang/NDK 工具链在真机
+ * 编译，WHEEL 标签必须是 cp314-cp314-android_24_arm64_v8a。两个包都不带
+ * 动态库依赖以外的运行期要求，运行时只需要 engine/lib 里的
+ * libopenblas / libavif / libz / libc++_shared。
+ * 构建方式与校验哈希见 docs/2026-11-22-v0.9.79-root特权与原生ML.md。
+ */
+export const NATIVE_ML = [
+  {
+    name: "scikit-learn",
+    file: "scikit_learn-1.9.1-cp314-cp314-android_24_arm64_v8a.whl",
+    sha256: "5ebf5af3645a011cce4dd3ea1c4f5914ca90cc4eba7e8a012333a6db202edc03",
+    anchor: "sklearn/__init__.py",
+  },
+  {
+    name: "opencv-python-headless",
+    file: "opencv_python_headless-5.1.0.95-cp314-cp314-android_24_arm64_v8a.whl",
+    sha256: "0828dc14a65341955427c7bf3058af5d59dda037e879235431be1a287f04bccc",
+    anchor: "cv2/__init__.py",
+  },
+];
+
+export function loadNativeMl({ log = () => {} } = {}) {
+  const files = new Map();
+  for (const item of NATIVE_ML) {
+    const path = join(NATIVE_ML_DIR, item.file);
+    if (!existsSync(path)) throw new Error(`缺少原生 wheel：${path}`);
+    const buf = readFileSync(path);
+    const got = createHash("sha256").update(buf).digest("hex");
+    if (got !== item.sha256) {
+      throw new Error(`${item.file} sha256 不匹配（期望 ${item.sha256}，实得 ${got}）`);
+    }
+    const unpacked = unzipToFiles(buf, PY_SITE);
+    if (!unpacked.has(`${PY_SITE}/${item.anchor}`)) {
+      throw new Error(`${item.file} 缺入口 ${item.anchor}`);
+    }
+    for (const [key, value] of unpacked) files.set(key, value);
+    log(`内置 ${item.name}：${item.file}（${(buf.length / 1048576).toFixed(1)} MiB）`);
+  }
+  return files;
 }

@@ -18,6 +18,7 @@ perf_event_paranoid、SELinux/seccomp 与进程身份，以现场系统调用结
 
 import errno
 import os
+import stat
 import struct
 import sys
 import time
@@ -180,10 +181,12 @@ def policy_hint(errnos):
         out.append(
             f"  提示：当前进程域 {dom} 下 perf_event_open 返回 EACCES"
             f"（perf_event_paranoid=-1 时，普通应用统计自身事件本不应被 paranoid 拒绝）。\n"
-            "  对照实测：同一台设备上，adb run-as 域（u:r:runas_app）同一命令可用：\n"
+            "  差异指向本 ROM 对应用域的策略限制；默认域内无法绕过。\n"
+            "  已 root（Magisk 已授权 app.kxxy）时可显式走真实 PMU：\n"
+            "      KXXY_PERF_ROOT=1 perf stat -e cycles,instructions -- <cmd>\n"
+            "  未 root 时仍可 adb run-as 对照验证：\n"
             "      adb shell run-as app.kxxy env LD_LIBRARY_PATH=files/engine/lib \\\n"
-            "          files/engine/bin/perf stat -- <cmd>\n"
-            "  差异指向本 ROM 对应用域的策略限制；应用内无法绕过。\n")
+            "          files/engine/bin/perf stat -- <cmd>\n")
     elif 1 in errnos:
         out.append("  提示：EPERM 常见于 seccomp 过滤或 perf_event_paranoid 限制。\n")
     return out
@@ -560,6 +563,15 @@ def alive(pid):
         return False
 
 
+def poll_child(pid):
+    """Nonblocking wait that preserves the status instead of discarding it."""
+    try:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        return status if waited == pid else None
+    except ChildProcessError:
+        return -1
+
+
 def reap(pid):
     try:
         _, status = os.waitpid(pid, 0)
@@ -905,11 +917,14 @@ def cmd_record(argv):
     comms = {}
     tail = 0
     lost = 0
+    target_status = None
     t0 = time.time()
     try:
         while time.time() - t0 < duration:
-            if child is not None and not alive(child):
-                break
+            if child is not None:
+                target_status = poll_child(child)
+                if target_status is not None:
+                    break
             head = ring.head()
             while tail < head:
                 hdr = ring.read(tail, 8)
@@ -967,8 +982,8 @@ def cmd_record(argv):
         except OSError:
             pass
 
-    if child is not None:
-        reap(child)
+    if child is not None and target_status is None:
+        target_status = reap(child)
     ring.close()
     os.close(fd)
 
@@ -1012,7 +1027,8 @@ def cmd_record(argv):
     sys.stderr.write(
         f"perf record: {len(samples)} 个样本 → {out}"
         f"{'（丢 ' + str(lost) + ' 块）' if lost else ''}\n")
-    return 0
+    # `record -- cmd` 不掩盖被采样命令的退出状态；-p 没有子进程状态可传。
+    return sampled_exit_status(target_status, bool(samples), child is not None)
 
 
 # ── ELF 符号 ───────────────────────────────────────────────────────────────
@@ -1307,12 +1323,47 @@ def cmd_list(argv):
     return 0
 
 
+def restore_record_owner(argv):
+    """A root perf.data must remain readable/removable by the calling app UID."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return
+    owner = os.environ.get("KXXY_ROOT_OWNER", "")
+    try:
+        uid_text, gid_text = owner.split(":", 1)
+        uid, gid = int(uid_text), int(gid_text)
+    except (ValueError, AttributeError):
+        return
+    if not argv or argv[0] != "record":
+        return
+    out = "perf.data"
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            break
+        if arg in ("-o", "--output"):
+            if i + 1 < len(argv):
+                out = argv[i + 1]
+            break
+        if not arg.startswith("-"):
+            break
+        if arg in ("-F", "--freq", "-c", "--count", "-e", "--event",
+                   "-p", "--pid", "--duration"):
+            i += 1
+        i += 1
+    try:
+        if stat.S_ISREG(os.lstat(out).st_mode):
+            os.chown(out, uid, gid, follow_symlinks=False)
+    except OSError as ex:
+        sys.stderr.write(f"perf record: 无法把 {out} 交还应用 UID：{ex}\n")
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return 0
     if argv[0] in ("--version", "-v", "version"):
-        print("kxxy-perf 1.1（perf_event_open 直连；无 PMU 时 rusage/ptrace 降级）")
+        print("kxxy-perf 1.2（可选 root PMU；默认无 PMU 时 rusage/ptrace 降级）")
         return 0
     cmd, rest = argv[0], argv[1:]
     table = {"stat": cmd_stat, "record": cmd_record, "report": cmd_report,
@@ -1325,7 +1376,12 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    argv = sys.argv[1:]
     try:
-        sys.exit(main(sys.argv[1:]))
+        try:
+            status = main(argv)
+        finally:
+            restore_record_owner(argv)
+        sys.exit(status)
     except KeyboardInterrupt:
         sys.exit(130)
