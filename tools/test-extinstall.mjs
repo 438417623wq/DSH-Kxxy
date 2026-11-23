@@ -263,6 +263,32 @@ try {
 	}
 
 	// -----------------------------------------------------------------------
+	console.log('[4c] bin/<name> 是 lib/<name>/<name> 的物化副本时换回软链（zig）');
+	// -----------------------------------------------------------------------
+	{
+		// 真机症状：extensions/zig/bin/zig 是 171 MB 实体副本，而 zig 按
+		// 「可执行文件所在目录」找标准库（exe/../lib/zig 或 exe/../lib），
+		// 副本在 bin/ 下永远找不到 lib/zig/lib/std →
+		// `zig build-exe` 报 unable to find zig installation directory。
+		// 换回相对软链后 /proc/self/exe 解析到真身，标准库立刻命中。
+		const root = join(workdir, 'r4c');
+		const extDir = makeExt(root, 'zig', {
+			'bin/zig': 'ZIG-BINARY',
+			'lib/zig/zig': 'ZIG-BINARY',
+			'lib/zig/lib/std/std.zig': 'STD',
+		});
+
+		buildViews(root, 'zig', extDir);
+		const bin = join(extDir, 'bin', 'zig');
+		check('bin/zig 变成软链（不再是副本）', lstatSync(bin).isSymbolicLink());
+		// 链接目标是相对路径（设备端是 POSIX；Windows 上 path.relative 会给反斜杠，
+		// 归一化后再比，避免这条断言变成平台噪声）
+		equal('指向 ../lib/zig/zig', readlinkSync(bin).split('\\').join('/'), '../lib/zig/zig');
+		equal('顺着软链仍读得到二进制', readFileSync(bin, 'utf8'), 'ZIG-BINARY');
+		check('标准库仍在原处', existsSync(join(extDir, 'lib', 'zig', 'lib', 'std', 'std.zig')));
+	}
+
+	// -----------------------------------------------------------------------
 	console.log('[5] etc / share 合并视图（问题.txt【6】fontconfig / tessdata）');	// -----------------------------------------------------------------------
 	{
 		const root = join(workdir, 'r5');

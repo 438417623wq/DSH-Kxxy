@@ -922,6 +922,9 @@ function repairWrapperRefs(binPath, extDir) {
  * 把副本换回**相对软链**：`bin/<cmd> -> ../opt/<pkg>/bin/<cmd>`。启动脚本的
  * `[ -h ]` 解析链因此能走到真身，`MAVEN_HOME` 自然落在 `opt/maven` 上。
  *
+ * 同一形状的还有 `bin/<cmd> -> ../lib/<cmd>/<cmd>`（zig 的布局），一并处理：
+ * 那条链断掉时工具不是"启动脚本算错路径"而是**根本找不到自己的标准库**。
+ *
  * 三条保守边界，宁可不修也不猜：
  *   · 只在 `<ext>/bin/<name>` 与 `<ext>/opt/<pkg>/bin/<name>` **同大小**时动手，
  *     4 MiB 以下再比一遍内容 —— 同名同大小但内容不同，说明它们本来就不是一份；
@@ -942,6 +945,38 @@ function relinkShadowedLauncher(entry, extDir) {
   if (!st.isFile()) return null
 
   const name = basename(entry)
+
+  // ① `lib/<name>/<name>`：包里另有一份「同名真身」，`bin/<name>` 是它的副本。
+  //
+  // zig 就是这种布局（Termux 的 bin/zig 原本链到 lib/zig/zig，被 poolextract
+  // 按「设备端 tar 只认文件」的规矩物化成 171 MB 副本）。代价不只是多占一倍
+  // 空间：zig 靠**可执行文件所在目录**找标准库（exe/../lib/zig 或 exe/../lib），
+  // 副本留在 bin/ 下就找不到 lib/zig/lib/std，`zig build-exe` 直接报
+  // `unable to find zig installation directory from executable path` —— 于是
+  // zig 只能看版本。换回相对软链后 `/proc/self/exe` 解析到真身，标准库立刻找到
+  // （真机实测：`zig build-obj` 与 `zig cc -target aarch64-linux-musl` 都过）。
+  const libTwin = join(extDir, 'lib', name, name)
+  try {
+    const lts = statSync(libTwin)
+    if (lts.isFile() && lts.size === st.size && sameBytes(entry, libTwin, st.size)) {
+      try {
+        const target = relative(dirname(entry), libTwin)
+        unlinkSync(entry)
+        symlinkSync(target, entry)
+        return libTwin
+      } catch {
+        // 同 opt 那一路：换不回去就把内容写回来，别让命令消失
+        try {
+          copyFileSync(libTwin, entry)
+          chmodSync(entry, st.mode & 0o777)
+        } catch { /* 还原失败只能认了 */ }
+        return null
+      }
+    }
+  } catch {
+    // 没有这一份，继续看 opt/ 布局
+  }
+
   let pkgs = []
   try {
     pkgs = readdirSync(join(extDir, 'opt'))

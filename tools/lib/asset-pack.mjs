@@ -49,6 +49,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { downloadTo } from './registry.mjs'
+import { readScriptText } from './script-source.mjs'
 import { tarGzSync } from '../../plugins/kxxy-host/lib/tar.mjs'
 
 /** 池条目的 `source` 值；deb 池没有这个字段。 */
@@ -173,7 +174,7 @@ function derefArchive(py, src) {
 function wrapperBody(name, extId) {
   const tpl = join(WRAPPER_DIR, `${name}.sh`)
   if (!existsSync(tpl)) throw new Error(`缺包装器模板：${tpl}`)
-  return readFileSync(tpl, 'utf8').split('__EXT_ID__').join(extId)
+  return readScriptText(tpl, `prebuilt/wrappers/${name}.sh`).split('__EXT_ID__').join(extId)
 }
 
 /**
@@ -194,7 +195,7 @@ function toolBody(tool, extId, templateName = 'glibc-tool') {
     __GROUP__: tool.group ?? tool.name,
     __HINT__: tool.hint ?? '首次要下载',
   }
-  let body = readFileSync(tpl, 'utf8')
+  let body = readScriptText(tpl, `prebuilt/wrappers/${templateName}.sh`)
   for (const [token, value] of Object.entries(fields)) {
     if (!value) throw new Error(`${extId}.${tool.name}: 垫片字段 ${token} 为空`)
     body = body.split(token).join(value)

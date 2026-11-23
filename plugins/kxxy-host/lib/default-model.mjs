@@ -37,6 +37,7 @@
  */
 
 import { appendFile, mkdir } from 'node:fs/promises'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 /** 等 provider 注册完成的上限（插件是并发加载的，llm 目录可能还没填满）。 */
@@ -249,7 +250,108 @@ export async function ensureUsableDefaultModel(ctx, options = {}) {
     throw error
   }
   await trace({ phase: 'result', ...result })
+  // 顺手把这份选择镜像给 headless profile：`dsh headless` 只有 base + headless
+  // 两个 bundle，看不到「模型」页写进 web 的那条路由，默认掉回
+  // `deepseek-official`（要 DEEPSEEK_API_KEY）→ 用户拿着能用 key 却被告知
+  // MISSING_CREDENTIAL。见 mirrorSelectionToHeadless 的文件头。
+  try {
+    const mirrored = mirrorSelectionToHeadless()
+    if (mirrored.changed) await trace({ phase: 'mirror-headless', blocks: mirrored.blocks })
+  } catch {
+    // 镜像失败不影响自愈本身
+  }
   return result
+}
+
+/** 镜像文件的首行标记：用户改掉它，宿主就不再覆盖（与 .bashrc 同一套规矩）。 */
+const HEADLESS_MIRROR_MARK = '# [kxxy] 由 kxxy-host 从 web profile 镜像，勿手改'
+
+/** 要镜像的条目：模型选择本身 + 定义路由的 llm-* 插件条目。 */
+const MIRRORED_ID = /^(agent-default-model$|llm-)/
+
+/**
+ * 把一个 patch 文本按**顶层列表项**切开。
+ *
+ * 不用 YAML 解析器往返一次（`parse` → `stringify`）是刻意的：那样会把用户写的
+ * 注释、引号风格、`!!js` 表达式全部重排，镜像文件看起来就成了另一份东西。
+ * patch 的顶层项一律以 `- ` 开头（第 0 列），按行切足够，也不会误伤嵌套内容。
+ *
+ * @param {string} text
+ * @returns {string[]} 每个顶层项的原文
+ */
+function topLevelBlocks(text) {
+  const out = []
+  let cur = null
+  for (const line of String(text).split(/\r?\n/)) {
+    if (/^- /.test(line)) {
+      if (cur) out.push(cur.join('\n'))
+      cur = [line]
+    } else if (cur) {
+      cur.push(line)
+    }
+  }
+  if (cur) out.push(cur.join('\n'))
+  return out.map((block) => block.replace(/\s+$/, ''))
+}
+
+/**
+ * 把 web profile 里的模型选择（以及定义路由的 `llm-*` 条目）镜像到 headless。
+ *
+ * ── 为什么需要 ────────────────────────────────────────────────────────────
+ *
+ * `dsh headless "…"` 起的是 base + headless 两个 bundle，**没有** web 的
+ * `cordis.patch.yml`，于是模型选择掉回上游默认 `deepseek-official`；那条路由
+ * 只认 `DEEPSEEK_API_KEY`，而用户通常配的是别的 provider（本机是硅基流动）。
+ * 症状是 `MISSING_CREDENTIAL: … provider route "deepseek-official"`，看起来
+ * 像凭据丢了，其实是"选错路由"。
+ *
+ * 判据与写回策略都尽量保守：
+ *   · 源就是 web 的 patch 文本，只摘 `agent-default-model` 与 `llm-*` 条目；
+ *   · 目标文件只接管两种状态：`[]`（出厂空补丁）或**首行是我们的标记**；
+ *   · 用户手写过的（首行不是标记）一律不动 —— 那是用户资产；
+ *   · 内容一致就不写盘（每次引擎启动都会跑一次）。
+ *
+ * @param {string} [home] `$DSH_HOME`，默认为环境变量
+ * @returns {{changed: boolean, blocks?: number, reason?: string}}
+ */
+export function mirrorSelectionToHeadless(home = process.env.DSH_HOME ?? '') {
+  if (!home) return { changed: false, reason: 'no-home' }
+  const from = join(home, 'profiles', 'web', 'cordis.patch.yml')
+  const to = join(home, 'profiles', 'headless', 'cordis.patch.yml')
+
+  let source
+  try {
+    source = readFileSync(from, 'utf8')
+  } catch {
+    return { changed: false, reason: 'no-web-patch' }
+  }
+
+  const blocks = topLevelBlocks(source).filter((block) => {
+    const m = /^- id:\s*(\S+)/.exec(block)
+    return Boolean(m && MIRRORED_ID.test(m[1].replace(/^['"]|['"]$/g, '')))
+  })
+  if (!blocks.length) return { changed: false, reason: 'nothing-to-mirror' }
+
+  const body = `${HEADLESS_MIRROR_MARK}\n${blocks.join('\n')}\n`
+
+  let prev = ''
+  try {
+    prev = readFileSync(to, 'utf8')
+  } catch {
+    // 文件还不存在：下面按"出厂空补丁"处理
+  }
+  if (prev === body) return { changed: false, reason: 'same' }
+  const isOurs = prev.startsWith(HEADLESS_MIRROR_MARK)
+  // 去掉注释行后只剩 `[]` 或空 ⇒ 还是出厂的空补丁
+  const isVanilla = prev.replace(/^\s*#.*$/gm, '').trim() === '[]'
+  if (prev && !isOurs && !isVanilla) return { changed: false, reason: 'user-edited' }
+
+  try {
+    writeFileSync(to, body, 'utf8')
+  } catch {
+    return { changed: false, reason: 'write-failed' }
+  }
+  return { changed: true, blocks: blocks.length }
 }
 
 /**

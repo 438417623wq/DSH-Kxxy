@@ -2005,10 +2005,17 @@ object EngineConfig {
      * **mtime 比较**。guile 靠 mtime 决定用不用 `.go`，扩展重装会刷新 `.scm`，
      * 于是目录在、文件也在，gdb 仍然每次现场重编 `system/repl`（真机 137 秒）。
      *
+     * `# kxxy-shell@7` 补 TLS 信任锚的兜底：Termux 编的 curl 把 CA 路径钉死在
+     * `/data/data/com.termux/files/usr/etc/tls/cert.pem`，终端里 `curl https://…`
+     * 直接 `(77) error adding trust anchors`；引擎进程有 SSL_CERT_FILE 所以 App 里
+     * 正常，两边的割裂感极强（`dsh headless` 报的就是 `TRANSPORT: Connection error`）。
+     * 这里给交互式 shell 补 SSL_CERT_FILE / CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE，
+     * 都只在文件存在、用户没设过时写。
+     *
      * @see buildEnv
      */
     private fun userShellInitContent(): String = """
-        # kxxy-shell@6
+        # kxxy-shell@7
         # [dsh-kxxy] 官方终端在 Android 上的默认交互式 shell 初始化。
         #
         # 上游以 `bash --rcfile <临时文件> -i` 启动终端，那个临时 rcfile 的第一行是
@@ -2192,6 +2199,28 @@ object EngineConfig {
         # 也不覆盖用户自己设的值 —— 判据与上面 GYP_DEFINES 同一条原则。
         if [ -z "${'$'}{VIMRUNTIME:-}" ] && [ -d "${'$'}{KXXY_ENGINE_ROOT:-}/share/nvim/runtime" ]; then
             export VIMRUNTIME="${'$'}{KXXY_ENGINE_ROOT:-}/share/nvim/runtime"
+        fi
+
+        # ── TLS 信任锚（curl / python requests / node 共用）─────────────────
+        # Termux 那套 curl 把 CA 路径**编译期**钉死在
+        #     /data/data/com.termux/files/usr/etc/tls/cert.pem
+        # 本机没有那个目录，于是终端里任何 https 请求都死在
+        #     curl: (77) error adding trust anchors from file: ...
+        # 而引擎进程自己带着 SSL_CERT_FILE（见 buildEnv，指向 <root>/etc/tls/
+        # cert.pem），所以「App 里的会话正常、终端里 curl 全废」这种割裂感特别
+        # 迷惑 —— 真机排查 dsh headless 时就是卡在这一层（先报 TRANSPORT:
+        # Connection error，其实一个证书都没加载）。
+        #
+        # 三个变量各管一路：SSL_CERT_FILE（openssl 系）、CURL_CA_BUNDLE（curl）、
+        # REQUESTS_CA_BUNDLE（python requests）。只在文件真实存在、且用户没自己
+        # 设过时写 —— 换 CA 是用户的正当选择，不该被我们覆盖回去。
+        if [ -f "${'$'}{KXXY_ENGINE_ROOT:-}/etc/tls/cert.pem" ]; then
+            [ -n "${'$'}{SSL_CERT_FILE:-}" ] || \
+                export SSL_CERT_FILE="${'$'}{KXXY_ENGINE_ROOT}/etc/tls/cert.pem"
+            [ -n "${'$'}{CURL_CA_BUNDLE:-}" ] || \
+                export CURL_CA_BUNDLE="${'$'}{KXXY_ENGINE_ROOT}/etc/tls/cert.pem"
+            [ -n "${'$'}{REQUESTS_CA_BUNDLE:-}" ] || \
+                export REQUESTS_CA_BUNDLE="${'$'}{KXXY_ENGINE_ROOT}/etc/tls/cert.pem"
         fi
 
         # ── GitHub 直链助手（ghraw / raw2api）在 PATH 上 ────────────────────

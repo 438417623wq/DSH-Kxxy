@@ -66,6 +66,7 @@ import { PYTHON_REVISION, PYTHON_HOST_FILES, loadPythonDependencies, verifyPytho
 import { loadPyDeps, loadNativeMl, NATIVE_ML, PYDEPS } from "./lib/pydeps.mjs";
 import { hardlinkWrappers, rsyncWrappers } from "./lib/hardlink-wrappers.mjs";
 import { pythonDefaultWrappers } from "./lib/python-default.mjs";
+import { readScriptText } from "./lib/script-source.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PROJECT = resolve(HERE, "..");
@@ -624,7 +625,9 @@ function corepackWrappers(bundledPnpm) {
 function kxxyToolScript(name) {
   const p = join(PROJECT, "tools", "prebuilt", "kxxy-tools", name);
   if (!existsSync(p)) throw new Error(`缺运行时脚本：${p}`);
-  return readFileSync(p);
+  // 解释器脚本也要按 LF 落盘：CRLF 的 shebang（`#!/usr/bin/env python3\r`）
+  // 直接 exec 会报「No such file or directory」，而 git 又会把这层差异藏起来。
+  return Buffer.from(readScriptText(p, `prebuilt/kxxy-tools/${name}`), "utf8");
 }
 
 /**
@@ -935,7 +938,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  *  2. `bin/ln` 的**内容**改了（`coreutils ln` → `coreutils --coreutils-prog=ln`，
  *     外加复制降级）。锚点只判「文件在不在」，内容换了同样看不见。
  */
-const PATCHSET_MARKER = "kxxy-patchset@37";
+const PATCHSET_MARKER = "kxxy-patchset@38";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

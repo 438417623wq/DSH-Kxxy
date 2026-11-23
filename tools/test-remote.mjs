@@ -788,6 +788,20 @@ console.log('\n[E] 平台边界与网络诊断')
         ),
       ))
   ok('平台边界项常绿', /code = 'PLATFORM'/.test(healthSrc))
+  // 判据是「还能不能取到内容」，不是「直链通不通」：有可用绕行就不该占告警位。
+  // 真机症状：raw 被 DNS 黑洞、api.github.com 实测可用、ghraw 已装在 PATH 上，
+  // 体检却一直挂个黄点 —— 用户只会以为哪里坏了，然后反复重连 Wi-Fi。
+  ok('绕行路线可用时 NET 报绿（不占告警位）',
+    healthSrc.includes('apiOk && helperOk') &&
+      healthSrc.includes('已自动绕行') &&
+      /Verdict\.OK,/.test(
+        healthSrc.slice(
+          healthSrc.indexOf('if (apiOk && helperOk)'),
+          healthSrc.indexOf("if (working)"),
+        ),
+      ))
+  ok('NET 认助手脚本是否落盘（$DSH_HOME/.kxxy/bin/ghraw）',
+    healthSrc.includes("'.kxxy', 'bin', 'ghraw'") && healthSrc.includes('helperOk'))
   ok('/state 顶层带 net 快照', hostLib.includes('net: netdiag.netSnapshot()'))
   ok('raw 镜像从 etc/net.json 读（默认不预置第三方地址）',
     kotlinInstaller.includes('etc/net.json') && kotlinInstaller.includes('insteadOf = https://raw.githubusercontent.com/'))
@@ -892,10 +906,15 @@ console.log('\n[E] 平台边界与网络诊断')
   ok('buildEnv 设 VIMRUNTIME（E484 的那一层）',
     /VIMRUNTIME=\$\{nvimRuntime\.absolutePath\}/.test(kotlin) &&
       /share\/nvim\/runtime/.test(kotlin))
-  ok('~/.bashrc 升到 kxxy-shell@5 并兜一层 VIMRUNTIME',
-    /# kxxy-shell@5/.test(kotlin) &&
+  ok('~/.bashrc 升到 kxxy-shell@7：VIMRUNTIME + TLS 信任锚',
+    /# kxxy-shell@7/.test(kotlin) &&
       /VIMRUNTIME:-/.test(kotlin) &&
-      /export VIMRUNTIME=/.test(kotlin))
+      /export VIMRUNTIME=/.test(kotlin) &&
+      // Termux 编的 curl 把 CA 路径钉死在 /data/data/com.termux/…，终端里
+      // https 一律 (77) error adding trust anchors；三个变量各管一路客户端。
+      /export SSL_CERT_FILE=/.test(kotlin) &&
+      /export CURL_CA_BUNDLE=/.test(kotlin) &&
+      /export REQUESTS_CA_BUNDLE=/.test(kotlin))
 }
 
 // 生成器

@@ -1,6 +1,7 @@
 /** Bare Python routing only: native bin/python* and absolute selftest paths stay intact. */
-import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+
+import { readScriptText } from './script-source.mjs'
 
 export const PYTHON_DEFAULT_SOURCE = fileURLToPath(new URL('../prebuilt/kxxy-tools/python-default.py', import.meta.url))
 export const PYTHON_DEFAULT_GLIBC_SOURCE = fileURLToPath(new URL('../prebuilt/wrappers/kxxy-glibc.sh', import.meta.url))
@@ -14,8 +15,8 @@ export const PYTHON_DEFAULT_PATHS = Object.freeze([
 
 export function pythonDefaultWrappers() {
   const files = [
-    { path: PYTHON_DEFAULT_DISPATCHER, data: readFileSync(PYTHON_DEFAULT_SOURCE), mode: 0o644 },
-    { path: PYTHON_DEFAULT_GLIBC, data: readFileSync(PYTHON_DEFAULT_GLIBC_SOURCE), mode: 0o755 },
+    { path: PYTHON_DEFAULT_DISPATCHER, data: Buffer.from(readScriptText(PYTHON_DEFAULT_SOURCE, 'prebuilt/kxxy-tools/python-default.py'), 'utf8'), mode: 0o644 },
+    { path: PYTHON_DEFAULT_GLIBC, data: Buffer.from(readScriptText(PYTHON_DEFAULT_GLIBC_SOURCE, 'prebuilt/wrappers/kxxy-glibc.sh'), 'utf8'), mode: 0o755 },
   ]
   for (const name of ['python', 'python3', 'pip', 'pip3']) {
     // Absolute native interpreter and -I are essential: never recursively resolve

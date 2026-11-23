@@ -16,7 +16,7 @@ const generated = [...pythonDefaultWrappers(), ...hardlinkWrappers(), ...rsyncWr
 
 await test('runtime and native installer share the new patchset contract', () => {
   const marker = (text) => /(?:const|val) PATCHSET_MARKER\s*=\s*"([^"]+)"/.exec(text)?.[1];
-  assert.equal(marker(build), 'kxxy-patchset@37');
+  assert.equal(marker(build), 'kxxy-patchset@38');
   assert.equal(marker(installer), marker(build));
 });
 await test('all independent Python routes have native completeness anchors', () => {
@@ -60,6 +60,29 @@ await test('bundled native wheels exist, match their pinned sha256 and carry and
     const buf = readFileSync(join(project, 'tools/prebuilt/native-ml', item.file));
     assert.equal(createHash('sha256').update(buf).digest('hex'), item.sha256, item.file);
   }
+});
+await test('build-time shell templates are LF (a CRLF shebang fails exec)', async () => {
+  const { readdirSync } = await import('node:fs');
+  const { normalizeScriptText } = await import('./lib/script-source.mjs');
+  assert.equal(normalizeScriptText('a\r\nb\rc\n'), 'a\nb\nc\n');
+  const bad = [];
+  for (const dir of ['prebuilt/wrappers', 'prebuilt/kxxy-tools']) {
+    for (const name of readdirSync(join(project, 'tools', dir))) {
+      if (!/\.(sh|py)$/.test(name)) continue;
+      if (readFileSync(join(project, 'tools', dir, name), 'utf8').includes('\r')) {
+        bad.push(`${dir}/${name}`);
+      }
+    }
+  }
+  assert.deepEqual(bad, [], '这些脚本是 CRLF，会让设备上 exec 报「No such file or directory」：' + bad.join(', '));
+});
+await test('packers read templates through the LF normalizer', () => {
+  const asset = readFileSync(join(project, 'tools/lib/asset-pack.mjs'), 'utf8');
+  const py = readFileSync(join(project, 'tools/lib/python-default.mjs'), 'utf8');
+  assert.ok(asset.includes('readScriptText(tpl'));
+  assert.ok(py.includes('readScriptText(PYTHON_DEFAULT_SOURCE'));
+  assert.ok(py.includes('readScriptText(PYTHON_DEFAULT_GLIBC_SOURCE'));
+  assert.ok(build.includes('readScriptText(p'));
 });
 await test('runtime route archive preserves bytes, permission bits and unique paths', async () => {
   const scratch = mkdtempSync(join(tmpdir(), 'kxxy-capability-contract-'));

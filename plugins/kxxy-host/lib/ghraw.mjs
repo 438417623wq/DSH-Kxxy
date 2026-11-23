@@ -397,6 +397,86 @@ export const HELPERS = [
 ]
 
 /**
+ * `dsh-headless` —— 用 headless profile 跑一次性任务，补上它缺的两样东西。
+ *
+ * `dsh headless "…"` 在真机上会连着撞两堵墙，两堵都不像"没配好"：
+ *
+ *   ① **TLS**：Termux 编出来的 curl/node 把 CA 路径钉死在
+ *      `/data/data/com.termux/files/usr/etc/tls/cert.pem`。引擎进程带着
+ *      `SSL_CERT_FILE`（EngineConfig.buildEnv），所以 App 里的会话正常；终端里
+ *      没有这个变量，于是每个 https 请求都在加载信任锚时就失败 —— headless 报的
+ *      `TRANSPORT: Connection error` 看起来像"手机没网"，其实是零个证书。
+ *   ② **凭据**：headless profile 只有 base + headless 两个 bundle，没有「模型」
+ *      页那条路由的补丁，默认掉回 `deepseek-official`（要 DEEPSEEK_API_KEY）。
+ *      用户在凭据库里存的键在 `$DSH_HOME/.credentials.yaml` 的 `refs:` 段，而
+ *      这个进程不会把它 materialize 成环境变量 → `MISSING_CREDENTIAL`。
+ *
+ * 这里只做这两件事：缺证书变量就补、`refs:` 里的键导进环境（**已设的不覆盖**），
+ * 然后 exec 真正的 dsh。不写任何文件、不改 profile —— 模型选择是用户资产。
+ */
+const DSH_HEADLESS_SH = `#!/system/bin/sh
+# [kxxy] dsh-headless —— headless profile 的一层壳：补证书变量与凭据，再 exec dsh。
+#
+#   dsh-headless "把 src 下的测试跑一遍"
+#   echo "..." | dsh-headless
+#
+# 其余参数原样转给 dsh（--json / --session-id / --permission-mode 都可用）。
+set -u
+
+err() { echo "dsh-headless: $*" >&2; }
+
+home_dir=\${DSH_HOME:-\${HOME:-}}
+
+# ── ① TLS 信任锚 ───────────────────────────────────────────────────────────
+root=\${KXXY_ENGINE_ROOT:-}
+if [ -z "$root" ]; then
+  _d=$(command -v dsh 2>/dev/null) && root=$(cd "\${_d%/*}/.." 2>/dev/null && pwd)
+fi
+if [ -n "$root" ] && [ -f "$root/etc/tls/cert.pem" ]; then
+  [ -n "\${SSL_CERT_FILE:-}" ] || export SSL_CERT_FILE="$root/etc/tls/cert.pem"
+  [ -n "\${CURL_CA_BUNDLE:-}" ] || export CURL_CA_BUNDLE="$root/etc/tls/cert.pem"
+  [ -n "\${REQUESTS_CA_BUNDLE:-}" ] || export REQUESTS_CA_BUNDLE="$root/etc/tls/cert.pem"
+fi
+unset _d
+
+# ── ② 凭据库里的 refs（DHD_API_KEY 之类）──────────────────────────────────
+# 文档结构是 version / records / refs，refs 是最后一段；两遍 sed 足够，
+# 不依赖 awk（/system/bin 里只有 toybox）。只读，不改文件。
+store="$home_dir/.credentials.yaml"
+if [ -n "$home_dir" ] && [ -f "$store" ]; then
+  _refs=$(sed -n '/^refs:/,\$p' "$store" \\
+    | sed -n 's/^  \\([A-Za-z_][A-Za-z0-9_]*\\): *\\(.*\\)\$/\\1=\\2/p')
+  if [ -n "$_refs" ]; then
+    _ifs=$IFS
+    IFS='
+'
+    for _kv in $_refs; do
+      _k=\${_kv%%=*}
+      _v=\${_kv#*=}
+      [ -n "$_v" ] || continue
+      eval "_cur=\\\${$_k-}"
+      [ -n "$_cur" ] || export "$_k=$_v"
+    done
+    IFS=$_ifs
+    unset _ifs _kv _k _v _cur
+  fi
+  unset _refs
+fi
+
+command -v dsh >/dev/null 2>&1 || { err "PATH 里没有 dsh（引擎没起？）"; exit 127; }
+exec dsh --profile headless "$@"
+`
+
+/**
+ * 与 GitHub 直链无关、但同样该落在 `$HOME/.kxxy/bin` 的助手。
+ *
+ * 单独一组是为了让「GitHub 直链助手」那条自检仍然只讲 ghraw/raw2api ——
+ * 把 shell 脚本混进那个名单，用户点「装 GitHub 直链助手」时看到多出来一个
+ * 跟 GitHub 无关的文件，只会犯迷糊。
+ */
+export const TOOL_HELPERS = [{ name: 'dsh-headless', body: DSH_HEADLESS_SH }]
+
+/**
  * 把两个助手脚本写进 `$DSH_HOME/.kxxy/bin`（幂等：内容一致就不碰文件）。
  *
  * 为什么是插件写而不是原生写：脚本内容需要和这里的 URL 转换逻辑保持一致，
@@ -419,7 +499,9 @@ export function installHelpers(home) {
     return out
   }
 
-  for (const h of HELPERS) {
+  // GitHub 那一对 + 与 GitHub 无关的 `dsh-headless`：同一份幂等写入，同一个
+  // PATH 目录（EngineConfig 只把这个目录挂进 PATH，再分一个目录没人会加）。
+  for (const h of [...HELPERS, ...TOOL_HELPERS]) {
     const file = join(dir, h.name)
     try {
       let same = false

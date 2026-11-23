@@ -684,8 +684,16 @@ export const CORE_BUNDLES = [
  * 结论来自 netdiag 的后台探测缓存 —— 这里必须是同步的：整份体检在每次
  * `/kxxy/api/state` 轮询里重算，不能因为一次 DNS 超时把响应拖住。
  *
- * 只有在「目标被黑洞、同域对照组正常」时才报 WARN。真的没网（ENOTFOUND /
- * 超时）报 UNKNOWN 并明说分不清 —— 让用户去查网络，别来查这个 App。
+ * ── 判据是「还能不能取到那份内容」，不是「直链通不通」 ────────────────────
+ *
+ * 直链被 DNS 黑洞是网络层的事实，手机这一侧改不了（why 见 netdiag 的文件头：
+ * 换 DNS、拿真 IP 直连都试过，走不通）。所以只要还有一条**实测可用**的等效
+ * 路线 —— api.github.com + 就位的 `ghraw`，或实测能通的镜像 —— 这台机器取
+ * raw 内容的能力就是完好的：报绿，把「直链被拦、已自动绕行」写进明细。
+ *
+ * 只有**一条都不可用**（API 与镜像全灭），或路线通了但助手脚本没落盘，
+ * 才报 WARN —— 那时用户是真的拿不到文件，才值得占一个告警位。真的没网
+ * （ENOTFOUND / 超时）仍报 UNKNOWN 并明说分不清，让人去查网络。
  */
 function checkNetwork() {
   const code = 'NET'
@@ -699,21 +707,17 @@ function checkNetwork() {
   const apiOk = Boolean(api && api.ok)
   const working = Array.isArray(snap.mirrors) ? snap.mirrors.find((m) => m.ok) : null
 
-  const route = apiOk
-    ? '最稳的绕法已实测可用：`ghraw <raw-url>`（走 api.github.com 的 Contents API，' +
-      '助手脚本已装在 PATH 上，等价于 curl 那份内容）；批量取记得设 GH_TOKEN，' +
-      '未认证只有 60 次/小时'
-    : working
-      ? `实测可用的镜像：${working.base}（写进 <引擎根>/etc/net.json 的 rawMirror，重启后 git 走它）`
-      : Array.isArray(snap.mirrors) && snap.mirrors.length
-        ? `API 与实测的 ${snap.mirrors.length} 个镜像都不通，只能换网络或在电脑上取文件`
-        : '正在实测绕行路线（结果在下一次刷新出现）'
+  // 助手脚本落在 `$DSH_HOME/.kxxy/bin`（引擎每次启动幂等写入，见 ghraw.mjs）。
+  // API 路线通只说明"这条路能走"，还得有脚本替用户走 —— 两个条件都满足才叫
+  // 「取 raw 内容没问题」。
+  const home = process.env.DSH_HOME || process.env.HOME || ''
+  const helper = home ? join(home, '.kxxy', 'bin', 'ghraw') : ''
+  const helperOk = Boolean(helper && existsSync(helper))
 
-  const hint =
-    '这不是手机能改的：DNS 对单个域名返 0.0.0.0，系统 DNS 也换不了；' +
-    '而且拿真实 IP 直连同样被 reset —— 不只是解析层。' +
-    `绕过办法：${route}。` +
-    'git clone / api.github.com / codeload 都正常，受影响的只有 raw 直链。'
+  const dns =
+    Array.isArray(snap.servers) && snap.servers.length
+      ? `（当前 DNS：${snap.servers.slice(0, 2).join('、')}）`
+      : ''
 
   if (snap.level === 'probing') {
     return check(code, title, Verdict.UNKNOWN, '正在后台探测（结果在下一次刷新出现）')
@@ -725,31 +729,50 @@ function checkNetwork() {
       .join('，')
     return check(code, title, Verdict.OK, addrs || '解析正常')
   }
-  if (snap.level === 'selective') {
-    const dns =
-      Array.isArray(snap.servers) && snap.servers.length
-        ? `（当前 DNS：${snap.servers.slice(0, 2).join('、')}）`
-        : ''
-    return check(
-      code,
-      title,
-      Verdict.WARN,
-      `raw.githubusercontent.com 解析到空地址，而 github.com 正常${dns} —— 单域名被 DNS 拦截，不是本机配置。` +
-        (apiOk ? 'api.github.com 实测可用（换接口即可）。' : '') +
-        (working ? `实测镜像 ${working.base} 可用。` : ''),
-      hint,
-    )
-  }
-  if (snap.level === 'blackhole') {
-    return check(
-      code,
-      title,
-      Verdict.WARN,
-      'GitHub 相关域名全部解析到空地址（DNS 层黑洞）' +
-        (apiOk ? '；api.github.com 实测可用' : '') +
-        (working ? `；实测镜像 ${working.base} 可用` : ''),
-      hint,
-    )
+
+  if (snap.level === 'selective' || snap.level === 'blackhole') {
+    const where =
+      snap.level === 'selective'
+        ? `raw.githubusercontent.com 解析到空地址、同域其他主机正常${dns} —— 单域名被 DNS 拦截，不是本机配置`
+        : 'GitHub 相关域名全部解析到空地址（DNS 层黑洞）'
+
+    if (apiOk && helperOk) {
+      return check(
+        code,
+        title,
+        Verdict.OK,
+        `${where}；已自动绕行：api.github.com 实测可用，ghraw 走 Contents API 取同一份内容` +
+          '（git clone 走 github.com，不受影响）—— 取 raw 文件无需任何操作。' +
+          '批量取记得设 GH_TOKEN，未认证只有 60 次/小时。',
+      )
+    }
+    if (working) {
+      return check(
+        code,
+        title,
+        Verdict.OK,
+        `${where}；绕行走实测可用的镜像 ${working.base}` +
+          '（也可写进 <引擎根>/etc/net.json 的 rawMirror，重启后 git 一并走它）。',
+      )
+    }
+
+    const hint = apiOk
+      ? '绕行接口 api.github.com 是通的，但 `ghraw` 没就位：' +
+        '在下方维护区点「装 GitHub 直链助手」补上；引擎每次启动也会幂等刷新一次。' +
+        '装好后 raw 链接用 `ghraw <raw-url>` 取，等价于 curl 那份内容。'
+      : '这不是手机能改的：DNS 对单个域名返 0.0.0.0，系统 DNS 也换不了；' +
+        '而且拿真实 IP 直连同样被 reset —— 不只是解析层。' +
+        '现在 API 与实测的镜像都不通，只能换网络，或在电脑上取文件再传过来。'
+
+    const facts = [where]
+    if (apiOk && !helperOk) facts.push('api.github.com 实测可用，但助手脚本 `ghraw` 缺失')
+    if (Array.isArray(snap.mirrors) && snap.mirrors.length) {
+      facts.push(`实测的 ${snap.mirrors.length} 个镜像都不通`)
+    } else if (!apiOk) {
+      facts.push('绕行路线正在实测（结果在下一次刷新出现）')
+    }
+
+    return check(code, title, Verdict.WARN, `${facts.join('；')}。`, hint)
   }
   return check(code, title, Verdict.UNKNOWN, `${snap.headline}（分不清是没网还是被拦，下次刷新再判）`)
 }

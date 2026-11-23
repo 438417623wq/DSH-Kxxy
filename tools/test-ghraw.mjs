@@ -137,7 +137,7 @@ try {
     const dir = join(home, HELPER_DIR_REL)
     check('安装成功', r.ok, r.error)
     equal('目录 = $DSH_HOME/.kxxy/bin', r.dir, dir)
-    equal('两个都写了', r.written.sort().join(','), 'ghraw,raw2api')
+    equal('三个都写了（含 dsh-headless）', r.written.sort().join(','), 'dsh-headless,ghraw,raw2api')
 
     const ghraw = readFileSync(join(dir, 'ghraw'), 'utf8')
     check('ghraw 是 sh 脚本', ghraw.startsWith('#!/system/bin/sh'))
@@ -162,7 +162,17 @@ try {
     // 幂等：第二次跑应该一个文件都不写（否则每次引擎启动都刷 mtime）
     const again = installHelpers(home)
     check('第二次不写盘', again.written.length === 0, again.written.join(','))
-    equal('第二次都记为未变', again.unchanged.sort().join(','), 'ghraw,raw2api')
+    equal('第二次都记为未变', again.unchanged.sort().join(','), 'dsh-headless,ghraw,raw2api')
+
+    // dsh-headless：headless profile 缺的两样东西都在这一层补（证书 + refs）。
+    const headless = readFileSync(join(dir, 'dsh-headless'), 'utf8')
+    check('dsh-headless 是 sh 脚本', headless.startsWith('#!/system/bin/sh'))
+    check('补 SSL_CERT_FILE / CURL_CA_BUNDLE',
+      headless.includes('SSL_CERT_FILE') && headless.includes('CURL_CA_BUNDLE'))
+    check('证书取引擎根的 etc/tls/cert.pem', headless.includes('etc/tls/cert.pem'))
+    check('从凭据库 refs 段导出键', headless.includes('/^refs:/') && headless.includes('credentials.yaml'))
+    check('已设的变量不覆盖', headless.includes('_cur=') && headless.includes('|| export'))
+    check('最后 exec dsh --profile headless', /exec dsh --profile headless "\$@"/.test(headless))
   }
 
   // ── 5. 内容被改坏 / 缺执行位时会重写 ─────────────────────────────────
