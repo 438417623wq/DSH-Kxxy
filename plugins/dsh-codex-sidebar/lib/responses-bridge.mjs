@@ -16,7 +16,9 @@ export const DEFAULT_BRIDGE_LIMITS = Object.freeze({
   maxOutputBytes: 2 * 1024 * 1024, maxArgumentBytes: 512 * 1024, maxOutputCalls: 40,
   maxReplayEntries: 64, maxReplayBytes: 8 * 1024 * 1024, maxReplayTotalBytes: 32 * 1024 * 1024,
   maxBufferedBytes: 512 * 1024, maxResponseBytes: 16 * 1024 * 1024,
-  bodyTimeoutMs: 15000, headerTimeoutMs: 10000, socketTimeoutMs: 130000,
+  // socketTimeoutMs 必须 ≥ 上游总时长（customTimeoutMs 600s），否则本轮刚跑
+  // 到 130s 就被本地 socket 超时掐掉，看起来像「模型自己停了」。
+  bodyTimeoutMs: 15000, headerTimeoutMs: 10000, socketTimeoutMs: 630000,
 })
 const SAFE_HEADERS = { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' }
 const REMOVED_CREDENTIALS = new Set(['apiKey', 'name', 'displayName'])
@@ -149,7 +151,7 @@ export class ResponsesBridge {
   #limits
   #grammarMode
 
-  constructor({ fetchImpl = globalThis.fetch, timeoutMs = 120000, roundImpl = streamCustomChat, limits = {}, customGrammarMode = 'reject' } = {}) {
+  constructor({ fetchImpl = globalThis.fetch, timeoutMs = 600000, roundImpl = streamCustomChat, limits = {}, customGrammarMode = 'reject' } = {}) {
     if (typeof fetchImpl !== 'function' || typeof roundImpl !== 'function') throw new BridgeError('bridge-config', 'The bridge needs fetch and round implementations.')
     if (!['reject', 'wrap-known'].includes(customGrammarMode)) throw new BridgeError('bridge-config', 'Invalid custom grammar compatibility mode.')
     for (const key of Object.keys(limits)) if (!Object.hasOwn(DEFAULT_BRIDGE_LIMITS, key)) throw new BridgeError('bridge-config', 'Unknown bridge limit.')

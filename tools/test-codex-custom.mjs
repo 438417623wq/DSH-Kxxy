@@ -123,14 +123,14 @@ async function waitUntil(check, label = 'condition', timeout = 2500) {
   assert.fail(`Timed out waiting for ${label}`)
 }
 
-async function completedTurn(service, threadId, turnId) {
+async function completedTurn(service, threadId, turnId, timeout = 2500) {
   let found
   await waitUntil(async () => {
     const snapshot = await service.snapshot('session')
     const thread = snapshot.threads.find((entry) => entry.id === threadId)
     found = thread?.turns?.find((entry) => entry.id === turnId)
     return found && found.status !== 'inProgress' && !thread.pending
-  }, 'terminal turn')
+  }, 'terminal turn', timeout)
   // The visible terminal state precedes the atomic history rename.
   await service.queue
   return found
@@ -703,4 +703,33 @@ test('custom model HTTP routes require host authentication, origin, nonce and a 
     }
     await rm(root, { recursive: true, force: true })
   }
+})
+
+// 手机切后台最典型的两种断法：还没吐字就断（可以安全重发）、吐了半个字再断（不能重发）。
+// 这条用例钉住的就是「重发的边界」—— 边界错了会重复执行工具命令，比超时严重得多。
+test('首包前的网络错误重发一次，已产出内容后绝不重发', async () => {
+  await fixture(async ({ service, provider }) => {
+    const model = await addModel(service, provider.origin)
+    const thread = await newThread(service, model)
+    provider.responses.push((_req, res) => { res.destroy() })
+    provider.responses.push((_req, res) => completion(res, '重试后成功'))
+    const first = await service.send('session', input(thread, model, 'retry-request'))
+    const recovered = await completedTurn(service, thread.id, first.turnId, 15000)
+    assert.equal(recovered.status, 'completed')
+    assert.equal(assistantText(recovered), '重试后成功')
+    assert.equal(provider.calls.length, 2)
+
+    const second = await newThread(service, model)
+    provider.responses.push((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.flushHeaders()
+      res.write('data: {"choices":[{"delta":{"content":"半个字"}}]}\n\n')
+      setTimeout(() => res.destroy(), 10)
+    })
+    const partial = await service.send('session', input(second, model, 'partial-request'))
+    const failed = await completedTurn(service, second.id, partial.turnId, 15000)
+    assert.notEqual(failed.status, 'completed')
+    assert.equal(assistantText(failed), '半个字')
+    assert.equal(provider.calls.length, 3)
+  })
 })

@@ -36,6 +36,14 @@ window.__ModuleLoader__.load({
       let retained = 0
       let controller = null
       let refreshTimer = null
+      // 前后台切换的恢复钩子：只在有订阅者时挂，释放时必须摘掉（组件会反复挂载）。
+      let resume = null
+      const detach = () => {
+        if (!resume) return
+        document.removeEventListener('visibilitychange', resume)
+        window.removeEventListener('pageshow', resume)
+        resume = null
+      }
       const publish = (patch) => {
         if (Object.prototype.hasOwnProperty.call(patch, 'draft')) patch = { ...patch, draftVersion: (snapshot.draftVersion || 0) + 1 }
         if (Object.prototype.hasOwnProperty.call(patch, 'files')) patch = { ...patch, filesVersion: (snapshot.filesVersion || 0) + 1 }
@@ -118,17 +126,33 @@ window.__ModuleLoader__.load({
           retained += 1
           if (retained === 1) {
             refresh()
-            source = new EventSource(`${PREFIX}/events?sessionId=${encodeURIComponent(sessionId)}`)
-            source.addEventListener('change', scheduleRefresh)
-            source.onopen = () => { publish({ disconnected: false, connectionEpoch: snapshot.connectionEpoch + 1 }); scheduleRefresh() }
-            source.onerror = () => publish({ disconnected: true, connectionEpoch: snapshot.connectionEpoch + 1 })
+            // 单页里只有一条 EventSource，重建时一定要先关旧的：
+            // 服务端上限是 8 条，泄漏几条之后新连接会被 429 挡掉，界面就假死了。
+            const connect = () => {
+              const stream = new EventSource(`${PREFIX}/events?sessionId=${encodeURIComponent(sessionId)}`)
+              stream.addEventListener('change', scheduleRefresh)
+              stream.onopen = () => { publish({ disconnected: false, connectionEpoch: snapshot.connectionEpoch + 1 }); scheduleRefresh() }
+              stream.onerror = () => publish({ disconnected: true, connectionEpoch: snapshot.connectionEpoch + 1 })
+              return stream
+            }
+            source = connect()
+            // 手机切后台再回来时，WebView 常常已经静默掐死了 SSE 而 readyState 还停在
+            // CONNECTING —— 浏览器自己的重连可能等上几分钟。回到可见状态就地重建，
+            // 代价是一条连接，收益是「回来就能看到新内容」。
+            resume = () => {
+              if (!retained || document.visibilityState !== 'visible') return
+              if (!source || source.readyState !== 1) { source?.close(); source = connect() }
+              scheduleRefresh()
+            }
+            document.addEventListener('visibilitychange', resume)
+            window.addEventListener('pageshow', resume)
           }
           return () => {
             retained -= 1
-            if (!retained) { source?.close(); source = null; clearTimeout(refreshTimer); refreshTimer = null; controller?.abort() }
+            if (!retained) { detach(); source?.close(); source = null; clearTimeout(refreshTimer); refreshTimer = null; controller?.abort() }
           }
         },
-        dispose() { retained = 0; source?.close(); controller?.abort(); clearTimeout(refreshTimer); refreshTimer = null; markdownCache.clear(); scrollPositions.clear(); listeners.clear() },
+        dispose() { retained = 0; detach(); source?.close(); source = null; controller?.abort(); clearTimeout(refreshTimer); refreshTimer = null; markdownCache.clear(); scrollPositions.clear(); listeners.clear() },
       }
     }
 

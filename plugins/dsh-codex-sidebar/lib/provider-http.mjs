@@ -58,9 +58,14 @@ function cancelBody(body) {
 /** One request, no retries. Never expose upstream error bodies or fetch exception strings. */
 export async function requestProvider({ model, payload, operation = 'generate', stream = true, controller = new AbortController(), signal, fetchImpl = globalThis.fetch, timeoutMs, firstByteTimeoutMs, idleTimeoutMs, maxBytes = MAX_RESPONSE_BYTES, onEvent = () => {} }) {
   const apiFormat = model.apiFormat
-  const total = duration(timeoutMs, 120000)
-  const firstByte = duration(firstByteTimeoutMs, Math.min(30000, total))
-  const idle = duration(idleTimeoutMs, Math.min(30000, total))
+  // 超时三档是按「手机切后台」定的，不是按桌面网络定的：
+  //   · 首字节 120s —— 推理模型思考阶段可以几十秒不出字，30s 会把正常请求判死；
+  //   · 流间隔 90s —— 后台弱网/省电策略下的 TCP 抖动常在 30-60s 量级；
+  //   · 总时长 600s —— 一轮工具调用加长回答，10 分钟是现实上限。
+  // 三档都只是「多久放弃」，真正的抗抖动靠 service.mjs 在首包前的有界重试。
+  const total = duration(timeoutMs, 600000)
+  const firstByte = duration(firstByteTimeoutMs, Math.min(120000, total))
+  const idle = duration(idleTimeoutMs, Math.min(90000, total))
   let reader, totalTimer, firstTimer, idleTimer, timeoutPhase, removeAbort, linkAbort
   let received = false
   const expire = (phase) => { timeoutPhase = phase; controller.abort(new Error('timeout')) }

@@ -21,6 +21,48 @@ const MAX_TOOL_ROUNDS = 25
 const MAX_TOOL_CALLS = 60
 const MAX_CONTEXT_FILES = 10
 
+/**
+ * 首包前的有界重试。
+ *
+ * 只在**这一轮还没吐出任何字符、也没执行过任何工具**时重发 —— 手机切后台那一瞬间
+ * 换 Wi-Fi/5G 会让 TCP 直接断，30 秒后再回来就晚了；重发一次的成本远低于让用户
+ * 重新提问。一旦已经产出文字或跑过工具就严格不重发：重复执行命令的副作用比超时
+ * 严重得多，那是 `completedCalls` 一直在防的事。
+ */
+const RETRY_DELAYS = [2000, 5000]
+/** 上游 5xx 里可以安全重发的那几个（不是 500 —— 那通常是服务端真出错）。 */
+const RETRY_STATUS = new Set([502, 503, 504])
+
+function retryableStreamError(error) {
+  // 用户主动停止、以及引擎判定的协议错误都不可重发。
+  if (!(error instanceof CodexError)) return false
+  if (error.code === 'model-network') return true
+  const diagnostics = error.details?.diagnostics ?? {}
+  // 首字节/流间隔超时意味着「上游还没给出可用输出」，重发是安全的；
+  // 总时长超时与智能体超时不重发，否则会把已经等了 10 分钟的一轮又续 10 分钟。
+  if (error.code === 'model-timeout') return diagnostics.phase === 'first-byte' || diagnostics.phase === 'idle'
+  if (error.code === 'model-http') return RETRY_STATUS.has(diagnostics.upstreamStatus)
+  return false
+}
+
+/** 超时三档各说自己的话：用户据此就能判断该等、该换网、还是该改配置。 */
+const TIMEOUT_MESSAGES = {
+  'first-byte': '模型 120 秒内没有返回第一个字节（后台弱网或服务端排队），已停止本轮；可直接重试，历史与已完成的工具结果都还在。',
+  idle: '模型流式输出中断超过 90 秒，已停止本轮；未完成的工具不会自动重跑。',
+  total: '单次模型请求超过 10 分钟总时长上限，已停止本轮；可重试或改用更小的任务。',
+  agent: '本轮智能体任务超过 30 分钟上限，已停止；不会自动重新执行工具。',
+}
+
+/**
+ * 审批等多久算过期。
+ *
+ * 原来是 5 分钟，配合「本轮智能体 10 分钟上限」：用户切后台看条消息回来，
+ * 审批已经静默超时并被判拒绝，表现就是「它自己停了」。
+ * 现在 15 分钟，必须严格小于 customAgentTimeoutMs（30 分钟）——
+ * 否则审批还没过期，整轮先被智能体总时长杀掉，延长就白延了。
+ */
+const APPROVAL_TIMEOUT_MS = 15 * 60 * 1000
+
 /** Text attachments are inlined; binary ones are referenced by path only. */
 function attachmentContext(context, { inlineImages = false } = {}) {
   let text = ''
@@ -123,7 +165,7 @@ export function reduceEvent(thread, method, params) {
 
 /** Only this plugin's recorded threads may be addressed; a thread id is not authorization. */
 export class CodexService {
-  constructor({ ctx, paths, resolveWorkspace, transportFactory = (options) => new CodexTransport(options), bridgeFactory = (options) => new ResponsesBridge(options), probe = probeRuntime, nativeProbe = probeNativeApp, env = process.env, fetchImpl = globalThis.fetch, customTimeoutMs = 120000, customAgentTimeoutMs = 600000 }) {
+  constructor({ ctx, paths, resolveWorkspace, transportFactory = (options) => new CodexTransport(options), bridgeFactory = (options) => new ResponsesBridge(options), probe = probeRuntime, nativeProbe = probeNativeApp, env = process.env, fetchImpl = globalThis.fetch, customTimeoutMs = 600000, customAgentTimeoutMs = 1800000 }) {
     Object.assign(this, { ctx, paths, resolveWorkspace, transportFactory, bridgeFactory, probe, nativeProbe, env, fetchImpl, customTimeoutMs, customAgentTimeoutMs })
     this.transport = null
     this.connecting = null
@@ -1150,23 +1192,50 @@ export class CodexService {
           this.publish()
         },
       })
+      // 每次尝试用独立的 controller，并把本轮 controller 作为 signal 接进去：
+      // requestProvider 会在 signal 上挂转发，所以「用户点停止」仍然能立刻打断；
+      // 不复用同一个 controller 是因为它一旦 abort 就永久失效，重试只会立刻再失败。
+      const streamRound = async (onDelta, onReasoningDelta) => {
+        for (let tries = 0; ; tries += 1) {
+          const attempt = new AbortController()
+          const forward = () => attempt.abort(controller.signal.reason)
+          if (controller.signal.aborted) forward()
+          else controller.signal.addEventListener('abort', forward, { once: true })
+          const before = outputLength
+          try {
+            return await streamCustomChat({
+              model: provider, messages, controller: attempt, signal: controller.signal, fetchImpl: this.fetchImpl,
+              timeoutMs: this.customTimeoutMs,
+              tools: binding.mode === 'agent' ? accessMode === 'readonly' ? readOnlyTools : WORKSPACE_TOOLS : [],
+              onDelta, onReasoningDelta,
+            })
+          } catch (error) {
+            const again = !controller.signal.aborted && outputLength === before && tries < RETRY_DELAYS.length && retryableStreamError(error)
+            if (!again) throw error
+            this.ctx?.logger?.warn?.(`[codex] ${error.code} 触发首包前重试（第 ${tries + 1} 次），尚未产出任何内容`)
+            await new Promise((done) => setTimeout(done, RETRY_DELAYS[tries]))
+          } finally {
+            controller.signal.removeEventListener('abort', forward)
+          }
+        }
+      }
       for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
         if (controller.signal.aborted) throw new CodexError('model-cancelled', '模型请求已停止', 409)
         if (round) { agent = { id: randomUUID(), type: 'agentMessage', text: '' }; turn.items.push(agent) }
         let reasoning = null
-        const response = await streamCustomChat({ model: provider, messages, controller, fetchImpl: this.fetchImpl, timeoutMs: this.customTimeoutMs, tools: binding.mode === 'agent' ? accessMode === 'readonly' ? readOnlyTools : WORKSPACE_TOOLS : [], onDelta: (delta) => {
+        const response = await streamRound((delta) => {
           outputLength += delta.length
           if (outputLength > MAX_OUTPUT_CHARS) throw new CodexError('model-output-limit', '本轮智能体回复超过长度上限', 413)
           agent.text += delta
           this.publish()
-        }, onReasoningDelta: (delta) => {
+        }, (delta) => {
           outputLength += delta.length
           if (outputLength > MAX_OUTPUT_CHARS) throw new CodexError('model-output-limit', '本轮智能体推理超过长度上限', 413)
           reasoning ??= { id: randomUUID(), type: 'reasoning', text: '' }
           if (!turn.items.includes(reasoning)) turn.items.push(reasoning)
           reasoning.text += delta
           this.publish()
-        } })
+        })
         const assistant = { role: 'assistant', content: response.text }
         if (provider.apiFormat === 'responses' && response.providerOutput.length) assistant.responses_output = response.providerOutput
         if (response.providerReplay) assistant.provider_replay = response.providerReplay
@@ -1209,12 +1278,20 @@ export class CodexService {
       turn.status = 'completed'
       record.outcome = 'completed'
     } catch (error) {
-      turn.status = controller.signal.aborted && controller.signal.reason?.message !== 'timeout' || error.code === 'model-cancelled' ? 'interrupted' : 'failed'
+      // 三档超时（首字节/流间隔/总时长）以前都被压成同一句「智能体任务超时」，
+      // 于是「挂后台断网」和「模型真的想太久」在界面上完全看不出区别。
+      // provider-http 一直把 phase 放在 details.diagnostics 里，这里只是把它接出来。
+      const timedOut = controller.signal.aborted && controller.signal.reason?.message === 'timeout'
+      const phase = error?.details?.diagnostics?.phase ?? null
+      const cancelled = (controller.signal.aborted && !timedOut) || error.code === 'model-cancelled'
+      turn.status = cancelled ? 'interrupted' : 'failed'
       // Keep the partial answer of the stopped round so the next message can continue from it.
       recordInterruptedTurn(turn, agent)
-      turn.error = controller.signal.aborted
-        ? { code: controller.signal.reason?.message === 'timeout' ? 'model-timeout' : 'model-cancelled', message: controller.signal.reason?.message === 'timeout' ? '智能体任务超时，已停止；不会自动重新执行工具。' : '模型请求已停止' }
-        : { code: error.code ?? 'model-network', message: error instanceof CodexError ? error.message : '模型请求失败，请检查服务状态' }
+      turn.error = timedOut
+        ? { code: 'model-timeout', message: TIMEOUT_MESSAGES[phase] ?? TIMEOUT_MESSAGES.agent, ...(phase ? { diagnostics: { phase } } : {}) }
+        : controller.signal.aborted
+          ? { code: 'model-cancelled', message: '模型请求已停止' }
+          : { code: error.code ?? 'model-network', message: error instanceof CodexError ? error.message : '模型请求失败，请检查服务状态', ...(error?.details?.diagnostics ? { diagnostics: error.details.diagnostics } : {}) }
       for (const item of turn.items) if (item.status === 'inProgress' || item.status === 'pending' || item.status === 'awaitingApproval') item.status = turn.status
       record.outcome = turn.status
     } finally {
@@ -1506,7 +1583,7 @@ export class CodexService {
       this.approvals.delete(key)
       try { this.rpc().respond(id, { decision: 'cancel' }) } catch { /* Process exited. */ }
       this.publish()
-    }, 5 * 60 * 1000)
+    }, APPROVAL_TIMEOUT_MS)
     entry.timer.unref()
     this.approvals.set(key, entry)
     this.publish()
@@ -1538,7 +1615,7 @@ export class CodexService {
         resolve({ allowed, ...(typeof note === 'string' && note.trim() ? { note: note.trim().slice(0, 2000) } : {}) })
       }
       entry.abortHandler = () => entry.resolveApproval(false)
-      entry.timer = setTimeout(() => entry.resolveApproval(false), 5 * 60 * 1000)
+      entry.timer = setTimeout(() => entry.resolveApproval(false), APPROVAL_TIMEOUT_MS)
       entry.timer.unref?.()
       signal.addEventListener('abort', entry.abortHandler, { once: true })
       this.approvals.set(id, entry)
