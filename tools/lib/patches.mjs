@@ -1487,6 +1487,189 @@ function patchDeveloperRoleCompat(ctx) {
 }
 
 /**
+ * 自定义路由的「图片模态」回退：pi-ai 目录里查不到同名模型时，按协议 + 模型名
+ * 继承内置目录的 `input`（以及 contextWindow / maxTokens）。
+ *
+ * ── 症状（用户报，2026-11-25 真机）──────────────────────────────────────
+ *
+ * 手机端给自定义 route（`guge` / `chat` / `guiji` 这类自建或中转 provider key）
+ * 发图，界面报「当前模型不支持图片」，逐轮失败；同一份模型在桌面端（route key
+ * 恰好等于内置 provider，如 `google`）发图正常。
+ *
+ * ── 根因（一层，但很隐蔽）──────────────────────────────────────────────
+ *
+ * `dsh-llm-pi-ai` 的 `resolveRouteModels()` 只按 **route key** 查内置目录：
+ *
+ *     const defaults = catalogModels(provider);   // pi-ai 不认识的 key ⇒ 空 Map
+ *     const base = defaults.get(entry.id);        // ⇒ undefined
+ *     input: declaredInput(entry.input) ?? base?.input ?? [...request.defaultInput],
+ *
+ * 而 `request.defaultInput` 在 profile 没写 `defaultInput` 时被 schema 物化成
+ * `["text"]`。于是「配置里没写 `input`」就等于「只收文本」—— 请求阶段的
+ * `if (containsImage && !model.input.includes("image")) throw ... UNSUPPORTED_CONTENT`
+ * 必然命中。桌面端之所以正常，是因为 route key 用了内置 provider 名，`base`
+ * 命中目录条目、`input` 直接从目录继承。
+ *
+ * ── 修法：只补「目录不知道」的那一格 ────────────────────────────────────
+ *
+ *   · `base` 命中（route key 是内置 provider）—— 完全不动，目录说了算；
+ *   · `base` 缺失 —— 依次尝试：
+ *       1. 按 route 的 `api` 协议映射到内置 provider（google-generative-ai →
+ *          google、openai-completions/openai-responses → openai、anthropic-messages
+ *          → anthropic），先精确匹配模型 id，再规范化（去 `Pro/`、`openai/`
+ *          这类前缀并小写）匹配；
+ *       2. 仍未命中，全局按规范化 id 找**已知多模态**模型。
+ *     只接受「声明了 `image` 且 api 是对话协议」的条目，纯文本模型不会被用来
+ *     放宽判定；继承的只有 `input` / `contextWindow` / `maxTokens`，`baseUrl`、
+ *     `cost`、`name` 一概不继承 —— 中转域的计费与端点与官方不同。
+ *
+ * 优先级保持不变、且用户显式配置始终优先：
+ *
+ *     entry.input ?? (显式写的) defaultInput ?? base.input ?? fallback.input ?? ["text"]
+ *
+ * 之所以要区分「显式 defaultInput」与「schema 默认值」：后者是 `["text"]`，
+ * 若把它排在回退之前，回退永远没有机会生效（这正是原实现的死结）。
+ *
+ * 幂等：记号 + 三处改写字节同时吻合才算已打；锚点或写法有任何漂移都让构建失败。
+ */
+export function patchCatalogModalityFallback(ctx) {
+  const rel = "@deepseek-ai/dsh-llm-pi-ai/lib/index.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无 dsh-llm-pi-ai）";
+  const src = ctx.read(rel);
+  if (src.includes("KXXY_CATALOG_MODALITY_FALLBACK")) {
+    return "已打过（自定义路由的图片模态回退），跳过";
+  }
+
+  const CATALOG_END = `function catalogModels(provider) {
+	if (!catalogProviders().has(provider)) return /* @__PURE__ */ new Map();
+	const models = getBuiltinModels(provider);
+	return new Map(models.map((model) => [model.id, model]));
+}`;
+  must(src.includes(CATALOG_END), "dsh-llm-pi-ai 的 catalogModels 结构变了");
+
+  const HELPERS = `
+/* KXXY_CATALOG_MODALITY_FALLBACK: 自定义 route（pi-ai 不认识的 provider key）在
+   目录里查不到同名模型时，按协议 / 规范化模型 id 回退到内置目录，只继承
+   模态能力（input）与容量（contextWindow / maxTokens）。见 tools/lib/patches.mjs
+   的 patchCatalogModalityFallback。 */
+const MODALITY_FALLBACK_PROTOCOLS = new Map([
+	["google-generative-ai", "google"],
+	["openai-completions", "openai"],
+	["openai-responses", "openai"],
+	["anthropic-messages", "anthropic"]
+]);
+const MODALITY_FALLBACK_APIS = new Set(MODALITY_FALLBACK_PROTOCOLS.keys());
+const MODALITY_FALLBACK_PREFIX = /^(?:[A-Za-z0-9_.-]+\\/)+/;
+/** 模型 id 去掉网关前缀（\`Pro/\`、\`openai/\`、\`models/\` …）并小写。 */
+function normalizedFallbackId(id) {
+	return String(id).replace(MODALITY_FALLBACK_PREFIX, "").toLowerCase();
+}
+/** 只接受「对话协议 + 明确声明图片输入」的目录条目，纯文本模型不得放宽判定。 */
+function multimodalCatalogBase(model) {
+	return model !== void 0 && Array.isArray(model.input) && model.input.includes("image") && MODALITY_FALLBACK_APIS.has(model.api) ? model : void 0;
+}
+let multimodalFallbackIndex;
+/** 规范化 id → 已知多模态模型（首次访问时建立，顺序取目录首条）。 */
+function multimodalFallbackModels() {
+	if (multimodalFallbackIndex !== void 0) return multimodalFallbackIndex;
+	const byId = /* @__PURE__ */ new Map();
+	for (const id of catalogProviderIds()) for (const model of getAllBuiltinModels(id)) {
+		const base = multimodalCatalogBase(model);
+		if (base !== void 0 && !byId.has(normalizedFallbackId(base.id))) byId.set(normalizedFallbackId(base.id), base);
+	}
+	multimodalFallbackIndex = byId;
+	return byId;
+}
+/**
+* 自定义 route 的目录回退：先按协议映射的 provider 找精确 id，再按规范化 id，
+* 最后全局按规范化 id 找已知多模态模型。
+* @param api - route 的 wire 协议；未知或非对话协议时只走全局回退。
+* @param id - 配置里写的模型 id（可能带网关前缀）。
+* @returns 可继承的目录条目，或 \`undefined\`（保持原判定，仍然只收文本）。
+*/
+function catalogModalityFallback(api, id) {
+	const own = MODALITY_FALLBACK_PROTOCOLS.get(api);
+	const key = normalizedFallbackId(id);
+	if (own !== void 0) {
+		const models = getAllBuiltinModels(own);
+		for (const model of models) {
+			const base = multimodalCatalogBase(model);
+			if (base !== void 0 && base.id === id) return base;
+		}
+		for (const model of models) {
+			const base = multimodalCatalogBase(model);
+			if (base !== void 0 && normalizedFallbackId(base.id) === key) return base;
+		}
+	}
+	return multimodalFallbackModels().get(key);
+}`;
+
+  let out = replaceOnce(
+    src,
+    CATALOG_END,
+    CATALOG_END + HELPERS,
+    "dsh-llm-pi-ai 的目录回退注入点",
+  );
+
+  // 1) profile 里是否**显式**写了 defaultInput：schema 会把缺省物化成 ["text"]，
+  //    两者必须区分，否则回退永远被默认值挡在前面。
+  out = replaceOnce(
+    out,
+    `		const defaultInput = [...source.defaultInput ?? DEFAULT_INPUT];`,
+    `		const defaultInput = [...source.defaultInput ?? DEFAULT_INPUT];
+		const defaultInputDeclared = Array.isArray(source.defaultInput) && source.defaultInput.length > 0;`,
+    "dsh-llm-pi-ai 的 defaultInput 声明探测",
+  );
+  /*
+   * 调用点的 `defaultInput,` 之后补一个布尔标记。
+   *
+   * 这里**不能**用「defaultInput, + defaultContextWindow: … ?? 262144」整段做锚点：
+   * rc.3 与 rc.5 的容量默认值不同（rc.3 是 `?? 1e6` / `?? 128e3`），而这两份
+   * 源码都要能打。传参点本身在两版里逐字相同，按「缩进 + 变量名」定位即可。
+   */
+  const callSite = /(\n(\t+)defaultInput,\n)/g;
+  const callHits = [...out.matchAll(callSite)];
+  must(callHits.length === 1, `dsh-llm-pi-ai 的 defaultInput 传参点不唯一：命中 ${callHits.length} 处`);
+  out = out.replace(callSite, (whole, line, indent) => `${line}${indent}defaultInputDeclared,\n`);
+
+  // 2) 目录缺失时的回退条目（不替换 base 本身，避免继承 baseUrl / cost）。
+  out = replaceOnce(
+    out,
+    `		const api = request.api ?? base?.api ?? routeApi;`,
+    `		const api = request.api ?? base?.api ?? routeApi;
+		const modalityBase = base ?? catalogModalityFallback(api, entry.id);`,
+    "dsh-llm-pi-ai 的回退条目选择",
+  );
+  out = replaceOnce(
+    out,
+    `		const contextWindow = entry.contextWindow ?? base?.contextWindow ?? request.defaultContextWindow;`,
+    `		const contextWindow = entry.contextWindow ?? base?.contextWindow ?? modalityBase?.contextWindow ?? request.defaultContextWindow;`,
+    "dsh-llm-pi-ai 的 contextWindow 回退",
+  );
+  out = replaceOnce(
+    out,
+    `		const maxTokens = entry.maxTokens ?? base?.maxTokens ?? request.defaultMaxTokens;`,
+    `		const maxTokens = entry.maxTokens ?? base?.maxTokens ?? modalityBase?.maxTokens ?? request.defaultMaxTokens;`,
+    "dsh-llm-pi-ai 的 maxTokens 回退",
+  );
+  out = replaceOnce(
+    out,
+    `			input: declaredInput(entry.input) ?? base?.input ?? [...request.defaultInput],`,
+    `			input: declaredInput(entry.input) ?? (request.defaultInputDeclared === true ? declaredInput(request.defaultInput) : void 0) ?? base?.input ?? modalityBase?.input ?? [...request.defaultInput],`,
+    "dsh-llm-pi-ai 的 input 回退链",
+  );
+
+  must(
+    out.includes("catalogModalityFallback(api, entry.id)") &&
+      out.includes("modalityBase?.input") &&
+      out.includes("defaultInputDeclared,"),
+    "dsh-llm-pi-ai 的图片模态回退未全部生效",
+  );
+  ctx.write(rel, out);
+  return "dsh-llm-pi-ai → 自定义路由从内置目录继承图片模态（guge/chat 等中转不再报「不支持图片」）";
+}
+
+/**
  * 旧世代客户端运行时的别名：`@deepseek-ai/dsh-client-runtime/client` → 平台 store 种子。
  *
  * 症状（用户报，2026-11-02 真机）：装上 `@neystan/dsh-web-ui-all`（task-board /
@@ -1705,7 +1888,7 @@ export function applyAllPatches(root, termuxRead) {
     patchRipgrep, patchFsLocal, patchAttachmentLocal, patchNativeCommandAndroid,
     patchDocumentPreviewUnicodeSets, patchLibreOfficeKitPlatform, patchLibreOfficeKitFontFallbacks,
     patchOfficeDefaultFonts, patchOfficeToPdfFormats, patchDocumentPreviewOfficeExtensions, patchDocumentPreviewArchiveProviders,
-    patchDocumentPreviewMediaProviders, patchDeveloperRoleCompat, patchClientRuntimeAlias,
+    patchDocumentPreviewMediaProviders, patchDeveloperRoleCompat, patchCatalogModalityFallback, patchClientRuntimeAlias,
     patchFrontendLenientBoot, patchDshManifest,
   ];
   const results = [], errors = [];

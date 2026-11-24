@@ -1591,6 +1591,7 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
 // 时真机上是 `exit 127` 加一行中文提示，比「命令不存在」更难归因。
 {
   const problems = [];
+  let bundledNpmVersion = "";
   const modeOf = (e) => (e.externalAttr >>> 16) & 0o7777;
 
   // ① corepack 系四个包装器
@@ -1614,6 +1615,37 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
     if (!text.includes('exec "$d/node"')) problems.push(`${name} 没有 exec "$d/node"`);
     if (target !== null && !text.includes(target)) problems.push(`${name} 未指向 ${target}`);
     if (modeOf(e) !== 0o755) problems.push(`${name} mode=0o${modeOf(e).toString(8)}（应 0755）`);
+  }
+
+  // ①' 离线 npm（v0.9.89）：包装器必须指向随包 cli，且 cli 本体真的在包里。
+  //
+  // 只断言「bin/npm 是 sh 包装器」会漏掉最要命的那种半修复：包装器生成了，
+  // 但里面仍 exec `corepack/dist/npm.js` —— 那是**首次运行要联网下载**的入口，
+  // 正是本版要消除的症状。
+  {
+    const npmPkg = byName.get("lib/node_modules/npm/package.json");
+    const npmCli = byName.get("lib/node_modules/npm/bin/npm-cli.js");
+    const npxCli = byName.get("lib/node_modules/npm/bin/npx-cli.js");
+    if (!npmPkg || !npmCli || !npxCli) {
+      problems.push("缺随包 npm（lib/node_modules/npm/package.json + bin/{npm,npx}-cli.js）");
+    } else {
+      try { bundledNpmVersion = JSON.parse(readLocal(npmPkg).toString("utf8")).version ?? ""; } catch { /* 下面统一报 */ }
+      if (!/^\d+\.\d+\.\d+/.test(bundledNpmVersion)) {
+        problems.push(`随包 npm 的版本号不可用：${JSON.stringify(bundledNpmVersion)}`);
+      }
+      for (const [name, cli] of [["bin/npm", "npm-cli.js"], ["bin/npx", "npx-cli.js"]]) {
+        const e = byName.get(name);
+        if (!e || e.comment.startsWith("LINK:")) continue; // 缺 / 软链已在上面报过
+        const text = readLocal(e).toString("utf8");
+        if (!text.includes(`lib/node_modules/npm/bin/${cli}`)) problems.push(`${name} 未指向随包 npm 的 ${cli}`);
+        if (text.includes("corepack/dist/")) problems.push(`${name} 仍走 corepack（首次运行要联网）`);
+      }
+      const corepackEntry = byName.get("bin/corepack");
+      if (corepackEntry && !corepackEntry.comment.startsWith("LINK:")
+        && !readLocal(corepackEntry).toString("utf8").includes("exec \"$d/npm\"")) {
+        problems.push("bin/corepack 未把 `corepack npm …` 改道到本地 npm");
+      }
+    }
   }
 
   // ② 反例闸门：bin/corepack 不许是 dist/corepack.js 的副本
@@ -1676,7 +1708,10 @@ console.log(`\nmanifest: runtimeVersion=${manifest.runtimeVersion} entries=${man
   }
 
   if (problems.length === 0) {
-    console.log("\n打包工具包装器：✓ corepack/npm/npx + bundletool + zipalign（0755 / LF）；pnpm（sh 包装器或 owner-executable ARM64 SEA）");
+    console.log(
+      `\n打包工具包装器：✓ corepack/npm/npx + bundletool + zipalign（0755 / LF）；` +
+        `npm 走随包 ${bundledNpmVersion || "?"}（离线可用）；pnpm（sh 包装器或 owner-executable ARM64 SEA）`,
+    );
   } else {
     console.log("\n打包工具包装器：✗");
     for (const p of problems) console.log(`  ${p}`);

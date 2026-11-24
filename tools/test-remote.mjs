@@ -906,15 +906,26 @@ console.log('\n[E] 平台边界与网络诊断')
   ok('buildEnv 设 VIMRUNTIME（E484 的那一层）',
     /VIMRUNTIME=\$\{nvimRuntime\.absolutePath\}/.test(kotlin) &&
       /share\/nvim\/runtime/.test(kotlin))
-  ok('~/.bashrc 升到 kxxy-shell@7：VIMRUNTIME + TLS 信任锚',
-    /# kxxy-shell@7/.test(kotlin) &&
+  ok('~/.bashrc 升到 kxxy-shell@8：VIMRUNTIME + TLS 信任锚 + PERL5LIB',
+    // 锚在**模板首行**（raw string 开头那段），不是 KDoc 里的历史说明：
+    // 注释里也会出现 `# kxxy-shell@N`，只判「文件里有没有这串」等于什么都没测。
+    /=\s*"""\n\s*# kxxy-shell@8\n/.test(kotlin) &&
       /VIMRUNTIME:-/.test(kotlin) &&
       /export VIMRUNTIME=/.test(kotlin) &&
       // Termux 编的 curl 把 CA 路径钉死在 /data/data/com.termux/…，终端里
       // https 一律 (77) error adding trust anchors；三个变量各管一路客户端。
       /export SSL_CERT_FILE=/.test(kotlin) &&
       /export CURL_CA_BUNDLE=/.test(kotlin) &&
-      /export REQUESTS_CA_BUNDLE=/.test(kotlin))
+      /export REQUESTS_CA_BUNDLE=/.test(kotlin) &&
+      // exiftool 的 site_perl/5.44.0 是「引擎启动之后」装扩展才出现的，
+      // 启动时的 PERL5LIB 快照里根本没有它 —— 必须按盘重算。
+      /for _d in \$\{'\$'\}\{PERL5LIB\/\/:\/ \}/.test(kotlin) &&
+      /export PERL5LIB="\$\{'\$'\}\{_pl#:\}"/.test(kotlin) &&
+      // 按值去重，而不是「前缀等于引擎根就丢」：反复 source 不会越滚越长。
+      /case ":\$\{'\$'\}_pl:" in[\s\S]{0,120}\*\)\s*_pl=/.test(kotlin) &&
+      // 版本目录（纯数字与点）与架构目录（带连字符）各一条判据。
+      /''\|\*\[!0-9\.\]\*\)\s*continue/.test(kotlin) &&
+      /case "\$\{'\$'\}\{_a##\*\/\}" in\s*\*-\*\)/.test(kotlin))
 }
 
 // 生成器

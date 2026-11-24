@@ -99,8 +99,60 @@ class DefaultPython(unittest.TestCase):
 
     def test_missing_python_diagnostic_no_provisioning(self):
         (self.rootfs / "usr/bin/python3").unlink()
-        with self.assertRaisesRegex(d.DispatchError, "no automatic provisioning"):
+        with self.assertRaisesRegex(d.DispatchError, "no automatic"):
             self.call()
+
+    def make_native(self):
+        native = self.root / "bin/python3.14"
+        native.parent.mkdir(parents=True, exist_ok=True)
+        native.write_bytes(elf_bytes(b"/system/bin/linker64"))
+        native.chmod(0o755)
+        return native
+
+    def test_missing_rootfs_falls_back_to_native_python(self):
+        native = self.make_native()
+        (self.rootfs / ".kxxy-seed").unlink()
+        argv, _ = self.call("python3", ["-c", "print(1)"])
+        self.assertEqual(argv, [str(native), "-c", "print(1)"])
+        with mock.patch.object(d.os, "execve") as execute:
+            d.dispatch(self.root, self.files, self.cwd, self.env, "python3", ["-c", "print(1)"])
+        self.assertEqual(execute.call_args.args[0], str(native))
+        self.assertEqual(execute.call_args.args[1], [str(native), "-c", "print(1)"])
+
+    def test_native_fallback_pip_and_environment(self):
+        native = self.make_native()
+        (self.rootfs / "usr/bin/python3").unlink()
+        argv, env = self.call("pip", ["install", "openpyxl"])
+        self.assertEqual(argv, [str(native), "-m", "pip", "install", "openpyxl"])
+        for key in ("LD_PRELOAD", "PYTHONPATH", "PYTHONHOME"):
+            self.assertNotIn(key, env)
+        # 原生解释器不需要 guest 隔离，调用方的其余环境原样保留。
+        self.assertEqual(env["SECRET"], "must not enter guest")
+        self.assertEqual(env["LD_LIBRARY_PATH"], "/wrong abi")
+
+    def test_native_fallback_resolves_python_symlink(self):
+        native = self.make_native()
+        try:
+            (self.root / "bin/python3").symlink_to(native.name)
+        except (OSError, NotImplementedError):
+            self.skipTest("host does not allow symlinks")
+        (self.rootfs / ".kxxy-seed").unlink()
+        argv, _ = self.call()
+        self.assertEqual(argv[0], str(native))
+        self.assertEqual(argv[1:], ["-V"])
+
+    def test_require_glibc_env_keeps_hard_failure(self):
+        self.make_native()
+        self.env["KXXY_PYTHON_REQUIRE_GLIBC"] = "1"
+        (self.rootfs / ".kxxy-seed").unlink()
+        with self.assertRaisesRegex(d.DispatchError, "native Python instead"):
+            self.call()
+
+    def test_explicit_venv_never_falls_back(self):
+        self.make_native()
+        (self.rootfs / ".kxxy-seed").unlink()
+        with self.assertRaisesRegex(d.DispatchError, "nothing was downloaded"):
+            self.call(venv=self.cwd / "missing venv")
 
     def test_exec_inherits_real_streams_and_rc(self):
         with mock.patch.object(d.os, "execve") as execute, mock.patch.object(d.os, "chdir"):

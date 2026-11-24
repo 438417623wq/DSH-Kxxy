@@ -2148,10 +2148,17 @@ object EngineConfig {
      * 这里给交互式 shell 补 SSL_CERT_FILE / CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE，
      * 都只在文件存在、用户没设过时写。
      *
+     * `# kxxy-shell@8` 补 `PERL5LIB` 的按盘重算：`buildEnv` 的 `PERL5LIB` 是
+     * 引擎启动时的快照，而 `exiftool` 这类**启动后才装**的扩展带的是
+     * `lib/perl5/site_perl/5.44.0`，那一刻还不存在，于是只固化了
+     * `<root>/lib/perl5`；之后 `exiftool` 一律报
+     * `Can't locate Image/ExifTool.pm in @INC`，且**重启引擎才会好**。
+     * 判据与 [perlLibPath] 一致：版本目录 + 架构目录，local::lib 不看存在性。
+     *
      * @see buildEnv
      */
     private fun userShellInitContent(): String = """
-        # kxxy-shell@7
+        # kxxy-shell@8
         # [dsh-kxxy] 官方终端在 Android 上的默认交互式 shell 初始化。
         #
         # 上游以 `bash --rcfile <临时文件> -i` 启动终端，那个临时 rcfile 的第一行是
@@ -2293,6 +2300,51 @@ object EngineConfig {
             esac
         done
         unset _gd
+
+        # ── PERL5LIB：perl 的 @INC 自愈（缺陷 BD 的第三个出口）──────────────
+        # 与 RUBYLIB 同型：[buildEnv] 里的 PERL5LIB 是**引擎进程启动时**算好的
+        # 快照。而 perl 与 exiftool 都是扩展池里的一项 —— 启动之后才装的扩展，
+        # 其 lib/perl5/site_perl/5.44.0 在算快照时还不存在，于是只固化了
+        # <root>/lib/perl5；之后 `exiftool` 一律报
+        #     Can't locate Image/ExifTool.pm in @INC
+        # 而且**只有重启引擎才会好**（用户感知就是「装了扩展但用不了」）。
+        #
+        # 判据与 [perlLibPath] 一致：版本目录（纯数字与点）与版本目录下的架构
+        # 目录（名字里带连字符）。local::lib 的两条**不看存在性** —— 它们由
+        # 第一次 cpan 创建，按存在性过滤会让「先 export 再 cpan」永远装不上。
+        #
+        # 旧条目逐条并回去，但**已经在算好的列表里就跳过**：这样既保留用户
+        # 自己加的目录，又保证反复 source 不会越滚越长（同一条不会出现两次）。
+        # 不用「前缀是否等于引擎根」来筛：路径形态（软链、大小写、迁移过的
+        # filesDir）都可能不同，按值去重才是稳的；残留的不存在目录 perl 会跳过。
+        if [ -n "${'$'}{KXXY_ENGINE_ROOT:-}" ]; then
+            _pl="${'$'}HOME/.perl5/lib/perl5:${'$'}HOME/.perl5/lib/perl5/aarch64-android"
+            for _base in "${'$'}KXXY_ENGINE_ROOT/lib/perl5" \
+                         "${'$'}KXXY_ENGINE_ROOT"/extensions/*/lib/perl5; do
+                [ -d "${'$'}_base" ] || continue
+                for _r5 in "${'$'}_base" "${'$'}_base/site_perl"; do
+                    [ -d "${'$'}_r5" ] || continue
+                    _pl="${'$'}_pl:${'$'}_r5"
+                    for _v in "${'$'}_r5"/*/; do
+                        _v="${'$'}{_v%/}"
+                        case "${'$'}{_v##*/}" in ''|*[!0-9.]*) continue ;; esac
+                        _pl="${'$'}_pl:${'$'}_v"
+                        for _a in "${'$'}_v"/*/; do
+                            _a="${'$'}{_a%/}"
+                            case "${'$'}{_a##*/}" in *-*) _pl="${'$'}_pl:${'$'}_a" ;; esac
+                        done
+                    done
+                done
+            done
+            for _d in ${'$'}{PERL5LIB//:/ }; do
+                case ":${'$'}_pl:" in
+                    *":${'$'}_d:"*) ;;
+                    *) _pl="${'$'}_pl:${'$'}_d" ;;
+                esac
+            done
+            export PERL5LIB="${'$'}{_pl#:}"
+            unset _pl _base _r5 _v _a _d
+        fi
 
         # ── node-gyp 的 android_ndk_path（原生 addon 编译）──────────────────
         # Termux 的 node 是 android/arm64 构建，它的 common.gypi 无条件引用

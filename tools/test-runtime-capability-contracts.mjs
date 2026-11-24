@@ -16,7 +16,7 @@ const generated = [...pythonDefaultWrappers(), ...hardlinkWrappers(), ...rsyncWr
 
 await test('runtime and native installer share the new patchset contract', () => {
   const marker = (text) => /(?:const|val) PATCHSET_MARKER\s*=\s*"([^"]+)"/.exec(text)?.[1];
-  assert.equal(marker(build), 'kxxy-patchset@39');
+  assert.equal(marker(build), 'kxxy-patchset@40');
   assert.equal(marker(installer), marker(build));
 });
 await test('all independent Python routes have native completeness anchors', () => {
@@ -61,6 +61,21 @@ await test('bundled native wheels exist, match their pinned sha256 and carry and
     assert.equal(createHash('sha256').update(buf).digest('hex'), item.sha256, item.file);
   }
 });
+await test('bundled npm keeps bin/npm offline and is restored as the local cli', async () => {
+  const { untarGz } = await import('./lib/targz.mjs');
+  const tarball = join(project, 'tools/prebuilt/npm/npm-11.21.3.tgz');
+  const names = untarGz(readFileSync(tarball)).map((entry) => entry.path);
+  for (const anchor of ['package/package.json', 'package/bin/npm-cli.js', 'package/bin/npx-cli.js', 'package/lib/cli.js']) {
+    assert.ok(names.includes(anchor), `离线 npm 缺 ${anchor}`);
+  }
+  assert.ok(names.some((name) => name.startsWith('package/node_modules/')), '离线 npm 没带 bundleDependencies');
+  // 构建期必须真的解包进 runtime，而不是只留一个 tarball。
+  assert.ok(build.includes('const bundledNpmInfo = loadBundledNpm();'));
+  assert.ok(build.includes('lib/node_modules/npm/bin/${cli}'), '包装器没有指向本地 npm-cli.js');
+  // 设备端自愈同理：补回来的必须是本地 cli，不能退回 corepack（那要联网）。
+  assert.ok(installer.includes('lib/node_modules/npm/bin/$name-cli.js'));
+});
+
 await test('build-time shell templates are LF (a CRLF shebang fails exec)', async () => {
   const { readdirSync } = await import('node:fs');
   const { normalizeScriptText } = await import('./lib/script-source.mjs');

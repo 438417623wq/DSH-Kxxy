@@ -4,6 +4,15 @@ The shell shims invoke absolute engine/bin/python -I. Only this control program
 runs natively; user Python and pip arguments run unchanged in an already-ready
 Ubuntu rootfs. Host venv shims are overlaid with their saved guest executables
 inside proot, so guest sys.executable/subprocess never re-enter bionic Python.
+
+When the glibc container is not initialized yet (or has no Python), bare
+`python3` / `pip` fall back to the runtime's own bionic interpreter
+(`engine/bin/python3.14`, which ships numpy/scipy/pandas/matplotlib/torch and
+pip). Without that fallback every Python tool died on a device where the user
+had not run `kxxy-glibc-provision python-ml` yet. Set
+KXXY_PYTHON_REQUIRE_GLIBC=1 to keep the old hard-failure behaviour (e.g. CI
+that must assert the container is provisioned). Explicit `--venv` and
+managed glibc venvs never fall back.
 """
 import argparse
 import json
@@ -22,6 +31,7 @@ GUEST_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PRIVATE = Path("libexec/kxxy")
 MARKER = "python-default.json"
 ALIAS = re.compile(r"(?:python(?:3(?:\.\d+)?)?|pip(?:3(?:\.\d+)?)?)\Z")
+NATIVE_PYTHON = re.compile(r"python3(?:\.\d+)+\Z")
 
 
 class DispatchError(Exception):
@@ -78,9 +88,12 @@ def require_ready(root, files, env):
     if not rootfs.is_absolute():
         fail("KXXY_GLIBC_ROOTFS must be an absolute path")
     if not (rootfs / ".kxxy-seed").is_file():
-        fail("glibc rootfs is not ready; install/initialize the glibc extension explicitly, then run kxxy-glibc-provision python-ml if Python is missing (nothing was downloaded)")
+        fail("glibc rootfs is not ready; install/initialize the glibc extension explicitly, then run "
+             "kxxy-glibc-provision python-ml if Python is missing (nothing was downloaded; unset "
+             "KXXY_PYTHON_REQUIRE_GLIBC to use the runtime's native Python instead)")
     if not elf(guest_file(rootfs, "/usr/bin/python3")):
-        fail("glibc Python is missing; run kxxy-glibc-provision python-ml explicitly (no automatic provisioning)")
+        fail("glibc Python is missing; run kxxy-glibc-provision python-ml explicitly (no automatic "
+             "provisioning; unset KXXY_PYTHON_REQUIRE_GLIBC to use the runtime's native Python instead)")
     for path in (root / "bin/proot", root / "libexec/python-default/kxxy-glibc"):
         if not path.is_file() or not os.access(path, os.X_OK):
             fail("missing runtime helper: " + str(path))
@@ -182,6 +195,54 @@ def bionic_elf(path):
     except (OSError, ValueError, struct.error):
         pass
     return False
+
+
+def native_fallback(root, env):
+    """Runtime's own bionic interpreter, used when the glibc guest cannot serve.
+
+    `engine/bin/python3` is a symlink to `python3.14`, so the candidate must be
+    resolved before the regular-file test (lstat on a symlink is not S_ISREG).
+    Refuses to substitute the native interpreter when the caller explicitly
+    demands glibc (KXXY_PYTHON_REQUIRE_GLIBC=1): silently changing interpreter
+    flavour would make "is the container provisioned?" unanswerable.
+    """
+    if env.get("KXXY_PYTHON_REQUIRE_GLIBC") not in (None, "", "0"):
+        return None
+    names = ["python3", "python"]
+    try:
+        # Versioned binaries are the real files (`python`/`python3` are symlinks);
+        # scan them too so a broken relink still leaves a usable interpreter.
+        names += sorted((entry.name for entry in (root / "bin").iterdir()
+                         if NATIVE_PYTHON.fullmatch(entry.name)), reverse=True)
+    except OSError:
+        pass
+    seen = set()
+    for name in names:
+        candidate = root / "bin" / name
+        try:
+            path = candidate.resolve()
+        except OSError:
+            continue
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        if plain_file(path) and os.access(path, os.X_OK) and elf(path):
+            return path
+    return None
+
+
+def fallback_environment(env):
+    """Native interpreter: no glibc/preload leakage, keep the rest of the caller's env."""
+    out = dict(env)
+    for key in list(out):
+        if key.startswith("PYTHON") or key in ("LD_PRELOAD",):
+            out.pop(key, None)
+    return out
+
+
+def fallback_notice(env):
+    """Opt-in stderr note: scripts parse stderr, so the default stays silent."""
+    return env.get("KXXY_PYTHON_FALLBACK_NOTICE") not in (None, "", "0")
 
 
 def selected_python(env):
@@ -445,6 +506,17 @@ def dispatch(root, files, cwd, env, command, arguments, explicit_venv=None, exec
     request = venv_request(python_args)
     if request is not None:
         return create_venvs(root, files, cwd, env, python_args, request, venv)
+    if venv is None:
+        fallback = native_fallback(root, env)
+        if fallback is not None:
+            argv = [str(fallback)] + python_args
+            child_env = fallback_environment(env)
+            if fallback_notice(env):
+                print("kxxy-python: glibc Python is not ready; using the runtime's native Python "
+                      "(run kxxy-glibc-provision python-ml to switch)", file=sys.stderr)
+            if execute:
+                os.execve(argv[0], argv, child_env)
+            return argv, child_env
     argv, child_env = guest_command(root, files, cwd, env, python_args, venv)
     if execute:
         os.chdir(cwd)
