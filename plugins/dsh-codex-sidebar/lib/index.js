@@ -10,18 +10,20 @@ export const name = 'dsh-codex-sidebar'
 export const inject = ['webServer']
 const PREFIX = '/kxxy/codex'
 const MAX_BODY = 800 * 1024
+// Attachments are Base64 inside JSON, so 32 MiB of file needs ~43 MiB of body.
+const MAX_UPLOAD_BODY = 48 * 1024 * 1024
 
 function json(res, status, value) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' })
   res.end(JSON.stringify(value))
 }
 
-async function body(req) {
+async function body(req, limit = MAX_BODY) {
   const parts = []
   let bytes = 0
   for await (const part of req) {
     bytes += part.length
-    if (bytes > MAX_BODY) throw new CodexError('request-too-large', '请求内容超过上限', 413)
+    if (bytes > limit) throw new CodexError('request-too-large', '请求内容超过上限', 413)
     parts.push(part)
   }
   let value
@@ -32,7 +34,7 @@ async function body(req) {
 
 /** A separate same-origin endpoint; no open port and no unauthenticated process API. */
 export function apply(ctx) {
-  const service = new CodexService({ ctx, resolveWorkspace: (id) => workspaceForSession(ctx, id) })
+  const service = new CodexService({ ctx, resolveWorkspace: (id, store) => workspaceForSession(ctx, id, { store }) })
   const nonce = randomBytes(32).toString('hex')
   const streams = new Set()
   const route = ctx.webServer.register({
@@ -56,8 +58,15 @@ export function apply(ctx) {
           json(res, 200, { nonce, ...snapshot })
           return
         }
-        if (req.method === 'GET' && action === '/events') {
-          if (streams.size >= 8) throw new CodexError('stream-limit', '打开的 Codex 观察连接过多', 429)
+        if (req.method === 'GET' && (action === '/workspace/list' || action === '/files')) {
+          await sessionForCodex(ctx, sessionId)
+          const result = action === '/workspace/list'
+            ? await service.workspaceListing(sessionId, url.searchParams.get('path') || null)
+            : await service.workspaceFiles(sessionId, url.searchParams.get('q') || '')
+          json(res, 200, service.sanitize(result))
+          return
+        }
+        if (req.method === 'GET' && action === '/events') {          if (streams.size >= 8) throw new CodexError('stream-limit', '打开的 Codex 观察连接过多', 429)
           await sessionForCodex(ctx, sessionId)
           res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', 'x-accel-buffering': 'no', 'x-content-type-options': 'nosniff' })
           res.flushHeaders?.()
@@ -99,14 +108,21 @@ export function apply(ctx) {
           json(res, failure.status, { error: 'write-rejected', message: failure.error })
           return
         }
-        const input = await body(req)
+        const input = await body(req, action === '/attachments' ? MAX_UPLOAD_BODY : MAX_BODY)
         await sessionForCodex(ctx, input.sessionId)
-        if (!['/connect', '/models/save', '/models/delete', '/models/fetch', '/models/test', '/refresh', '/login', '/login/cancel'].includes(action)) await workspaceForSession(ctx, input.sessionId)
+        if (!['/connect', '/models/save', '/models/save-batch', '/models/delete', '/models/delete-group', '/models/fetch', '/models/test', '/refresh', '/login', '/login/cancel', '/workspace/select', '/workspace/pin'].includes(action)) await workspaceForSession(ctx, input.sessionId, { store: await service.prepareWorkspaceStore() })
         let result
         switch (action) {
+          case '/workspace/select': result = await service.selectWorkspace(input.sessionId, input); break
+          case '/workspace/mkdir': result = await service.createWorkspaceDirectory(input.sessionId, input); break
+          case '/workspace/pin': result = await service.pinWorkspace(input.path, input.pin !== false); break
+          case '/thread/rename': result = await service.renameThread(input.sessionId, input); break
+          case '/thread/delete': result = await service.deleteThread(input.sessionId, input); break
           case '/connect': result = await service.connect(input.consent); break
           case '/models/save': result = await service.saveModel(input); break
+          case '/models/save-batch': result = await service.saveModels(input); break
           case '/models/delete': result = await service.deleteModel(input.id); break
+          case '/models/delete-group': result = await service.deleteModelGroup(input.groupId); break
           case '/environment/check': result = await service.environmentCheck(input.sessionId); break
           case '/models/fetch': result = await service.inspectModel(input, true); break
           case '/models/test': result = await service.inspectModel(input); break
@@ -124,6 +140,7 @@ export function apply(ctx) {
           case '/access/apply': result = await service.applyAccess(input.sessionId, input); break
           case '/changes/preview': result = await service.previewChanges(input.sessionId, input); break
           case '/changes/revert': result = await service.revertChanges(input.sessionId, input); break
+          case '/attachments': result = await service.uploadAttachment(input.sessionId, input); break
           case '/turn': result = await service.send(input.sessionId, input); break
           case '/interrupt': result = await service.interrupt(input.sessionId, input.threadId); break
           case '/approval': result = await service.decide(input.sessionId, input); break

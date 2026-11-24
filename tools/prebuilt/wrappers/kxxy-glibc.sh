@@ -104,14 +104,67 @@ while [ "$COUNT" -gt 0 ]; do
   VALUE="$1"; shift; set -- "$@" "$VALUE"; COUNT="$((COUNT - 1))"
 done
 set -- "$@" -b /dev -b /proc -b /sys
+# Private /dev/shm.
+#
+# Android has no usable /dev/shm: on most devices the name does not exist at
+# all, on some it is a symlink to /dev, and neither is writable by the app.
+# glibc takes /dev/shm as the POSIX shm directory for shm_open()/sem_open(),
+# so without it Python's multiprocessing.SemLock, joblib and sklearn cannot
+# create their locks — joblib just prints `UserWarning: … joblib will operate
+# in serial mode` and every "parallel" run silently runs serially. Binding a
+# real app-private directory gives the guest a writable /dev/shm; glibc >= 2.34
+# (Ubuntu 22.04+) no longer insists on TMPFS_MAGIC there, so a plain ext4 dir
+# is accepted. proot matches guest paths by longest prefix, so this bind wins
+# over the `-b /dev` above while the rest of /dev stays untouched.
+# Kept beside $DATA/tmp and $DATA/etc rather than inside the rootfs: swapping
+# the rootfs must not take live semaphores with it.
+GUEST_SHM="$DATA/shm"
+mkdir -p "$GUEST_SHM" || die "cannot create $GUEST_SHM"
+chmod 1777 "$GUEST_SHM" 2>/dev/null || true
+set -- "$@" -b "$GUEST_SHM:/dev/shm"
 [ ! -d /storage ] || set -- "$@" -b /storage:/storage
 [ ! -d /sdcard ] || set -- "$@" -b /sdcard:/sdcard
 [ ! -d "$FILES" ] || set -- "$@" -b "$FILES:/mnt/kxxy"
-if [ -f /system/etc/resolv.conf ]; then
-  set -- "$@" -b /system/etc/resolv.conf:/etc/resolv.conf
-elif [ -f /etc/resolv.conf ]; then
-  set -- "$@" -b /etc/resolv.conf:/etc/resolv.conf
-fi
+# Guest /etc/resolv.conf and /etc/hosts.
+#
+# Resolution order: the copy the App generated for the *current* network
+# (`$ROOT/etc`, written by RuntimeInstaller.ensureResolvConf) → system →
+# baked fallback. The old code only looked at /system/etc and /etc, neither of
+# which exists on Android, so the guest got no nameserver at all: apt / pip /
+# curl all failed with `Temporary failure resolving`, which reads like "the
+# phone has no network". The file was there the whole time, just under $ROOT.
+GUEST_ETC="$DATA/etc"
+mkdir -p "$GUEST_ETC" || die "cannot create $GUEST_ETC"
+
+# `-s` rather than `-f`: a 0-byte resolv.conf is as useless as a missing one,
+# so keep walking down the list instead of binding an empty file.
+pick() {
+  for f in "$@"; do
+    [ -s "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+RESOLV="$(pick "$ROOT/etc/resolv.conf" /system/etc/resolv.conf /etc/resolv.conf)" || {
+  printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > "$GUEST_ETC/resolv.conf" \
+    || die "cannot write $GUEST_ETC/resolv.conf"
+  RESOLV="$GUEST_ETC/resolv.conf"
+}
+set -- "$@" -b "$RESOLV:/etc/resolv.conf"
+
+# hosts: without `127.0.0.1 localhost` a guest-side `getent hosts localhost`
+# comes back empty and every "talk to my own service" path (java's
+# InetAddress.getLocalHost, curl to 127.0.0.1:port by name) goes out to DNS
+# first. The base image's own copy comes right after ours — when it already
+# has localhost we simply re-bind it onto itself, which keeps any extra
+# entries the image shipped.
+HOSTS="$(pick "$ROOT/etc/hosts" "$ROOTFS/etc/hosts" /system/etc/hosts /etc/hosts)" || {
+  printf '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n' > "$GUEST_ETC/hosts" \
+    || die "cannot write $GUEST_ETC/hosts"
+  HOSTS="$GUEST_ETC/hosts"
+}
+set -- "$@" -b "$HOSTS:/etc/hosts"
+
 set -- "$@" -w "$WD" /usr/bin/env -i "HOME=$GUEST_HOME" "TERM=${TERM:-xterm-256color}" \
   LANG=C.UTF-8 "PATH=$GUEST_PATH" DEBIAN_FRONTEND=noninteractive
 [ -z "$GUEST_VENV" ] || set -- "$@" "VIRTUAL_ENV=$GUEST_VENV"

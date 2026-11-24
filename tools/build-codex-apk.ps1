@@ -42,6 +42,11 @@ if ($meta.codexRuntimeIncluded) {
 } elseif ($NativeApp) { throw 'Native application APK must contain the official CLI' }
 & $env:KXXY_NODE "$project\tools\verify-runtime.mjs" $Runtime
 if ($LASTEXITCODE -ne 0) { throw 'Runtime verification failed; refusing to package' }
+# APK 里那份 glibc 启动器模板必须是当前源码：设备侧自愈只认它（扩展池与 runtime.zip
+# 两条分发路径在升级后的第一次启动上都可能是旧的）。漂移的后果不是构建报错，而是
+# 「装上新 APK 后容器内 DNS 依旧不可用」，所以必须在这里拦住。
+& $env:KXXY_NODE "$project\tools\sync-glibc-route-asset.mjs" --check
+if ($LASTEXITCODE -ne 0) { throw 'APK glibc launcher asset out of sync; run node tools/sync-glibc-route-asset.mjs' }
 if ($meta.pythonRuntimeRevision) {
     & $env:KXXY_NODE "$project\tools\verify-python-repair.mjs" $Runtime "$project\android\app\src\main\assets\python-repair" "$project\android\app\src\main\assets\meta\build.json"
     if ($LASTEXITCODE -ne 0) { throw 'Python offline repair assets do not match the runtime' }

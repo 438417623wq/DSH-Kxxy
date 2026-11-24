@@ -99,3 +99,71 @@ await test('runtime route archive preserves bytes, permission bits and unique pa
   } finally { zip.close(); }
   console.log('Contract-only archive retained: ' + path);
 });
+
+/** 取一个 Kotlin 函数的正文（到下一段 KDoc 之前），供「实现方式」类断言用。 */
+function kotlinFunction(name) {
+  const start = installer.indexOf(`private fun ${name}`);
+  assert.ok(start > 0, `找不到 private fun ${name}`);
+  const next = installer.indexOf('\n    /**', start + 1);
+  return installer.slice(start, next > 0 ? next : installer.length);
+}
+
+/*
+ * APK 里那份启动器模板必须与源码逐字节一致。
+ *
+ * 它是 RuntimeInstaller.healGlibcLaunchers 的唯一权威来源：升级后的第一次启动
+ * 上，扩展池与 runtime.zip 两条分发路径都可能是旧的（时序见该函数注释），
+ * 只有随 APK 走的这份模板一定是新的。模板漂移的后果不是「报错」，而是
+ * 「装上新 APK 后容器内 DNS 依旧不可用」—— 恰好是这轮要修的那个症状，
+ * 所以用测试钉死，而不是靠人记得跑同步脚本。
+ */
+await test('APK ships a byte-identical copy of the glibc launcher template', () => {
+  const source = readFileSync(join(project, 'tools/prebuilt/wrappers/kxxy-glibc.sh'), 'utf8');
+  const asset = readFileSync(join(project, 'android/app/src/main/assets/glibc-route/kxxy-glibc.sh'), 'utf8');
+  assert.equal(asset, source, '资产与源码不一致：跑 node tools/sync-glibc-route-asset.mjs 重新生成');
+  assert.equal(asset.includes('\r'), false, '资产是 CRLF：shebang 会变成 #!/system/bin/sh\\r');
+  assert.ok(asset.includes('GUEST_ETC='), '模板缺 GUEST_ETC=，/etc/resolv.conf 与 /etc/hosts 的挂载会丢');
+  assert.ok(asset.includes('GUEST_SHM='), '模板缺 GUEST_SHM=，容器内 /dev/shm 仍不可用（joblib 会退回串行）');
+  assert.ok(asset.includes('"$GUEST_SHM:/dev/shm"'), '模板没有把私有 shm 目录绑到 /dev/shm');
+  assert.ok(installer.includes('"glibc-route/kxxy-glibc.sh"'));
+  assert.ok(installer.includes('"extensions/glibc/bin/kxxy-glibc"'));
+  assert.ok(installer.includes('"libexec/python-default/kxxy-glibc"'));
+});
+
+await test('glibc launcher heal covers both device copies from the APK asset', () => {
+  const heal = kotlinFunction('healGlibcLaunchers');
+  // 两份都要覆盖：裸 python3 走 runtime 那份，kxxy-glibc-provision 走扩展那份
+  assert.ok(heal.includes('GLIBC_LAUNCHER_EXTENSION'), heal);
+  assert.ok(heal.includes('PYTHON_ROUTE_SCRIPT'), heal);
+  // 不再拿扩展那份当捐赠者：升级首启时它还是旧的（时序倒挂）
+  assert.equal(heal.includes('donor'), false, '扩展那份不能当捐赠者');
+  assert.ok(kotlinFunction('glibcLauncherTemplate').includes('GLIBC_LAUNCHER_ASSET'));
+  /*
+   * 判据必须逐字节比，不能是「含某个特征串」。
+   *
+   * v0.9.82 用的是 `GUEST_ETC=` 特征串，结果 v0.9.83 的 `/dev/shm` 修复到了
+   * 已升级设备上会被判「已最新」跳过 —— 症状是「升了 APK，joblib 还是串行」。
+   * 钉死这一条，避免下一个人再往「加个 mark」的方向改。
+   */
+  assert.ok(heal.includes('contentEquals'), '自愈判据要逐字节比对，不能只看特征串');
+});
+
+/*
+ * JVM 启动器壳不能用 `$0` 推同目录。
+ *
+ * PATH 上的 `<root>/bin/java` 是指向 `lib/jvm/<jdk>/bin/java` 的软链，经软链
+ * 调用时 `$0` 是软链路径，`${0%/*}` 得到 `<root>/bin`，壳会去找
+ * `<root>/bin/java.real`（不存在）—— 症状是 java / d8 / apksigner 一起失效。
+ */
+await test('JVM launcher shell locates its real binary by absolute path, not $0', () => {
+  const body = kotlinFunction('jvmWrapperScript');
+  assert.ok(body.includes('realPath: String'), body);
+  assert.equal(body.includes('${0%/*}'), false, '壳不能按 $0 推同目录');
+  assert.equal(body.includes('${0##*/}'), false, '壳不能按 $0 取文件名');
+  const call = installer.slice(
+    installer.indexOf('val data = jvmWrapperScript'),
+    installer.indexOf('\n', installer.indexOf('val data = jvmWrapperScript')),
+  );
+  assert.ok(call.includes('real.absolutePath'), call);
+});
+

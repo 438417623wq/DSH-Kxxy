@@ -5,7 +5,8 @@ export const MAX_OUTPUT_CHARS = 262144
 const MAX_TOOL_CALLS = 40
 const MAX_ARGUMENT_CHARS = 512 * 1024
 const TOOL_NAME = /^[\w-]{1,100}$/
-const CALL_ID = /^[\w-]{1,200}$/
+// Some OpenAI-compatible servers emit call ids that contain ':' or '.', e.g. "call_0:1".
+const CALL_ID = /^[\w.:-]{1,200}$/
 const object = (value) => !!value && typeof value === 'object' && !Array.isArray(value)
 const clone = (value) => structuredClone(value)
 const fault = (message, code = 'model-response') => providerError(code, message, { status: code.endsWith('-limit') ? 413 : 502 })
@@ -14,7 +15,47 @@ function contentText(value) {
   if (typeof value === 'string') return value
   if (value == null) return ''
   if (!Array.isArray(value)) throw fault('模型消息内容格式不正确')
-  return value.map((part) => ['text', 'output_text', 'input_text'].includes(part?.type) ? typeof part.text === 'string' ? part.text : '' : '').join('')
+  return value.map((part) => imageBlock(part) ? '' : ['text', 'output_text', 'input_text'].includes(part?.type) ? typeof part.text === 'string' ? part.text : '' : '').join('')
+}
+const IMAGE_MIME = /^image\/(?:png|jpeg|webp|gif)$/
+/**
+ * Images travel as protocol-neutral `{ type: 'image', mime, data }` blocks; every format below
+ * maps that one shape onto its own encoding. Anything else in the array is rejected so a
+ * malformed part fails before the request is spent.
+ */
+function imageBlock(part) {
+  if (!object(part) || part.type !== 'image') return null
+  if (typeof part.mime !== 'string' || !IMAGE_MIME.test(part.mime) || typeof part.data !== 'string' || !part.data) throw fault('模型消息图片格式不正确')
+  return part
+}
+const dataUrl = (block) => `data:${block.mime};base64,${block.data}`
+function chatContent(parts) {
+  return parts.map((part) => {
+    const image = imageBlock(part)
+    if (image) return { type: 'image_url', image_url: { url: dataUrl(image) } }
+    if (part?.type === 'text') return { type: 'text', text: typeof part.text === 'string' ? part.text : '' }
+    throw fault('模型消息内容格式不正确')
+  })
+}
+function anthropicContent(value) {
+  if (typeof value === 'string') return value ? [{ type: 'text', text: value }] : []
+  if (!Array.isArray(value)) throw fault('模型消息内容格式不正确')
+  const blocks = []
+  for (const part of value) {
+    const image = imageBlock(part)
+    if (image) blocks.push({ type: 'image', source: { type: 'base64', media_type: image.mime, data: image.data } })
+    else if (part?.type === 'text') { if (part.text) blocks.push({ type: 'text', text: String(part.text) }) }
+    else throw fault('模型消息内容格式不正确')
+  }
+  return blocks
+}
+function responsesContent(parts) {
+  return parts.map((part) => {
+    const image = imageBlock(part)
+    if (image) return { type: 'input_image', image_url: dataUrl(image) }
+    if (part?.type === 'text') return { type: 'input_text', text: typeof part.text === 'string' ? part.text : '' }
+    throw fault('模型消息内容格式不正确')
+  })
 }
 function replay(message, format) {
   const value = message.provider_replay
@@ -24,7 +65,7 @@ function replay(message, format) {
 }
 function chatMessages(messages, compat) {
   return messages.map((message) => {
-    const result = { role: ['system', 'developer'].includes(message.role) ? compat.systemRole : message.role, content: message.content ?? '' }
+    const result = { role: ['system', 'developer'].includes(message.role) ? compat.systemRole : message.role, content: Array.isArray(message.content) ? chatContent(message.content) : message.content ?? '' }
     if (message.role === 'tool') result.tool_call_id = message.tool_call_id
     if (message.role === 'assistant') {
       if (message.tool_calls?.length) result.tool_calls = clone(message.tool_calls)
@@ -43,7 +84,8 @@ function responsesInput(messages, compat) {
       if (!Array.isArray(output)) throw fault('Responses 回放数据格式不正确')
       input.push(...clone(output))
     } else {
-      if (message.content || !message.tool_calls?.length) input.push({ role: ['system', 'developer'].includes(message.role) ? compat.systemRole : message.role, content: message.content ?? '' })
+      const content = Array.isArray(message.content) ? responsesContent(message.content) : message.content ?? ''
+      if (content || !message.tool_calls?.length) input.push({ role: ['system', 'developer'].includes(message.role) ? compat.systemRole : message.role, content })
       for (const call of message.tool_calls ?? []) input.push({ type: 'function_call', call_id: call.id, name: call.function.name, arguments: call.function.arguments })
     }
   }
@@ -64,8 +106,7 @@ function anthropicInput(messages) {
       if (!Array.isArray(saved.content) || saved.content.some((block) => !object(block) || !['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block.type) || block.type === 'thinking' && (typeof block.thinking !== 'string' || typeof block.signature !== 'string' || !block.signature))) throw fault('Anthropic 回放数据格式不正确')
       add('assistant', clone(saved.content)); continue
     }
-    const text = contentText(message.content)
-    const blocks = text ? [{ type: 'text', text }] : []
+    const blocks = anthropicContent(message.content)
     for (const call of message.tool_calls ?? []) {
       let input
       try { input = JSON.parse(call.function.arguments) } catch { throw fault('历史工具参数不是完整 JSON') }
@@ -222,7 +263,8 @@ function usageOf(value, format, previous = {}) {
     ? { inputTokens: value.prompt_tokens, outputTokens: value.completion_tokens, totalTokens: value.total_tokens, cachedInputTokens: value.prompt_tokens_details?.cached_tokens, reasoningTokens: value.completion_tokens_details?.reasoning_tokens }
     : { inputTokens: value.input_tokens, outputTokens: value.output_tokens, totalTokens: value.total_tokens, cachedInputTokens: value.input_tokens_details?.cached_tokens ?? value.cache_read_input_tokens, reasoningTokens: value.output_tokens_details?.reasoning_tokens }
   const result = { ...previous }
-  for (const [key, item] of Object.entries(mapping)) if (item !== undefined) {
+  // Servers that omit a counter as often send an explicit null; treat both as "not reported".
+  for (const [key, item] of Object.entries(mapping)) if (item !== undefined && item !== null) {
     if (!Number.isSafeInteger(item) || item < 0) throw fault('模型 token 用量格式不正确')
     result[key] = item
   }
@@ -230,6 +272,8 @@ function usageOf(value, format, previous = {}) {
   return result
 }
 
+// parallelToolCalls only shapes the outgoing payload; the collector accepts any number of
+// calls per reply because the agent loop always executes them sequentially.
 export function createProtocolCollector({ model, definitions, choice, parallelToolCalls = false, onDelta = () => {}, onReasoningDelta = () => {}, onToolCallDelta = () => {} }) {
   const format = model.apiFormat
   let text = '', reasoningContent = '', terminal = false, finishReason = null, usage = {}, sawEvent = false, stopped = false
@@ -252,6 +296,18 @@ export function createProtocolCollector({ model, definitions, choice, parallelTo
     if (!Number.isSafeInteger(value) || value < 0) throw fault('模型输出索引格式不正确')
     return value
   }
+  const declared = [...definitions.keys()]
+  /**
+   * vLLM/SGLang style servers resend the whole function name on every chunk, sometimes
+   * cumulatively. Declared tool names are the authority: pick whichever candidate is still a
+   * prefix of a real tool instead of blindly concatenating (which produced "read_fileread_file").
+   */
+  const mergeName = (current, incoming) => {
+    if (!current) return incoming
+    if (incoming === current) return current
+    const match = [current + incoming, incoming].find((name) => declared.some((tool) => tool.startsWith(name)))
+    return match ?? current + incoming
+  }
   const collect = (index, value, replace = false) => {
     indexOf(index)
     if (!definitions.size || choice === 'none') throw fault('此请求不允许工具调用')
@@ -259,12 +315,14 @@ export function createProtocolCollector({ model, definitions, choice, parallelTo
     const call = calls.get(index) ?? { id: '', name: '', arguments: '', ordinal: calls.size }
     const delta = { index: call.ordinal }
     for (const field of ['id', 'name', 'arguments']) {
-      if (value[field] === undefined) continue
+      // OpenAI-compatible servers commonly send explicit nulls for fields this chunk omits.
+      if (value[field] === undefined || value[field] === null) continue
       if (typeof value[field] !== 'string') throw fault('模型工具调用格式不正确')
       if (replace) {
         if (call[field] && value[field] !== call[field] && !value[field].startsWith(call[field])) throw fault('模型最终工具调用与流式增量不一致')
-        call[field] = value[field]
+        call[field] = field === 'name' ? mergeName(call[field], value[field]) : value[field]
       } else if (field === 'id' && value[field] === call[field]) { /* Some servers repeat the stable id. */ }
+      else if (field === 'name') call[field] = mergeName(call[field], value[field])
       else call[field] += value[field]
       if (field === 'arguments') delta[replace ? 'arguments' : 'argumentsDelta'] = value[field]
       else delta[field] = call[field]
@@ -316,9 +374,12 @@ export function createProtocolCollector({ model, definitions, choice, parallelTo
     terminal = true; finishReason = calls.size ? 'tool_calls' : 'stop'; stopped = true
   }
   const chatTerminal = (reason) => {
-    if (!['stop', 'tool_calls'].includes(reason)) throw fault(reason === 'length' ? '模型回复被服务截断，请调整输出上限后重试' : '模型服务未返回完整回复')
-    if (calls.size && reason !== 'tool_calls' || !calls.size && reason === 'tool_calls') throw fault('工具调用与模型结束原因不一致')
-    terminal = true; finishReason = reason
+    // Several OpenAI-compatible servers report 'stop' even though the message carries complete
+    // tool calls; treat that as 'tool_calls' instead of failing an otherwise usable reply.
+    const actual = reason === 'stop' && calls.size ? 'tool_calls' : reason
+    if (!['stop', 'tool_calls'].includes(actual)) throw fault(actual === 'length' ? '模型回复被服务截断，请调整输出上限后重试' : '模型服务未返回完整回复')
+    if (!calls.size && actual === 'tool_calls') throw fault('工具调用与模型结束原因不一致')
+    terminal = true; finishReason = actual
   }
   const anthropicStop = (reason) => {
     if (!['end_turn', 'stop_sequence', 'tool_use'].includes(reason)) throw fault(reason === 'max_tokens' ? '模型回复被服务截断，请调整输出上限后重试' : '模型服务未返回完整回复')
@@ -348,11 +409,11 @@ export function createProtocolCollector({ model, definitions, choice, parallelTo
       if (!Array.isArray(value.choices) || value.choices.length !== 1 || !object(value.choices[0].message)) throw fault('Chat Completions 消息格式不正确')
       const entry = value.choices[0], message = entry.message
       addText(contentText(message.content)); addText(message.reasoning_content ?? message.reasoning, true)
-      if (entry.type === 'function_call' || message.function_call !== undefined) throw fault('旧版 function_call 不受支持，请使用 tool_calls', 'model-unsupported')
-      if (message.tool_calls !== undefined && !Array.isArray(message.tool_calls)) throw fault('工具调用列表格式不正确')
+      if (entry.type === 'function_call' || message.function_call != null) throw fault('旧版 function_call 不受支持，请使用 tool_calls', 'model-unsupported')
+      if (message.tool_calls != null && !Array.isArray(message.tool_calls)) throw fault('工具调用列表格式不正确')
       for (const [index, call] of (message.tool_calls ?? []).entries()) {
-        if (call.type !== 'function') throw fault('不支持的工具调用类型')
-        collect(index, { id: call.id, name: call.function?.name, arguments: call.function?.arguments }, true)
+        if (call?.type && call.type !== 'function') throw fault('不支持的工具调用类型')
+        collect(call?.index ?? index, { id: call?.id, name: call?.function?.name, arguments: call?.function?.arguments }, true)
       }
       chatTerminal(entry.finish_reason)
       usage = usageOf(value.usage, format, usage); stopped = true
@@ -422,11 +483,14 @@ export function createProtocolCollector({ model, definitions, choice, parallelTo
         const delta = entry.delta ?? {}
         if (terminal && (delta.content || delta.reasoning_content || delta.reasoning || delta.tool_calls?.length || entry.finish_reason)) throw fault('模型成功终态后仍返回内容')
         addText(contentText(delta.content)); addText(delta.reasoning_content ?? delta.reasoning, true)
-        if (delta.function_call !== undefined) throw fault('旧版 function_call 不受支持，请使用 tool_calls', 'model-unsupported')
-        if (delta.tool_calls !== undefined && !Array.isArray(delta.tool_calls)) throw fault('工具调用增量格式不正确')
-        for (const call of delta.tool_calls ?? []) {
-          if (call.type && call.type !== 'function') throw fault('不支持的工具调用类型')
-          collect(call.index, { id: call.id, name: call.function?.name, arguments: call.function?.arguments })
+        if (delta.function_call != null) throw fault('旧版 function_call 不受支持，请使用 tool_calls', 'model-unsupported')
+        if (delta.tool_calls != null && !Array.isArray(delta.tool_calls)) throw fault('工具调用增量格式不正确')
+        for (const [position, call] of (delta.tool_calls ?? []).entries()) {
+          if (call?.type && call.type !== 'function') throw fault('不支持的工具调用类型')
+          // A single-call delta may omit its index; multi-call deltas must identify themselves.
+          const index = call?.index ?? (delta.tool_calls.length === 1 ? 0 : undefined)
+          if (index === undefined) throw fault('工具调用增量缺少索引')
+          collect(index, { id: call?.id, name: call?.function?.name, arguments: call?.function?.arguments })
         }
         if (entry.finish_reason != null) chatTerminal(entry.finish_reason)
       }
@@ -436,19 +500,23 @@ export function createProtocolCollector({ model, definitions, choice, parallelTo
   }
   const finish = ({ streamed }) => {
     if (!terminal || streamed && !sawEvent) throw fault('模型流式连接提前结束，未收到完整成功终态')
-    if (!parallelToolCalls && calls.size > 1) throw fault('此请求不允许并行工具调用')
+    // The caller executes tool calls strictly one after another, so a server that ignores
+    // parallel_tool_calls:false must not lose an otherwise valid reply. Keep the sequential
+    // order and the unique-id/limit checks instead of failing the whole turn.
     const toolCalls = [], completedDeltas = []
     const ids = new Set()
     for (const [index, call] of [...calls].sort(([a], [b]) => a - b)) {
       if (!CALL_ID.test(call.id) || !TOOL_NAME.test(call.name) || ids.has(call.id) || !definitions.has(call.name)) throw fault('模型工具调用缺少有效且唯一的标识或已声明名称')
       if (object(choice) && call.name !== choice.function.name) throw fault('模型未调用指定的工具')
+      // Argument-less tools legitimately arrive as an empty string on some servers.
+      const rawArguments = call.arguments.trim() ? call.arguments : '{}'
       let args
-      try { args = JSON.parse(call.arguments) } catch { throw fault('模型工具参数不是完整 JSON 对象') }
+      try { args = JSON.parse(rawArguments) } catch { throw fault('模型工具参数不是完整 JSON 对象') }
       if (!object(args) || !schemaMatches(args, definitions.get(call.name))) throw fault('模型工具参数不符合已声明的 JSON schema')
       ids.add(call.id)
-      toolCalls.push({ id: call.id, name: call.name, arguments: call.arguments })
+      toolCalls.push({ id: call.id, name: call.name, arguments: rawArguments })
       if (format === 'anthropic-messages') blocks.get(index).value.input = args
-      completedDeltas.push({ index: call.ordinal, id: call.id, name: call.name, arguments: call.arguments, done: true })
+      completedDeltas.push({ index: call.ordinal, id: call.id, name: call.name, arguments: rawArguments, done: true })
     }
     if ((choice === 'required' || object(choice)) && !toolCalls.length) throw fault('模型未按要求返回工具调用')
     if (!text && !toolCalls.length) throw fault('模型没有返回文字回复或有效工具调用', 'model-empty')

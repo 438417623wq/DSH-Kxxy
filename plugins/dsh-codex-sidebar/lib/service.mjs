@@ -1,19 +1,65 @@
-import { mkdir, readFile, writeFile, rename, realpath, unlink } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, readFile, writeFile, rename, realpath, unlink, stat } from 'node:fs/promises'
+import { join, dirname, isAbsolute, basename, resolve } from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
 import { CodexError, CodexTransport, redact } from './transport.mjs'
-import { runtimePaths, childEnvironment, probeRuntime, probeNativeApp, contextFile, CHAT_UNAVAILABLE } from './security.mjs'
+import { runtimePaths, childEnvironment, probeRuntime, probeNativeApp, contextFile, saveAttachment, CHAT_UNAVAILABLE } from './security.mjs'
+import { WorkspaceStore, listWorkspace, breadcrumbs, workspaceRoots, checkDirectoryName, canonicalWorkspace, deniedWorkspace, projectMarkers } from './workspace-state.mjs'
 import { CustomModels, modelRevision, credentialRevision, providerSecrets } from './custom-models.mjs'
 import { providerConfiguration, fetchProviderModels, testProviderModel } from './provider-api.mjs'
 import { ResponsesBridge } from './responses-bridge.mjs'
-import { streamCustomChat, conversationMessages, validateMessages, MAX_HISTORY_BYTES, MAX_OUTPUT_CHARS } from './custom-chat.mjs'
-import { WORKSPACE_TOOLS, readOnlyTools, WorkspaceTools, workspaceEnvironment, checkWorkspaceEnvironment } from './workspace-tools.mjs'
+import { streamCustomChat, conversationMessages, validateMessages, recordInterruptedTurn, MAX_HISTORY_BYTES, MAX_OUTPUT_CHARS } from './custom-chat.mjs'
+import { WORKSPACE_TOOLS, readOnlyTools, WorkspaceTools, workspaceEnvironment, checkWorkspaceEnvironment, findWorkspaceFiles } from './workspace-tools.mjs'
 import { AccessPolicy } from './access-policy.mjs'
 import { FileChanges } from './file-changes.mjs'
 import { runMessageAction } from './thread-actions.mjs'
 import { nativeProviderParameters, nativeExecutionParameters } from './native-models.mjs'
 
 const APPROVAL_METHODS = new Set(['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'])
+const GRANT_WRITE = 'write'
+const GRANT_READONLY_COMMANDS = 'readonly-commands'
+const MAX_TOOL_ROUNDS = 25
+const MAX_TOOL_CALLS = 60
+const MAX_CONTEXT_FILES = 10
+
+/** Text attachments are inlined; binary ones are referenced by path only. */
+function attachmentContext(context, { inlineImages = false } = {}) {
+  let text = ''
+  for (const file of context) {
+    const path = JSON.stringify(file.path)
+    if (file.image && inlineImages) text += `\n\n<workspace-image path=${path} mime=${JSON.stringify(file.image.mime)} bytes=${file.size}>\n[图片已作为图像输入随本条消息发送，同时保存在工作区；后续轮次如需重看，请用工具按此路径读取。]\n</workspace-image>`
+    else if (file.image) text += `\n\n<workspace-image path=${path} bytes=${file.size}>\n[图片已保存在工作区，当前引擎不支持内联图像，请用工具按此路径读取。]\n</workspace-image>`
+    else if (file.binary) text += `\n\n<workspace-attachment path=${path} bytes=${file.size}>\n[二进制附件，内容未注入上下文；需要时请用工具按此路径读取。]\n</workspace-attachment>`
+    else if (file.truncated) text += `\n\n<workspace-file path=${path} truncated="128KiB" bytes=${file.size}>\n${file.text}\n</workspace-file>\n[以上只包含文件开头部分，完整内容请用工具按路径读取。]`
+    else text += `\n\n<workspace-file path=${path}>\n${file.text}\n</workspace-file>`
+  }
+  return text
+}
+/**
+ * The picked images belong to this turn's user message. They are never persisted: provider
+ * history keeps the path note so a long conversation cannot grow by tens of megabytes.
+ */
+function inlineUserImages(messages, text, context) {
+  const images = context.filter((file) => file.image)
+  if (!images.length) return []
+  const last = messages.at(-1)
+  if (last?.role !== 'user' || last.content !== text) return []
+  messages[messages.length - 1] = {
+    role: 'user',
+    content: [{ type: 'text', text }, ...images.map((file) => ({ type: 'image', mime: file.image.mime, data: file.image.data }))],
+  }
+  return images.map((file) => ({ type: 'image', path: file.path, mime: file.image.mime, bytes: file.size }))
+}
+// Deliberately narrow: only commands whose primary effect is reading. Anything else needs a
+// per-command approval even after the session grant; the grant is never persisted.
+const READONLY_COMMANDS = [
+  /^(?:git\s+(?:status|diff|log|show|branch(?:\s+-[av])?|remote(?:\s+-v)?|stash\s+list|rev-parse|describe|ls-files|blame)\b[^\n;&|<>]*)$/i,
+  /^(?:ls|pwd|cat|head|tail|wc|file|stat|du|df|rg|grep|find|tree|uname|whoami|date)(?:\s[^\n;&|<>]*)?$/i,
+  /^(?:node|python3?|npm|pnpm|yarn)\s+(?:--version|-v|ls|list|test|run\s+(?:test|lint|typecheck|check))\b[^\n;&|<>]*$/i,
+]
+export function readonlyCommand(command) {  const text = typeof command === 'string' ? command.trim() : ''
+  if (!text || text.length > 4096 || /[\n\r`$]/.test(text)) return false
+  return READONLY_COMMANDS.some((pattern) => pattern.test(text))
+}
 const EVENTS = new Set([
   'thread/started', 'thread/status/changed', 'turn/started', 'turn/completed',
   'item/started', 'item/completed', 'item/agentMessage/delta', 'item/reasoning/summaryTextDelta',
@@ -117,6 +163,43 @@ export class CodexService {
     this.activeAccess = new Map()
     this.messageActions = new Map()
     this.undoViews = new Map()
+    this.workspaces = null
+    this.workspaceWarning = null
+    this.grants = new Map()
+  }
+
+  /** Preferences are optional; a broken file degrades to "follow the DSH session" and never blocks tools. */
+  async prepareWorkspaceStore() {
+    this.paths ??= runtimePaths(this.env, { requireExecutable: false })
+    if (!this.workspaces) {
+      try {
+        this.workspaces = new WorkspaceStore(this.paths.home, { env: this.env })
+        await this.workspaces.load()
+        if (this.workspaces.warning) this.workspaceWarning = this.workspaces.warning
+      } catch (error) {
+        this.workspaces = null
+        this.workspaceWarning = `工作区偏好不可用：${redact(error.message)}`
+      }
+    }
+    return this.workspaces
+  }
+
+  async workspaceOf(sessionId) {
+    const store = await this.prepareWorkspaceStore()
+    return this.resolveWorkspace(sessionId, store)
+  }
+
+  /** Phone-side files land inside the workspace so tools can read them afterwards. */
+  async uploadAttachment(sessionId, input) {
+    const cwd = await this.workspaceOf(sessionId)
+    // The preview is only used while injecting the prompt; never echo it back over HTTP.
+    const { text: preview, ...result } = await saveAttachment(cwd, input)
+    return result
+  }
+
+  async sessionDefaultWorkspace(sessionId) {
+    // The default is whatever DSH reports, independent of the sidebar override.
+    return this.resolveWorkspace(sessionId, null)
   }
 
   async load() {
@@ -351,6 +434,61 @@ export class CodexService {
     return result
   }
 
+  /** Batch save: one provider connection, many selected models, one atomic write. */
+  async saveModels(input) {
+    this.paths ??= runtimePaths(this.env, { requireExecutable: false })
+    this.customModels ??= new CustomModels(this.paths.home)
+    await this.customModels.load()
+    const result = await this.customModels.saveBatch(input)
+    for (const entry of result.saved) {
+      this.rememberProvider(this.customModels.get(entry.id))
+      this.modelVersions.set(entry.id, randomUUID())
+      this.modelDiagnostics.delete(entry.id)
+      this.forgetThreadCredentials(entry.id)
+    }
+    for (const id of result.removedIds) {
+      this.forgetThreadCredentials(id)
+      for (const [scope, bridge] of this.bridgeBindings) if (bridge.providerId === id) {
+        this.bridge?.revoke(bridge.bindingId)
+        this.bridgeBindings.delete(scope)
+      }
+      this.modelVersions.delete(id)
+      this.modelDiagnostics.delete(id)
+    }
+    this.publish()
+    return this.sanitize({
+      groupId: result.groupId,
+      saved: result.saved.map((entry) => this.modelView(entry)),
+      removedIds: result.removedIds,
+    })
+  }
+
+  async deleteModelGroup(groupId) {
+    this.paths ??= runtimePaths(this.env, { requireExecutable: false })
+    this.customModels ??= new CustomModels(this.paths.home)
+    await this.customModels.load()
+    const result = await this.customModels.deleteGroup(groupId)
+    for (const id of result.removedIds) {
+      this.forgetThreadCredentials(id)
+      for (const [scope, bridge] of this.bridgeBindings) if (bridge.providerId === id) {
+        this.bridge?.revoke(bridge.bindingId)
+        this.bridgeBindings.delete(scope)
+      }
+      this.modelVersions.delete(id)
+      this.modelDiagnostics.delete(id)
+    }
+    this.publish()
+    return { ...result, removedIds: result.removedIds }
+  }
+
+  /** Editing or removing a provider must drop any one-shot grant that relied on it. */
+  forgetThreadCredentials(providerId) {
+    for (const binding of this.bindings.values()) if (binding.providerId === providerId) {
+      this.revokeAccess(binding.id)
+      this.loadedThreads.delete(binding.id)
+    }
+  }
+
   async inspectModel(input, discovery = false) {
     if (this.disposed) throw new CodexError('disposed', '插件已停用', 503)
     this.paths ??= runtimePaths(this.env, { requireExecutable: false })
@@ -406,8 +544,8 @@ export class CodexService {
   async snapshot(sessionId) {
     let cwd = null
     let workspaceError = null
-    try { cwd = await this.resolveWorkspace(sessionId) } catch (error) {
-      if (!['workspace-unavailable', 'workspace-invalid'].includes(error.code)) throw error
+    try { cwd = await this.workspaceOf(sessionId) } catch (error) {
+      if (!['workspace-unavailable', 'workspace-invalid', 'workspace-denied'].includes(error.code)) throw error
       workspaceError = error.message
     }
     const environment = cwd ? (() => {
@@ -416,20 +554,33 @@ export class CodexService {
     })() : null
     let historyError = null
     try { await this.load() } catch (error) { historyError = error.message }
-    const bindings = [...this.bindings.values()].filter((entry) => cwd && entry.sessionId === sessionId && entry.cwd === cwd)
+    const store = this.workspaces
+    const override = store?.override?.(sessionId) ?? null
+    let sessionDefault = null
+    try { sessionDefault = await this.sessionDefaultWorkspace(sessionId) } catch { /* The DSH session may have no cwd. */ }
+    const all = [...this.bindings.values()].filter((entry) => entry.sessionId === sessionId)
+    const bindings = all.filter((entry) => cwd && entry.cwd === cwd)
     const ids = new Set(bindings.map((entry) => entry.id))
-    for (const binding of this.bindings.values()) if (binding.sessionId === sessionId && binding.cwd !== cwd) {
+    for (const binding of all) if (binding.cwd !== cwd) {
       this.revokeAccess(binding.id)
       this.loadedThreads.delete(binding.id)
     }
     const threads = await Promise.all([...this.threads.values()].filter((thread) => ids.has(thread.id)).map(async (thread) => {
       const binding = this.bindings.get(thread.id)
       const turns = await Promise.all((thread.turns ?? []).map(async (turn) => ({ ...turn, ...(turn.metadata ? {} : binding.turnMetadata?.[turn.id] ? { metadata: binding.turnMetadata[turn.id] } : {}), undo: await this.turnUndo(binding, turn) })))
-      return { ...thread, turns, model: binding.model, mode: binding.mode, source: binding.source ?? 'native', engine: binding.engine ?? 'workspace', approvalPolicy: binding.approvalPolicy ?? 'untrusted', permissionMode: binding.permissionMode ?? environment.permissionMode, environment: { ...environment, toolsMode: binding.mode, executionMode: binding.executionMode, permissionMode: binding.permissionMode ?? environment.permissionMode, sandboxVerified: binding.engine === 'native' ? false : undefined }, pending: this.running.has(thread.id), access: this.accessView(binding), capabilities: this.threadCapabilities(binding) }
+      return { ...thread, turns, model: binding.model, mode: binding.mode, source: binding.source ?? 'native', engine: binding.engine ?? 'workspace', approvalPolicy: binding.approvalPolicy ?? 'untrusted', permissionMode: binding.permissionMode ?? environment.permissionMode, environment: { ...environment, toolsMode: binding.mode, executionMode: binding.executionMode, permissionMode: binding.permissionMode ?? environment.permissionMode, sandboxVerified: binding.engine === 'native' ? false : undefined }, pending: this.running.has(thread.id), access: this.accessView(binding), capabilities: this.threadCapabilities(binding), grants: this.grantsFor(thread.id) }
     }))
+    const workspace = {
+      cwd, override: Boolean(override && override === cwd), sessionDefault,
+      name: cwd ? basename(cwd) || cwd : null, parent: cwd ? dirname(cwd) : null,
+      roots: workspaceRoots(this.env),
+      recent: (store?.recent?.() ?? []).filter((entry) => entry !== cwd).slice(0, 6),
+      pinned: (store?.pinned?.() ?? []).filter((entry) => entry !== cwd).slice(0, 8),
+      warning: this.workspaceWarning,
+    }
     return this.sanitize({
-      ...this.status(), cwd, environment, historyError, workspaceError,
-      history: bindings.sort((a, b) => b.updatedAt - a.updatedAt),
+      ...this.status(), cwd, environment, historyError, workspaceError, workspace,
+      history: all.sort((a, b) => b.updatedAt - a.updatedAt).map((entry) => ({ ...entry, workspaceName: basename(entry.cwd) || entry.cwd, active: entry.cwd === cwd })),
       threads,
       approvals: [...this.approvals.values()].filter((entry) => ids.has(entry.threadId)).map(({ timer, requestId, resolveApproval, abortHandler, ...view }) => view),
     })
@@ -439,7 +590,7 @@ export class CodexService {
     await this.load()
     const binding = this.bindings.get(threadId)
     if (!binding || binding.sessionId !== sessionId) throw new CodexError('thread-forbidden', '该 Codex 会话不属于当前 DSH 会话', 403)
-    const cwd = await this.resolveWorkspace(sessionId)
+    const cwd = await this.workspaceOf(sessionId)
     if (cwd !== binding.cwd) {
       this.revokeAccess(binding.id)
       this.loadedThreads.delete(binding.id)
@@ -450,7 +601,9 @@ export class CodexService {
 
   revokeAccess(threadId) {
     const ids = threadId ? [threadId] : [...this.bindings.keys()]
+    if (threadId === undefined) this.grants.clear()
     for (const id of ids) {
+      this.grants.delete(id)
       this.accessEpochs.set(id, (this.accessEpochs.get(id) ?? 0) + 1)
       if (this.activeAccess.get(id) === 'full') {
         this.customControllers.get(id)?.abort(new Error('access-revoked'))
@@ -465,8 +618,21 @@ export class CodexService {
     this.fileChanges?.invalidate(threadId)
   }
 
-  accessView(binding) {
-    const native = binding.engine === 'native'
+  /** Session-scoped, in-memory grants; revoked by reconnect, workspace change, model change and delete. */
+  grantsFor(threadId) {
+    const value = this.grants.get(threadId) ?? {}
+    return { write: value[GRANT_WRITE] === true, readonlyCommands: value[GRANT_READONLY_COMMANDS] === true }
+  }
+
+  setGrant(threadId, kind) {
+    if (![GRANT_WRITE, GRANT_READONLY_COMMANDS].includes(kind)) return null
+    if (!this.grants.has(threadId) && this.grants.size >= 128) this.grants.delete(this.grants.keys().next().value)
+    const next = { ...(this.grants.get(threadId) ?? {}), [kind]: true }
+    this.grants.set(threadId, next)
+    return this.grantsFor(threadId)
+  }
+
+  accessView(binding) {    const native = binding.engine === 'native'
     const editable = binding.source === 'custom' && binding.mode === 'agent'
     return { mode: this.accessPolicy.mode(binding, this.transportGeneration), supportsReadOnly: editable, supportsFull: editable || native && this.health.nativeApp?.available === true, scope: 'thread', ...(native ? { reason: '原生只读沙箱尚未验证；完全访问仅代表 Android 应用权限。' } : binding.mode === 'chat' ? { reason: '此对话没有文件或命令工具。' } : {}) }
   }
@@ -575,24 +741,148 @@ export class CodexService {
 
   turnMetadata(binding, effort = binding.effort, startedAt = Date.now()) {
     const entry = this.customModels?.get(binding.model) || this.models.find((model) => model.id === binding.model)
-    return { model: entry?.model ?? binding.model, modelLabel: entry?.name || entry?.displayName || entry?.model || binding.model, effort: effort || '', engine: binding.engine || 'workspace', access: this.accessPolicy.mode(binding, this.transportGeneration), startedAt }
+    return { model: entry?.model ?? binding.model, modelLabel: entry?.name || entry?.displayName || entry?.model || binding.model, ...(entry?.apiFormat ? { apiFormat: entry.apiFormat } : {}), effort: effort || '', engine: binding.engine || 'workspace', access: this.accessPolicy.mode(binding, this.transportGeneration), startedAt }
   }
 
   async environmentCheck(sessionId) {
     if (this.disposed) throw new CodexError('disposed', '插件已停用', 503)
-    const cwd = await this.resolveWorkspace(sessionId)
-    if (this.disposed) throw new CodexError('disposed', '插件已停用', 503)
+    // Reserve the slot synchronously so concurrent callers cannot both pass the limit check
+    // while the (now multi-step) workspace resolution is still pending.
     if (this.environmentChecks.has(sessionId) || this.environmentChecks.size >= 2) throw new CodexError('environment-busy', '环境检查正在进行，请稍后再试', 429)
     const controller = new AbortController()
     const record = { controller, completion: null }
     this.environmentChecks.set(sessionId, record)
     const timer = setTimeout(() => controller.abort(new Error('timeout')), 30000)
     timer.unref?.()
-    record.completion = checkWorkspaceEnvironment({ cwd, env: this.env, signal: controller.signal })
-    try { return await record.completion } finally {
+    try {
+      const cwd = await this.workspaceOf(sessionId)
+      if (this.disposed) throw new CodexError('disposed', '插件已停用', 503)
+      record.completion = checkWorkspaceEnvironment({ cwd, env: this.env, signal: controller.signal })
+      return await record.completion
+    } finally {
       clearTimeout(timer)
       this.environmentChecks.delete(sessionId)
     }
+  }
+
+  async workspaceEntry(path) {
+    const canonical = await canonicalWorkspace(path, { env: this.env, label: '目录' })
+    const markers = await projectMarkers(canonical)
+    return { name: basename(canonical) || canonical, path: canonical, isProject: markers.length > 0, projectMarkers: markers, pinned: this.workspaces?.isPinned?.(canonical) === true }
+  }
+
+  /** One read-only call backs the drawer: current workspace, shortcuts, recents, pins and one directory level. */
+  async workspaceListing(sessionId, path = null) {
+    if (this.disposed) throw new CodexError('disposed', '插件已停用', 503)
+    const store = await this.prepareWorkspaceStore()
+    const current = await this.workspaceOf(sessionId)
+    let sessionDefault = null
+    try { sessionDefault = await this.sessionDefaultWorkspace(sessionId) } catch { /* No DSH workspace configured. */ }
+    const listing = await listWorkspace({ path: path || current, env: this.env })
+    const describe = async (value) => {
+      try { return await this.workspaceEntry(value) } catch { return null }
+    }
+    const recent = (await Promise.all((store?.recent() ?? []).slice(0, 8).map(describe))).filter(Boolean)
+    const pinned = (await Promise.all((store?.pinned() ?? []).slice(0, 12).map(describe))).filter(Boolean)
+    const roots = workspaceRoots(this.env)
+    const shortcuts = []
+    if (sessionDefault) shortcuts.push({ id: 'default', label: '会话默认目录', path: sessionDefault, current: sessionDefault === current })
+    for (const root of roots) shortcuts.push({ id: root.id, label: root.label, path: root.path, current: root.path === current })
+    return this.sanitize({
+      current, sessionDefault, override: Boolean(store?.override?.(sessionId) && store.override(sessionId) === current),
+      path: listing.path, name: listing.name, parent: listing.parent, breadcrumbs: breadcrumbs(listing.path, this.env),
+      shortcuts, recent, pinned, entries: listing.entries, truncated: listing.truncated, warning: this.workspaceWarning,
+    })
+  }
+
+  /** Switching the sidebar workspace never touches the DSH session itself and never keeps a grant alive. */
+  async selectWorkspace(sessionId, { path, reset = false, pin = false } = {}) {
+    await this.load()
+    if (this.disposed) throw new CodexError('disposed', '插件已停用', 503)
+    const store = await this.prepareWorkspaceStore()
+    if (!store) throw new CodexError('workspace-state', '工作区偏好不可用，暂不能独立切换目录', 503)
+    const busy = [...this.bindings.values()].filter((binding) => binding.sessionId === sessionId).some((binding) => this.running.has(binding.id) || this.preparing.has(binding.id) || this.actionLocks.has(binding.id) || this.threads.get(binding.id)?.turns?.some((turn) => turn.status === 'inProgress'))
+    if (busy) throw new CodexError('busy', '会话正在执行，请先停止任务再切换工作区', 409)
+    let cwd
+    if (reset) {
+      await store.clearOverride(sessionId)
+      cwd = await this.sessionDefaultWorkspace(sessionId)
+    } else {
+      if (typeof path !== 'string' || !path) throw new CodexError('workspace-invalid', '请选择要使用的工作区目录', 400)
+      cwd = await canonicalWorkspace(path, { env: this.env })
+      await store.setOverride(sessionId, cwd)
+      if (pin) await store.pin(cwd)
+    }
+    for (const binding of this.bindings.values()) if (binding.sessionId === sessionId) {
+      this.revokeAccess(binding.id)
+      this.loadedThreads.delete(binding.id)
+    }
+    this.publish()
+    return this.sanitize({ cwd, sessionDefault: await this.sessionDefaultWorkspace(sessionId).catch(() => null), override: !reset, pinned: pin ? store.pinned() : undefined })
+  }
+
+  async pinWorkspace(path, pin = true) {
+    const store = await this.prepareWorkspaceStore()
+    if (!store) throw new CodexError('workspace-state', '工作区偏好不可用', 503)
+    const cwd = await canonicalWorkspace(path, { env: this.env, label: '收藏目录' })
+    if (pin) await store.pin(cwd)
+    else await store.unpin(cwd)
+    this.publish()
+    return this.sanitize({ path: cwd, pinned: store.isPinned(cwd), pinnedList: store.pinned() })
+  }
+
+  async createWorkspaceDirectory(sessionId, { parentPath, name } = {}) {
+    await this.prepareWorkspaceStore()
+    const cwd = await this.workspaceOf(sessionId)
+    const parent = parentPath ? await canonicalWorkspace(parentPath, { env: this.env, label: '父目录' }) : cwd
+    const safe = checkDirectoryName(name)
+    const target = join(parent, safe)
+    try {
+      await mkdir(target, { recursive: false, mode: 0o755 })
+    } catch (error) {
+      if (error.code === 'EEXIST') throw new CodexError('workspace-exists', '同名目录已存在', 409)
+      throw new CodexError(error.code === 'EACCES' || error.code === 'EPERM' ? 'workspace-forbidden' : 'workspace-write', '无法在此目录新建文件夹', error.code === 'EACCES' || error.code === 'EPERM' ? 403 : 500)
+    }
+    this.publish()
+    return this.sanitize({ path: target, parent, name: safe })
+  }
+
+  async workspaceFiles(sessionId, query = '') {
+    const cwd = await this.workspaceOf(sessionId)
+    if (typeof query !== 'string' || query.length > 256 || query.includes('\0')) throw new CodexError('arguments-invalid', '搜索关键词无效', 400)
+    return this.sanitize(await findWorkspaceFiles({ cwd, query, env: this.env }))
+  }
+
+  async renameThread(sessionId, { threadId, title } = {}) {
+    const binding = await this.bound(sessionId, threadId)
+    const text = typeof title === 'string' ? title.trim() : ''
+    if (!text || text.length > 80 || /[\u0000-\u001f\u007f]/.test(text)) throw new CodexError('title-invalid', '标题需为 1–80 个可见字符', 400)
+    binding.title = text
+    binding.updatedAt = Date.now()
+    await this.save()
+    this.publish()
+    return { ok: true, threadId, title: text }
+  }
+
+  /** Removes the sidebar entry only; the on-disk workspace and files are untouched. */
+  async deleteThread(sessionId, { threadId } = {}) {
+    const binding = await this.bound(sessionId, threadId)
+    this.assertIdle(binding)
+    this.clearApprovals(threadId, false)
+    this.revokeAccess(threadId)
+    const scope = binding.bridgeScope || binding.id
+    const bridge = this.bridgeBindings.get(scope)
+    if (bridge) { this.bridge?.revoke(bridge.bindingId); this.bridgeBindings.delete(scope) }
+    this.bindings.delete(threadId)
+    this.threads.delete(threadId)
+    this.loadedThreads.delete(threadId)
+    this.reservedThreads.delete(threadId)
+    this.actionLocks.delete(threadId)
+    this.grants.delete(threadId)
+    this.undoViews.clear()
+    await this.save()
+    this.publish()
+    return { ok: true, threadId }
   }
 
   parameters(modelId, effort, mode) {
@@ -614,6 +904,31 @@ export class CodexService {
     if (binding && (binding.providerId !== model.id || binding.providerRevision !== modelRevision(model))) throw new CodexError('model-change', '模型、URL 或接口类型已改变，请新建对话，避免将历史消息发送到其他模型服务', 409)
     // Copy the provider so editing or deleting settings cannot redirect an accepted request.
     return { ...model }
+  }
+
+  /**
+   * In-conversation model switching. Only same-engine workspace models can be swapped
+   * mid-thread: the history is plain text for every HTTP provider, while native CLI
+   * threads carry provider-private state and still require a new conversation.
+   */
+  switchableProvider(binding, modelId, mode) {
+    if (this.disposed) throw new CodexError('disposed', '插件已停用', 503)
+    if (!['chat', 'agent'].includes(mode)) throw new CodexError('mode-invalid', '请选择智能体或对话模式')
+    if (binding.mode !== mode) throw new CodexError('mode-change', '切换工作模式需要新建对话', 409)
+    if (binding.source !== 'custom' || binding.replyOnly) throw new CodexError('model-change', '此对话不能切换到其他模型，请新建对话', 409)
+    if ((binding.engine ?? 'workspace') !== 'workspace') throw new CodexError('engine-change', '原生 Codex CLI 对话需要新建对话才能换模型', 409)
+    const model = this.customModels?.get(modelId)
+    if (!model) throw new CodexError('model-missing', '此自定义模型已被删除，请在设置中添加模型', 404)
+    if ((model.engine ?? 'workspace') !== 'workspace') throw new CodexError('engine-change', '切换到原生 Codex CLI 需要新建对话', 409)
+    return { ...model }
+  }
+
+  /** Binds a different provider to an existing conversation and drops stale one-shot grants. */
+  adoptProvider(binding, provider) {
+    Object.assign(binding, { model: provider.id, providerId: provider.id, providerRevision: modelRevision(provider) })
+    this.revokeAccess(binding.id)
+    this.loadedThreads.delete(binding.id)
+    return provider
   }
 
   async nativeParameters(modelId, effort, mode, binding = null, approvalPolicy = 'untrusted', bridgeScope = binding?.bridgeScope || binding?.id) {
@@ -684,7 +999,7 @@ export class CodexService {
   async createCustom(sessionId, { model, effort, mode, continueFrom }, { reservation = null } = {}) {
     const provider = this.customParameters(model, mode)
     const selectedEffort = this.providerEffort(provider, effort)
-    const cwd = await this.resolveWorkspace(sessionId)
+    const cwd = await this.workspaceOf(sessionId)
     let inherited = [], source = null
     if (continueFrom !== undefined) {
       requireString(continueFrom, '原对话标识', 200)
@@ -729,7 +1044,10 @@ export class CodexService {
   }
 
   sendCustom(binding, input, key, { contextSuffix = '', preparedMessages = null } = {}) {
-    const provider = this.customParameters(input.model, input.mode, binding)
+    const providerChanged = !!input.model && input.model !== binding.model
+    const provider = providerChanged
+      ? this.adoptProvider(binding, this.switchableProvider(binding, input.model, input.mode))
+      : this.customParameters(input.model, input.mode, binding)
     const selectedEffort = this.providerEffort(provider, input.effort, binding)
     const accessMode = this.accessPolicy.mode(binding, this.transportGeneration)
     const accessEpoch = this.accessEpochs.get(binding.id) ?? 0
@@ -741,7 +1059,7 @@ export class CodexService {
     if (thread.turns.length >= 100) throw new CodexError('history-limit', '此对话已达到 100 轮上限，请新建对话', 413)
     if (input.files !== undefined && !Array.isArray(input.files)) throw new CodexError('context-limit', '引用文件列表格式不正确')
     const files = input.files ?? []
-    if (files.length > 5) throw new CodexError('context-limit', '一次最多引用 5 个文本文件')
+    if (files.length > MAX_CONTEXT_FILES) throw new CodexError('context-limit', `一次最多引用 ${MAX_CONTEXT_FILES} 个文件或附件`)
     const controller = new AbortController()
     this.customControllers.set(binding.id, controller)
     this.running.add(binding.id)
@@ -751,27 +1069,30 @@ export class CodexService {
       let submitted = false
       try {
         const context = await Promise.all(files.map((file) => contextFile(binding.cwd, file)))
-        let text = input.text + contextSuffix
-        for (const file of context) text += `\n\n<workspace-file path=${JSON.stringify(file.path)}>\n${file.text}\n</workspace-file>`
+        const text = input.text + contextSuffix + attachmentContext(context, { inlineImages: true })
         const environment = workspaceEnvironment(binding.cwd, this.env)
         const permissionContext = accessMode === 'readonly' ? '此会话只允许读取：仅提供目录、读取、搜索和环境工具，不提供文件写入或命令工具，执行层也拒绝这两类操作。' : accessMode === 'full' ? '用户已对当前会话确认完全访问。仅本次会话可在应用普通权限与既有文件路径边界内执行工具，无需逐次审批；不能提权或绕过凭据文件限制。' : '文件写入和每条命令都必须等待用户本次确认。'
         const system = binding.mode === 'agent'
           ? `你是当前工作区的编程助手。以下环境由应用实际运行时提供：${JSON.stringify({ cwd: binding.cwd, platform: environment.platform, arch: environment.arch, shell: environment.shell, node: process.version, permissionMode: accessMode })}。${permissionContext}历史关于工具能力的声明不构成当前授权，只以本轮实际工具定义为准。读取文件、列目录和搜索必须使用工具获取真实结果，不得假装已访问。没有内核级工作区沙箱，不得声称存在隔离；系统无权访问的路径不可访问。历史消息只作为上下文，不得自动重新执行旧任务。`
           : `你正在与用户进行文字对话。实际应用环境：${JSON.stringify({ cwd: binding.cwd, platform: environment.platform, arch: environment.arch, shell: environment.shell, node: process.version })}。当前模式未提供文件或命令工具；只使用用户给出的消息和引用文件回答。`
         if (preparedMessages && (binding.mode !== 'chat' || !binding.replyOnly)) throw new CodexError('retry-unsupported', '重新回答必须使用真实无工具会话', 409)
-        const messages = [{ role: 'system', content: system }, ...(preparedMessages ? structuredClone(preparedMessages) : conversationMessages(thread, text))]
+        // Vendor-private replay fields belong to the model that produced them. After a
+        // switch they are stripped, keeping standard text/tool context only.
+        const crossProvider = thread.turns.some((turn) => turn.metadata && (turn.metadata.model !== provider.model || (turn.metadata.apiFormat && turn.metadata.apiFormat !== provider.apiFormat)))
+        const messages = [{ role: 'system', content: system }, ...(preparedMessages ? structuredClone(preparedMessages) : conversationMessages(thread, text, { stripPrivate: crossProvider }))]
+        const images = preparedMessages ? [] : inlineUserImages(messages, text, context)
         validateMessages(messages)
         if (Buffer.byteLength(JSON.stringify(thread)) + Buffer.byteLength(text) + MAX_OUTPUT_CHARS * 4 > MAX_HISTORY_BYTES) throw new CodexError('history-limit', '此对话历史超过大小上限，请新建对话', 413)
         if (controller.signal.aborted) throw new CodexError('model-cancelled', '模型请求已停止', 409)
         const turnId = randomUUID()
         const agent = { id: randomUUID(), type: 'agentMessage', text: '' }
-        const turn = { id: turnId, status: 'inProgress', metadata: this.turnMetadata(binding, selectedEffort), providerMessages: preparedMessages ? structuredClone(preparedMessages) : [{ role: 'user', content: text }], items: [{ id: randomUUID(), type: 'userMessage', content: [{ type: 'text', text: input.text }], providerText: text }, agent] }
+        const turn = { id: turnId, status: 'inProgress', metadata: this.turnMetadata(binding, selectedEffort), providerMessages: preparedMessages ? structuredClone(preparedMessages) : [{ role: 'user', content: text }], items: [{ id: randomUUID(), type: 'userMessage', content: [{ type: 'text', text: input.text }], providerText: text, ...(images.length ? { images } : {}) }, agent] }
         const record = { id: input.requestId, outcome: 'accepted', turnId, at: Date.now() }
         const previous = { title: binding.title, updatedAt: binding.updatedAt, effort: binding.effort }
         binding.requests ??= []
         binding.requests.push(record)
         if (binding.requests.length > 500) binding.requests.shift()
-        Object.assign(binding, { title: input.text.slice(0, 60), updatedAt: Date.now(), effort: selectedEffort })
+        Object.assign(binding, { title: binding.title && binding.title !== '新对话' ? binding.title : input.text.slice(0, 60), updatedAt: Date.now(), effort: selectedEffort })
         thread.turns.push(turn)
         thread.status = { type: 'active' }
         try { await this.save() } catch (error) {
@@ -815,6 +1136,12 @@ export class CodexService {
     try {
       const journal = binding.mode === 'agent' && accessMode !== 'readonly' ? (await this.changes()).adapter({ binding, turnId: turn.id, signal: controller.signal, secrets: providerSecrets(provider) }) : null
       const tools = new WorkspaceTools({ cwd: binding.cwd, env: this.env, signal: controller.signal, secrets: providerSecrets(provider), accessMode, journal,
+        preApproved: (operation) => {
+          const grants = this.grants.get(binding.id) ?? {}
+          if (operation.kind === 'fileChange') return grants[GRANT_WRITE] === true
+          if (operation.kind === 'commandExecution') return grants[GRANT_READONLY_COMMANDS] === true && readonlyCommand(operation.command)
+          return false
+        },
         approve: (operation) => this.askCustomApproval(binding, turn, currentItemId, operation, controller.signal),
         onItem: (item) => {
           const index = turn.items.findIndex((entry) => entry.id === item.id)
@@ -823,7 +1150,7 @@ export class CodexService {
           this.publish()
         },
       })
-      for (let round = 0; round < 12; round += 1) {
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
         if (controller.signal.aborted) throw new CodexError('model-cancelled', '模型请求已停止', 409)
         if (round) { agent = { id: randomUUID(), type: 'agentMessage', text: '' }; turn.items.push(agent) }
         let reasoning = null
@@ -848,7 +1175,7 @@ export class CodexService {
         messages.push(assistant)
         turn.providerMessages.push(assistant)
         if (!response.toolCalls.length) break
-        if (round === 11 || toolCount + response.toolCalls.length > 40) throw new CodexError('model-tools-limit', '本轮智能体已达到工具调用上限，请发送新消息继续', 413)
+        if (round === MAX_TOOL_ROUNDS - 1 || toolCount + response.toolCalls.length > MAX_TOOL_CALLS) throw new CodexError('model-tools-limit', '本轮智能体已达到工具调用上限，请发送新消息继续', 413)
         for (const call of response.toolCalls) {
           if (controller.signal.aborted) throw new CodexError('model-cancelled', '模型请求已停止', 409)
           await this.bound(binding.sessionId, binding.id)
@@ -883,6 +1210,8 @@ export class CodexService {
       record.outcome = 'completed'
     } catch (error) {
       turn.status = controller.signal.aborted && controller.signal.reason?.message !== 'timeout' || error.code === 'model-cancelled' ? 'interrupted' : 'failed'
+      // Keep the partial answer of the stopped round so the next message can continue from it.
+      recordInterruptedTurn(turn, agent)
       turn.error = controller.signal.aborted
         ? { code: controller.signal.reason?.message === 'timeout' ? 'model-timeout' : 'model-cancelled', message: controller.signal.reason?.message === 'timeout' ? '智能体任务超时，已停止；不会自动重新执行工具。' : '模型请求已停止' }
         : { code: error.code ?? 'model-network', message: error instanceof CodexError ? error.message : '模型请求失败，请检查服务状态' }
@@ -912,7 +1241,7 @@ export class CodexService {
       if (continueFrom !== undefined) throw new CodexError('continuation-invalid', '原生 Codex 需要新建独立线程', 409)
       const bridgeScope = randomUUID()
       const parameters = await this.nativeParameters(model, effort, mode, null, approvalPolicy, bridgeScope)
-      const cwd = await this.resolveWorkspace(sessionId)
+      const cwd = await this.workspaceOf(sessionId)
       if (parameters.source === 'native' && this.account?.requiresAuth && !this.account.loggedIn) throw new CodexError('login-required', '请先完成 Codex 登录', 401)
       const { effort: selectedEffort, providerId, providerRevision, credentialRevision: credentials, source, ...start } = parameters
       const generation = this.transportGeneration
@@ -941,7 +1270,7 @@ export class CodexService {
     if (this.customModels.get(model)) return this.createCustom(sessionId, { model, effort, mode, continueFrom }, { reservation })
     if (continueFrom !== undefined) throw new CodexError('continuation-invalid', '仅支持将自定义模型的对话继续为工作区助手', 409)
     const parameters = this.parameters(model, effort, mode)
-    const cwd = await this.resolveWorkspace(sessionId)
+    const cwd = await this.workspaceOf(sessionId)
     if (this.account?.requiresAuth && !this.account.loggedIn) throw new CodexError('login-required', '请先完成 Codex 登录', 401)
     const { effort: unused, ...start } = parameters
     const result = await this.rpc().request('thread/start', { ...start, cwd })
@@ -1060,10 +1389,9 @@ export class CodexService {
           ? { type: 'dangerFullAccess' }
           : { type: 'workspaceWrite', writableRoots: [binding.cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true }
         const files = Array.isArray(input.files) ? input.files : []
-        if (files.length > 5) throw new CodexError('context-limit', '一次最多引用 5 个文本文件')
+        if (files.length > MAX_CONTEXT_FILES) throw new CodexError('context-limit', `一次最多引用 ${MAX_CONTEXT_FILES} 个文件或附件`)
         const context = await Promise.all(files.map((file) => contextFile(binding.cwd, file)))
-        let text = input.text
-        for (const file of context) text += `\n\n<workspace-file path=${JSON.stringify(file.path)}>\n${file.text}\n</workspace-file>`
+        const text = input.text + attachmentContext(context)
         if (!this.loadedThread(binding, credentials)) {
           const resumed = await this.resumeNative(binding, binding.engine === 'native' ? parameters : null)
           if (resumed.status?.type === 'active' || resumed.turns.some((turn) => turn.status === 'inProgress')) throw new CodexError('busy', '恢复的会话仍在运行，请先等待或停止', 409)
@@ -1102,7 +1430,7 @@ export class CodexService {
         const record = binding.requests.find((entry) => entry.id === input.requestId)
         if (record) { record.turnId = result.turn.id; record.outcome = 'accepted' }
         if (this.threads.get(binding.id).turns.find((turn) => turn.id === result.turn.id)?.status !== 'inProgress') this.running.delete(binding.id)
-        Object.assign(binding, { title: input.text.slice(0, 60), model: input.model, updatedAt: Date.now() })
+        Object.assign(binding, { title: binding.title && binding.title !== '新对话' ? binding.title : input.text.slice(0, 60), model: input.model, updatedAt: Date.now() })
         if (input.effort) binding.effort = input.effort
         await this.save()
         this.publish()
@@ -1185,7 +1513,7 @@ export class CodexService {
   }
 
   askCustomApproval(binding, turn, itemId, operation, signal) {
-    if (signal.aborted || turn.status !== 'inProgress' || !this.running.has(binding.id)) return Promise.resolve(false)
+    if (signal.aborted || turn.status !== 'inProgress' || !this.running.has(binding.id)) return Promise.resolve({ allowed: false })
     const id = randomUUID()
     return new Promise((resolve) => {
       let settled = false
@@ -1194,17 +1522,20 @@ export class CodexService {
         itemId: operation.itemId ?? itemId, command: operation.command ?? null, cwd: operation.cwd ?? binding.cwd,
         path: operation.path ?? null, diff: operation.diff ?? null,
         expectedHash: operation.expectedHash ?? null,
+        readonlyCommand: operation.kind === 'commandExecution' && readonlyCommand(operation.command),
+        grants: this.grantsFor(binding.id),
         reason: operation.kind === 'commandExecution' ? '此命令将在应用普通权限下运行，请确认命令及目录。' : '请确认本次文件变更。确认后将重新检查文件，避免覆盖已修改内容。',
         createdAt: Date.now(),
       }
-      entry.resolveApproval = (approved) => {
+      entry.resolveApproval = (decision, note) => {
         if (settled) return
         settled = true
         clearTimeout(entry.timer)
         signal.removeEventListener('abort', entry.abortHandler)
         this.approvals.delete(id)
         this.publish()
-        resolve(approved)
+        const allowed = decision === true || decision === 'accept'
+        resolve({ allowed, ...(typeof note === 'string' && note.trim() ? { note: note.trim().slice(0, 2000) } : {}) })
       }
       entry.abortHandler = () => entry.resolveApproval(false)
       entry.timer = setTimeout(() => entry.resolveApproval(false), 5 * 60 * 1000)
@@ -1216,15 +1547,23 @@ export class CodexService {
     })
   }
 
-  async decide(sessionId, { approvalId, decision }) {
+  async decide(sessionId, { approvalId, decision, note, grant } = {}) {
     if (!['accept', 'decline', 'cancel'].includes(decision)) throw new CodexError('decision-invalid', '只支持本次允许、拒绝或取消')
     const entry = this.approvals.get(approvalId)
     if (!entry) throw new CodexError('approval-expired', '审批已过期或已处理', 409)
     await this.bound(sessionId, entry.threadId)
     if (this.approvals.get(approvalId) !== entry || this.threads.get(entry.threadId)?.turns?.find((turn) => turn.id === entry.turnId)?.status !== 'inProgress') throw new CodexError('approval-expired', '该轮操作已结束或审批已被处理', 409)
+    if (typeof note === 'string' && (note.length > 2000 || note.includes('\0'))) throw new CodexError('approval-note', '审批意见过长或包含无效字符', 400)
     if (entry.source === 'custom') {
-      entry.resolveApproval(decision === 'accept')
-      return { ok: true }
+      const allowed = decision === 'accept'
+      let grants = this.grantsFor(entry.threadId)
+      if (allowed && grant) {
+        const valid = grant === GRANT_WRITE && entry.kind === 'fileChange' || grant === GRANT_READONLY_COMMANDS && entry.kind === 'commandExecution' && entry.readonlyCommand
+        if (!valid) throw new CodexError('grant-invalid', '本次操作不符合会话放行的条件', 409)
+        grants = this.setGrant(entry.threadId, grant)
+      }
+      entry.resolveApproval(allowed, allowed ? '' : note)
+      return { ok: true, grants }
     }
     const native = this.bindings.get(entry.threadId)?.engine === 'native'
     if (native ? this.health.nativeApp?.available !== true : !this.health.agent) {

@@ -6,6 +6,8 @@ export const AUTH_TYPES = Object.freeze(['bearer', 'x-api-key', 'api-key', 'none
 export const PROVIDER_PROFILES = Object.freeze(['standard', 'deepseek', 'local', 'anthropic'])
 const CONTROL = /[\u0000-\u001f\u007f]/
 const MAX_TOKENS = 1048576
+// Public metadata exposes a derived id for legacy entries, so both forms are accepted.
+const GROUP_ID = /^(?:group-[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}|derived-[\da-f]{8,32})$/i
 const HEADER_NAME = /^[!#$%&'*+.^_`|~\da-z-]{1,128}$/i
 const FORBIDDEN_HEADERS = new Set(['host', 'content-length', 'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-connection', 'expect', 'content-type', 'accept', 'accept-encoding', 'origin', 'referer'])
 const CREDENTIAL_HEADER = /(?:authorization|authentication|cookie|(?:^|[-_])(?:auth|token|secret|password|credential|apikey|api[-_]key|access[-_]key|subscription[-_]key|key)(?:$|[-_]))/i
@@ -86,6 +88,19 @@ function normalizeCompat(input, base, format) {
   return result
 }
 
+/**
+ * Every model entry belongs to one provider connection (a "group"). Old stores have no
+ * group fields, so they fall back to a stable hash of the connection identity: the same
+ * endpoint, protocol and engine always lands in the same card without a migration.
+ */
+export function derivedGroupId(model) {
+  return `derived-${hash([model.baseUrl, model.apiFormat ?? 'chat-completions', model.engine ?? 'workspace']).slice(0, 16)}`
+}
+
+export function groupIdOf(model) {
+  return model?.groupId || derivedGroupId(model)
+}
+
 /** The only configuration validator, shared by save, discovery, probes and generation. */
 export function normalizeProvider(input, { existing = null, requireModel = true, requireName = false } = {}) {
   if (!plain(input)) fail('model-input', '模型设置必须是对象')
@@ -113,6 +128,18 @@ export function normalizeProvider(input, { existing = null, requireModel = true,
   const maxOutputTokens = integer(field('maxOutputTokens', null), '输出 token 上限')
   const thinkingBudget = integer(field('thinkingBudget', null), '思考预算', 1024)
   if (thinkingBudget !== null && maxOutputTokens !== null && thinkingBudget >= maxOutputTokens) fail('model-tokens', '思考预算必须小于输出 token 上限')
+  // Grouping is cosmetic: it never joins the revision hash, so renaming a provider or
+  // moving an entry between cards cannot invalidate an existing conversation.
+  let groupId = existing?.groupId
+  if (has(input, 'groupId')) {
+    if (input.groupId === null || input.groupId === '') groupId = undefined
+    else if (typeof input.groupId !== 'string' || !GROUP_ID.test(input.groupId)) fail('model-group', '服务商分组标识格式不正确')
+    else groupId = input.groupId
+  }
+  let groupName = existing?.groupName
+  if (has(input, 'groupName')) {
+    groupName = typeof input.groupName === 'string' && input.groupName.trim() ? text(input.groupName, '服务商名称', 60) : undefined
+  }
   const value = {
     ...(existing?.id || input.id ? { id: existing?.id ?? input.id } : {}),
     ...(requireName || has(input, 'name') || existing?.name ? { name: text(field('name'), '模型名称', 100) } : {}),
@@ -120,6 +147,7 @@ export function normalizeProvider(input, { existing = null, requireModel = true,
     baseUrl, apiFormat, engine, apiKey, authType, profile, compat,
     headers: privateObject(field('headers', {}), 'headers'), query: privateObject(field('query', {}), 'query'),
     reasoningEfforts: [...efforts], reasoningEffort, maxOutputTokens, thinkingBudget,
+    ...(groupId ? { groupId } : {}), ...(groupName ? { groupName } : {}),
   }
   providerUrl(value) // Reject mismatching explicit endpoints before saving or sending.
   return value
@@ -202,6 +230,7 @@ export function providerMetadata(model) {
   const compat = resolvedCompat(model)
   return {
     id, name: redactProviderText(name ?? model.model, model), model: redactProviderText(model.model, model), baseUrl: redactProviderText(model.baseUrl, model),
+    groupId: groupIdOf(model), groupName: redactProviderText(model.groupName ?? '', model),
     apiFormat, engine, profile, authType: model.authType ?? (apiFormat === 'anthropic-messages' ? 'x-api-key' : 'bearer'),
     hasApiKey: !!model.apiKey, hasHeaders: !!Object.keys(model.headers ?? {}).length, hasQuery: !!Object.keys(model.query ?? {}).length,
     headerNames: Object.keys(model.headers ?? {}).sort(), queryNames: Object.keys(model.query ?? {}).sort(),

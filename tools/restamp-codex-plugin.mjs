@@ -257,6 +257,19 @@ async function main() {
   const entryCount = entries.length - stale.length + additions.length
   if (entryCount > MAX_ZIP_ENTRIES) throw new Error('新增插件条目会超过有界 ZIP64 计数上限')
   if (additions.length) console.log(`新增 ${additions.length} 个插件条目`)
+
+  // 根清单里的 `entries` 是**重封后**的条目总数。`verify-python-repair.mjs` 用它
+  // 断言 `kxxy-runtime.json` 与 zip 实际条目数一致 —— 新增插件文件后不跟着改就会
+  // 在出包时被判「runtime 根清单与修复合同不一致」。
+  if (manifest.entries !== entryCount) {
+    const previousEntries = manifest.entries
+    manifest.entries = entryCount
+    files.set('kxxy-runtime.json', {
+      data: Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8'),
+      mode: 0o644,
+    })
+    console.log(`manifest entries：${previousEntries} → ${entryCount}`)
+  }
   if (opts.checkOnly) {
     closeSync(fd)
     console.log('--check-only：结构可增量重封，未写出任何文件')

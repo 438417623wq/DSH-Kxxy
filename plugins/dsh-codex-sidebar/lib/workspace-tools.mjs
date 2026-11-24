@@ -12,6 +12,8 @@ const RESULT_BYTES = 64 * 1024
 const OUTPUT_BYTES = 128 * 1024
 const SEARCH_ENTRIES = 2000
 const SEARCH_FILES = 500
+const COMMAND_TIMEOUT_MAX = 180000
+const CONTEXT_LINES = 3
 const SECRET_NAME = /^(?:\.env(?:\..*)?|auth(?:\..*)?|credentials.*|secrets?(?:\..*)?|sidebar-models\.json|codex-change-journal|\.codex(?:-sidebar)?|\.npmrc|\.netrc|\.git-credentials|\.ssh|\.gnupg|id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?|.*\.(?:pem|key|p12|pfx))$/i
 const SKIP_DIRECTORY = new Set(['.git', 'node_modules', '.cache', '.codex', '.codex-sidebar'])
 const ENV_KEYS = [
@@ -42,24 +44,37 @@ function definition(name, description, properties, required = []) {
 export const WORKSPACE_TOOLS = [
   definition('get_environment', 'Report the actual workspace, host platform, architecture, shell, Node.js version and available workspace capabilities. Account credentials and environment variables are never returned.', {}),
   definition('list_directory', 'List up to 200 entries in a workspace directory. Credential files are excluded.', { path: pathProperty }),
-  definition('read_file', 'Read a workspace text file of at most 128 KiB. Results are bounded; use character offset to continue a truncated read.', {
+  definition('read_file', 'Read a workspace text file of at most 128 KiB. Results are bounded; use offset/limit (characters) or startLine/endLine (1-based lines, numbered output) to page through it.', {
     path: pathProperty, offset: { type: 'integer', minimum: 0, description: 'UTF-16 character offset, default 0.' },
     limit: { type: 'integer', minimum: 1, maximum: 49152, description: 'Maximum characters to return, default 49152.' },
+    startLine: { type: 'integer', minimum: 1, maximum: 200000, description: 'First line to return (1-based). When set, the text is prefixed with line numbers.' },
+    endLine: { type: 'integer', minimum: 1, maximum: 200000, description: 'Last line to return (inclusive). Defaults to the remaining file within the size budget.' },
   }, ['path']),
-  definition('search_files', 'Find literal text in bounded workspace files. Skips credentials, binary files, .git and node_modules. Optional glob supports *, ** and ?.', {
+  definition('search_files', 'Find text inside bounded workspace files. Skips credentials, binary files, .git and node_modules. Optional glob supports *, ** and ?; set regex for a JavaScript regular expression.', {
     query: { type: 'string', minLength: 1, maxLength: 1024 }, path: pathProperty,
     glob: { type: 'string', maxLength: 256 }, maxResults: { type: 'integer', minimum: 1, maximum: 100 },
+    regex: { type: 'boolean', description: 'Treat query as a regular expression instead of literal text.' },
   }, ['query']),
+  definition('find_files', 'List workspace file paths whose relative path matches a glob, without reading contents. Skips credentials, .git and node_modules.', {
+    pattern: { type: 'string', minLength: 1, maxLength: 256 }, path: pathProperty, maxResults: { type: 'integer', minimum: 1, maximum: 200 },
+  }, ['pattern']),
   definition('write_file', 'Create or replace a workspace text file, at most 256 KiB. The user must approve the actual file diff for every change. Files changed while approval is pending are rejected.', {
     path: pathProperty, content: { type: 'string', description: 'The complete new UTF-8 file content.' },
   }, ['path', 'content']),
-  definition('run_command', 'Run a shell command in the app process environment after explicit user approval of this exact command. This uses ordinary process permissions. Default timeout 30 seconds, maximum 60 seconds.', {
+  definition('edit_file', 'Replace exact text inside an existing workspace file. Each oldText must occur exactly once in the file at the time it is applied; read the file first. The user approves the resulting diff.', {
+    path: pathProperty,
+    edits: {
+      type: 'array', minItems: 1, maxItems: 20, description: 'Ordered replacements; each oldText must be unique in the file when applied.',
+      items: { type: 'object', properties: { oldText: { type: 'string', minLength: 1, maxLength: 32768 }, newText: { type: 'string', maxLength: 32768 } }, required: ['oldText', 'newText'], additionalProperties: false },
+    },
+  }, ['path', 'edits']),
+  definition('run_command', 'Run a shell command in the app process environment after explicit user approval of this exact command. This uses ordinary process permissions. Default timeout 30 seconds, maximum 180 seconds.', {
     command: { type: 'string', minLength: 1, maxLength: 16384 }, cwd: pathProperty,
-    timeoutMs: { type: 'integer', minimum: 100, maximum: 60000 },
+    timeoutMs: { type: 'integer', minimum: 100, maximum: COMMAND_TIMEOUT_MAX },
   }, ['command']),
 ]
 
-export const readOnlyTools = WORKSPACE_TOOLS.filter((entry) => !['write_file', 'run_command'].includes(entry.function.name))
+export const readOnlyTools = WORKSPACE_TOOLS.filter((entry) => !['write_file', 'edit_file', 'run_command'].includes(entry.function.name))
 
 function fault(code, message) { return Object.assign(new Error(message), { code }) }
 function checkAbort(signal) { if (signal?.aborted) throw Object.assign(new Error('操作已停止'), { name: 'AbortError', code: 'aborted' }) }
@@ -98,8 +113,42 @@ function jsonBounded(text, budget, fromEnd = false) {
   }
   return fromEnd ? text.slice(text.length - low) : text.slice(0, low)
 }
-function validExecutable(path) {
-  try { return typeof path === 'string' && isAbsolute(path) && existsSync(path) && statSync(path).isFile() } catch { return false }
+/** Model-supplied arguments are validated against the declared schema, including arrays of objects. */
+function validateArgument(key, value, spec) {
+  const text = (name, item, limits) => {
+    if (typeof item !== 'string' || item.includes('\0')) throw fault('arguments-invalid', `${name} 必须是有效文本`)
+    if (limits.minLength && item.length < limits.minLength) throw fault('arguments-invalid', `${name} 过短`)
+    if (limits.maxLength && item.length > limits.maxLength) throw fault('arguments-invalid', `${name} 过长`)
+  }
+  if (spec.type === 'string') { text(key, value, spec); return }
+  if (spec.type === 'integer') {
+    if (!Number.isSafeInteger(value) || spec.minimum !== undefined && value < spec.minimum || spec.maximum !== undefined && value > spec.maximum) throw fault('arguments-invalid', `${key} 超出允许范围`)
+    return
+  }
+  if (spec.type === 'boolean') {
+    if (typeof value !== 'boolean') throw fault('arguments-invalid', `${key} 必须是布尔值`)
+    return
+  }
+  if (spec.type === 'array') {
+    if (!Array.isArray(value)) throw fault('arguments-invalid', `${key} 必须是数组`)
+    if (spec.minItems && value.length < spec.minItems) throw fault('arguments-invalid', `${key} 至少需要 ${spec.minItems} 项`)
+    if (spec.maxItems && value.length > spec.maxItems) throw fault('arguments-invalid', `${key} 最多 ${spec.maxItems} 项`)
+    if (spec.items?.type === 'object') {
+      const properties = spec.items.properties || {}
+      for (const [index, entry] of value.entries()) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw fault('arguments-invalid', `${key}[${index}] 必须是对象`)
+        if (Object.keys(entry).some((name) => !Object.hasOwn(properties, name)) || (spec.items.required ?? []).some((name) => !Object.hasOwn(entry, name))) throw fault('arguments-invalid', `${key}[${index}] 字段缺失或包含未知字段`)
+        for (const [name, item] of Object.entries(entry)) validateArgument(`${key}[${index}].${name}`, item, properties[name])
+      }
+      return
+    }
+    if (spec.items?.type) for (const [index, entry] of value.entries()) validateArgument(`${key}[${index}]`, entry, spec.items)
+    return
+  }
+  throw fault('arguments-invalid', `${key} 的类型不受支持`)
+}
+
+function validExecutable(path) {  try { return typeof path === 'string' && isAbsolute(path) && existsSync(path) && statSync(path).isFile() } catch { return false }
 }
 function executableOnPath(name, env) {
   for (const directory of (env.PATH || '').split(delimiter)) {
@@ -153,19 +202,125 @@ function argumentsForShell(shell, command) {
   return ['-c', command]
 }
 
-function unifiedDiff(path, before, after, addition) {
-  const lines = (text) => text ? text.replace(/\n$/, '').split('\n') : []
-  const oldLines = lines(before), newLines = lines(after)
-  const result = [`--- ${addition ? '/dev/null' : `a/${path}`}`, `+++ b/${path}`, `@@ -${oldLines.length ? 1 : 0},${oldLines.length} +${newLines.length ? 1 : 0},${newLines.length} @@`]
-  if (oldLines.length) {
-    result.push(...oldLines.map((line) => `-${line}`))
-    if (!before.endsWith('\n')) result.push('\\ No newline at end of file')
+function splitLines(text) {
+  if (!text) return []
+  return String(text).replace(/\r\n?/g, '\n').split('\n')
+}
+
+function trimTrailingBreak(lines) {
+  if (lines.length && lines[lines.length - 1] === '') return lines.slice(0, -1)
+  return lines
+}
+
+/** Myers diff over lines. Beyond the edit-distance cap it degrades to one replaced region. */
+function diffOps(a, b) {
+  const n = a.length, m = b.length
+  let start = 0
+  while (start < n && start < m && a[start] === b[start]) start += 1
+  let endA = n, endB = m
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA -= 1; endB -= 1 }
+  const ops = []
+  for (let index = 0; index < start; index += 1) ops.push({ type: 'eq', text: a[index] })
+  const middle = myers(a.slice(start, endA), b.slice(start, endB))
+  if (middle) ops.push(...middle)
+  else {
+    for (let index = start; index < endA; index += 1) ops.push({ type: 'del', text: a[index] })
+    for (let index = start; index < endB; index += 1) ops.push({ type: 'ins', text: b[index] })
   }
-  if (newLines.length) {
-    result.push(...newLines.map((line) => `+${line}`))
-    if (!after.endsWith('\n')) result.push('\\ No newline at end of file')
+  for (let index = endA; index < n; index += 1) ops.push({ type: 'eq', text: a[index] })
+  return ops
+}
+
+function myers(a, b, maxDistance = 600) {
+  const n = a.length, m = b.length
+  if (!n && !m) return []
+  if (!n) return b.map((text) => ({ type: 'ins', text }))
+  if (!m) return a.map((text) => ({ type: 'del', text }))
+  const limit = Math.min(n + m, maxDistance)
+  const offset = limit + 1
+  const width = 2 * limit + 3
+  const trace = []
+  let vector = new Int32Array(width)
+  for (let d = 0; d <= limit; d += 1) {
+    trace.push(vector.slice())
+    for (let k = -d; k <= d; k += 2) {
+      let x
+      if (k === -d || (k !== d && vector[offset + k - 1] < vector[offset + k + 1])) x = vector[offset + k + 1]
+      else x = vector[offset + k - 1] + 1
+      let y = x - k
+      while (x < n && y < m && a[x] === b[y]) { x += 1; y += 1 }
+      vector[offset + k] = x
+      if (x >= n && y >= m) return backtrack(trace, a, b, offset)
+    }
   }
-  return `${result.join('\n')}\n`
+  return null
+}
+
+function backtrack(trace, a, b, offset) {
+  const ops = []
+  let x = a.length, y = b.length
+  for (let d = trace.length - 1; d > 0; d -= 1) {
+    const vector = trace[d]
+    const k = x - y
+    const previous = k === -d || (k !== d && vector[offset + k - 1] < vector[offset + k + 1]) ? k + 1 : k - 1
+    const previousX = vector[offset + previous]
+    const previousY = previousX - previous
+    while (x > previousX && y > previousY) { ops.push({ type: 'eq', text: a[x - 1] }); x -= 1; y -= 1 }
+    if (x === previousX) { ops.push({ type: 'ins', text: b[y - 1] }); y -= 1 }
+    else { ops.push({ type: 'del', text: a[x - 1] }); x -= 1 }
+  }
+  while (x > 0 && y > 0) { ops.push({ type: 'eq', text: a[x - 1] }); x -= 1; y -= 1 }
+  while (x > 0) { ops.push({ type: 'del', text: a[x - 1] }); x -= 1 }
+  while (y > 0) { ops.push({ type: 'ins', text: b[y - 1] }); y -= 1 }
+  return ops.reverse()
+}
+
+/** Standard unified diff with @@ hunks and three lines of context. */
+export function unifiedDiff(path, before, after, addition) {
+  const oldLines = trimTrailingBreak(splitLines(before))
+  const newLines = trimTrailingBreak(splitLines(after))
+  const ops = diffOps(oldLines, newLines)
+  const header = [`--- ${addition ? '/dev/null' : `a/${path}`}`, `+++ b/${path}`]
+  const changed = []
+  for (let index = 0; index < ops.length; index += 1) if (ops[index].type !== 'eq') changed.push(index)
+  if (!changed.length) return `${header.join('\n')}\n`
+  const positions = []
+  let oldNumber = 1, newNumber = 1
+  for (const op of ops) {
+    positions.push({ oldNumber, newNumber })
+    if (op.type !== 'ins') oldNumber += 1
+    if (op.type !== 'del') newNumber += 1
+  }
+  const groups = []
+  for (const position of changed) {
+    const last = groups[groups.length - 1]
+    if (last && position - last.end <= CONTEXT_LINES * 2) last.end = position
+    else groups.push({ start: position, end: position })
+  }
+  const hunks = []
+  const missingOldBreak = Boolean(before) && !String(before).endsWith('\n')
+  const missingNewBreak = Boolean(after) && !String(after).endsWith('\n')
+  const lastOldOp = ops.findLastIndex((op) => op.type !== 'ins')
+  const lastNewOp = ops.findLastIndex((op) => op.type !== 'del')
+  for (const group of groups) {
+    const first = Math.max(0, group.start - CONTEXT_LINES)
+    const last = Math.min(ops.length - 1, group.end + CONTEXT_LINES)
+    const slice = ops.slice(first, last + 1)
+    const oldCount = slice.filter((op) => op.type !== 'ins').length
+    const newCount = slice.filter((op) => op.type !== 'del').length
+    const oldStart = oldCount ? positions[first].oldNumber : positions[first].oldNumber - 1
+    const newStart = newCount ? positions[first].newNumber : positions[first].newNumber - 1
+    const body = []
+    for (let index = first; index <= last; index += 1) {
+      const op = ops[index]
+      const marker = op.type === 'eq' ? ' ' : op.type === 'del' ? '-' : '+'
+      body.push(`${marker}${op.text}`)
+      if (missingOldBreak && index === lastOldOp) body.push('\\ No newline at end of file')
+      if (missingNewBreak && index === lastNewOp) body.push('\\ No newline at end of file')
+    }
+    hunks.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`, ...body)
+  }
+  return `${[...header, ...hunks].join('\n')}\n`
 }
 
 function matchGlob(glob) {
@@ -188,7 +343,7 @@ function matchGlob(glob) {
 
 /** Tool permissions are enforced at dispatch and again before every mutating operation. */
 export class WorkspaceTools {
-  constructor({ cwd, env = process.env, signal, approve, onItem, secrets = [], accessMode = 'approval', journal = null } = {}) {
+  constructor({ cwd, env = process.env, signal, approve, preApproved, onItem, secrets = [], accessMode = 'approval', journal = null } = {}) {
     if (typeof cwd !== 'string' || !isAbsolute(cwd)) throw fault('workspace-invalid', '工作区必须是绝对目录')
     this.accessMode = validateAccessMode(accessMode)
     if (journal !== null && (!journal || ['prepareWrite', 'commitWrite', 'failWrite'].some((name) => typeof journal[name] !== 'function'))) throw fault('changes-journal', '文件变更日志适配器无效')
@@ -197,6 +352,7 @@ export class WorkspaceTools {
     this.environment = workspaceEnvironment(this.cwd, env)
     this.signal = signal
     this.approve = approve
+    this.preApproved = typeof preApproved === 'function' ? preApproved : null
     this.onItem = onItem
     const accountSecrets = Object.entries(env).filter(([name, value]) => /(?:key|token|secret|password|authorization|credential)/i.test(name) && typeof value === 'string' && value.length >= 8).map(([, value]) => value)
     this.secrets = [...new Set([...accountSecrets, ...(Array.isArray(secrets) ? secrets.filter((value) => typeof value === 'string' && value.length) : [])])]
@@ -263,19 +419,24 @@ export class WorkspaceTools {
     if (this.accessMode === 'readonly') throw fault('access-readonly', '只读模式不允许修改文件或执行命令')
   }
 
+  /** Returns { allowed, note }; a rejection may carry the user's own instruction for the model. */
   async permission(details) {
     this.requireMutation()
-    if (this.accessMode === 'full') return true
-    if (typeof this.approve !== 'function') return false
+    if (this.accessMode === 'full') return { allowed: true, granted: true }
+    if (typeof this.preApproved === 'function' && this.preApproved(details) === true) return { allowed: true, granted: true }
+    if (typeof this.approve !== 'function') return { allowed: false, note: '' }
     let listener
     const aborted = new Promise((_, reject) => {
       listener = () => reject(Object.assign(new Error('操作已停止'), { name: 'AbortError', code: 'aborted' }))
       this.signal?.addEventListener('abort', listener, { once: true })
     })
     try {
-      const accepted = await Promise.race([Promise.resolve(this.approve(details)), aborted])
+      const answer = await Promise.race([Promise.resolve(this.approve(details)), aborted])
       checkAbort(this.signal)
-      return accepted === true
+      if (answer === true) return { allowed: true, granted: false }
+      if (answer && answer.allowed === true) return { allowed: true, granted: answer.granted === true }
+      const note = typeof answer?.note === 'string' ? answer.note.slice(0, 2000) : ''
+      return { allowed: false, note }
     } finally { this.signal?.removeEventListener('abort', listener) }
   }
 
@@ -332,23 +493,19 @@ export class WorkspaceTools {
     checkAbort(this.signal)
     try {
       validateAccessMode(this.accessMode)
-      if (['write_file', 'run_command'].includes(name)) this.requireMutation()
+      if (['write_file', 'edit_file', 'run_command'].includes(name)) this.requireMutation()
       const schema = WORKSPACE_TOOLS.find((entry) => entry.function.name === name)?.function.parameters
       if (!schema) throw fault('tool-unknown', '未知的工作区工具')
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw fault('arguments-invalid', '工具参数必须是对象')
       if (Object.keys(args).some((key) => !Object.hasOwn(schema.properties, key)) || schema.required.some((key) => !Object.hasOwn(args, key))) throw fault('arguments-invalid', '工具参数缺失或包含未知字段')
-      for (const [key, value] of Object.entries(args)) {
-        const spec = schema.properties[key]
-        if (spec.type === 'string' && (typeof value !== 'string' || value.includes('\0') || spec.minLength && value.length < spec.minLength || spec.maxLength && value.length > spec.maxLength)) throw fault('arguments-invalid', `${key} 必须是有效文本`)
-        if (spec.type === 'integer' && (!Number.isSafeInteger(value) || spec.minimum !== undefined && value < spec.minimum || spec.maximum !== undefined && value > spec.maximum)) throw fault('arguments-invalid', `${key} 超出允许范围`)
-      }
+      for (const [key, value] of Object.entries(args)) validateArgument(key, value, schema.properties[key])
       const value = await this[name](args)
       checkAbort(this.signal)
       if (Buffer.byteLength(JSON.stringify(value)) > RESULT_BYTES) throw fault('tool-output-limit', '工具结果超过 64 KiB 上限，请缩小操作范围')
       return value
     } catch (error) {
       if (error.name === 'AbortError' || this.signal?.aborted) { checkAbort(this.signal); throw error }
-      const known = typeof error.code === 'string' && /^(?:path-|file-|workspace-|sensitive-|arguments-|approval-|tool-|access-|changes-)/.test(error.code)
+      const known = typeof error.code === 'string' && /^(?:path-|file-|workspace-|sensitive-|arguments-|approval-|tool-|access-|changes-|edit-)/.test(error.code)
       return { ok: false, code: error.code || 'tool-error', error: known ? this.clean(error.message) : error.code === 'ENOENT' ? '文件或目录不存在' : error.code === 'EACCES' || error.code === 'EPERM' ? '应用进程没有操作此路径的权限' : '工作区操作失败', ...(error.writeApplied ? { writeApplied: true, journalPending: true } : {}) }
     }
   }
@@ -363,7 +520,8 @@ export class WorkspaceTools {
         tools: (this.accessMode === 'readonly' ? readOnlyTools : WORKSPACE_TOOLS).map((entry) => entry.function.name),
         readFileMaxBytes: READ_BYTES, writeFileMaxBytes: WRITE_BYTES, toolResultMaxBytes: RESULT_BYTES,
         fileChangesRequireApproval: this.accessMode === 'approval', commandsRequireApproval: this.accessMode === 'approval',
-        shellAvailable: validExecutable(shell), commandTimeoutMaxMs: 60000,
+        shellAvailable: validExecutable(shell), commandTimeoutMaxMs: COMMAND_TIMEOUT_MAX,
+        editFile: true, findFiles: true, regexSearch: true, lineRangeRead: true,
       },
     }
   }
@@ -398,28 +556,56 @@ export class WorkspaceTools {
     return { ok: true, path: this.clean(entry.name), entries, truncated }
   }
 
-  async read_file({ path, offset = 0, limit = 49152 }) {
+  async read_file({ path, offset = 0, limit = 49152, startLine, endLine }) {
     const entry = await this.existing(path)
     const file = await this.bytes(entry.path, READ_BYTES)
     const source = file.data.toString('utf8')
     const ranges = this.redactionRanges(source)
-    let consumed = Math.min(limit, Math.max(0, source.length - offset))
-    let text = this.cleanSlice(source, offset, consumed, ranges)
+    const totalLines = source ? source.split('\n').length : 0
+    let from = offset
+    let numbered = false
+    let firstLine = null, lastLine = null
+    if (startLine !== undefined || endLine !== undefined) {
+      const lines = source.split('\n')
+      firstLine = Math.min(Math.max(1, startLine ?? 1), Math.max(1, lines.length))
+      lastLine = Math.min(Math.max(firstLine, endLine ?? lines.length), lines.length)
+      from = 0
+      for (let index = 0; index < firstLine - 1; index += 1) from += lines[index].length + 1
+      const span = lines.slice(firstLine - 1, lastLine).join('\n')
+      limit = Math.min(Math.max(limit, 1), Math.max(span.length, 1))
+      numbered = true
+    }
+    let consumed = Math.min(limit, Math.max(0, source.length - from))
+    let text = this.cleanSlice(source, from, consumed, ranges)
     if (Buffer.byteLength(JSON.stringify(text)) > 48 * 1024) {
       let low = 0, high = consumed
       while (low < high) {
         const middle = Math.ceil((low + high) / 2)
-        if (Buffer.byteLength(JSON.stringify(this.cleanSlice(source, offset, middle, ranges))) <= 48 * 1024) low = middle
+        if (Buffer.byteLength(JSON.stringify(this.cleanSlice(source, from, middle, ranges))) <= 48 * 1024) low = middle
         else high = middle - 1
       }
       consumed = low
-      text = this.cleanSlice(source, offset, consumed, ranges)
+      text = this.cleanSlice(source, from, consumed, ranges)
     }
-    return { ok: true, path: this.clean(entry.name), text, offset, nextOffset: offset + consumed, totalCharacters: source.length, truncated: offset + consumed < source.length, sha256: file.hash }
+    if (numbered && text) {
+      const base = firstLine - 1
+      text = text.split('\n').map((line, index) => `${base + index + 1}| ${line}`).join('\n')
+    }
+    return {
+      ok: true, path: this.clean(entry.name), text, offset: from, nextOffset: from + consumed,
+      totalCharacters: source.length, truncated: from + consumed < source.length, sha256: file.hash,
+      ...(numbered ? { numbered, totalLines, startLine: firstLine, endLine: lastLine } : { totalLines }),
+    }
   }
 
-  async search_files({ query, path = '.', glob, maxResults = 50 }) {
+  async search_files({ query, path = '.', glob, maxResults = 50, regex = false }) {
     if (/[\r\n]/.test(query)) throw fault('arguments-invalid', '搜索文本必须位于同一行')
+    let pattern = null
+    if (regex) {
+      if (query.length > 512) throw fault('arguments-invalid', '正则表达式过长')
+      try { pattern = new RegExp(query) } catch (error) { throw fault('arguments-invalid', `正则表达式无效：${error.message.slice(0, 120)}`) }
+    }
+    const found = (line) => pattern ? pattern.test(line) : line.includes(query)
     const entry = await this.existing(path, { directory: true })
     const matches = matchGlob(glob)
     const files = []
@@ -476,12 +662,57 @@ export class WorkspaceTools {
       const ranges = this.redactionRanges(content)
       let offset = 0
       for (let index = 0; index < lines.length; index += 1) {
-        if (lines[index].includes(query) && !add(file.path, index + 1, this.cleanSlice(content, offset, Math.min(lines[index].length, 2048), ranges))) break
+        if (found(lines[index]) && !add(file.path, index + 1, this.cleanSlice(content, offset, Math.min(lines[index].length, 2048), ranges))) break
         offset += lines[index].length + 1
       }
       if (results.length >= maxResults) { truncated = true; break }
     }
     return { ok: true, path: this.clean(entry.name), query: this.clean(query), matches: results, scannedFiles: files.length, truncated }
+  }
+
+  /** Path-only search: never reads file contents, so it is safe to run before any approval. */
+  async find_files({ pattern, path = '.', maxResults = 100 }) {
+    const entry = await this.existing(path, { directory: true })
+    const matches = matchGlob(pattern)
+    const pending = [{ path: entry.path, depth: 0 }]
+    const visited = new Set()
+    const files = []
+    let inspected = 0, truncated = false
+    while (pending.length && files.length < maxResults && inspected < SEARCH_ENTRIES) {
+      checkAbort(this.signal)
+      const next = pending.pop()
+      if (visited.has(next.path)) continue
+      const canonicalDirectory = await realpath(next.path).catch(() => null)
+      if (canonicalDirectory !== next.path || !contained(entry.root, canonicalDirectory) || secretPath(displayPath(entry.root, canonicalDirectory))) { truncated = true; continue }
+      visited.add(next.path)
+      const directory = await opendir(next.path)
+      try {
+        while (inspected < SEARCH_ENTRIES && files.length < maxResults) {
+          const child = await directory.read()
+          if (!child) break
+          inspected += 1
+          checkAbort(this.signal)
+          if (SECRET_NAME.test(child.name) || child.isSymbolicLink()) continue
+          const target = join(next.path, child.name)
+          if (child.isDirectory()) {
+            if (!SKIP_DIRECTORY.has(child.name) && next.depth < 16) pending.push({ path: target, depth: next.depth + 1 })
+            else if (next.depth >= 16) truncated = true
+            continue
+          }
+          if (!child.isFile()) continue
+          const relative = displayPath(entry.root, target)
+          if (!matches(relative)) continue
+          if (secretPath(relative)) continue
+          try {
+            const info = await stat(target)
+            files.push({ path: this.clean(relative), size: info.size })
+          } catch { /* Vanished between readdir and stat. */ }
+        }
+      } finally { await directory.close() }
+    }
+    truncated ||= pending.length > 0 || inspected >= SEARCH_ENTRIES || files.length >= maxResults
+    files.sort((a, b) => a.path.localeCompare(b.path))
+    return { ok: true, path: this.clean(entry.name), pattern: this.clean(pattern), files, truncated, scannedEntries: inspected }
   }
 
   async writable(name) {
@@ -516,6 +747,30 @@ export class WorkspaceTools {
   async write_file({ path, content }) {
     this.requireMutation()
     if (typeof content !== 'string' || content.includes('\0')) throw fault('arguments-invalid', '写入内容必须是 UTF-8 文本')
+    return this.writeContent({ path, content })
+  }
+
+  async edit_file({ path, edits }) {
+    this.requireMutation()
+    if (!Array.isArray(edits) || !edits.length || edits.length > 20) throw fault('arguments-invalid', 'edits 需为 1–20 个替换项')
+    const entry = await this.existing(path)
+    const original = await this.bytes(entry.path, WRITE_BYTES)
+    let content = original.data.toString('utf8')
+    for (const [index, edit] of edits.entries()) {
+      const oldText = edit?.oldText, newText = edit?.newText
+      if (typeof oldText !== 'string' || !oldText || typeof newText !== 'string') throw fault('arguments-invalid', `第 ${index + 1} 个替换项必须包含非空 oldText 与 newText`)
+      const occurrences = content.split(oldText).length - 1
+      if (occurrences === 0) throw fault('edit-not-found', `第 ${index + 1} 个替换项的 oldText 未出现在文件中；请重新读取文件后再改`)
+      if (occurrences > 1) throw fault('edit-ambiguous', `第 ${index + 1} 个替换项的 oldText 出现 ${occurrences} 次；请补充上下文使其唯一`)
+      content = content.replace(oldText, () => newText)
+    }
+    if (content === original.data.toString('utf8')) return { ok: true, path: entry.name, unchanged: true, sha256: original.hash }
+    return this.writeContent({ path, content })
+  }
+
+  async writeContent({ path, content }) {
+    this.requireMutation()
+    if (typeof content !== 'string' || content.includes('\0')) throw fault('arguments-invalid', '写入内容必须是 UTF-8 文本')
     const after = Buffer.from(content)
     if (after.length > WRITE_BYTES) throw fault('file-too-large', '写入内容超过 256 KiB 上限')
     const afterHash = digest(after)
@@ -527,9 +782,10 @@ export class WorkspaceTools {
     await this.item(item)
     let temporary = null, journalToken, applied = false
     try {
-      if (!await this.permission({ kind: 'fileChange', itemId: item.id, path: before.name, cwd: before.root, diff, expectedHash: original?.hash ?? null })) {
+      const decision = await this.permission({ kind: 'fileChange', itemId: item.id, path: before.name, cwd: before.root, diff, expectedHash: original?.hash ?? null })
+      if (!decision.allowed) {
         item.status = 'declined'; await this.item(item)
-        return { ok: false, code: 'approval-declined', error: '用户拒绝了本次文件变更' }
+        return { ok: false, code: 'approval-declined', error: '用户拒绝了本次文件变更', ...(decision.note ? { feedback: decision.note } : {}) }
       }
       const validate = async () => {
         this.requireMutation()
@@ -619,14 +875,15 @@ export class WorkspaceTools {
 
   async run_command({ command, cwd = '.', timeoutMs = 30000 }) {
     this.requireMutation()
-    if (typeof command !== 'string' || !command.trim() || command.includes('\0') || command.length > 16384 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60000) throw fault('arguments-invalid', '命令或超时参数无效')
+    if (typeof command !== 'string' || !command.trim() || command.includes('\0') || command.length > 16384 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > COMMAND_TIMEOUT_MAX) throw fault('arguments-invalid', '命令或超时参数无效')
     const workspace = await this.existing(cwd, { directory: true })
     const item = { id: `workspace-command-${randomUUID()}`, type: 'commandExecution', status: 'inProgress', command: this.clean(command), cwd: this.clean(workspace.path), aggregatedOutput: '', exitCode: null }
     await this.item(item)
     try {
-      if (!await this.permission({ kind: 'commandExecution', itemId: item.id, command, cwd: workspace.path })) {
+      const decision = await this.permission({ kind: 'commandExecution', itemId: item.id, command, cwd: workspace.path })
+      if (!decision.allowed) {
         item.status = 'declined'; await this.item(item)
-        return { ok: false, code: 'approval-declined', error: '用户拒绝了本次命令执行' }
+        return { ok: false, code: 'approval-declined', error: '用户拒绝了本次命令执行', ...(decision.note ? { feedback: decision.note } : {}) }
       }
       this.requireMutation()
       if ((await this.existing(cwd, { directory: true })).path !== workspace.path) throw fault('workspace-changed', '审批期间命令目录已改变，请重新申请')
@@ -738,4 +995,69 @@ export async function checkWorkspaceEnvironment({ cwd, env = process.env, signal
   checkAbort(signal)
   if (await tools.root() !== root) throw fault('workspace-changed', '检查期间工作区已改变，请重新检查')
   return { ok: checks.every((check) => check.status === 'ok'), environment, checks, checkedAt: Date.now() }
+}
+
+/**
+ * Candidate paths for the composer's `@` picker. Paths only — no file contents are read,
+ * so the list can be produced before the user approves anything.
+ */
+export async function findWorkspaceFiles({ cwd, query = '', env = process.env, limit = 30, maxEntries = 3000 } = {}) {
+  if (typeof cwd !== 'string' || !isAbsolute(cwd)) throw fault('workspace-invalid', '工作区必须是绝对目录')
+  const root = await realpath(cwd)
+  const directory = await stat(root)
+  if (!directory.isDirectory()) throw fault('workspace-invalid', '当前工作区不是目录')
+  const files = []
+  const pending = [{ path: root, depth: 0 }]
+  const visited = new Set()
+  let inspected = 0, truncated = false
+  while (pending.length && inspected < maxEntries && files.length < 600) {
+    const next = pending.pop()
+    if (visited.has(next.path)) continue
+    const canonical = await realpath(next.path).catch(() => null)
+    if (canonical !== next.path || !contained(root, canonical) || secretPath(displayPath(root, canonical))) { truncated = true; continue }
+    visited.add(next.path)
+    let handle
+    try { handle = await opendir(next.path) } catch { continue }
+    try {
+      while (inspected < maxEntries && files.length < 600) {
+        const child = await handle.read()
+        if (!child) break
+        inspected += 1
+        if (SECRET_NAME.test(child.name) || child.isSymbolicLink()) continue
+        const target = join(next.path, child.name)
+        if (child.isDirectory()) {
+          if (!SKIP_DIRECTORY.has(child.name) && next.depth < 12) pending.push({ path: target, depth: next.depth + 1 })
+          else if (next.depth >= 12) truncated = true
+          continue
+        }
+        if (!child.isFile()) continue
+        try {
+          const info = await stat(target)
+          files.push({ path: displayPath(root, target), size: info.size, mtimeMs: info.mtimeMs })
+        } catch { /* Vanished. */ }
+      }
+    } finally { await handle.close() }
+  }
+  truncated ||= pending.length > 0 || inspected >= maxEntries
+  const needle = String(query).trim().toLowerCase()
+  const subsequence = (text, part) => {
+    let index = 0
+    for (const character of part) {
+      index = text.indexOf(character, index)
+      if (index === -1) return false
+      index += 1
+    }
+    return true
+  }
+  const score = (entry) => {
+    if (!needle) return 1
+    const name = basename(entry.path).toLowerCase()
+    if (name.startsWith(needle)) return 5
+    if (name.includes(needle)) return 4
+    if (entry.path.toLowerCase().includes(needle)) return 3
+    return subsequence(entry.path.toLowerCase(), needle) ? 1 : 0
+  }
+  const matches = files.map((entry) => ({ ...entry, score: score(entry) })).filter((entry) => entry.score > 0)
+  matches.sort((a, b) => b.score - a.score || b.mtimeMs - a.mtimeMs || a.path.localeCompare(b.path))
+  return { files: matches.slice(0, Math.max(1, Math.min(limit, 60))).map(({ score: unused, ...entry }) => entry), truncated: truncated || matches.length > limit }
 }

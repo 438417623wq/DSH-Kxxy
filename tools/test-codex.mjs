@@ -141,7 +141,7 @@ test('workspace derives from live or persisted host sessions, never caller cwd',
   await assert.rejects(workspaceForSession(stored, 'missing'), { code: 'session-invalid' })
 })
 
-test('context rejects traversal, credentials, binary and oversized files', async () => {
+test('context rejects traversal and credentials but references binary and truncates oversized files', async () => {
   const root = await mkdtemp(join(tmpdir(), 'codex-context-'))
   try {
     const cwd = join(root, 'workspace')
@@ -161,8 +161,12 @@ test('context rejects traversal, credentials, binary and oversized files', async
     await mkdir(join(cwd, '.ssh'))
     await writeFile(join(cwd, '.ssh', 'config'), 'private-host')
     await assert.rejects(contextFile(cwd, '.ssh/config'), { code: 'sensitive-file' })
-    await assert.rejects(contextFile(cwd, 'binary'), { code: 'file-binary' })
-    await assert.rejects(contextFile(cwd, 'large'), { code: 'file-too-large' })
+    // Binary attachments are referenced by path so the model can open them with its tools.
+    const binary = await contextFile(cwd, 'binary')
+    assert.equal(binary.binary, true); assert.equal(binary.text, undefined); assert.equal(binary.size, 2)
+    // Long text is truncated in the prompt instead of failing the whole request.
+    const large = await contextFile(cwd, 'large')
+    assert.equal(large.truncated, true); assert.equal(large.text.length, 128 * 1024); assert.equal(large.size, 140000)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

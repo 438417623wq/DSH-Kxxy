@@ -3,6 +3,7 @@ package app.kxxy.engine
 import android.content.Context
 import android.util.Log
 import java.io.File
+import java.nio.file.Files
 
 /**
  * DSH Kxxy 引擎配置：路径、环境变量与全局常量。
@@ -299,6 +300,44 @@ object EngineConfig {
             ?.filter { it.isDirectory && File(it, "bin/java").isFile }
             ?.sortedBy { it.name }
             ?.firstOrNull()
+    }
+
+    /**
+     * JVM 进程默认要带的那组 `-D` 参数——原先挂在 `JAVA_TOOL_OPTIONS` 上。
+     *
+     * 为什么不在这里直接导环境变量：只要用 `JAVA_TOOL_OPTIONS`（或
+     * `JDK_JAVA_OPTIONS`），**每个** JVM 启动都会往 stderr 打一行
+     * `Picked up …`，没有任何开关能关掉。它污染 `javac` 的输出、`gradle
+     * --version` 的解析、以及用户脚本里的 `2>&1 | grep`，而换取的好处只是
+     * 「少写几处调用点」。所以改成由 [RuntimeInstaller.ensureJvmWrappers] 把这份
+     * 清单拼进 JDK 启动器壳里——覆盖面一样（裸 `java`、`$JAVA_HOME/bin/java`、
+     * gradle daemon 都是同一个入口），但完全不打印。
+     *
+     * 四条参数的理由：
+     *   · `java.io.tmpdir` / `user.home` —— JVM 里的默认值是**编译期写死的
+     *     Termux 路径**（`/data/data/com.termux/files/home`、
+     *     `.../usr/tmp/`），Android 上都不存在，只能盖（问题.txt【1】）；
+     *   · `user.timezone` —— JVM 不读 `LANG`/`LC_ALL`，也不看
+     *     `/etc/localtime`（Android 上没有这个文件），不盖就报 `time zone: GMT`；
+     *   · `jansi.mode=strip` + `jansi.graceful=true` —— jansi 的 native 库
+     *     `DT_NEEDED` 写的是 `libc.so.6`，bionic 只有 `libc.so`，
+     *     `System.load` 必抛 `UnsatisfiedLinkError`，而 `JansiLoader` 会把异常
+     *     **println 到 stderr**（缺陷 BM）。`strip` 让 `AnsiConsole` 直接走
+     *     「不输出 ANSI」分支，这条路径彻底安静。
+     *
+     * 时区取系统当前 Olson ID，与 `TZ` 同源；换时区后重启引擎，壳会按新值重写。
+     */
+    fun jvmDefaultFlags(ctx: Context): List<String> {
+        val home = dshHome(ctx)
+        val tmp = tmpDir(ctx)
+        val tzId = runCatching { java.util.TimeZone.getDefault().id }.getOrDefault("UTC")
+        return listOf(
+            "-Djava.io.tmpdir=${tmp.absolutePath}",
+            "-Duser.home=${home.absolutePath}",
+            "-Duser.timezone=$tzId",
+            "-Djansi.mode=strip",
+            "-Djansi.graceful=true",
+        )
     }
 
     /**
@@ -1120,13 +1159,34 @@ object EngineConfig {
             "COREPACK_NPM_REGISTRY=https://registry.npmmirror.com",
             "npm_config_registry=https://registry.npmmirror.com",
             "NPM_CONFIG_REGISTRY=https://registry.npmmirror.com",
+            // pnpm / yarn 的专属键（问题清单 R4）。
+            //
+            // `npm_config_registry` pnpm 也认，但 yarn 完全不看它：yarn 1 只读
+            // `YARN_REGISTRY`，yarn 2+ 只读 `YARN_NPM_REGISTRY_SERVER`。这里三条
+            // 一起给，配合 RuntimeInstaller.ensureJsRegistry 落盘的配置文件
+            // （`.npmrc` / `.yarnrc` / `.yarnrc.yml`）两层覆盖 —— 有些脚本用
+            // `env -i` 清环境，那时只剩配置文件。
+            //
+            // 注意：`pnpm_config_*` 前缀不是笔误。用 `npm_config_*` 的话 npm 也会
+            // 读到这些键，未知键会变成 `Unknown env config` 警告；而 pnpm 自己
+            // 认这个前缀（不认的版本会忽略它，落到下面那份 rc 文件上）。
+            "pnpm_config_registry=https://registry.npmmirror.com/",
+            "YARN_REGISTRY=https://registry.npmmirror.com/",
+            "YARN_NPM_REGISTRY_SERVER=https://registry.npmmirror.com",
             // pnpm 默认 `package-import-method=auto`：先试 clone，再试 **hardlink**，
             // 最后才 copy。而这台设备的 SELinux 把 `link(2)` 拒成 EACCES
             // （取证见 `build-runtime.mjs` 的 hardlinkWrappers 注释），
             // pnpm 的 hardlink 探测会把整条安装流程拖进 EACCES 分支重试。
             // 直接钉成 copy：少一次注定失败的探测，代价是 node_modules 多占一份空间
             // —— 在「硬链接根本不存在」的平台上没有别的选择。
-            "npm_config_package_import_method=copy",
+            //
+            // ⚠️ 前缀必须是 `pnpm_config_`，不能用 `npm_config_`：后者会被 **npm**
+            // 也读到，于是 `npm -v` / `npm ls` 每次都多一行
+            // `Unknown env config "package-import-method"`（npm 12 起直接报错）。
+            // 这条只是兜底，权威来源是 `~/.config/pnpm/rc`
+            // （RuntimeInstaller.ensurePnpmImportMethod 写的）—— 有些脚本用
+            // `env -i` 清环境，那时只剩配置文件生效。
+            "pnpm_config_package_import_method=copy",
             // pip 镜像（缺陷 EF）：此前只做了 npm 半边，pip 直连 pypi.org/simple，
             // 大索引十几秒都下不完。pip.conf 由 RuntimeInstaller.ensurePipConfig
             // 写（持久），这里再给一份环境变量 —— 有些脚本用 `env -i` 清环境，
@@ -1531,36 +1591,24 @@ object EngineConfig {
         //   只加 GRADLE_USER_HOME               → rc=1  createVirtualFileSystem 失败
         //   **两个都加**                        → rc=0  真的编出 A.class
         //   不设 GRADLE_USER_HOME、只靠 -Duser.home → 也能过（两者等价，任选其一）
-        // 所以这里两个都给：GRADLE_USER_HOME 显式钉死缓存根，JAVA_TOOL_OPTIONS 覆盖
-        // 任意 JVM 进程（kotlinc / d8 / apksigner 也一并受益）。用空格拼成一条值而不是
-        // 两条导出，是因为 JAVA_TOOL_OPTIONS 本身就是「由 JVM 自行按空格拆分」的变量。
-        val jvmOpts = buildList {
-            add("-Djava.io.tmpdir=${tmp.absolutePath}")
-            add("-Duser.home=${home.absolutePath}")
-            // 时区（问题清单【7】）。JVM 不读 LANG/LC_ALL，也不看 /etc/localtime
-            // （Android 上根本没有这个文件），唯一可靠入口就是这条 —— 与上面
-            // 的 `TZ` 取同一个 ID。缺了它 `mvn -v` 会报 `time zone: GMT`。
-            add("-Duser.timezone=$tzId")
-            // jansi 的 native 库在 bionic 上必然 dlopen 失败（缺陷 BM）。
-            //
-            // 字节码级取证（jansi 2.4.0，打进 kotlin-compiler.jar 与 gradle 里）：
-            //   · `Linux/arm64/libjansi.so` 的 DT_NEEDED 只有 `libc.so.6`，
-            //     而 Android 是 bionic，只有 `libc.so` ⇒ `System.load` 必抛
-            //     `UnsatisfiedLinkError: dlopen failed: "libc.so.6" not found`；
-            //   · `JansiLoader.loadNativeLibrary` 只 catch `UnsatisfiedLinkError`，
-            //     然后**把异常对象 println 到 stderr**（字节码 :89-93），
-            //     所以真机日志里那两行 "Failed to load native library…" 后面
-            //     紧跟的 ULE 只是**噪音**，不是崩溃；
-            //   · `initialize()` 在 graceful（默认 true）下静默返回 false，
-            //     `AnsiConsole.ansiStream` 的异常表也把 `Throwable` 兜住了。
-            // 即便如此，噪音会让人误判成「工具链崩了」，而且每次 JVM 启动都刷。
-            // `jansi.mode=strip` 让 AnsiConsole 直接走「不输出 ANSI」的分支，
-            // 配合构建期剥掉 jar 内 native 资源（见 tools/lib/poolextract.py）
-            // 之后，jansi 这条路径彻底安静。
-            add("-Djansi.mode=strip")
-            add("-Djansi.graceful=true")
-        }.joinToString(" ")
-        env += "JAVA_TOOL_OPTIONS=$jvmOpts"
+        // 所以这里两个都给：GRADLE_USER_HOME 显式钉死缓存根，`-Djava.io.tmpdir`
+        // 与 `-Duser.home` 覆盖任意 JVM 进程（kotlinc / d8 / apksigner 也一并受益）。
+        //
+        // ⚠️ 但这两条 -D **不再**走 `JAVA_TOOL_OPTIONS`（v0.9.81 起）。用那个变量
+        // 的代价是每个 JVM 启动都往 stderr 打一行
+        //
+        //     Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=…
+        //
+        // 而 `JDK_JAVA_OPTIONS` 只是把 `Picked up` 换成 `NOTE: Picked up …`，
+        // 一样洗不掉 —— 两处都没有开关能关。于是 `javac` 的输出、`gradle
+        // --version` 的解析、脚本里的 `2>&1 | grep` 全被这行污染，连
+        // `java -version 2>&1 | grep -c "Picked up"` 这种自检都写不出来。
+        //
+        // 同样的参数改由**启动器壳**带上：`RuntimeInstaller.ensureJvmWrappers` 把
+        // `<root>/lib/jvm/<jdk>/bin/java` 换成一层壳，壳里把 [jvmDefaultFlags]
+        // 拼在真身（`java.real`）前面。覆盖面不变 —— gradle 的 daemon / worker、
+        // kotlinc、d8、apksigner 最终都是 exec `$JAVA_HOME/bin/java` 或 PATH 上的
+        // java，两个入口都在壳后面；而壳只加参数，一个字都不打印。
         env += "GRADLE_USER_HOME=${File(home, ".gradle").absolutePath}"
 
         // Termux 编译的 node 把 OpenSSL 目录硬编码为 /data/data/com.termux/...，
@@ -1803,6 +1851,93 @@ object EngineConfig {
     fun profileModulesDir(ctx: Context): File = File(profileDir(ctx), "node_modules")
 
     /**
+     * 给 profile 里声明的**预装包**补软链，让 `npm ls` / `pnpm` 在 profile 目录里
+     * 也能解析到它们（问题清单 R5）。
+     *
+     * ── 现状为什么是「假警报」与「真隐患」各一半 ───────────────────────────
+     *
+     * 插件实际装在 `engine/lib/node_modules/`，而引擎**不用** profile 的
+     * `node_modules` 解析它们：`dsh-app-boot` 的
+     * `collectInstallationScopePackages()` 从 `@deepseek-ai/dsh/package.json`
+     * 出发 BFS `dependencies`，把预装包记成 `interception` 路由（见
+     * `tools/lib/patches.mjs` 的 `patchDshManifest`）。所以运行时一切正常，
+     * 在 profile 里跑 `npm ls` 报一堆 missing 是**假警报**。
+     *
+     * 但假警报会咬人：`dsh plugin` / 用户在 profile 里手动 `npm install` 都会
+     * 真往 `profiles/web/node_modules` 落一份 —— 于是同名插件在「引擎顶层」与
+     * 「profile」并存，升级只升一份，之后的行为取决于谁先被解析到。
+     *
+     * ── 做法 ──────────────────────────────────────────────────────────────
+     *
+     * 只建**软链**、不复制：包本体仍然只有 `engine/lib/node_modules` 一份，
+     * 升级天然跟着走，磁盘也不翻倍（Android app 域禁止的只有硬链，软链可以）。
+     * 每次引擎启动重跑：引擎升级换的是链接目标里的内容，路径不变，链自动仍有效；
+     * 链被人为删掉/弄坏时这次会补回来。
+     *
+     * 三条边界：
+     *   1. **只在链接目标确实存在时建**（`lib/node_modules/<name>/package.json`
+     *      在），否则不制造必然断掉的链；
+     *   2. **已存在且不是软链**（用户真装了一份）就跳过 —— 那是用户的资产；
+     *   3. 名字带 scope（`@scope/name`）时先把父目录建出来。
+     */
+    fun ensureProfileLinks(ctx: Context) {
+        val manifest = profileManifestFile(ctx)
+        if (!manifest.isFile) return
+        val deps = runCatching {
+            org.json.JSONObject(manifest.readText().replace("\uFEFF", "")).optJSONObject("dependencies")
+        }.getOrNull() ?: return
+        val engineModules = File(engineRoot(ctx), "lib/node_modules")
+        val targetDir = profileModulesDir(ctx)
+        var made = 0
+        for (name in deps.keys().asSequence().toList()) {
+            val src = File(engineModules, name)
+            if (!File(src, "package.json").isFile) continue
+            val link = File(targetDir, name)
+            if (Files.isSymbolicLink(link.toPath())) {
+                if (link.exists()) continue          // 链还活着，什么都不用做
+                runCatching { Files.deleteIfExists(link.toPath()) }   // 断链：清掉重建
+            } else if (link.exists()) {
+                continue                              // 用户真装的，不动
+            }
+            runCatching {
+                link.parentFile?.mkdirs()
+                Files.createSymbolicLink(link.toPath(), src.toPath())
+                made++
+            }.onFailure { Log.w(TAG, "ensureProfileLinks: $name 建链失败：${it.message}") }
+        }
+        if (made > 0) Log.i(TAG, "ensureProfileLinks: $made link(s) created under ${targetDir.path}")
+    }
+
+    /**
+     * 把预装包的依赖声明写成 `file:<engine>/lib/node_modules/<name>`。
+     *
+     * 为什么不能只写裸版本号：官方插件页只读**键名**（`installed` 判据是
+     * `.dependencies` 里有这个名字），但这个值会被 npm / pnpm 当依赖解析 ——
+     * 裸版本号意味着「去 registry 拿 3.3.5」，于是 profile 里跑任何
+     * `npm install` 都会为一个**已经在盘上**的包联网重下一份，把
+     * [ensureProfileLinks] 建的软链换成实体目录（同名插件从此有两份）。
+     * `file:` 是 npm 与 pnpm 都认的本地链接依赖：`npm ls` 不报 missing，
+     * `pnpm install` 也只会建链、不下载。
+     *
+     * 只迁移「值恰好等于我们自己写过的那个版本号」的条目：用户改过版本、
+     * 或从 registry 真装过别的版本时一律不动。
+     */
+    private fun ensurePreinstalledDependency(
+        ctx: Context,
+        deps: org.json.JSONObject,
+        name: String,
+        version: String,
+    ) {
+        val dir = File(engineRoot(ctx), "lib/node_modules/$name")
+        val preinstalled = File(dir, "package.json").isFile
+        val current = deps.optString(name, "")
+        when {
+            !deps.has(name) -> deps.put(name, if (preinstalled) "file:${dir.absolutePath}" else version)
+            preinstalled && current == version -> deps.put(name, "file:${dir.absolutePath}")
+        }
+    }
+
+    /**
      * 崩溃自愈的备份根（`files/kxxy-recovery/`）。
      *
      * 刻意**不放在 `$DSH_HOME` 里**：那个目录会被引擎当作 home 扫描（会话、
@@ -1871,8 +2006,9 @@ object EngineConfig {
             }
 
             val dependencies = json.optJSONObject("dependencies") ?: org.json.JSONObject()
-            if (!dependencies.has(MOBILE_PLUGIN_NAME)) {
-                dependencies.put(MOBILE_PLUGIN_NAME, MOBILE_PLUGIN_VERSION)
+            ensurePreinstalledDependency(ctx, dependencies, MOBILE_PLUGIN_NAME, MOBILE_PLUGIN_VERSION)
+            if (dependencies.has(CODEX_PLUGIN_NAME)) {
+                ensurePreinstalledDependency(ctx, dependencies, CODEX_PLUGIN_NAME, CODEX_PLUGIN_VERSION)
             }
             json.put("dependencies", dependencies)
 
@@ -1891,7 +2027,7 @@ object EngineConfig {
             if (codexAvailable && !migrations.optBoolean("codexSidebarSeeded", false)) {
                 val alreadyInstalled = dependencies.has(CODEX_PLUGIN_NAME)
                 if (!alreadyInstalled) {
-                    dependencies.put(CODEX_PLUGIN_NAME, CODEX_PLUGIN_VERSION)
+                    ensurePreinstalledDependency(ctx, dependencies, CODEX_PLUGIN_NAME, CODEX_PLUGIN_VERSION)
                     var codexPresent = false
                     for (i in 0 until bundles.length()) {
                         if (bundles.optString(i) == CODEX_PLUGIN_NAME) codexPresent = true

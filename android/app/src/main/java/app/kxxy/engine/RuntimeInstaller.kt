@@ -211,11 +211,14 @@ class RuntimeInstaller(private val ctx: Context) {
             // TeX, extension pool, font/dev defaults run separately after Healthy.
             healCopiedAliases(root)
             ensureJvmExecBits(root)
+            ensureJvmWrappers(root)
             materialiseSonameAliases(root)
             installExecShim(root)
             ensureDshWrapper(root)
             repairPlaceholderScripts(root)
             ensureResolvConf(root)
+            ensureHosts(root)
+            healGlibcLaunchers(root)
             // 这两步必须留在「启动前」的同步路径，不能只挂在 maintainAfterHealthy()：
             // 桩库遮蔽会直接让加载 libz/libunwindstack 的进程报
             // `cannot locate symbol`，而维护阶段只在引擎 Healthy 之后才跑 ——
@@ -283,8 +286,11 @@ class RuntimeInstaller(private val ctx: Context) {
             installExecShim(root)
             ensureDshWrapper(root)
             ensureResolvConf(root)
+            ensureHosts(root)
             restoreExecBits(root)
             ensureJvmExecBits(root)
+            ensureJvmWrappers(root)
+            healGlibcLaunchers(root)
             check(dshRuntimeUpgrade.restoreCurrentModes(root)) { "APK DSH 目标内容不匹配；停止安装" }
             RuntimeInstallIo.checkCancelled()
             check(isComplete(root, checkMarker = false)) { "APK runtime verification failed; offline repair can be retried" }
@@ -332,7 +338,7 @@ class RuntimeInstaller(private val ctx: Context) {
                 synchronized(INSTALL_LOCK) {
                     val root = EngineConfig.engineRoot(ctx)
                     val steps: List<() -> Unit> = listOf(
-                        { ensureExtensionPool(root) }, { ensureTmpDir(ctx) },
+                        { ensureExtensionPool(root) }, { healGlibcLaunchers(root) }, { ensureTmpDir(ctx) },
                         { ensureNoShadowingStubs(root) }, { ensureEmacsSiteLoad(root) },
                         { ensureGuileCcacheFresh(root) }, { ensureFontConfig(root) },
                         { ensureDevEnvDefaults(root) }, { ensureTexExecBits(root) },
@@ -998,7 +1004,7 @@ class RuntimeInstaller(private val ctx: Context) {
         val plugin = File(root, "lib/node_modules/dsh-codex-sidebar")
         val actual = runCatching { File(plugin, "plugin.fingerprint").readText().trim() }.getOrNull()
         if (actual != expected) return false
-        for (path in listOf("package.json", "cordis.patch.yml", "lib/index.js", "lib/client.js", "lib/transport.mjs", "lib/security.mjs", "lib/service.mjs", "lib/custom-models.mjs", "lib/custom-chat.mjs", "lib/native-models.mjs", "lib/provider-api.mjs", "lib/provider-config.mjs", "lib/provider-http.mjs", "lib/provider-protocols.mjs", "lib/responses-bridge.mjs", "lib/responses-bridge-codec.mjs", "lib/workspace-tools.mjs", "lib/access-policy.mjs", "lib/file-changes.mjs", "lib/thread-actions.mjs", "web/codex.css")) {
+        for (path in listOf("package.json", "cordis.patch.yml", "lib/index.js", "lib/client.js", "lib/transport.mjs", "lib/security.mjs", "lib/service.mjs", "lib/custom-models.mjs", "lib/custom-chat.mjs", "lib/native-models.mjs", "lib/provider-api.mjs", "lib/provider-config.mjs", "lib/provider-http.mjs", "lib/provider-protocols.mjs", "lib/responses-bridge.mjs", "lib/responses-bridge-codec.mjs", "lib/workspace-tools.mjs", "lib/workspace-state.mjs", "lib/access-policy.mjs", "lib/file-changes.mjs", "lib/thread-actions.mjs", "web/codex.css")) {
             if (!File(plugin, path).isFile) return false
         }
         if (metadata.optBoolean("codexRuntimeIncluded", false)) {
@@ -1751,6 +1757,155 @@ class RuntimeInstaller(private val ctx: Context) {
     }
 
     /**
+     * 需要套壳的 JDK 启动器 → 参数前缀。
+     *
+     * `java` 吃裸 `-D`；`javac` / `jar` / `javadoc` / `jshell` / `keytool` 是
+     * launcher 二进制，要 `-J` 才能把选项转给内部那个 JVM。
+     */
+    private val JVM_LAUNCHERS = listOf(
+        "java" to "",
+        "javac" to "-J",
+        "jar" to "-J",
+        "javadoc" to "-J",
+        "jshell" to "-J",
+        "keytool" to "-J",
+    )
+
+    /** 启动器壳里的识别标记：[ensureJvmWrappers] 靠它区分「壳」与「真身」。 */
+    private val JVM_WRAPPER_MARK = "kxxy-jvm-launcher:"
+
+    /**
+     * 给 JDK 的启动器套一层壳，把 [EngineConfig.jvmDefaultFlags] 的 `-D` 带上。
+     *
+     * 这是 `JAVA_TOOL_OPTIONS` 的替代品：那个变量会让每个 JVM 往 stderr 打
+     * `Picked up JAVA_TOOL_OPTIONS: …`（`JDK_JAVA_OPTIONS` 换成 `NOTE: Picked
+     * up …`，一样洗不掉），而 `javac` 的输出、`gradle --version` 的解析、
+     * 用户脚本里的 `2>&1 | grep` 都会被它污染。参数写进壳里效果完全一样，
+     * 但一个字都不打印。
+     *
+     * 为什么改 `lib/jvm/<jdk>/bin/` 而不是 `<root>/bin/`：gradle 的 launcher、
+     * daemon 和 worker 全部直接 exec `$JAVA_HOME/bin/java`（`JAVA_HOME` 见
+     * [EngineConfig.buildEnv]），`<root>/bin/java` 那条软链只覆盖「PATH 上的
+     * java」。改 JDK 里这一份，软链会天然带过去，两个入口一起覆盖。
+     *
+     * 为什么真身改名成 `<name>.real` 而不是搬到别的目录：JVM 是按**自身路径**
+     * 去 `../lib/server/libjvm.so` 找运行时的（不看 cwd），同目录改名不影响这个
+     * 相对关系；搬到别处就是 `Error: could not find libjava.so`。
+     *
+     * 三种状态都要收敛，且幂等（内容一致不写盘）：
+     *   ① 首次：`bin/java` 是 ELF ⇒ 改名成 `java.real`，写壳；
+     *   ② 已在：`bin/java` 是壳 ⇒ 只按最新参数重写内容（换时区会触发）；
+     *   ③ 重装：`lib/` 整棵换新 ⇒ `bin/java` 又是 ELF，`java.real` 可能是旧版
+     *      残留 ⇒ 删旧真身、把新二进制改名过去，再写壳。
+     */
+    private fun ensureJvmWrappers(root: File) {
+        val jvmRoot = File(root, "lib/jvm")
+        if (!jvmRoot.isDirectory) return
+        val flags = EngineConfig.jvmDefaultFlags(ctx)
+        var written = 0
+        for (jdk in jvmRoot.listFiles().orEmpty()) {
+            val binDir = File(jdk, "bin")
+            if (!binDir.isDirectory) continue
+            for ((name, prefix) in JVM_LAUNCHERS) {
+                RuntimeInstallIo.checkCancelled()
+                val launcher = File(binDir, name)
+                if (!launcher.isFile) continue
+                // 软链形态不碰：它指向的真身不一定在本套布局里，改名会把链变成
+                // 它自己（真机非常规布局下，跳过并留日志是唯一安全的做法）。
+                if (Files.isSymbolicLink(launcher.toPath())) {
+                    Log.w(TAG, "ensureJvmWrappers: $name 是软链，跳过（${launcher.path}）")
+                    continue
+                }
+                val real = File(binDir, "$name.real")
+                val head = runCatching { launcher.readText() }.getOrNull().orEmpty()
+                if (!head.contains(JVM_WRAPPER_MARK)) {
+                    // ① / ③：手上这份是二进制（本次安装解出来的）⇒ 先让它归位成真身。
+                    if (real.exists() && !real.delete()) {
+                        Log.w(TAG, "ensureJvmWrappers: 旧真身删不掉（${real.path}）")
+                        continue
+                    }
+                    if (!launcher.renameTo(real)) {
+                        Log.w(TAG, "ensureJvmWrappers: 无法把 ${launcher.path} 改名为真身")
+                        continue
+                    }
+                    if (!real.setExecutable(true, false)) {
+                        Log.w(TAG, "ensureJvmWrappers: 真身置执行位失败（${real.path}）")
+                    }
+                } else if (!real.isFile) {
+                    // 壳在、真身没了。壳自己救不回来（二进制只存在于 runtime.zip 里），
+                    // 但必须留一条能对上号的日志 —— 否则表现是「java 突然不见了」。
+                    Log.w(TAG, "ensureJvmWrappers: $name 的真身缺失（${real.path}）")
+                    continue
+                }
+                val data = jvmWrapperScript(name, real.absolutePath, prefix, flags).toByteArray(Charsets.UTF_8)
+                val upToDate = runCatching {
+                    launcher.length() == data.size.toLong() && launcher.readBytes().contentEquals(data)
+                }.getOrDefault(false)
+                if (upToDate) {
+                    if (!launcher.canExecute()) launcher.setExecutable(true, false)
+                    continue
+                }
+                runCatching {
+                    launcher.writeBytes(data)
+                    launcher.setExecutable(true, false)
+                    written++
+                }.onFailure { Log.w(TAG, "ensureJvmWrappers: 写 $name 失败：${it.message}") }
+            }
+        }
+        if (written > 0) Log.i(TAG, "ensureJvmWrappers: $written launcher(s) wrapped")
+    }
+
+    /**
+     * 生成一个启动器壳。参数逐个加双引号：App 目录理论上可能带空格。
+     *
+     * ── 真身为什么写**绝对路径**，而不是按 `$0` 推同目录 ────────────────────
+     *
+     * 最初写的是 `d=${0%/*}; n=${0##*/}; r="$d/$n.real"`，在
+     * `$JAVA_HOME/bin/java`（gradle / mvn 直接 exec 的入口）上完全正确 —— 那
+     * 时候 `$0` 就是本文件自己的路径。
+     *
+     * 但 `PATH` 上还有第二条入口：`<root>/bin/java` 是指向
+     * `lib/jvm/<jdk>/bin/java` 的**软链**。经软链调用时 `$0` 是软链的路径
+     * （`<root>/bin/java`），于是 `d=<root>/bin`、壳去找 `<root>/bin/java.real`
+     * —— 那里没有真身，只有 `chmod` 静默失败和一句
+     * `java: inaccessible or not found`。用户看到的是「java 突然消失」，
+     * 而真正坏掉的是 `$0` 的语义：它永远是**被调用时的路径**，不是文件本身的
+     * 位置。连带 `d8`、`apksigner`（两个都是包一层 `java` 的垫片）一起失效，
+     * 整条 APK 打包链在设备上断掉。
+     *
+     * 真身的绝对路径在写壳这一刻就是已知的（[ensureJvmWrappers] 里的
+     * `real.absolutePath`），直接写死即可 —— 比在壳里 `readlink -f` 少 fork
+     * 一次，也不依赖设备上有没有 `readlink`。`$0` 现在完全不参与定位，无论
+     * 从软链、从 `$JAVA_HOME`、从相对路径调用都指向同一份真身。
+     *
+     * 路径变了（换 JDK / 换引擎根）会触发内容比对，[ensureJvmWrappers] 自动
+     * 按新路径重写；因此这里写死绝对路径不会留下「指向旧目录」的陈旧壳。
+     */
+    private fun jvmWrapperScript(name: String, realPath: String, prefix: String, flags: List<String>): String {
+        val args = flags.joinToString(" ") { "\"$prefix$it\"" }
+        // 单引号字符串里唯一需要转义的字符：`'` 写成 `'\''`。App 目录一般不含
+        // 引号，但壳是 `/system/bin/sh` 直接解析的，宁可多这一行也不能拼出语法错。
+        val escaped = realPath.replace("'", "'\\''")
+        return buildString {
+            append("#!/system/bin/sh\n")
+            append("# generated by Kxxy RuntimeInstaller — do not edit\n")
+            append("# $JVM_WRAPPER_MARK$name\n")
+            append("#\n")
+            append("# 为什么套壳而不用 JAVA_TOOL_OPTIONS：那个变量会让每个 JVM 往 stderr\n")
+            append("# 打一行 `Picked up JAVA_TOOL_OPTIONS: …`，没有任何开关能关掉，而它\n")
+            append("# 污染 javac 输出、gradle/mvn 的结果解析和脚本里的 `2>&1 | grep`。\n")
+            append("# 参数写在这里效果相同、完全安静（取舍见 EngineConfig.jvmDefaultFlags）。\n")
+            append("#\n")
+            append("# 真身是 $name.real（绝对路径见下），JVM 按自身路径找\n")
+            append("# ../lib/server/libjvm.so，同目录改名不影响这个相对关系。\n")
+            append("# 不按 \$0 推同目录：PATH 上的 java 是软链，\$0 会是软链的路径。\n")
+            append("r='$escaped'\n")
+            append("[ -x \"\$r\" ] || chmod 700 \"\$r\" 2>/dev/null\n")
+            append("exec \"\$r\" $args \"\$@\"\n")
+        }
+    }
+
+    /**
      * 剔除**会遮蔽系统真库**的 Termux 桩库，每次启动都跑（缺陷 AZ）。
      *
      * 背景：`libandroid-stub_30-1` 发的 `<root>/lib/libbinder_ndk.so` 只有
@@ -2204,7 +2359,7 @@ class RuntimeInstaller(private val ctx: Context) {
         }
     }
 
-    /** 开发环境默认值（git 身份 / pip 镜像 / pnpm 导入方式）——两处调用点共用这一层。 */
+    /** 开发环境默认值（git 身份 / pip 镜像 / pnpm 导入方式 / npm·pnpm·yarn 软件源 / pandoc 中文 PDF / ImageMagick 规则 / git 直链镜像）——两处调用点共用这一层。 */
     private fun ensureDevEnvDefaults(root: File) {
         runCatching { ensureGitIdentity(ctx) }
             .onFailure { Log.w(TAG, "ensureGitIdentity crashed: ${it.message}") }
@@ -2212,6 +2367,8 @@ class RuntimeInstaller(private val ctx: Context) {
             .onFailure { Log.w(TAG, "ensurePipConfig crashed: ${it.message}") }
         runCatching { ensurePnpmImportMethod(ctx) }
             .onFailure { Log.w(TAG, "ensurePnpmImportMethod crashed: ${it.message}") }
+        runCatching { ensureJsRegistry(ctx) }
+            .onFailure { Log.w(TAG, "ensureJsRegistry crashed: ${it.message}") }
         runCatching { ensurePandocCjkDefaults(ctx) }
             .onFailure { Log.w(TAG, "ensurePandocCjkDefaults crashed: ${it.message}") }
         runCatching { ensureImageMagickTypes(root) }
@@ -2289,32 +2446,123 @@ class RuntimeInstaller(private val ctx: Context) {
      * --link-dest`、`cp -l`、`git worktree` 共享对象都走同一条 `link(2)`，全部
      * 被拒。能做的只有「降级得干净」，不是「让它能硬链」。
      *
-     * 只在用户没有自己设置该项时写一行，并且带管理边界标记 —— `~/.npmrc` 是
-     * 用户资产，和其它自愈一样不覆盖用户的显式选择。
+     * ── 为什么不再写 `~/.npmrc` ────────────────────────────────────────────
+     *
+     * `package-import-method` 是 **pnpm 独有**的键，而 `~/.npmrc` 是 **npm 也
+     * 会读**的文件。写在那里，`npm -v` / `npm ls` / 插件跑的每一次 `npm
+     * install` 都会多一行
+     *
+     *     npm warn Unknown user config "package-import-method"
+     *
+     * （npm 12 起对未知键直接报错）。而这一行的唯一作用就是让 pnpm 别去试
+     * 硬链 —— npm 根本不需要它。所以这个键只能出现在 pnpm 自己的配置里：
+     * pnpm 的全局 rc 是 `$XDG_CONFIG_HOME/pnpm/rc`，没有 XDG 时就是
+     * `~/.config/pnpm/rc`（本应用 HOME = `kxxy-home`，没有设 XDG_CONFIG_HOME）。
+     *
+     * 旧的 `~/.npmrc` / `.pnpmfile.npmrc` 里的管理块由下面的迁移步骤摘掉 ——
+     * 升级过的设备上那份文件还在，不摘就永远继续报警告。
+     *
+     * 只在用户没有自己设置该项时写，并带管理边界标记；配置是用户资产，和
+     * 其它自愈一样不覆盖用户的显式选择。
      */
     private fun ensurePnpmImportMethod(ctx: Context) {
         val home = EngineConfig.dshHome(ctx)
         val begin = "# kxxy:pnpm-import begin"
         val end = "# kxxy:pnpm-import end"
         val block = "$begin\npackage-import-method=copy\n$end\n"
+
+        // ① 写 pnpm 自己的全局 rc。
+        val rc = File(home, ".config/pnpm/rc")
+        val current = runCatching { if (rc.isFile) rc.readText() else "" }.getOrDefault("")
+        val outside = stripManagedBlock(current, begin, end)
+        val userSet = Regex("(?m)^\\s*package-import-method\\s*=").containsMatchIn(outside)
+        if (!userSet) {
+            val next = upsertManagedBlock(current, begin, end, block)
+            if (next != current) {
+                runCatching {
+                    rc.parentFile?.mkdirs()
+                    rc.writeText(next)
+                    Log.i(TAG, "ensurePnpmImportMethod: wrote ${rc.path}")
+                }.onFailure { Log.w(TAG, "ensurePnpmImportMethod rc failed: ${it.message}") }
+            }
+        }
+
+        // ② 迁移：摘掉上一版写进 npm 配置的块（块外的用户条目原样保留）。
         for (name in listOf(".npmrc", ".pnpmfile.npmrc")) {
             val target = File(home, name)
-            if (name == ".pnpmfile.npmrc" && !target.isFile) continue
-            val existing = runCatching { if (target.isFile) target.readText() else "" }
-                .getOrDefault("")
-            // 用户已经显式设过（不管设成什么）就不动。
-            if (Regex("(?m)^\\s*package-import-method\\s*=").containsMatchIn(existing)) continue
-            val next = if (existing.contains(begin)) {
-                // 换掉我们上次写的那一块，保留上下文。
-                existing.replace(Regex("(?s)" + Regex.escape(begin) + ".*?" + Regex.escape(end) + "\\n?"), block)
-            } else {
-                (if (existing.isEmpty() || existing.endsWith("\n")) existing else "$existing\n") + block
-            }
+            if (!target.isFile) continue
+            val existing = runCatching { target.readText() }.getOrNull() ?: continue
+            if (!existing.contains(begin)) continue
+            val next = stripManagedBlock(existing, begin, end)
+            runCatching {
+                target.writeText(next)
+                Log.i(TAG, "ensurePnpmImportMethod: migrated ${target.path} (removed managed block)")
+            }.onFailure { Log.w(TAG, "ensurePnpmImportMethod migrate $name failed: ${it.message}") }
+        }
+    }
+
+    /** 摘掉一段由本应用写过的管理块（`begin … end`）；块不存在时原样返回。 */
+    private fun stripManagedBlock(existing: String, begin: String, end: String): String =
+        existing.replace(Regex("(?s)" + Regex.escape(begin) + ".*?" + Regex.escape(end) + "\\n?"), "")
+
+    /**
+     * 把 `block` 放进 `existing`：已有同名管理块就整块替换，否则追加到末尾。
+     * 返回原文本表示「没有变化」，调用方据此跳过写盘。
+     */
+    private fun upsertManagedBlock(existing: String, begin: String, end: String, block: String): String =
+        if (existing.contains(begin)) {
+            existing.replace(Regex("(?s)" + Regex.escape(begin) + ".*?" + Regex.escape(end) + "\\n?"), block)
+        } else {
+            (if (existing.isEmpty() || existing.endsWith("\n")) existing else "$existing\n") + block
+        }
+
+    /** 由 [ensureJsRegistry] 写进 `~/.npmrc` / `~/.yarnrc` / `~/.yarnrc.yml` 的块边界。 */
+    private val REGISTRY_BEGIN = "# kxxy:registry begin"
+    private val REGISTRY_END = "# kxxy:registry end"
+
+    /**
+     * 让 npm / pnpm / yarn 指向**同一个**镜像（问题清单 R4）。
+     *
+     * [EngineConfig.buildEnv] 已经给了 `npm_config_registry` /
+     * `NPM_CONFIG_REGISTRY` / `COREPACK_NPM_REGISTRY`，但那只覆盖「环境变量还在」
+     * 的进程：`env -i`、`sudo`、部分 npm 生命周期脚本都会把环境清掉，那时
+     * npm 回 `registry.npmjs.org`、yarn 回 `registry.yarnpkg.com`，在境内就是
+     * 几十 KB/s 的挂死。这和 [ensurePipConfig] 是同一类取舍：**配置文件和环境
+     * 变量两层都要有**。
+     *
+     * 三处文件三种语法，不能共用一个模板：
+     *
+     *     ~/.npmrc       registry=https://…        npm 与 pnpm 都读这一份
+     *     ~/.yarnrc      registry "https://…"      yarn 1 的 key "value" 语法
+     *     ~/.yarnrc.yml  npmRegistryServer: "…"    yarn 2+ 的 YAML
+     *
+     * `npmRegistryServer` 不能带结尾斜杠（yarn 会拼成 `//pkg` 然后 404），
+     * 另外两份带不带都行，统一带。
+     *
+     * 用户已经自己设过同一个键（不管设成什么）就整份不动 —— 配置是用户资产，
+     * 与 [ensurePnpmImportMethod] 同一条规则。
+     */
+    private fun ensureJsRegistry(ctx: Context) {
+        val home = EngineConfig.dshHome(ctx)
+        val reg = "https://registry.npmmirror.com/"
+        val jobs = listOf(
+            Triple(".npmrc", "registry", "registry=$reg"),
+            Triple(".yarnrc", "registry", "registry \"$reg\""),
+            Triple(".yarnrc.yml", "npmRegistryServer", "npmRegistryServer: \"${reg.trimEnd('/')}\""),
+        )
+        for ((name, key, line) in jobs) {
+            RuntimeInstallIo.checkCancelled()
+            val target = File(home, name)
+            val existing = runCatching { if (target.isFile) target.readText() else "" }.getOrDefault("")
+            val outside = stripManagedBlock(existing, REGISTRY_BEGIN, REGISTRY_END)
+            if (Regex("(?m)^\\s*${Regex.escape(key)}\\s*[:=]").containsMatchIn(outside)) continue
+            val next = upsertManagedBlock(existing, REGISTRY_BEGIN, REGISTRY_END, "$REGISTRY_BEGIN\n$line\n$REGISTRY_END\n")
+            if (next == existing) continue
             runCatching {
                 target.parentFile?.mkdirs()
                 target.writeText(next)
-                Log.i(TAG, "ensurePnpmImportMethod: wrote ${target.path}")
-            }.onFailure { Log.w(TAG, "ensurePnpmImportMethod failed: ${it.message}") }
+                Log.i(TAG, "ensureJsRegistry: wrote ${target.path}")
+            }.onFailure { Log.w(TAG, "ensureJsRegistry $name failed: ${it.message}") }
         }
     }
 
@@ -2643,6 +2891,140 @@ class RuntimeInstaller(private val ctx: Context) {
         }.onFailure { Log.w(TAG, "ensureResolvConf failed: ${it.message}") }
     }
 
+    /**
+     * 落一份 `<root>/etc/hosts`，由 `kxxy-glibc` 挂进容器（缺陷 CK）。
+     *
+     * 容器是 `proot -r <rootfs>`：guest 的 `/etc/hosts` 就是 rootfs 里那份，
+     * 而启动器此前**一个 hosts 都不挂**。缺了 `127.0.0.1 localhost` 的直接
+     * 后果是 guest 里 `getent hosts localhost` 空、Java 的
+     * `InetAddress.getLocalHost()` 先去问 DNS，连本机服务要绕一圈 DNS 再失败。
+     *
+     * 为什么写引擎根而不是写进 rootfs：rootfs 在 `$DATA/rootfs`，用户可以删、
+     * 也可以用 `KXXY_GLIBC_ROOTFS` 整个换掉；引擎根随 runtime 重装走，每次
+     * 启动都会重跑本函数。启动器的查找顺序是
+     * `<root>/etc/hosts` → rootfs 自带 → 系统 → 兜底。
+     *
+     * 不覆盖用户加过条目的那份：只在文件缺失、为空、或压根没有 localhost
+     * 那一行时动手（追加而不是整份替换）。
+     */
+    private fun ensureHosts(root: File) {
+        val target = File(root, "etc/hosts")
+        val minimal = "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n"
+        val existing = runCatching { if (target.isFile) target.readText() else "" }.getOrDefault("")
+        // 已经有 `127.0.0.1 … localhost` 就认为这份文件是好的，不动。
+        if (Regex("(?m)^\\s*127\\.0\\.0\\.1\\s+[^#]*\\blocalhost\\b").containsMatchIn(existing)) return
+        val body = when {
+            existing.isEmpty() -> "# generated by Kxxy RuntimeInstaller — do not edit\n$minimal"
+            existing.endsWith("\n") -> existing + minimal
+            else -> "$existing\n$minimal"
+        }
+        runCatching {
+            target.parentFile?.mkdirs()
+            target.writeText(body)
+            Log.i(TAG, "ensureHosts: wrote ${target.path}")
+        }.onFailure { Log.w(TAG, "ensureHosts failed: ${it.message}") }
+    }
+
+    /**
+     * 把两份 glibc 启动器都升到当前内容 —— **从 APK 自带的模板**，不看扩展池。
+     *
+     * 同一个启动器在设备上存在两份：
+     *   ① `extensions/glibc/bin/kxxy-glibc` —— 扩展池（`glibc.pool`）解出来的，
+     *      扩展中心包装备一次就换一次，`kxxy-glibc-provision` 直接调它；
+     *   ② `libexec/python-default/kxxy-glibc` —— runtime.zip 里那份，裸 `python3` /
+     *      `pip` 路由直接 exec 它（`python-default.py`）。
+     *
+     * ── 为什么不再「拿扩展那份覆盖 ②」 ─────────────────────────────────────
+     *
+     * v0.9.81 是这么做的，实测在**升级后的第一次启动**上不成立，时序是倒挂的：
+     *   1. 引擎启动前（本函数所在的同步路径）：`ext-pool/glibc.pool` 还是旧文件，
+     *      `extensions/glibc/bin/kxxy-glibc` 自然是旧的 ⇒ 找不到可用的捐赠者；
+     *   2. 引擎初始化：`kxxy-host` 立刻跑 `extinstall.staleExtensions(root)`，
+     *      它比的是「池体积 vs `.links.json` 里记的体积」，此刻两边都是旧值
+     *      ⇒ 判「已最新」，不重装；
+     *   3. 引擎 Healthy 之后：[maintainAfterHealthy] 才把新池拷进 `ext-pool/`，
+     *      但 `staleExtensions` 已经跑完、不会自己再跑一次；
+     *   4. 于是这一整个会话里两份启动器都是旧的：容器内 DNS / localhost 照旧不可用，
+     *      连带 `kxxy-glibc-provision base`（它调 ①）继续失败 —— 用户看到的是
+     *      「升了 APK 什么都没变」，必须再重启一次才可能好。
+     *
+     * 所以判据只能来自 APK 本体：`assets/glibc-route/kxxy-glibc.sh` 是构建期从
+     * `tools/prebuilt/wrappers/kxxy-glibc.sh` 逐字节同步过来的模板（同一份源码，
+     * `tools/sync-glibc-route-asset.mjs --check` 与契约测试都会拦漂移），这里做
+     * 与 [rewriteRootPlaceholder] 同一套占位符回填，直接写两份。不依赖扩展重装、
+     * 不依赖引擎、不等下一次启动。
+     *
+     * 为什么不从 `runtime.zip` 里读 ②：`ZipFile` 只接受文件路径，而 asset 是流，
+     * 读一个条目要先把这个 982 MB 的 zip 整份拷到 cacheDir —— 启动路径上不可接受。
+     * 一个 8 KiB 的模板资产没有这个问题。
+     *
+     * ── 判据：逐字节比对，不是「含某个特征串」 ─────────────────────────────
+     *
+     * v0.9.82 用的是「盘上文件头部含 `GUEST_ETC=` 就算最新」。那个判据有个
+     * 结构性缺陷：**每改一次启动器就要记得同步推进这个常量**，忘一次（或改的
+     * 内容正好也在别的版本里出现过）就意味着已升级的设备收不到修复 —— v0.9.83
+     * 的 `/dev/shm` 绑定正好撞上：老设备已经带 `GUEST_ETC=`，只加特征串的话
+     * 自愈会判「已最新」直接跳过，用户看到的现象就是「升了 APK，joblib 还是
+     * 串行」。现在改成与 [ensureJvmWrappers] 同一套做法：回填后的模板与盘上
+     * 内容逐字节相等就跳过，否则整份替换。启动器是**随包分发的可执行文件**，
+     * 不是配置，覆盖语义是对的（代价：手工改过它的人会被改回去）。
+     *
+     * 保护面：只动「本来就存在」的两个路径（扩展没装时 ① 不该凭空出现，② 由
+     * runtime 解压负责）；写临时文件再 rename，中断不会留下半个脚本；比较失败
+     * （读不动、权限异常）按「不等于」处理，写失败只记日志、不影响启动。
+     */
+    private fun healGlibcLaunchers(root: File) {
+        val targets = listOf(File(root, GLIBC_LAUNCHER_EXTENSION), File(root, PYTHON_ROUTE_SCRIPT))
+            .filter { it.isFile }
+        if (targets.isEmpty()) return
+        val data = runCatching { glibcLauncherTemplate(root) }.getOrElse {
+            Log.w(TAG, "healGlibcLaunchers: 读不到 APK 里的启动器模板（${it.message}），本轮跳过")
+            return
+        }
+        val stale = targets.filter { target ->
+            runCatching { target.readBytes().contentEquals(data) }.getOrDefault(false).not()
+        }
+        if (stale.isEmpty()) return
+        for (target in stale) {
+            runCatching {
+                val tmp = File("${target.absolutePath}.heal")
+                tmp.writeBytes(data)
+                if (!tmp.renameTo(target)) {
+                    // rename 失败（目标被占用等极少数情形）：直接覆盖，别把 tmp 留在树里。
+                    target.writeBytes(data)
+                    tmp.delete()
+                }
+                target.setExecutable(true, false)
+                Log.i(TAG, "healGlibcLaunchers: refreshed ${target.path}")
+            }.onFailure { Log.w(TAG, "healGlibcLaunchers: 写 ${target.path} 失败：${it.message}") }
+        }
+    }
+
+    /**
+     * 读 APK 里的启动器模板并回填占位符。
+     *
+     * 模板必须是**新版**（含 [GLIBC_LAUNCHER_FEATURE]）：拿旧模板去「修」只会把两份
+     * 启动器写回旧行为，比什么都不做更糟。
+     *
+     * 换行统一成 LF：`.gitattributes` 已按 LF 收文件，但资产也可能被 Windows
+     * 工具链改成 CRLF，而 `#!/system/bin/sh\r` 会让内核去找一个叫 `sh\r` 的
+     * 解释器（报 `No such file or directory`，v0.9.79 在 provision 上踩过一次）。
+     * 回填范围与 [rewriteRootPlaceholder] 一致：这份模板只用 `@DSH_ROOT@` 与
+     * `@DSH_FILES@`；残留任何 `@DSH_*@` 一律认为是模板问题，直接放弃本轮。
+     */
+    private fun glibcLauncherTemplate(root: File): ByteArray {
+        val raw = ctx.assets.open(GLIBC_LAUNCHER_ASSET).use { it.readBytes().decodeToString() }
+        val text = raw.replace("\r\n", "\n").replace("\r", "\n")
+        require(text.contains(GLIBC_LAUNCHER_FEATURE)) {
+            "APK 里的启动器模板缺 $GLIBC_LAUNCHER_FEATURE（旧包？）"
+        }
+        val body = text
+            .replace(ROOT_PLACEHOLDER, root.absolutePath)
+            .replace(FILES_PLACEHOLDER, ctx.filesDir.absolutePath)
+        require(!Regex("@DSH_[A-Z]+@").containsMatchIn(body)) { "启动器模板还有未回填的占位符" }
+        return body.toByteArray(Charsets.UTF_8)
+    }
+
     /** 当前活动网络的 DNS 服务器（IPv4 与 IPv6 都收，去重保序）。 */
     private fun activeDnsServers(): List<String> {
         val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
@@ -2651,7 +3033,6 @@ class RuntimeInstaller(private val ctx: Context) {
         val props = cm.getLinkProperties(network) ?: return emptyList()
         return props.dnsServers.mapNotNull { it.hostAddress }.distinct()
     }
-
     /**
      * 给 Emacs 落一份 `site-load.el`，抹掉 Android 构建期的 git 探测噪音（缺陷 BA 收尾）。
      *
@@ -3417,6 +3798,33 @@ class RuntimeInstaller(private val ctx: Context) {
 
         /** 读版本标记时探测的头部字节数；标记都写在首行，取小值即可。 */
         private const val COMPAT_MARKER_PROBE_BYTES = 256
+
+        /** 默认 Python 路由脚本（runtime.zip 里那份，见 [healGlibcLaunchers]）。 */
+        private const val PYTHON_ROUTE_SCRIPT = "libexec/python-default/kxxy-glibc"
+
+        /** glibc 扩展里那份启动器（扩展池解出来的，`kxxy-glibc-provision` 直接调它）。 */
+        private const val GLIBC_LAUNCHER_EXTENSION = "extensions/glibc/bin/kxxy-glibc"
+
+        /**
+         * APK 自带的启动器模板 —— 上面两份的**唯一权威来源**（[healGlibcLaunchers]）。
+         *
+         * 由 `tools/sync-glibc-route-asset.mjs` 从
+         * `tools/prebuilt/wrappers/kxxy-glibc.sh` 逐字节同步（LF），构建期
+         * `--check` 与 `tools/test-runtime-capability-contracts.mjs` 都会拦漂移。
+         * 用「小资产」而不是从 `runtime.zip` 里抽：后者要先拷 982 MB 到 cacheDir。
+         */
+        private const val GLIBC_LAUNCHER_ASSET = "glibc-route/kxxy-glibc.sh"
+
+
+        /**
+         * 启动器模板必须带的功能特征：`-b "$GUEST_SHM:/dev/shm"`。
+         *
+         * 这不是「盘上文件是否最新」的判据（那个已改为逐字节比对，见
+         * [healGlibcLaunchers]），只用来保证**模板本身**是新的：拿旧模板去
+         * 「修」会把两份启动器写回旧行为，比什么都不做更糟。取 shm 绑定这个
+         * 最新特性，等于「模板至少是 v0.9.83」。
+         */
+        private const val GLIBC_LAUNCHER_FEATURE = ":/dev/shm"
 
         private const val MAX_SCAN_DEPTH = 6
 

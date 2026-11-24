@@ -800,7 +800,7 @@ for (const [suffix, label] of NEED_ANY) {
 // Codex client/host assets must agree with installation-scope discovery.
 {
   const base = "lib/node_modules/dsh-codex-sidebar/";
-  const required = ["package.json", "cordis.patch.yml", "lib/index.js", "lib/client.js", "lib/transport.mjs", "lib/security.mjs", "lib/service.mjs", "lib/custom-models.mjs", "lib/custom-chat.mjs", "lib/native-models.mjs", "lib/provider-api.mjs", "lib/provider-config.mjs", "lib/provider-http.mjs", "lib/provider-protocols.mjs", "lib/responses-bridge.mjs", "lib/responses-bridge-codec.mjs", "lib/workspace-tools.mjs", "lib/access-policy.mjs", "lib/file-changes.mjs", "lib/thread-actions.mjs", "web/codex.css", "plugin.fingerprint"];
+  const required = ["package.json", "cordis.patch.yml", "lib/index.js", "lib/client.js", "lib/transport.mjs", "lib/security.mjs", "lib/service.mjs", "lib/custom-models.mjs", "lib/custom-chat.mjs", "lib/native-models.mjs", "lib/provider-api.mjs", "lib/provider-config.mjs", "lib/provider-http.mjs", "lib/provider-protocols.mjs", "lib/responses-bridge.mjs", "lib/responses-bridge-codec.mjs", "lib/workspace-tools.mjs", "lib/workspace-state.mjs", "lib/access-policy.mjs", "lib/file-changes.mjs", "lib/thread-actions.mjs", "web/codex.css", "plugin.fingerprint"];
   for (const path of required) {
     if (!byName.has(base + path)) {
       console.log(`Codex plugin: ✗ missing ${path}`);

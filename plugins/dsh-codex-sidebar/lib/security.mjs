@@ -1,11 +1,12 @@
 import { access, realpath, stat, mkdir, mkdtemp, writeFile, readFile, rm } from 'node:fs/promises'
 import { constants, createReadStream } from 'node:fs'
-import { resolve, relative, isAbsolute, join, dirname, delimiter } from 'node:path'
+import { resolve, relative, isAbsolute, join, dirname, delimiter, sep } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createHash } from 'node:crypto'
 import { CodexError, redact } from './transport.mjs'
 import { workspaceEnvironment, secretPath } from './workspace-tools.mjs'
+import { canonicalWorkspace } from './workspace-state.mjs'
 
 const execute = promisify(execFile)
 export const CODEX_VERSION = '0.167.0'
@@ -94,18 +95,54 @@ export async function sessionForCodex(ctx, sessionId) {
   return header
 }
 
-export async function workspaceForSession(ctx, sessionId) {
+/**
+ * The workspace is the session's own DSH directory unless the user explicitly picked another
+ * one in the Codex sidebar. The override lives in the plugin's private state, is re-validated
+ * through realpath on every read, and silently drops back to the session default when stale.
+ */
+export async function workspaceForSession(ctx, sessionId, { store = null, env = process.env } = {}) {
   const header = await sessionForCodex(ctx, sessionId)
-  if (!header.cwd || !isAbsolute(header.cwd)) throw new CodexError('workspace-unavailable', '请先在 DSH 中选择有工作区的会话', 404)
+  const fallback = await defaultWorkspace(header)
+  if (store) {
+    try { await store.load() } catch { /* Preferences are optional; the session default still applies. */ }
+    const override = store.override?.(sessionId)
+    if (override) {
+      try { return await canonicalWorkspace(override, { env, label: '已选工作区' }) } catch { await store.clearOverride?.(sessionId).catch(() => {}) }
+    }
+  }
+  if (fallback.cwd) return fallback.cwd
+  throw fallback.error
+}
+
+async function defaultWorkspace(header) {
+  if (!header.cwd || !isAbsolute(header.cwd)) return { cwd: null, error: new CodexError('workspace-unavailable', '请先在 DSH 中选择有工作区的会话', 404) }
   let cwd
-  try { cwd = await realpath(header.cwd) } catch { throw new CodexError('workspace-unavailable', '当前工作区不可访问，请重新选择目录', 404) }
-  if (!(await stat(cwd)).isDirectory()) throw new CodexError('workspace-invalid', '工作区不是目录')
-  return cwd
+  try { cwd = await realpath(header.cwd) } catch { return { cwd: null, error: new CodexError('workspace-unavailable', '当前工作区不可访问，请重新选择目录', 404) } }
+  if (!(await stat(cwd)).isDirectory()) return { cwd: null, error: new CodexError('workspace-invalid', '工作区不是目录') }
+  return { cwd, error: null }
 }
 
 export function inside(root, target) {
   const path = relative(root, target)
   return path === '' || (!path.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) && path !== '..' && !isAbsolute(path))
+}
+
+/** Workspace-relative paths are always POSIX so prompts and tools agree on Windows too. */
+const displayPath = (root, target) => sep === '/' ? relative(root, target) : relative(root, target).split(sep).join('/')
+
+/**
+ * Vision requests only accept a few container formats, and the type must be sniffed from the
+ * bytes: a renamed .txt would otherwise be sent as a broken image block and fail the whole turn.
+ */
+const IMAGE_MAGIC = [
+  { mime: 'image/png', head: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] },
+  { mime: 'image/jpeg', head: [0xff, 0xd8, 0xff] },
+  { mime: 'image/gif', head: [0x47, 0x49, 0x46, 0x38] },
+]
+export function imageMime(buffer) {
+  for (const { mime, head } of IMAGE_MAGIC) if (head.every((byte, index) => buffer[index] === byte)) return mime
+  if (buffer.length > 12 && buffer.toString('latin1', 0, 4) === 'RIFF' && buffer.toString('latin1', 8, 12) === 'WEBP') return 'image/webp'
+  return null
 }
 
 export async function contextFile(cwd, name) {
@@ -114,10 +151,57 @@ export async function contextFile(cwd, name) {
   if (!inside(cwd, path)) throw new CodexError('file-outside', '不能引用工作区外的文件', 403)
   if (secretPath(name) || secretPath(path)) throw new CodexError('sensitive-file', '不能直接将凭据文件加入模型上下文', 403)
   const info = await stat(path)
-  if (!info.isFile() || info.size > 128 * 1024) throw new CodexError('file-too-large', '只支持 128 KiB 以内的文本文件', 413)
+  if (!info.isFile()) throw new CodexError('file-invalid', '只能引用工作区内的普通文件')
+  if (info.size > MAX_ATTACHMENT_BYTES) throw new CodexError('file-too-large', '单个附件不超过 32 MiB', 413)
   const data = await readFile(path)
-  if (data.includes(0)) throw new CodexError('file-binary', '此处只支持文本文件')
-  return { path: relative(cwd, path), text: data.toString('utf8') }
+  const mime = imageMime(data)
+  // Vision-capable models get the pixels inline; anything else stays a path reference.
+  if (mime) {
+    if (info.size > MAX_INLINE_IMAGE_BYTES) return { path: displayPath(cwd, path), binary: true, size: info.size, image: null, imageTooLarge: true }
+    return { path: displayPath(cwd, path), binary: true, size: info.size, image: { mime, data: data.toString('base64') } }
+  }
+  // Binary attachments (PDF, archives) are only referenced by path; the model reads
+  // them with its tools instead of receiving megabytes of mojibake in the prompt.
+  if (data.includes(0)) return { path: displayPath(cwd, path), binary: true, size: info.size }
+  const text = data.toString('utf8')
+  if (data.length > MAX_TEXT_BYTES) return { path: displayPath(cwd, path), text: text.slice(0, MAX_TEXT_BYTES), size: info.size, truncated: true }
+  return { path: displayPath(cwd, path), text, size: info.size }
+}
+
+export const UPLOAD_DIRECTORY = '.codex-uploads'
+const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
+const MAX_TEXT_BYTES = 128 * 1024
+// Providers reject large inline images anyway; bigger files stay path references.
+export const MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024
+const UPLOAD_NAME = /^[^\u0000-\u001f\u007f/\\:*?"<>|]{1,120}$/
+
+/**
+ * Phone-side attachments are written into the workspace so the model can open them with its
+ * normal tools. The name is sanitized and never used as a path, so an upload can escape neither
+ * the directory nor the workspace.
+ */
+export async function saveAttachment(cwd, { name, data } = {}) {
+  if (typeof name !== 'string' || name !== name.trim() || !UPLOAD_NAME.test(name) || name === '.' || name === '..') throw new CodexError('attachment-name', '文件名不能包含路径分隔符或控制字符', 400)
+  if (typeof data !== 'string' || !data) throw new CodexError('attachment-invalid', '附件内容为空', 400)
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data)) throw new CodexError('attachment-invalid', '附件内容必须是 Base64 编码', 400)
+  const buffer = Buffer.from(data, 'base64')
+  if (!buffer.length) throw new CodexError('attachment-invalid', '附件内容为空', 400)
+  if (buffer.length > MAX_ATTACHMENT_BYTES) throw new CodexError('attachment-too-large', '单个附件不超过 32 MiB', 413)
+  const directory = join(cwd, UPLOAD_DIRECTORY)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const stamp = `${Date.now().toString(36)}`
+  let target = join(directory, `${stamp}-${name}`)
+  for (let index = 1; ; index += 1) {
+    try { await access(target); target = join(directory, `${stamp}-${index}-${name}`) } catch { break }
+  }
+  await writeFile(target, buffer, { mode: 0o600, flag: 'wx' })
+  const binary = buffer.includes(0)
+  const mime = imageMime(buffer)
+  return {
+    path: displayPath(cwd, target), name, size: buffer.length, binary,
+    ...(mime ? { mime } : {}),
+    ...(binary ? {} : { text: buffer.toString('utf8').slice(0, MAX_TEXT_BYTES) }),
+  }
 }
 
 /** Test both allowed writes and a forbidden sibling write; success alone is not isolation. */

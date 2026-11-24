@@ -201,13 +201,49 @@ test('Chat tools assemble sparse indexes, validate full JSON schema and enforce 
 
 test('parallel tool permission and call count limits are independent of sparse provider indexes', async () => {
   const calls = Array.from({ length: 40 }, (_, index) => ccall(`call-${index}`))
-  await assert.rejects(run(jsonResponse(chat(null, { message: { tool_calls: calls.slice(0, 2) }, finish_reason: 'tool_calls' })), { tools: TOOLS }), { code: 'model-response' })
+  // Servers that ignore parallel_tool_calls:false must not lose an otherwise valid reply:
+  // the agent loop executes the calls sequentially, so the order is preserved instead of failing.
+  const sequential = await run(jsonResponse(chat(null, { message: { tool_calls: calls.slice(0, 2) }, finish_reason: 'tool_calls' })), { tools: TOOLS })
+  assert.deepEqual(sequential.toolCalls.map((call) => call.id), ['call-0', 'call-1'])
   const result = await run(jsonResponse(chat(null, { message: { tool_calls: calls }, finish_reason: 'tool_calls' })), { tools: TOOLS, parallelToolCalls: true })
   assert.equal(result.toolCalls.length, 40)
   await assert.rejects(run(jsonResponse(chat(null, { message: { tool_calls: [...calls, ccall('call-40')] }, finish_reason: 'tool_calls' })), { tools: TOOLS, parallelToolCalls: true }), { code: 'model-tools-limit' })
   await assert.rejects(run(jsonResponse(chat()), { model: { ...MODEL, compat: { parallelToolCalls: false } }, tools: TOOLS, parallelToolCalls: true }), { code: 'model-unsupported' })
   const payload = buildProviderPayload({ model: MODEL, messages: MESSAGES, tools: TOOLS, parallelToolCalls: true }).payload
   assert.equal(payload.parallel_tool_calls, true)
+})
+
+test('SiliconFlow/vLLM style nulls, repeated names, missing indexes and stop terminals stay usable', async () => {
+  const tools = [...TOOLS, { type: 'function', function: { name: 'fixture_noargs', description: 'No arguments', parameters: { type: 'object', properties: {}, additionalProperties: false } } }]
+  const repeated = await run(sse([
+    { choices: [{ index: 0, delta: { content: '查看。' } }] },
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'fixture_echo', arguments: '' } }] } }] },
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: null, type: 'function', function: { name: 'fixture_echo', arguments: '{"value":' } }] } }] },
+    { choices: [{ delta: { tool_calls: [{ index: 0, function: { name: null, arguments: '"ok"}' } }] } }] },
+    { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: null, completion_tokens: 7, total_tokens: null } },
+    '[DONE]',
+  ]), { tools })
+  assert.deepEqual(repeated.toolCalls, [{ id: 'call-1', name: 'fixture_echo', arguments: '{"value":"ok"}' }])
+  assert.equal(repeated.finishReason, 'tool_calls'); assert.equal(repeated.text, '查看。'); assert.equal(repeated.usage.outputTokens, 7); assert.equal(repeated.usage.inputTokens, undefined)
+  const cumulative = await run(sse([
+    { choices: [{ delta: { tool_calls: [{ index: 3, id: 'call:1.a', type: 'function', function: { name: 'fixture_', arguments: '{"value":' } }] } }] },
+    { choices: [{ delta: { tool_calls: [{ index: 3, id: null, function: { name: 'fixture_echo', arguments: '"ok"}' } }] } }] },
+    { choices: [{ delta: { tool_calls: [{ id: 'call:2', type: 'function', function: { name: 'fixture_noargs', arguments: '' } }] } }] },
+    { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+    '[DONE]',
+  ]), { tools })
+  assert.deepEqual(cumulative.toolCalls, [{ id: 'call:2', name: 'fixture_noargs', arguments: '{}' }, { id: 'call:1.a', name: 'fixture_echo', arguments: '{"value":"ok"}' }])
+  const tolerant = await run(sse([
+    { choices: [{ delta: { tool_calls: null, function_call: null, content: '等' } }] },
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'fixture_echo', arguments: '{"value":"ok"}' } }] } }] },
+    { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 2, completion_tokens: null } },
+    '[DONE]',
+  ]), { tools })
+  assert.equal(tolerant.text, '等'); assert.equal(tolerant.toolCalls.length, 1)
+  const json = await run(jsonResponse(chat(null, { message: { content: '好', tool_calls: [ccall('call-1', 'fixture_noargs', '')], function_call: null }, finish_reason: 'stop' })), { tools })
+  assert.deepEqual(json.toolCalls, [{ id: 'call-1', name: 'fixture_noargs', arguments: '{}' }]); assert.equal(json.finishReason, 'tool_calls')
+  await assert.rejects(run(jsonResponse(chat(null, { message: { tool_calls: [ccall('call-1', 'fixture_echo', '{"value":"ok"}'), ccall('call-2', 'fixture_echo', '{"value":1}')] }, finish_reason: 'tool_calls' })), { tools }), { code: 'model-response' })
+  assert.throws(() => buildProviderPayload({ model: MODEL, messages: MESSAGES, tools, parallelToolCalls: 'yes' }), { code: 'model-response' })
 })
 
 test('Responses tools and encrypted reasoning replay survive full terminal output without duplication', async () => {
@@ -391,4 +427,44 @@ test('discovery supports no-key auth and custom routing while suppressing secret
   const result = await fetchProviderModels(model, { fetchImpl: async (url, init) => { captured = { url, init }; return jsonResponse({ data: [{ id: 'valid', name: 'secret-tenant secret-version' }, { id: 'secret-tenant' }, { id: 'secret-version' }] }) } })
   assert.equal(result.count, 1); assert.equal(result.models[0].id, 'valid'); assert.ok(!JSON.stringify(result).includes('secret-'))
   assert.equal(captured.url, 'http://127.0.0.1:3000/v2/models?version=secret-version'); assert.equal(captured.init.headers.authorization, undefined); assert.equal(captured.init.headers['x-api-key'], undefined)
+})
+
+test('images are encoded per protocol from one neutral block and malformed parts fail early', async () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]).toString('base64')
+  const messages = [{ role: 'user', content: [{ type: 'text', text: '看这张图' }, { type: 'image', mime: 'image/png', data: png }] }]
+  const chatPayload = buildProviderPayload({ model: MODEL, messages, stream: false }).payload
+  assert.deepEqual(chatPayload.messages, [{ role: 'user', content: [
+    { type: 'text', text: '看这张图' },
+    { type: 'image_url', image_url: { url: `data:image/png;base64,${png}` } },
+  ] }])
+  const anthropicPayload = buildProviderPayload({ model: { ...MODEL, apiFormat: 'anthropic-messages' }, messages, stream: false }).payload
+  assert.deepEqual(anthropicPayload.messages, [{ role: 'user', content: [
+    { type: 'text', text: '看这张图' },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } },
+  ] }])
+  const responsesPayload = buildProviderPayload({ model: { ...MODEL, apiFormat: 'responses' }, messages, stream: false }).payload
+  assert.deepEqual(responsesPayload.input, [{ role: 'user', content: [
+    { type: 'input_text', text: '看这张图' },
+    { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+  ] }])
+  // Text-only history still uses plain strings, so providers that never see images are untouched.
+  assert.deepEqual(buildProviderPayload({ model: MODEL, messages: MESSAGES, stream: false }).payload.messages, [{ role: 'user', content: 'Hello' }])
+  for (const content of [
+    [{ type: 'image', mime: 'image/bmp', data: png }],
+    [{ type: 'image', mime: 'image/png', data: '' }],
+    [{ type: 'image', mime: 'image/png' }],
+    [{ type: 'audio', data: png }],
+  ]) {
+    // Rejected either when the message is validated or when the protocol block is built.
+    await assert.rejects(run(jsonResponse(chat()), { messages: [{ role: 'user', content }] }), (error) => ['model-messages', 'model-response'].includes(error.code))
+  }
+})
+
+test('inline images are measured apart from the text context budget', async () => {
+  const { validateMessages } = await import('../plugins/dsh-codex-sidebar/lib/custom-chat.mjs')
+  const picture = 'A'.repeat(2 * 1024 * 1024)
+  // 2 MiB of base64 would blow the 1 MiB text cap if it were counted as text.
+  validateMessages([{ role: 'user', content: [{ type: 'text', text: '说明' }, { type: 'image', mime: 'image/png', data: picture }] }])
+  assert.throws(() => validateMessages([{ role: 'user', content: 'x'.repeat(1100 * 1024) }]), { code: 'context-limit' })
+  assert.throws(() => validateMessages([{ role: 'user', content: [{ type: 'image', mime: 'image/png', data: 'A'.repeat(8 * 1024 * 1024 + 4) }] }]), { code: 'context-limit' })
 })

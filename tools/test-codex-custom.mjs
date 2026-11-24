@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { setImmediate as nextTick } from 'node:timers/promises'
 import { CodexService } from '../plugins/dsh-codex-sidebar/lib/service.mjs'
+import { conversationMessages, recordInterruptedTurn, turnMessages } from '../plugins/dsh-codex-sidebar/lib/custom-chat.mjs'
 import { CodexError } from '../plugins/dsh-codex-sidebar/lib/transport.mjs'
 
 const SECRET = 'private-test-key-without-sk-prefix'
@@ -276,7 +277,7 @@ test('custom chat enforces session, workspace, context and mode validation befor
     await assert.rejects(service.send('other-session', input(thread, model, 'wrong-session')), { code: 'thread-forbidden' })
     await assert.rejects(service.send('session', input(thread, model, 'sensitive', { files: ['.env'] })), { code: 'sensitive-file' })
     await assert.rejects(service.send('session', input(thread, model, 'traversal', { files: ['../outside.txt'] })), { code: 'file-outside' })
-    await assert.rejects(service.send('session', input(thread, model, 'too-many', { files: Array(6).fill('missing.txt') })), { code: 'context-limit' })
+    await assert.rejects(service.send('session', input(thread, model, 'too-many', { files: Array(11).fill('missing.txt') })), { code: 'context-limit' })
     const different = join(root, 'different-workspace')
     await mkdir(different)
     changeWorkspace(await realpath(different))
@@ -285,7 +286,7 @@ test('custom chat enforces session, workspace, context and mode validation befor
   })
 })
 
-test('concurrent custom turns deduplicate and reject provider changes within an existing chat', async () => {
+test('concurrent custom turns deduplicate and allow an in-thread model switch only while the target config is unchanged', async () => {
   await fixture(async ({ service, provider }) => {
     const model = await addModel(service, provider.origin)
     const thread = await newThread(service, model)
@@ -303,16 +304,98 @@ test('concurrent custom turns deduplicate and reject provider changes within an 
     await completedTurn(service, thread.id, results[0].turnId)
     assert.deepEqual(await service.send('session', request), results[0])
     assert.equal(provider.calls.length, 1)
+    // Same engine, same mode: the thread keeps its context and the provider is swapped.
     const other = await addModel(service, provider.origin, { name: '另一个模型', model: 'another-model' })
-    await assert.rejects(service.send('session', input(thread, other, 'provider-change')), { code: 'model-change' })
-    await service.saveModel({ ...model, baseUrl: `${provider.origin}/alternate/v1`, apiKey: '' })
-    await assert.rejects(service.send('session', input(thread, model, 'edited-provider')), { code: 'model-change' })
-    assert.equal(provider.calls.length, 1)
-    const changed = (await service.snapshot('session')).customModels.find((entry) => entry.id === model.id)
+    const switched = await service.send('session', input(thread, other, 'switch-model'))
+    await completedTurn(service, thread.id, switched.turnId)
+    assert.equal(provider.calls[1].body.model, 'another-model')
+    assert.equal(provider.calls[1].body.messages.filter((entry) => entry.role === 'user').length, 2)
+    assert.equal((await service.snapshot('session')).threads.find((entry) => entry.id === thread.id).model, other.id)
+    // Editing the bound provider still requires a fresh conversation.
+    await service.saveModel({ ...other, baseUrl: `${provider.origin}/alternate/v1`, apiKey: '' })
+    await assert.rejects(service.send('session', input(thread, other, 'edited-provider')), { code: 'model-change' })
+    assert.equal(provider.calls.length, 2)
+    const changed = (await service.snapshot('session')).customModels.find((entry) => entry.id === other.id)
     const newChat = await newThread(service, changed)
     const next = await service.send('session', input(newChat, changed, 'new-chat'))
     await completedTurn(service, newChat.id, next.turnId)
-    assert.equal(provider.calls[1].url, '/alternate/v1/chat/completions')
+    assert.equal(provider.calls[2].url, '/alternate/v1/chat/completions')
+  })
+})
+
+test('batch save keeps one connection, many models, inherits the saved key and drops deselected entries', async () => {
+  await fixture(async ({ service, provider, home }) => {
+    const group = {
+      groupName: 'DeepSeek 中转', engine: 'workspace', apiFormat: 'chat-completions',
+      baseUrl: `${provider.origin}/v1`, authType: 'bearer', apiKey: SECRET,
+      models: [
+        { model: 'deepseek-chat', name: 'DeepSeek Chat' },
+        { model: 'deepseek-reasoner', name: 'DeepSeek R1' },
+        { model: 'deepseek-coder', name: 'DeepSeek Coder' },
+      ],
+    }
+    const first = await service.saveModels(group)
+    assert.match(first.groupId, /^group-/)
+    assert.equal(first.saved.length, 3)
+    const snapshot = await service.snapshot('session')
+    assert.equal(snapshot.customModels.length, 3)
+    assert.ok(snapshot.customModels.every((entry) => entry.groupId === first.groupId && entry.groupName === group.groupName))
+    assert.ok(!JSON.stringify(snapshot).includes(SECRET))
+    // A second save reuses the group, inherits the stored key and keeps the untouched id.
+    const byModel = Object.fromEntries(first.saved.map((entry) => [entry.model, entry]))
+    const second = await service.saveModels({
+      ...group, apiKey: '', groupId: first.groupId,
+      models: [
+        { id: byModel['deepseek-chat'].id, model: 'deepseek-chat', name: 'DeepSeek V3' },
+        { model: 'deepseek-reasoner', name: 'DeepSeek R1' },
+        { id: byModel['deepseek-coder'].id, model: 'deepseek-coder', name: 'DeepSeek Coder' },
+        { model: 'deepseek-vl', name: 'DeepSeek VL' },
+      ],
+    })
+    assert.equal(second.groupId, first.groupId)
+    assert.deepEqual(second.removedIds, [])
+    const three = await service.snapshot('session')
+    assert.equal(three.customModels.length, 4)
+    assert.equal(three.customModels.find((entry) => entry.model === 'deepseek-chat').id, byModel['deepseek-chat'].id)
+    assert.equal(three.customModels.find((entry) => entry.model === 'deepseek-chat').name, 'DeepSeek V3')
+    const remaining = Object.fromEntries(second.saved.map((entry) => [entry.model, entry.id]))
+    const third = await service.saveModels({
+      ...group, apiKey: '', groupId: first.groupId,
+      models: [{ id: remaining['deepseek-chat'], model: 'deepseek-chat', name: 'DeepSeek V3' }],
+    })
+    assert.equal(third.saved.length, 1)
+    assert.equal(third.removedIds.length, 3)
+    assert.equal((await service.snapshot('session')).customModels.length, 1)
+    // The inherited key still works for the surviving model.
+    const survivor = (await service.snapshot('session')).customModels[0]
+    const chat = await newThread(service, survivor)
+    const sent = await service.send('session', input(chat, survivor, 'batch-key'))
+    await completedTurn(service, chat.id, sent.turnId)
+    assert.equal(provider.calls[0].headers.authorization, `Bearer ${SECRET}`)
+    const files = await filesText(home)
+    assert.ok(files.filter((entry) => entry.text.includes(SECRET)).every((entry) => entry.path.endsWith('sidebar-models.json')))
+  })
+})
+
+test('switching models inside a thread strips vendor-private replay fields but keeps standard context', async () => {
+  await fixture(async ({ service, provider }) => {
+    const responses = await addModel(service, provider.origin, { name: 'Responses 模型', model: 'gpt-responses', apiFormat: 'responses' })
+    const chat = await addModel(service, provider.origin, { name: 'Chat 模型', model: 'vendor-chat-model' })
+    const thread = await newThread(service, responses)
+    provider.responses.push((_req, res) => splitSse(res, [
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', delta: '第一轮' })}\n\n`,
+      `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { status: 'completed', id: 'resp-1', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '第一轮' }] }] } })}\n\n`,
+    ].join('')))
+    const first = await service.send('session', { ...input(thread, responses, 'turn-a'), mode: 'chat' })
+    await completedTurn(service, thread.id, first.turnId)
+    const second = await service.send('session', { ...input(thread, chat, 'turn-b'), mode: 'chat' })
+    await completedTurn(service, thread.id, second.turnId)
+    const sent = provider.calls[1].body.messages
+    assert.equal(provider.calls[1].url, '/v1/chat/completions')
+    assert.ok(sent.some((entry) => entry.role === 'assistant' && entry.content === '第一轮'))
+    assert.ok(sent.every((entry) => !('responses_output' in entry) && !('provider_replay' in entry) && !('reasoning_content' in entry)))
+    const turn = (await service.snapshot('session')).threads.find((entry) => entry.id === thread.id).turns.find((entry) => entry.id === second.turnId)
+    assert.equal(turn.metadata.model, 'vendor-chat-model')
   })
 })
 
@@ -338,6 +421,121 @@ test('custom chat cancellation and timeout end the turn and never resend an acce
     assert.ok(JSON.stringify(timedTurn).includes('timeout') || JSON.stringify(timedTurn).includes('超时'))
     assert.deepEqual(await timedService.send('session', timedRequest), timed)
     assert.equal(provider.calls.length, 2)
+  })
+})
+
+test('history keeps the usable part of a stopped turn and repairs dangling tool calls', () => {
+  const completed = { status: 'completed', providerMessages: [{ role: 'user', content: '一' }, { role: 'assistant', content: '答一', provider_replay: { apiFormat: 'anthropic-messages', content: [{ type: 'text', text: '答一' }] } }], items: [] }
+  const dangling = {
+    status: 'interrupted',
+    providerMessages: [
+      { role: 'user', content: '二' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'look', arguments: '{}' } }, { id: 'call-2', type: 'function', function: { name: 'look', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call-1', content: '{"ok":true}' },
+    ],
+    items: [{ type: 'agentMessage', text: '' }],
+  }
+  const partial = { status: 'failed', providerMessages: [{ role: 'user', content: '三' }], items: [{ type: 'agentMessage', text: '写到一半' }] }
+  assert.deepEqual(turnMessages(completed).map((entry) => entry.role), ['user', 'assistant'])
+  assert.equal(turnMessages(completed, { stripPrivate: true })[1].provider_replay, undefined)
+  const repairedMessages = turnMessages(dangling)
+  assert.deepEqual(repairedMessages.map((entry) => entry.role), ['user', 'assistant', 'tool', 'tool'])
+  assert.deepEqual(repairedMessages.map((entry) => entry.tool_call_id), [undefined, undefined, 'call-1', 'call-2'])
+  assert.match(repairedMessages[3].content, /not-executed/)
+  const stopped = turnMessages(partial)
+  assert.equal(stopped[1].role, 'assistant'); assert.ok(stopped[1].content.startsWith('写到一半')); assert.ok(stopped[1].content.includes('停止'))
+  assert.deepEqual(turnMessages({ status: 'inProgress', providerMessages: [{ role: 'user', content: '四' }] }), [])
+  // Legacy turns without providerMessages still contribute their visible items.
+  assert.deepEqual(turnMessages({ status: 'interrupted', items: [{ type: 'userMessage', content: [{ type: 'text', text: '五' }] }, { type: 'agentMessage', text: '半' }] }).map((entry) => entry.role), ['user', 'assistant'])
+  const turn = { status: 'interrupted', providerMessages: [{ role: 'user', content: '六' }], items: [{ type: 'agentMessage', text: '半' }] }
+  assert.equal(recordInterruptedTurn(turn, { text: '半' }), true)
+  assert.equal(recordInterruptedTurn(turn, { text: '半' }), false)
+  assert.deepEqual(turn.providerMessages, [{ role: 'user', content: '六' }, { role: 'assistant', content: '半' }])
+  const messages = conversationMessages({ turns: [completed, dangling, partial] }, '继续')
+  assert.deepEqual(messages.map((entry) => entry.role), ['user', 'assistant', 'user', 'assistant', 'tool', 'tool', 'user', 'assistant', 'user'])
+  assert.equal(messages.at(-1).content, '继续')
+})
+
+test('phone attachments are stored inside the workspace and referenced by path', async () => {
+  await fixture(async ({ service, provider, cwd }) => {
+    const model = await addModel(service, provider.origin)
+    const thread = await newThread(service, model)
+    const pdf = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00, 0x01, 0xff])
+    const saved = await service.uploadAttachment('session', { name: '扫描件.pdf', data: pdf.toString('base64') })
+    assert.match(saved.path, /^\.codex-uploads\/[\da-z]+-扫描件\.pdf$/)
+    assert.equal(saved.binary, true); assert.equal(saved.size, pdf.length)
+    assert.ok(!('text' in saved))
+    assert.ok((await readFile(join(cwd, saved.path))).equals(pdf))
+    const note = await service.uploadAttachment('session', { name: 'notes.md', data: Buffer.from('# 标题').toString('base64') })
+    assert.equal(note.binary, false); assert.ok(!('text' in note))
+    await writeFile(join(cwd, 'context.txt'), '工作区上下文')
+    const { turnId } = await service.send('session', input(thread, model, 'attach-request', { text: '看看附件', files: [saved.path, note.path, 'context.txt'] }))
+    assert.equal((await completedTurn(service, thread.id, turnId)).status, 'completed')
+    const prompt = provider.calls[0].body.messages.find((entry) => entry.role === 'user').content
+    assert.ok(prompt.includes('<workspace-attachment path=')); assert.ok(prompt.includes(saved.path))
+    assert.ok(prompt.includes('二进制附件'))
+    assert.ok(prompt.includes(`<workspace-file path="${note.path}">\n# 标题`))
+    assert.ok(prompt.includes('<workspace-file path="context.txt">\n工作区上下文'))
+    assert.ok(!prompt.includes('\u0000'))
+    await assert.rejects(service.uploadAttachment('session', { name: '../escape.txt', data: 'aGk=' }), { code: 'attachment-name' })
+  })
+})
+
+test('picked images are sent as vision blocks and never persisted in the history', async () => {
+  await fixture(async ({ service, provider }) => {
+    const model = await addModel(service, provider.origin)
+    const thread = await newThread(service, model)
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52])
+    const saved = await service.uploadAttachment('session', { name: '截图.png', data: png.toString('base64') })
+    assert.equal(saved.mime, 'image/png'); assert.equal(saved.binary, true)
+    const { turnId } = await service.send('session', input(thread, model, 'vision-request', { text: '这张图里是什么', files: [saved.path] }))
+    const turn = await completedTurn(service, thread.id, turnId)
+    assert.equal(turn.status, 'completed')
+    const sent = provider.calls[0].body.messages.filter((entry) => entry.role !== 'system')
+    const last = sent.at(-1)
+    assert.equal(last.role, 'user')
+    assert.ok(Array.isArray(last.content))
+    assert.equal(last.content[0].type, 'text')
+    assert.ok(last.content[0].text.includes('这张图里是什么'))
+    assert.ok(last.content[0].text.includes('<workspace-image path='))
+    assert.deepEqual(last.content[1], { type: 'image_url', image_url: { url: `data:image/png;base64,${png.toString('base64')}` } })
+    assert.equal(turn.items[0].images[0].path, saved.path)
+    assert.equal(turn.items[0].images[0].mime, 'image/png')
+    // The base64 must never reach the on-disk history: the replay keeps the path note only.
+    assert.ok(!JSON.stringify(await service.snapshot('session')).includes(png.toString('base64')))
+    const second = await service.send('session', input(thread, model, 'vision-follow-up', { text: '继续', files: [] }))
+    assert.equal((await completedTurn(service, thread.id, second.turnId)).status, 'completed')
+    const replay = provider.calls[1].body.messages.filter((entry) => entry.role === 'user')
+    // History replay is text again: the image path note survives, the pixels are not resent.
+    assert.equal(typeof replay[0].content, 'string')
+    assert.ok(replay[0].content.includes(saved.path))
+    assert.ok(!replay[0].content.includes(png.toString('base64')))
+  })
+})
+
+test('a stopped turn keeps its partial answer as context for the next message', async () => {
+  await fixture(async ({ service, provider }) => {
+    const model = await addModel(service, provider.origin)
+    const thread = await newThread(service, model)
+    provider.responses.push(async (_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' })
+      res.flushHeaders()
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '部分回答' } }] })}\n\n`)
+      await waitUntil(async () => assistantText((await service.snapshot('session')).threads[0].turns[0]) === '部分回答', 'visible delta')
+    })
+    const first = await service.send('session', input(thread, model, 'partial-request'))
+    await waitUntil(() => provider.calls.length === 1, 'running request')
+    await waitUntil(async () => assistantText((await service.snapshot('session')).threads[0].turns[0]) === '部分回答', 'streamed text')
+    await service.interrupt('session', thread.id)
+    const stopped = await completedTurn(service, thread.id, first.turnId)
+    assert.equal(stopped.status, 'interrupted')
+    const second = await service.send('session', input(thread, model, 'resume-request', { text: '继续' }))
+    assert.equal((await completedTurn(service, thread.id, second.turnId)).status, 'completed')
+    const sent = provider.calls[1].body.messages.filter((entry) => entry.role !== 'system')
+    assert.deepEqual(sent.map((entry) => entry.role), ['user', 'assistant', 'user'])
+    assert.ok(sent[0].content.includes('你好'))
+    assert.ok(sent[1].content.startsWith('部分回答')); assert.ok(sent[1].content.includes('停止'))
+    assert.equal(sent[2].content, '继续')
   })
 })
 

@@ -83,6 +83,8 @@ test('incremental restamp registers added modules, removes stale modules and pre
     const manifest = JSON.parse(actual.get('kxxy-runtime.json').data.toString('utf8'))
     assert.equal(manifest.plugins.codexFingerprint, fingerprint)
     assert.equal(manifest.plugins.other, 'kept')
+    // 根清单的 entries 必须与重封后的实际条目数一致，否则 verify-python-repair 会拦包。
+    assert.equal(manifest.entries, actual.size)
     assert.equal(await readFile(join(root, 'next', 'alias-links.txt'), 'utf8'), 'lib/example\tlib/target\n')
     const frozen = await readFile(out)
     await assert.rejects(execute(process.execPath, [script, '--in', input, '--out', out, '--meta', meta, '--plugin', plugin]))

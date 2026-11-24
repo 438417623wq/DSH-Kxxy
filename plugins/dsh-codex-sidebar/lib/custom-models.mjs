@@ -2,12 +2,14 @@ import { mkdir, readFile, writeFile, rename, unlink, chmod } from 'node:fs/promi
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { CodexError } from './transport.mjs'
-import { normalizeProvider, providerMetadata } from './provider-config.mjs'
+import { normalizeProvider, providerMetadata, groupIdOf, normalizeBaseUrl } from './provider-config.mjs'
 export { normalizeBaseUrl, modelRevision, credentialRevision, providerSecrets } from './provider-config.mjs'
 
-const MAX_MODELS = 100
-const MAX_STORE_BYTES = 1024 * 1024
+const MAX_MODELS = 300
+const MAX_STORE_BYTES = 2 * 1024 * 1024
 const ID = /^custom-[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i
+const CONNECTION_FIELDS = ['apiFormat', 'engine', 'authType', 'profile', 'compat', 'headers', 'query', 'reasoningEfforts', 'reasoningEffort', 'maxOutputTokens', 'thinkingBudget']
+const has = (value, key) => Object.hasOwn(value, key) && value[key] !== undefined
 
 /** Credentials and unparseable entries stay in private storage, never in snapshots. */
 export class CustomModels {
@@ -77,7 +79,7 @@ export class CustomModels {
       const records = this.records.filter((record) => record.invalid || models.has(record.id))
       const known = new Set(records.filter((record) => !record.invalid).map((record) => record.id))
       for (const id of models.keys()) if (!known.has(id)) records.push({ id })
-      if (records.length > MAX_MODELS) throw new CodexError('models-limit', '最多可保存 100 个模型条目（包含需修复的条目）', 413)
+      if (records.length > MAX_MODELS) throw new CodexError('models-limit', `最多可保存 ${MAX_MODELS} 个模型条目（包含需修复的条目）`, 413)
       const invalidModelIndices = records.flatMap((record, index) => record.invalid ? [index] : [])
       const raw = JSON.stringify({ version: 2, models: records.map((record) => record.invalid ? record.raw : models.get(record.id)), ...(invalidModelIndices.length ? { invalidModelIndices } : {}) }, null, 2) + '\n'
       if (Buffer.byteLength(raw) > MAX_STORE_BYTES) throw new CodexError('models-limit', '模型配置总大小超过上限', 413)
@@ -118,6 +120,85 @@ export class CustomModels {
       if (!models.has(id)) throw new CodexError('model-missing', '自定义模型不存在', 404)
       models.delete(id)
       return { ok: true, id }
+    })
+  }
+
+  /**
+   * One connection, many models: validate the connection once, then create/update/remove
+   * entries inside a single atomic mutation. Blank credentials are inherited from the
+   * group so a second batch save never needs the key typed again (it is never returned).
+   */
+  async saveBatch(input) {
+    return this.mutate((models) => {
+      if (!input || typeof input !== 'object' || Array.isArray(input)) throw new CodexError('model-input', '模型设置必须是对象')
+      const requests = input.models
+      if (!Array.isArray(requests) || !requests.length) throw new CodexError('model-input', '请至少勾选 1 个模型')
+      if (requests.length > MAX_MODELS) throw new CodexError('model-input', `一次最多保存 ${MAX_MODELS} 个模型`, 413)
+      const baseUrl = normalizeBaseUrl(input.baseUrl)
+      const apiFormat = typeof input.apiFormat === 'string' ? input.apiFormat : 'chat-completions'
+      const engine = typeof input.engine === 'string' ? input.engine : 'workspace'
+      let groupId = typeof input.groupId === 'string' && input.groupId.trim() ? input.groupId : ''
+      if (!groupId) {
+        const sameConnection = [...models.values()].find((entry) => entry.groupId && entry.baseUrl === baseUrl
+          && (entry.apiFormat ?? 'chat-completions') === apiFormat && (entry.engine ?? 'workspace') === engine)
+        groupId = sameConnection?.groupId ?? `group-${randomUUID()}`
+      }
+      const members = [...models.values()].filter((entry) => groupIdOf(entry) === groupId)
+      const donor = members.find((entry) => entry.apiKey) ?? members[0] ?? null
+      const template = { ...input, groupId }
+      delete template.id
+      delete template.models
+      delete template.replaceGroup
+      if (donor) {
+        for (const key of CONNECTION_FIELDS) if (!has(template, key) && donor[key] !== undefined) template[key] = donor[key]
+        // A blank key means "keep using this connection's saved key", never "erase it".
+        if (!has(template, 'apiKey')) template.apiKey = donor.apiKey ?? ''
+        else if (typeof template.apiKey === 'string' && !template.apiKey.trim() && donor.apiKey) template.apiKey = donor.apiKey
+        if (!has(template, 'groupName')) template.groupName = donor.groupName
+      }
+      const saved = []
+      const keep = new Set()
+      for (const request of requests) {
+        if (!request || typeof request !== 'object' || Array.isArray(request)) throw new CodexError('model-input', '模型条目格式不正确')
+        let existing = null
+        if (request.id) {
+          existing = models.get(request.id)
+          if (!existing) throw new CodexError('model-missing', '部分模型条目已被删除，请重新获取模型列表', 404)
+        } else {
+          // A selection without an id still refers to the same model of this connection.
+          existing = members.find((entry) => entry.model === request.model && !keep.has(entry.id)) ?? null
+        }
+        const entry = normalizeProvider({
+          ...template,
+          ...(existing ? { id: existing.id } : {}),
+          model: request.model,
+          name: typeof request.name === 'string' && request.name.trim() ? request.name : request.model,
+        }, { existing, requireName: true })
+        entry.id = existing?.id ?? `custom-${randomUUID()}`
+        entry.groupId = groupId
+        if (template.groupName) entry.groupName = template.groupName
+        models.set(entry.id, entry)
+        keep.add(entry.id)
+        saved.push(providerMetadata(entry))
+      }
+      const removedIds = []
+      if (input.replaceGroup !== false) {
+        for (const member of members) {
+          if (keep.has(member.id)) continue
+          models.delete(member.id)
+          removedIds.push(member.id)
+        }
+      }
+      return { groupId, saved, removedIds }
+    })
+  }
+
+  async deleteGroup(groupId) {
+    return this.mutate((models) => {
+      const removedIds = [...models.values()].filter((entry) => groupIdOf(entry) === groupId).map((entry) => entry.id)
+      if (!removedIds.length) throw new CodexError('model-missing', '服务商连接不存在或已被删除', 404)
+      for (const id of removedIds) models.delete(id)
+      return { ok: true, groupId, removedIds }
     })
   }
 }

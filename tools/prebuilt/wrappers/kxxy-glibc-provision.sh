@@ -48,6 +48,21 @@ in_guest() {
 
 prov_base() {
   [ -f "$STAMP/base" ] && return 0
+  # DNS 预检：容器里没有 nameserver 时，apt 的报错是一条
+  # `Temporary failure resolving 'ports.ubuntu.com'` 后面紧跟
+  # `Unable to locate package curl` —— 后半句太像「软件源写错了」，
+  # 于是排错全跑偏。先单独探一次，失败就直接说是 DNS。
+  # 只用 `-s` 允许跳过：有人的实测环境是「DNS 不通、sources.list 里全是 IP」，
+  # 那种情况下这条预检是误伤，`touch <stamp>/base` 就能放行。
+  if ! in_guest 'command -v getent >/dev/null 2>&1 || exit 0
+    getent hosts ports.ubuntu.com >/dev/null 2>&1'; then
+    echo "kxxy-glibc-provision: 容器内 DNS 不可用（getent hosts ports.ubuntu.com 失败）" >&2
+    echo "  → 容器 /etc/resolv.conf 没有可用的 nameserver；确认 kxxy-glibc 是否把" >&2
+    echo "    <root>/etc/resolv.conf 挂进了 guest（见 kxxy-glibc.sh 的 pick 段）" >&2
+    echo "  → 若你的软件源本来就是 IP 直连、确实不需要 DNS：" >&2
+    echo "    touch \"$STAMP/base\" 跳过本项后再重跑" >&2
+    return 1
+  fi
   echo "== 准备容器：apt update + ca-certificates/curl ==" >&2
   in_guest 'export DEBIAN_FRONTEND=noninteractive
     apt-get update '"$APT"' >/tmp/kp-base.log 2>&1 || { tail -3 /tmp/kp-base.log >&2; exit 1; }

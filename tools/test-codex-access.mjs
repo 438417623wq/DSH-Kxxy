@@ -69,7 +69,7 @@ test('native full is server-trusted only and readonly is genuinely unsupported',
 test('readonly blocks dispatch and direct mutation methods, not just schemas', () => fixture(async (cwd) => {
   let approvals = 0
   const tools = new WorkspaceTools({ cwd, accessMode: 'readonly', approve: () => { approvals++; return true } })
-  assert.deepEqual(readOnlyTools, WORKSPACE_TOOLS.filter((entry) => !['write_file', 'run_command'].includes(entry.function.name)))
+  assert.deepEqual(readOnlyTools, WORKSPACE_TOOLS.filter((entry) => !['write_file', 'edit_file', 'run_command'].includes(entry.function.name)))
   assert.equal((await tools.execute('write_file', { path: 'blocked.txt', content: 'blocked' })).code, 'access-readonly')
   assert.equal((await tools.execute('run_command', { command: command('process.exit(0)') })).code, 'access-readonly')
   await assert.rejects(tools.write_file({ path: 'blocked.txt', content: 'blocked' }), { code: 'access-readonly' })
@@ -88,7 +88,7 @@ test('full bypasses only approval and retains boundaries, timeouts and cancellat
   assert.equal((await tools.execute('write_file', { path: '../outside', content: 'x' })).code, 'path-outside')
   assert.equal((await tools.execute('write_file', { path: '.env', content: 'x' })).code, 'sensitive-file')
   assert.equal((await tools.execute('write_file', { path: 'large', content: 'x'.repeat(256 * 1024 + 1) })).code, 'file-too-large')
-  assert.equal((await tools.execute('run_command', { command: command('process.exit(0)'), timeoutMs: 60001 })).code, 'arguments-invalid')
+  assert.equal((await tools.execute('run_command', { command: command('process.exit(0)'), timeoutMs: 180001 })).code, 'arguments-invalid')
   assert.equal((await tools.execute('run_command', { command: command('console.log(123)'), timeoutMs: 15000 })).ok, true)
   const timeout = await tools.execute('run_command', { command: command('setTimeout(()=>{},10000)'), timeoutMs: 100 })
   assert.equal(timeout.timedOut, true)
