@@ -996,7 +996,9 @@
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
-        const detail = body && body.error ? body.error : '';
+        // detail 才是人能看懂的说明（如「已安装 x v1.2，覆盖会先移除旧包体」），
+        // error 常常只是机器码（conflict / not implemented）。
+        const detail = (body && (body.detail || body.error)) || '';
         throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
       }
       return body;
@@ -3620,6 +3622,54 @@
     if (fill) fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
   }
 
+  /**
+   * 选包步骤的行内错误。
+   * 为什么不能只靠 toast：toast 会自己消失，而且这层弹层曾经把它压在遮罩下面 ——
+   * 「选了包没反应」实际上全是「错误提示看不见」。原因要留在选择页上。
+   */
+  function setPiSelectError(message) {
+    const box = piEl('pi-select-error');
+    if (!box) return;
+    if (!message) {
+      box.hidden = true;
+      box.textContent = '';
+      return;
+    }
+    box.textContent = message;
+    box.hidden = false;
+  }
+
+  /** 确认页的行内错误（覆盖安装被拒、写盘失败等，原因要留在选中状态的页面上）。 */
+  function setPiReviewError(message) {
+    const box = piEl('pi-report');
+    if (!box) return;
+    const existing = piEl('pi-review-error');
+    if (!message) {
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing) {
+      existing.textContent = message;
+      return;
+    }
+    box.insertAdjacentHTML('beforeend', '<div class="pi-error-box" id="pi-review-error"></div>');
+    const node = piEl('pi-review-error');
+    if (node) node.textContent = message;
+  }
+
+  /** 文件头魔数：0x1f8b = gzip(.tgz/.tar.gz)，0x504b = zip。不信后缀与 MIME。 */
+  async function sniffArchiveKind(file) {
+    let head = null;
+    try {
+      head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+    } catch {
+      return 'unknown';
+    }
+    if (head.length >= 2 && head[0] === 0x1f && head[1] === 0x8b) return 'gzip';
+    if (head.length >= 2 && head[0] === 0x50 && head[1] === 0x4b) return 'zip';
+    return 'unknown';
+  }
+
   function formatBytes(n) {
     if (!Number.isFinite(n) || n <= 0) return '0 B';
     if (n < 1024) return `${n} B`;
@@ -3651,6 +3701,8 @@
       piEl('pi-tab-online').setAttribute('aria-selected', String(piMethod === 'online'));
       const fileInput = piEl('pi-file-input');
       if (fileInput) fileInput.value = '';
+      setPiSelectError('');
+      setPiReviewError('');
       piEl('pi-enable').checked = true;
       piEl('pi-overwrite').checked = false;
       if (dom.pluginInstallSheet) dom.pluginInstallSheet.hidden = false;
@@ -3679,7 +3731,7 @@
     const rows = [
       `<div class="pi-row"><span class="k">插件</span>${v(`${escapeHtml(report.name)}${report.version ? ` v${escapeHtml(report.version)}` : ''}`)}</div>`,
       '<div class="pi-row"><span class="k">来源</span>' + v('本地 .tgz 插件包') + '</div>',
-      `<div class="pi-row"><span class="k">清单与入口</span>${report.entryDeclared ? v('可识别（main/exports）', 'ok') : v('未声明入口', 'bad')}</div>`,
+      `<div class="pi-row"><span class="k">清单与入口</span>${report.entryDeclared ? v('可识别（main/exports/index）', 'ok') : v('未声明入口', 'bad')}</div>`,
       `<div class="pi-row"><span class="k">归档检查</span>${v(`${report.entryCount} 个条目 · 解压约 ${formatBytes(report.uncompressedBytes)}`, 'ok')}</div>`,
       `<div class="pi-row"><span class="k">依赖</span>${report.depsMissing.length ? v(`缺 ${report.depsMissing.length} 项：${escapeHtml(report.depsMissing.join('、'))}`, 'bad') : v(report.deps.length ? '已满足' : '无外部依赖', 'ok')}</div>`,
     ];
@@ -3724,19 +3776,28 @@
         if (xhr.status >= 200 && xhr.status < 300 && body.ok === true) resolve(body);
         else reject(new Error(body.detail || body.error || `HTTP ${xhr.status}`));
       };
-      xhr.onerror = () => reject(new Error('网络错误，上传失败'));
+      xhr.onerror = () => reject(new Error('上传中断：文件读取或网络失败。可把插件包移到「下载」目录后再选一次（部分网盘/聊天 App 的临时授权读不到大文件）。'));
+      xhr.ontimeout = () => reject(new Error('上传超时，请重试或换一个更小的插件包'));
       xhr.send(file);
     });
   }
 
+  /** 选包 → 魔数校验 → 上传 → 静态检查。任何一步失败都在选择页留下原因。 */
   async function uploadAndInspect(file) {
     if (!file) return;
-    if (!/\.tgz$/i.test(file.name) && !/gzip/i.test(file.type || '')) {
-      showToast('请选择 .tgz 插件包（npm pack 产物）', 'warning');
+    setPiSelectError('');
+    const label = file.name || '所选文件';
+    if (file.size > 90 * 1024 * 1024) {
+      setPiSelectError(`插件包超过 90 MB 上限：${label}（${formatBytes(file.size)}）。`);
       return;
     }
-    if (file.size > 90 * 1024 * 1024) {
-      showToast('插件包超过 90 MB 上限', 'error');
+    const kind = await sniffArchiveKind(file);
+    if (kind === 'zip') {
+      setPiSelectError(`「${label}」是 ZIP 压缩包。本地安装只接受 npm pack 产出的 .tgz（tar.gz）插件包，源码 ZIP 不是插件包。`);
+      return;
+    }
+    if (kind !== 'gzip') {
+      setPiSelectError(`「${label}」不是 .tgz / .tar.gz 插件包（文件头不是 gzip，大小 ${formatBytes(file.size)}）。请确认选的是 npm pack 的产物。`);
       return;
     }
     showPiStep('progress');
@@ -3749,7 +3810,9 @@
     } catch (err) {
       piUpload = null;
       showPiStep('select');
-      showToast(err.message || '检查未通过', 'error');
+      const message = (err && err.message) || '检查未通过';
+      setPiSelectError(`${label} 检查未通过：${message}`);
+      showToast('插件包检查未通过', 'error');
     }
   }
 
@@ -3757,6 +3820,7 @@
     if (!piUpload) return;
     const btn = piEl('pi-confirm');
     btn.disabled = true;
+    setPiReviewError('');
     showPiStep('progress');
     // 安装本身是秒级事务（解包 + 写清单），进度条给个中段值即可
     setPiProgress('正在安装（解包落位 + 写清单）…', 60);
@@ -3778,8 +3842,9 @@
       updatePluginFoot();
       fetchPlugins();
     } catch (err) {
-      // apiPost 已 toast 原因（多为 conflict：没勾覆盖）。回确认页让用户改选项重试
+      // 回确认页让用户改选项重试；原因同时写进报告区（toast 会消失，落盘失败要能复查）
       showPiStep('review');
+      setPiReviewError(`安装未完成：${(err && err.message) || '未知错误'}`);
     } finally {
       btn.disabled = false;
       if (piUpload && piUpload.report) updatePiConfirmState(piUpload.report);
@@ -3819,10 +3884,16 @@
     }
     const fileInput = piEl('pi-file-input');
     if (fileInput) {
-      fileInput.addEventListener('change', () => {
+      fileInput.addEventListener('change', async () => {
         const file = fileInput.files && fileInput.files[0];
-        uploadAndInspect(file);
-        fileInput.value = '';
+        if (!file) return;
+        try {
+          await uploadAndInspect(file);
+        } finally {
+          // **必须等读完再清空**：Android WebView 对 content:// 是惰性读取，
+          // 同步 reset value 会让上传读到 0 字节（表现为「选了包没反应」）。
+          fileInput.value = '';
+        }
       });
     }
     if (piEl('pi-overwrite')) {

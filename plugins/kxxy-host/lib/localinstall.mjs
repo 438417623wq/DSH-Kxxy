@@ -11,6 +11,10 @@
  * 源码 ZIP、原生扩展包、离线依赖整包一律拒绝 —— 它们各有各的正确装法，
  * 硬塞进 tar 解包只会做出一个看起来成功、加载必炸的假安装。
  *
+ * 包根定位放宽到三种等价布局（见 locatePackageDir）：`package/`、根目录直放
+ * `package.json`、唯一一个顶层目录带 `package.json`（`tar -czf x.tgz 插件名/`）。
+ * 归档条目里的前导 `./` 会先剥掉，`tar -czf` 与 `npm pack` 得到的条目名一致。
+ *
  * ## 安全边界
  *
  *   · 两遍处理：先「清单遍历」（只读 tar 头，不落盘）做静态校验 —— 条目数、
@@ -79,7 +83,7 @@ const BLOCK = 512
 /**
  * 进行中的上传会话：id → { tgzPath, stagingDir, name, version, ts }。
  * 只在进程内有效 —— 引擎重启后没提交的 uploadId 自然失效，前端重新走一遍。
- * @type {Map<string, {tgzPath: string, stagingDir: string, name: string, version: string, ts: number}>}
+ * @type {Map<string, {tgzPath: string, stagingDir: string, pkgRel: string, name: string, version: string, ts: number}>}
  */
 const UPLOADS = new Map()
 
@@ -213,7 +217,9 @@ async function listTarGz(gzPath) {
     longName = null
     paxPath = null
 
-    const target = name.replace(/\/+$/, '')
+    // 普通 `tar -czf` 打出来的是 `./package/...`：先剥前导 `./` 再校验与记账，
+    // 否则同一份内容会因打包命令不同而得到不同条目名（目录项 `./` 还会变成空目标）。
+    const target = name.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '')
     if (!target) {
       if (!await reader.skip(padded(size))) throw new Error('归档在空目标条目处截断')
       continue
@@ -282,16 +288,58 @@ function depSatisfied(dep, bundledRoot, engineRoot) {
   return false
 }
 
+/** 未声明 main 时 Node 认的默认入口（包根目录下）。 */
+const DEFAULT_ENTRIES = ['index.js', 'index.mjs', 'index.cjs']
+
+/**
+ * 定位「包根目录」——放 package.json 的那一层。
+ *
+ * 认三种布局，按优先级：
+ *   ① `package/package.json`（npm pack 标准产物）
+ *   ② 根目录 `package.json`（`tar -czf x.tgz -C pkg .` 之类）
+ *   ③ **唯一**一个顶层目录里带 package.json（`tar -czf x.tgz 插件名/`）
+ * 多个顶层目录各带 package.json 时拒绝 —— 猜错就是装错包。
+ *
+ * @returns {{dir: string, rel: string} | {error: string, detail: string}}
+ */
+function locatePackageDir(stagingDir) {
+  const hasPkg = (dir) => existsSync(join(dir, 'package.json'))
+
+  const npmPack = join(stagingDir, 'package')
+  if (hasPkg(npmPack)) return { dir: npmPack, rel: 'package' }
+  if (hasPkg(stagingDir)) return { dir: stagingDir, rel: '' }
+
+  let children = []
+  try {
+    children = readdirSync(stagingDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      .sort()
+  } catch { /* 读不出来按找不到处理 */ }
+
+  const candidates = children.filter((name) => hasPkg(join(stagingDir, name)))
+  if (candidates.length === 1) return { dir: join(stagingDir, candidates[0]), rel: candidates[0] }
+  if (candidates.length > 1) {
+    return {
+      error: '归档里有多个 package.json',
+      detail: `顶层目录 ${candidates.join('、')} 各自带 package.json，无法判断哪个才是插件本体。请只打包一个插件（npm pack 的产物是 package/package.json）。`,
+    }
+  }
+  return {
+    error: '归档里没有 package.json',
+    detail: '这不是插件包。npm pack 的产物应在 package/package.json；源码 ZIP 与原生扩展包不是插件。',
+  }
+}
+
 /**
  * 解包后的静态检查（读 staged package.json + 依赖核对 + 冲突探测）。
  * 返回给前端的「安装前检查」报告；不通过时返回 {ok:false,...}。
  */
 function inspectStaged(stagingDir, engineRoot) {
-  const stagedPkgDir = join(stagingDir, 'package')
+  const located = locatePackageDir(stagingDir)
+  if (!located.dir) return { ok: false, error: located.error, detail: located.detail }
+  const stagedPkgDir = located.dir
   const pkgFile = join(stagedPkgDir, 'package.json')
-  if (!existsSync(pkgFile)) {
-    return { ok: false, error: '归档里没有 package/package.json', detail: '这不是 npm 发布包（npm pack 产物）的布局，无法作为 DSH 插件安装。' }
-  }
   const pkg = readJsonFile(pkgFile)
   if (!pkg || typeof pkg !== 'object') {
     return { ok: false, error: 'package.json 无法解析', detail: '包内的 package.json 不是合法 JSON。' }
@@ -305,7 +353,9 @@ function inspectStaged(stagingDir, engineRoot) {
     return { ok: false, error: `${name} 是受保护的核心组件`, detail: '不允许通过本地安装覆盖引擎核心或控制台本体。' }
   }
 
-  const hasEntry = Boolean(pkg.main || pkg.exports || pkg.module)
+  // 入口判定：显式声明优先；未声明时认 Node 默认入口与插件声明（pkg.dsh）。
+  const hasDefaultEntry = DEFAULT_ENTRIES.some((f) => existsSync(join(stagedPkgDir, f)))
+  const hasEntry = Boolean(pkg.main || pkg.exports || pkg.module || pkg.dsh) || hasDefaultEntry
   const deps = pkg.dependencies && typeof pkg.dependencies === 'object' ? Object.keys(pkg.dependencies) : []
   const depsMissing = deps.filter((d) => !depSatisfied(d, join(stagedPkgDir, 'node_modules'), engineRoot))
 
@@ -321,6 +371,8 @@ function inspectStaged(stagingDir, engineRoot) {
     description: String(pkg.description ?? ''),
     hasDshPatch: existsSync(join(stagedPkgDir, 'dsh.bundle.patch')) || Boolean(pkg.dsh),
     entryDeclared: hasEntry,
+    /** 包根相对 staging 的位置（'' = staging 根；'package' = npm pack；或唯一顶层目录名）。 */
+    pkgRel: located.rel,
     deps,
     depsMissing,
     conflict,
@@ -484,6 +536,8 @@ export async function handleInspectRequest(req, engineRoot) {
   UPLOADS.set(id, {
     tgzPath,
     stagingDir,
+    // 检查阶段已经定位好的包根，安装时不能重新猜（布局可能是唯一顶层目录）
+    pkgRel: report.pkgRel,
     name: report.name,
     version: report.version,
     ts: Date.now(),
@@ -515,10 +569,12 @@ export function installFromUpload({ id, enable, overwrite }) {
     return { ok: false, error: '上传会话不存在或已过期', detail: '请从「本地安装」重新选择插件包。' }
   }
 
-  const stagedPkgDir = join(entry.stagingDir, 'package')
+  // 包根由检查阶段定好（可能是 package/、唯一顶层目录或 staging 根本身）
+  const pkgRel = typeof entry.pkgRel === 'string' ? entry.pkgRel : 'package'
+  const stagedPkgDir = pkgRel ? join(entry.stagingDir, pkgRel) : entry.stagingDir
   if (!existsSync(join(stagedPkgDir, 'package.json'))) {
     removeUpload(String(id))
-    return { ok: false, error: '上传会话的数据不完整', detail: 'staging 里找不到 package/，请重新选择插件包。' }
+    return { ok: false, error: '上传会话的数据不完整', detail: `staging 里找不到 ${pkgRel || '根目录'}/package.json，请重新选择插件包。` }
   }
 
   // uploadId 与包名的绑定在这里重新确认：前端拿到什么就装什么，不信任缓存的旧字段。

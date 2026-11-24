@@ -4004,7 +4004,8 @@ input, textarea, select {
 .plugin-pending-text span { display: block; font-size: 11px; color: var(--text-muted); margin-top: 2px; line-height: 1.5; }
 
 /* ---- 瀹夎寮瑰眰 ---- */
-.plugin-sheet-mask { position: fixed; inset: 0; z-index: 200; background: rgba(0, 0, 0, 0.5); display: flex; align-items: flex-end; justify-content: center; }
+/* 190 而不是 200：.toast-container 是 200，弹层打开时的失败提示仍要能盖在上面 */
+.plugin-sheet-mask { position: fixed; inset: 0; z-index: 190; background: rgba(0, 0, 0, 0.5); display: flex; align-items: flex-end; justify-content: center; }
 .plugin-sheet-mask[hidden] { display: none; }
 .plugin-sheet {
   width: 100%; max-width: 480px; background: var(--bg-card);
@@ -4044,6 +4045,9 @@ input, textarea, select {
 .pi-row .v.ok { color: var(--accent-green); }
 .pi-row .v.bad { color: var(--accent-red); }
 .pi-error-box { border-radius: 10px; background: rgba(239, 68, 68, 0.12); color: var(--accent-red); padding: 11px 13px; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.pi-error-box[hidden] { display: none; }
+/* 弹层内行内错误：选包失败的原因必须留在界面上，不能只靠会自消失的 toast */
+.pi-select-error { margin-top: 12px; }
 
 .pi-check { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--text-secondary); margin-top: 12px; line-height: 1.6; }
 .pi-check input { accent-color: var(--accent-blue); margin-top: 2px; }

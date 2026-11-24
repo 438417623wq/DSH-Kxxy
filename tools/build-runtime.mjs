@@ -937,8 +937,17 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  *     pandas 与 matplotlib 就是缺这几个才 import 失败。纯新增文件，锚点看不见。
  *  2. `bin/ln` 的**内容**改了（`coreutils ln` → `coreutils --coreutils-prog=ln`，
  *     外加复制降级）。锚点只判「文件在不在」，内容换了同样看不见。
+ *
+ * 38 → 39：本地插件安装的可用性修复（v0.9.87）。四处都在 `plugins/kxxy-host`：
+ * `host.css` 把安装弹层遮罩从 z-index 200 降到 190（原先与 `.toast-container`
+ * 同层且 DOM 在后 ⇒ 失败提示被遮罩压住，用户看到的是「选了包没反应」）、
+ * `index.html` 放宽 `accept` 并加行内错误区、`host.js` 改用文件头魔数判定格式
+ * 并延后清空 `input.value`、`lib/localinstall.mjs` 放宽包根布局与入口判定。
+ * **`host.css` 与 `lib/localinstall.mjs` 都不在 Python 增量修复的受管名单里**
+ * （`PythonRuntimeRepair.HOST_WEB_FILES` 只有 index.html 与 host.js），
+ * 不涨编号就是「新页面 + 旧样式 + 旧后端」—— 弹层依旧看不见任何报错。
  */
-const PATCHSET_MARKER = "kxxy-patchset@38";
+const PATCHSET_MARKER = "kxxy-patchset@39";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

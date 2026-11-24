@@ -1171,14 +1171,17 @@
         <!-- 步骤 1：选包（本地） -->
         <div class="plugin-sheet-step" id="pi-step-select">
           <label class="plugin-dropzone">
-            <input type="file" id="pi-file-input" accept=".tgz,application/gzip,application/x-gzip" hidden>
+            <!-- accept 放宽到 .tar.gz / octet-stream：Android 各 ROM 对 .tgz 的 MIME 判定不一致，
+                 后缀过滤会让文件在 DocumentsUI 里灰显。真实校验放在 host.js 的文件头魔数。 -->
+            <input type="file" id="pi-file-input" accept=".tgz,.tar.gz,application/gzip,application/x-gzip,application/octet-stream" hidden>
             <span class="plugin-dropzone-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/></svg>
             </span>
             <strong>从手机选择插件包</strong>
-            <span class="plugin-dropzone-sub">支持 npm 发布包（.tgz）。源码 ZIP 与原生扩展包不是插件，装了也加载不了。</span>
+            <span class="plugin-dropzone-sub">支持 npm 发布包（.tgz / .tar.gz）。源码 ZIP 与原生扩展包不是插件，装了也加载不了。</span>
             <span class="button button-primary button-sm" role="button">选择文件</span>
           </label>
+          <div class="pi-error-box pi-select-error" id="pi-select-error" hidden></div>
         </div>
 
         <!-- 步骤 1：在线添加（引导到官方入口） -->

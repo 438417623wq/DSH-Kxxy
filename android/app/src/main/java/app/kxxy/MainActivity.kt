@@ -512,7 +512,7 @@ class MainActivity : Activity() {
                 filePathCallback?.onReceiveValue(null)
                 filePathCallback = callback
 
-                val intent = params.createIntent().apply {
+                val intent = buildFileChooserIntent(params).apply {
                     addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
                 return try {
@@ -871,6 +871,36 @@ class MainActivity : Activity() {
             override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
                 super.doUpdateVisitedHistory(view, url, isReload)
                 if (url != null) currentPath = pathOf(url)
+            }
+        }
+    }
+
+    /**
+     * 构造文件选择 Intent。
+     *
+     * 为什么不直接用 `FileChooserParams.createIntent()`：它把 `accept` 里的后缀
+     * 用 `MimeTypeMap` 翻成 MIME，而 `.tgz` / `.tar.gz` 在多数 ROM 上翻不出来
+     * （或翻成 `application/gzip`/`application/x-compressed`）；`Intent.type` 一旦
+     * 是这个冷门 MIME，DocumentsUI 就会把文件灰显甚至整类过滤掉 —— 用户看到的是
+     * 「插件包选不中」。含非媒体后缀（或 accept 为空）时退回通配 MIME +
+     * `CATEGORY_OPENABLE`，让系统列出全部文件；真正的格式校验在网页侧做
+     * （kxxy-host 读文件头魔数 + 后端 tar 清单校验）。
+     */
+    private fun buildFileChooserIntent(params: WebChromeClient.FileChooserParams): Intent {
+        val accepts = params.acceptTypes
+            ?.map { it.trim().lowercase() }
+            ?.filter { it.isNotEmpty() }
+            .orEmpty()
+        // 媒体类型仍按原样过滤（相册/相机体验不该被这次放宽影响）
+        val needsAnyFile = accepts.isEmpty() || accepts.any { type ->
+            type.startsWith('.') && type !in MEDIA_FILE_EXTENSIONS
+        }
+        if (!needsAnyFile) return params.createIntent()
+        return Intent(Intent.ACTION_GET_CONTENT).apply {
+            this.type = "*/*"
+            addCategory(Intent.CATEGORY_OPENABLE)
+            if (params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE) {
+                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
             }
         }
     }
@@ -1939,6 +1969,17 @@ class MainActivity : Activity() {
 
         /** 扫码页的回执码。 */
         private const val REQ_SCAN = 4203
+
+        /**
+         * `accept` 里的**媒体**后缀（相册/相机/录音）。
+         * 只有这些仍交给 `createIntent()` 按 MIME 过滤；其余后缀（`.tgz`、`.zip`、
+         * `.json` 等）一律退回通配 MIME，否则冷门 MIME 会让文件在选择器里灰显。
+         */
+        private val MEDIA_FILE_EXTENSIONS = setOf(
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif", ".avif",
+            ".mp4", ".mov", ".m4v", ".webm", ".3gp", ".mkv", ".avi",
+            ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".opus", ".flac", ".amr",
+        )
 
         /**
          * 自动连接的等待上限。

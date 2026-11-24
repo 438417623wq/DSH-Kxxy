@@ -281,6 +281,83 @@ try {
   equal('临时 profile 清单未改动', readFileSync(join(profile, 'package.json'), 'utf8'), manifest)
   check('没有安装到 node_modules', !existsSync(join(profile, 'node_modules')))
   equal('隔离引擎目录保持空白', readdirSync(engineRoot).length, 0)
+
+  console.log('\n[7] 包根布局：npm pack / 唯一顶层目录 / 根目录直放 / 前导 ./')
+  {
+    // npm pack 标准布局
+    const files = [packageFile(), { name: 'package/index.cjs', data: Buffer.from('module.exports = {}\n') }]
+    const report = await accepted('package/ 标准布局', tarGzSync(files), files)
+    equal('package/ 的包根', report?.pkgRel, 'package')
+  }
+  {
+    // tar -czf x.tgz 插件名/ —— 唯一顶层目录
+    const files = [
+      { name: 'my-plugin/package.json', data: Buffer.from(JSON.stringify({ name: 'kxxy-localinstall-fixture', version: '1.0.0', main: 'index.js' })) },
+      { name: 'my-plugin/index.js', data: Buffer.from('module.exports = {}\n') },
+    ]
+    const report = await accepted('唯一顶层目录', tarGzSync(files), files)
+    equal('唯一顶层目录的包根', report?.pkgRel, 'my-plugin')
+  }
+  {
+    // tar -czf x.tgz -C pkg . —— package.json 直放根目录
+    const files = [
+      { name: 'package.json', data: Buffer.from(JSON.stringify({ name: 'kxxy-localinstall-fixture', version: '1.0.0' })) },
+      { name: 'index.js', data: Buffer.from('module.exports = {}\n') },
+    ]
+    const report = await accepted('根目录直放', tarGzSync(files), files)
+    equal('根目录直放的包根', report?.pkgRel, '')
+    equal('默认入口 index.js 视为已声明', report?.entryDeclared, true)
+  }
+  {
+    // 前导 ./ 不应影响定位与记账（tar -czf x.tgz . 会产生 ./ 前缀）
+    const files = [
+      { name: './package/package.json', data: Buffer.from(JSON.stringify({ name: 'kxxy-localinstall-fixture', version: '1.0.0', main: 'index.js' })) },
+      { name: './package/index.js', data: Buffer.from('module.exports = {}\n') },
+    ]
+    const report = await accepted('前导 ./ 归档', tarGzSync(files), files)
+    equal('./ 归档的包根', report?.pkgRel, 'package')
+  }
+  {
+    // 没有任何入口声明，也没有 index.*：仍可见，但 entryDeclared=false（前端禁用安装）
+    const files = [{ name: 'package/package.json', data: Buffer.from(JSON.stringify({ name: 'kxxy-localinstall-fixture', version: '1.0.0' })) }]
+    const report = await accepted('无入口声明', tarGzSync(files), files)
+    equal('无入口时 entryDeclared', report?.entryDeclared, false)
+  }
+  {
+    // 多个顶层目录各带 package.json：无法判断插件本体，必须拒绝
+    const files = [
+      { name: 'a/package.json', data: Buffer.from(JSON.stringify({ name: 'kxxy-localinstall-fixture', version: '1.0.0', main: 'index.js' })) },
+      { name: 'b/package.json', data: Buffer.from(JSON.stringify({ name: 'kxxy-localinstall-fixture', version: '1.0.0', main: 'index.js' })) },
+    ]
+    await rejected('多个顶层 package.json', tarGzSync(files), /多个 package\.json/, { staticCheck: false })
+  }
+
+  console.log('\n[8] 提交安装：非 package/ 布局也能落到 node_modules')
+  {
+    const name = 'kxxy-localinstall-fixture'
+    const tgz = tarGzSync([
+      { name: 'my-plugin/package.json', data: Buffer.from(JSON.stringify({ name, version: '2.3.4', main: 'index.js' })) },
+      { name: 'my-plugin/index.js', data: Buffer.from('module.exports = "fixture"\n') },
+    ])
+    const report = await inspect(tgz)
+    equal('安装前检查通过', report.ok, true)
+    if (report.ok) {
+      activeUploads.add(report.uploadId)
+      const result = api.installFromUpload({ id: report.uploadId, enable: true, overwrite: false })
+      activeUploads.delete(report.uploadId)
+      equal('安装返回 ok', result.ok, true)
+      if (!result.ok) console.log(`       ${result.error}`)
+      const target = join(profile, 'node_modules', name)
+      check('包体落在 node_modules/<name>', existsSync(join(target, 'package.json')))
+      check('包内文件完整', existsSync(join(target, 'index.js')))
+      check('staging 未残留', stagedDirs().length === 0)
+      const after = JSON.parse(readFileSync(join(profile, 'package.json'), 'utf8'))
+      equal('清单写入依赖版本', after.dependencies?.[name], '2.3.4')
+      check('清单加入启用列表', Array.isArray(after.dsh?.profile?.bundles) && after.dsh.profile.bundles.includes(name))
+      rmSync(join(profile, 'node_modules'), { recursive: true, force: true })
+    }
+  }
+
   equal('所有输入归档目录已回收', readdirSync(archiveRoot).length, 0)
   cleanStaging('最终检查')
 } catch (error) {

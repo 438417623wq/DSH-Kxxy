@@ -3652,7 +3652,10 @@ class RuntimeInstaller(private val ctx: Context) {
         // 并带复制降级。前者是纯新增文件、后者是既有文件改内容 —— 十六条锚点
         // 一条都判不出来，只能再借这个编号让老设备重解一次。
         // 32 → 33：默认 Python 独立 glibc 路由、原生 ln 语义及 perf 失败诊断。
-        private const val PATCHSET_MARKER = "kxxy-patchset@38"
+        // 38 → 39（v0.9.87）：本地插件安装修复。`host.css` 的安装弹层遮罩降到 190
+        // （原先与 toast 同为 200，失败提示被遮罩盖住）、`lib/localinstall.mjs`
+        // 放宽包根布局 —— 这两个都不在 HOST_WEB_FILES 里，只能靠本编号重解。
+        private const val PATCHSET_MARKER = "kxxy-patchset@39"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
         private val PYTHON_DEFAULT_FILES = listOf(
             "libexec/python-default/python-default.py",
