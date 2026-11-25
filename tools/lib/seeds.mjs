@@ -609,7 +609,7 @@ export const POOL_ITEMS = [
   // 而这份 rootfs 有 194 条软链 —— 详见 `tools/lib/asset-pack.mjs` 顶部注释。
   {
     id: "glibc", source: "asset", category: "toolchain",
-    version: "24.04.3-r4",
+    version: "24.04.3-r5",
     name: "glibc 用户态（Ubuntu 24.04 + proot）",
     description:
       "在 proot 里跑一份**未改动的 Ubuntu 24.04 base**：`kxxy-glibc` 进容器，" +
@@ -617,7 +617,8 @@ export const POOL_ITEMS = [
       "julia、dotnet-sdk、wkhtmltopdf、PyPI 的 manylinux 轮子（sklearn/cv2）都在这一类。" +
       "装完扩展还多出四条**普通命令**：`julia`、`dotnet`、`wkhtmltopdf`、`kxxy-py`，" +
       "首次运行时各自在容器里预置 —— julia / dotnet / wkhtmltopdf 随扩展携带离线包，" +
-      "**断网也能装**（kxxy-py 仍要联网拉 manylinux 轮子，裸 python3 已原生可用）。" +
+      "**断网也能装**（kxxy-py 仍要联网拉 manylinux 轮子，裸 python3 已原生可用）；" +
+      "KXXY_GLIBC_OFFLINE=1 禁止一切联网，缺本地包直接报错、不静默下载。" +
       "无需 root、不改系统，代价是每条系统调用多一层 ptrace 转发（比原生慢 2–5 倍）。" +
       "首次运行解包 rootfs 约 1 分钟；之后 apt 装的东西都留在 <files>/glibc/rootfs，" +
       "重装扩展或升级 APK 都不会丢。",

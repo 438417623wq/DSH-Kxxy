@@ -1,4 +1,4 @@
-# Package the current Codex sidebar as a development APK; never install on a device.
+﻿# Package the current Codex sidebar as a development APK; never install on a device.
 param(
     [Parameter(Mandatory = $true)][string]$Runtime,
     [Parameter(Mandatory = $true)][string]$Backup,

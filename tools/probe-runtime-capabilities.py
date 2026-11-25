@@ -281,6 +281,48 @@ def perf_probe(root, scratch, record, load):
     return result
 
 
+def office_probe(root, scratch):
+    """Informational: which document engine office_convert/office_render actually uses.
+
+    Runs the Kit's own `capabilities --json`, so the answer comes from the package that
+    performs the conversion instead of a second opinion. Android ships the WASM engine
+    only (no soffice, and the native engine package needs a glibc userland), so
+    `backend: wasm` is the declared configuration, not a silent degradation — that is
+    what keeps "render differs from desktop Word" from being re-filed as a defect.
+    Never fails the report: office is optional.
+    """
+    node = root / "bin/node"
+    cli = root / "lib/node_modules/@deepseek-ai/libreoffice-kit/lib/cli.js"
+    if not node.is_file():
+        return {"status": "skip", "reason": "runtime node not installed", "node": str(node)}
+    if not cli.is_file():
+        return {"status": "skip", "reason": "libreoffice-kit not installed", "kit": str(cli)}
+    run = run_command([str(node), str(cli), "capabilities", "--json"], scratch, timeout=120)
+    result = {"status": "pass", "argv": run.get("argv"), "code": run.get("code"),
+              "elapsed_seconds": run.get("elapsed_seconds")}
+    payload = None
+    for line in reversed(run["stdout"].splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                payload = json.loads(line)
+                break
+            except ValueError:
+                continue
+    if payload is None:
+        result.update(status="skip", reason="capabilities --json produced no JSON",
+                      stdout=run["stdout"][-400:], stderr=run["stderr"][-400:])
+        return result
+    runtime = payload.get("runtime") or {}
+    result.update(kitVersion=runtime.get("version"), backend=runtime.get("backend"),
+                  nativePreview=runtime.get("nativePreview"), cliPath=runtime.get("cliPath"),
+                  conversions=payload.get("conversions"), pdfBackend=(payload.get("imageRendering") or {}).get("pdfBackend"))
+    result["native"] = result["backend"] == "native"
+    result["note"] = ("native LibreOffice engine is in use" if result["native"]
+                      else "WASM engine: conversion works, desktop-exact layout is not guaranteed")
+    return result
+
+
 def collect(root, scratch):
     checks = {"process": process_info(), "selinux_context": read_metadata("/proc/self/attr/current"),
               "perf_event_paranoid": read_metadata("/proc/sys/kernel/perf_event_paranoid")}
@@ -288,6 +330,10 @@ def collect(root, scratch):
         checks[kind] = link_probe(root, scratch, kind)
     checks["default_python"] = python_probe(root, scratch, True)
     checks["native_python3"] = python_probe(root, scratch, False)
+    try:
+        checks["office_engine"] = office_probe(root, scratch)
+    except (OSError, ValueError) as ex:
+        checks["office_engine"] = {"status": "skip", **failure(ex)}
     for record in (False, True):
         for load in (False, True):
             name = "perf_" + ("record" if record else "stat") + ("_load" if load else "_true")
@@ -303,7 +349,8 @@ def probe(root, scratch_parent):
               "PATH": os.environ.get("PATH", ""), "checks": {},
               "notes": ["Manual probe only; no root/su, policy changes, provisioning, or secret reads.",
                         "Inherited PATH/environment are unchanged; wrappers may apply their normal runtime environment.",
-                        "A zero-sample true run is not proof of a denied counter; inspect load and syscall diagnostics."]}
+                        "A zero-sample true run is not proof of a denied counter; inspect load and syscall diagnostics.",
+                        "office_engine is informational and never required: Android ships the WASM document engine."]}
     scratch = None
     try:
         scratch = Path(tempfile.mkdtemp(prefix="kxxy-capabilities-", dir=str(scratch_parent)))

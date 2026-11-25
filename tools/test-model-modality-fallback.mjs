@@ -174,6 +174,32 @@ function verify(asarPath) {
   assert.ok(!original.includes('const modalityBase = catalogModalityFallback'), '回退不得越过 base（目录命中的路由保持原判定）');
   assert.ok(!original.includes('?? [...request.defaultInput],'), 'input 仍直接落到 schema 默认值（未知中转永远发不了图）');
 
+  // 三条判定语义（「方案 B」的契约，与实现方式无关）：
+  //   ① 声明了 input        → 按声明；
+  //   ② 未声明、目录与回退都查不到 → 不能落到 schema 的 ["text"]；
+  //   ③ 显式写 defaultInput  → 按该值，且优先于 base。
+  // 本产物里 ② 只能「按协议补 image」而不能置空 —— 见下面的第二道门。
+  let cursor = -1;
+  for (const needle of [
+    'declaredInput(entry.input)',
+    'request.defaultInputDeclared === true',
+    'base?.input',
+    'modalityBase?.input',
+    'unknownRouteInput(',
+  ]) {
+    const at = CHAIN.indexOf(needle);
+    assert.ok(at > cursor, `回退链优先级错位：${needle} 出现了两次或越过了前面的来源`);
+    cursor = at;
+  }
+
+  // 第二道门（请求期）：pi-ai 在真正发请求前还会用 model.input 再判一次图片。
+  // 只把 adapter 的 inputModalities 置空（准入放行）在这里会以 UNSUPPORTED_CONTENT
+  // 失败，所以 input 必须真的带上 image —— 这条断言就是为了防止有人「简化」回去。
+  assert.ok(
+    original.includes('if (containsImage && !model.input.includes("image")) throw new LlmError('),
+    '请求期的图片守卫不在了：请重核 input 兜底是否仍必要（闸门若已放宽，这里可以只报 modality）',
+  );
+
   // ── 4. 用受控目录跑真实抽取出来的回退函数 ──────────────────────────────
   exerciseFallback(original);
 

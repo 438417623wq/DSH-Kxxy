@@ -18,6 +18,10 @@
 #
 # 每个目标成功后在 <files>/glibc/.provisioned/ 下留一个标记，重复执行直接跳过。
 # 想重来就删掉对应标记；想换 rootfs 用 KXXY_GLIBC_ROOTFS（透传给 kxxy-glibc）。
+#
+# julia / dotnet / wkhtmltopdf 三个有随扩展的离线包，断网也能装（装成功会删包，
+# 想留着复用设 KXXY_PROVISION_KEEP=1）。KXXY_GLIBC_OFFLINE=1 时禁止一切联网：
+# 缺本地包直接报「需要联网」，不会静默去下载。
 set -u
 
 ROOT=@DSH_ROOT@
@@ -29,6 +33,12 @@ STAMP="$FILES/glibc/.provisioned"
 # 有本地包就不联网；没有才回退 apt / curl。
 BUNDLES="$EXT/provision"
 ROOTFS="${KXXY_GLIBC_ROOTFS:-$FILES/glibc/rootfs}"
+
+# 离线模式：KXXY_GLIBC_OFFLINE=1 时禁止一切联网（apt / pip / 官方 tarball）。
+# 缺本地包就直接报「缺少本地缓存」并返回非 0，不静默转去下载 —— 弱网下
+# 285 MiB 的 julia 能挂十几分钟，看起来像脚本卡死。
+# 离线可用的只有随扩展的 julia / dotnet / wkhtmltopdf 三个；python-* 需要网络。
+OFFLINE="${KXXY_GLIBC_OFFLINE:-0}"
 
 [ -x "$GC" ] || { echo "kxxy-glibc-provision: 缺 $GC（glibc 扩展没装全？）" >&2; exit 127; }
 mkdir -p "$STAMP" || { echo "kxxy-glibc-provision: 无法创建 $STAMP" >&2; exit 1; }
@@ -51,6 +61,15 @@ in_guest() {
   "$GC" -c "$1"
 }
 
+# 离线模式下要联网的路径：直接失败，并说清缺的是什么。
+offline_fail() {
+  echo "kxxy-glibc-provision: KXXY_GLIBC_OFFLINE=1，但$1需要联网" >&2
+  echo "  → 离线模式只走随扩展的本地包（julia / dotnet / wkhtmltopdf 三个）。" >&2
+  echo "  → python-ml / python-data / python-torch 需要网络；" >&2
+  echo "    想离线用 Python 请直接用原生 python3（已自带 numpy/scipy/pandas/torch）。" >&2
+  return 1
+}
+
 # 装成功后删掉用过的离线包：它们已经在扩展目录里占了 ~580 MiB，而装好的东西
 # 落在 <files>/glibc/rootfs（扩展重装/APK 升级都不会丢）。想留着复用就
 # KXXY_PROVISION_KEEP=1。删了也能恢复 —— 重装扩展会重新释放。
@@ -71,6 +90,7 @@ ensure_rootfs() {
 
 prov_base() {
   [ -f "$STAMP/base" ] && return 0
+  [ "$OFFLINE" = "1" ] && { offline_fail " apt 源（base）"; return 1; }
   # DNS 预检：容器里没有 nameserver 时，apt 的报错是一条
   # `Temporary failure resolving 'ports.ubuntu.com'` 后面紧跟
   # `Unable to locate package curl` —— 后半句太像「软件源写错了」，
@@ -106,6 +126,11 @@ prov_apt() {
 
 prov_julia() {
   [ -f "$STAMP/julia" ] && return 0
+  # 标记丢了（扩展重装过、手动删过）但东西还在：确认一下就走，不必重解 285 MiB。
+  if in_guest 'test -x /opt/julia-1.11.7/bin/julia' 2>/dev/null; then
+    : > "$STAMP/julia"
+    return 0
+  fi
   if [ -f "$BUNDLES/julia-1.11.7-linux-aarch64.tar.gz" ]; then
     echo "== 安装 Julia 1.11.7（离线包，约 285 MiB）==" >&2
     ensure_rootfs || return 1
@@ -116,7 +141,7 @@ prov_julia() {
     drop_bundle "$BUNDLES/julia-1.11.7-linux-aarch64.tar.gz"
     return 0
   fi
-  in_guest 'test -x /opt/julia-1.11.7/bin/julia' && { : > "$STAMP/julia"; return 0; }
+  [ "$OFFLINE" = "1" ] && { offline_fail " Julia（离线包已缺失）"; return 1; }
   prov_base || return 1
   echo "== 下载 Julia 1.11.7（约 285 MiB，单线程；离线包缺失才走这条路）==" >&2
   in_guest 'cd /tmp && rm -f julia.tgz \
@@ -131,6 +156,11 @@ prov_julia() {
 # —— 否则 `dotnet --info` 会以 "Couldn't find a valid ICU package" 退出。
 prov_dotnet() {
   [ -f "$STAMP/dotnet" ] && return 0
+  # 已装（标记丢了）就先确认包装器在：wrapper 是判定 dotnet 可用的唯一入口。
+  if in_guest 'test -x /usr/bin/dotnet' 2>/dev/null; then
+    : > "$STAMP/dotnet"
+    return 0
+  fi
   if [ -f "$BUNDLES/dotnet-sdk-8.0.404-linux-arm64.tar.gz" ]; then
     echo "== 安装 .NET SDK 8.0.404（离线包，约 200 MiB）==" >&2
     ensure_rootfs || return 1
@@ -151,6 +181,7 @@ DOTNET_WRAPPER
     drop_bundle "$BUNDLES/dotnet-sdk-8.0.404-linux-arm64.tar.gz"
     return 0
   fi
+  [ "$OFFLINE" = "1" ] && { offline_fail " .NET（离线包已缺失）"; return 1; }
   prov_base || return 1
   prov_apt dotnet-sdk-8.0 dotnet || return 1
   in_guest 'dotnet --version' || return 1
@@ -161,6 +192,10 @@ DOTNET_WRAPPER
 # 之所以不用 apt 装本地 deb：apt 解本地文件仍会去索引里找依赖，断网直接失败。
 prov_wkhtmltopdf() {
   [ -f "$STAMP/wkhtmltopdf" ] && return 0
+  if in_guest 'command -v wkhtmltopdf >/dev/null 2>&1' 2>/dev/null; then
+    : > "$STAMP/wkhtmltopdf"
+    return 0
+  fi
   if [ -f "$BUNDLES/wkhtmltopdf-noble-arm64-debs.tar.gz" ]; then
     echo "== 安装 wkhtmltopdf 0.12.6 + 依赖（离线包）==" >&2
     ensure_rootfs || return 1
@@ -181,6 +216,7 @@ prov_wkhtmltopdf() {
     drop_bundle "$BUNDLES/wkhtmltopdf-noble-arm64-debs.tar.gz"
     return 0
   fi
+  [ "$OFFLINE" = "1" ] && { offline_fail " wkhtmltopdf（离线包已缺失）"; return 1; }
   prov_base || return 1
   prov_apt wkhtmltopdf wkhtmltopdf || return 1
   in_guest 'wkhtmltopdf --version' || return 1
@@ -188,13 +224,14 @@ prov_wkhtmltopdf() {
 }
 
 prov_python() {
-  prov_base || return 1
-  prov_apt python3-pip python-pip || return 1
   # 已经有整套就跳过：apt 自带一个 numpy，但没有 sklearn/cv2
-  if in_guest 'python3 -c "import sklearn, cv2" >/dev/null 2>&1'; then
+  if in_guest 'python3 -c "import sklearn, cv2" >/dev/null 2>&1' 2>/dev/null; then
     : > "$STAMP/python-ml"
     return 0
   fi
+  [ "$OFFLINE" = "1" ] && { offline_fail " pip（python-ml）"; return 1; }
+  prov_base || return 1
+  prov_apt python3-pip python-pip || return 1
   echo "== pip 安装 numpy / scikit-learn / opencv-python-headless（manylinux 轮子）==" >&2
   in_guest "python3 -m pip install --break-system-packages --no-cache-dir -q $PIP_OPT \
     numpy scikit-learn opencv-python-headless" || return 1
