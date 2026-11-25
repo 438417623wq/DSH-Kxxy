@@ -12,8 +12,10 @@
 #   kxxy-glibc-provision python-ml       apt python3-pip + pip 装 numpy/sklearn/cv2
 #   kxxy-glibc-provision python-data     pip 装 pandas（约 12 MiB）
 #   kxxy-glibc-provision python-torch    pip 装 torch（aarch64 轮子约 485 MiB）
+#   kxxy-glibc-provision libreoffice     无头原生 LibreOffice（writer/calc/impress-nogui）
 #   kxxy-glibc-provision python-full     以上三者：让默认 python3 一个环境全都有
 #   kxxy-glibc-provision base            只做 apt update + ca-certificates/curl
+#   kxxy-glibc-provision offline-all     只装五个离线包（julia/dotnet/wkhtmltopdf/python-ml/libreoffice）
 #   kxxy-glibc-provision all             以上全做
 #
 # 每个目标成功后在 <files>/glibc/.provisioned/ 下留一个标记，重复执行直接跳过。
@@ -61,12 +63,18 @@ in_guest() {
   "$GC" -c "$1"
 }
 
+# LibreOffice 的真身。**别用 /usr/bin/soffice**：那是 oosplash 启动器，
+# 它会先自检 /proc，proot 里没挂 /proc 就直接 `ERROR: /proc not mounted` + exit 1，
+# 连 `--version` 都不回。program/soffice.bin 是同一个二进制的本体，实测在容器里
+# `--version` 与 `--convert-to pdf` 都正常，libreoffice-kit 的桥接也指向它。
+LO_BIN=/usr/lib/libreoffice/program/soffice.bin
+
 # 离线模式下要联网的路径：直接失败，并说清缺的是什么。
 offline_fail() {
   echo "kxxy-glibc-provision: KXXY_GLIBC_OFFLINE=1，但$1需要联网" >&2
-  echo "  → 离线模式只走随扩展的本地包（julia / dotnet / wkhtmltopdf 三个）。" >&2
-  echo "  → python-ml / python-data / python-torch 需要网络；" >&2
-  echo "    想离线用 Python 请直接用原生 python3（已自带 numpy/scipy/pandas/torch）。" >&2
+  echo "  → 离线模式只走随扩展的本地包（julia / dotnet / wkhtmltopdf / python-ml / libreoffice 五个）。" >&2
+  echo "  → python-data / python-torch 仍需网络；" >&2
+  echo "    想离线用完整科学计算栈请直接用原生 python3（已自带 numpy/scipy/pandas/torch）。" >&2
   return 1
 }
 
@@ -224,12 +232,32 @@ prov_wkhtmltopdf() {
 }
 
 prov_python() {
+  [ -f "$STAMP/python-ml" ] && return 0
   # 已经有整套就跳过：apt 自带一个 numpy，但没有 sklearn/cv2
   if in_guest 'python3 -c "import sklearn, cv2" >/dev/null 2>&1' 2>/dev/null; then
     : > "$STAMP/python-ml"
     return 0
   fi
-  [ "$OFFLINE" = "1" ] && { offline_fail " pip（python-ml）"; return 1; }
+  if [ -f "$BUNDLES/python-ml-noble-arm64.tar.gz" ]; then
+    echo "== 安装容器内 Python 3.12 + numpy/sklearn/cv2（离线包）==" >&2
+    ensure_rootfs || return 1
+    rm -rf "$ROOTFS/tmp/kxxy-python-ml"
+    mkdir -p "$ROOTFS/tmp/kxxy-python-ml" || return 1
+    tar -xzf "$BUNDLES/python-ml-noble-arm64.tar.gz" -C "$ROOTFS/tmp/kxxy-python-ml" || return 1
+    if ! in_guest 'export DEBIAN_FRONTEND=noninteractive
+      dpkg -i --force-confold /tmp/kxxy-python-ml/debs/*.deb >/tmp/kp-python-debs.log 2>&1'; then
+      echo "python-ml: dpkg 返回非 0（postinst 警告？），日志尾巴——" >&2
+      in_guest 'tail -8 /tmp/kp-python-debs.log' >&2 || true
+    fi
+    in_guest 'python3 -m pip install --no-index --find-links=/tmp/kxxy-python-ml/wheels --break-system-packages --no-cache-dir -q numpy scikit-learn opencv-python-headless' || return 1
+    in_guest 'python3 -c "import numpy,sklearn,cv2;print(\"numpy\",numpy.__version__,\"sklearn\",sklearn.__version__,\"cv2\",cv2.__version__)"' || return 1
+    : > "$STAMP/python-ml"
+    : > "$STAMP/python-pip"
+    rm -rf "$ROOTFS/tmp/kxxy-python-ml"
+    drop_bundle "$BUNDLES/python-ml-noble-arm64.tar.gz"
+    return 0
+  fi
+  [ "$OFFLINE" = "1" ] && { offline_fail " pip（python-ml 离线包已缺失）"; return 1; }
   prov_base || return 1
   prov_apt python3-pip python-pip || return 1
   echo "== pip 安装 numpy / scikit-learn / opencv-python-headless（manylinux 轮子）==" >&2
@@ -237,6 +265,47 @@ prov_python() {
     numpy scikit-learn opencv-python-headless" || return 1
   in_guest 'python3 -c "import numpy,sklearn,cv2;print(\"numpy\",numpy.__version__,\"sklearn\",sklearn.__version__,\"cv2\",cv2.__version__)"' || return 1
   : > "$STAMP/python-ml"
+}
+
+# libreoffice：Ubuntu noble/arm64 无头原生 LibreOffice（writer/calc/impress-nogui）。
+# 装好后容器里 `$LO_BIN`（= program/soffice.bin）直接可用，libreoffice-kit 在
+# Android 上自动优先走容器原生后端（失败才回退 WASM）。
+#
+# 判定一律走 lo_ok：既不看 dpkg 退出码（proot 里 postinst 常返回非 0），也不调
+# /usr/bin/soffice（oosplash 在 proot 里必失败，见上面 LO_BIN 的注释）。
+lo_ok() {
+  in_guest "test -x $LO_BIN && $LO_BIN --version >/dev/null 2>&1" 2>/dev/null
+}
+
+prov_libreoffice() {
+  [ -f "$STAMP/libreoffice" ] && return 0
+  if lo_ok; then
+    : > "$STAMP/libreoffice"
+    return 0
+  fi
+  if [ -f "$BUNDLES/libreoffice-noble-arm64-debs.tar.gz" ]; then
+    echo "== 安装原生 LibreOffice（无头版 + 依赖，离线包）==" >&2
+    ensure_rootfs || return 1
+    rm -rf "$ROOTFS/tmp/kxxy-libreoffice"
+    mkdir -p "$ROOTFS/tmp/kxxy-libreoffice" || return 1
+    tar -xzf "$BUNDLES/libreoffice-noble-arm64-debs.tar.gz" -C "$ROOTFS/tmp/kxxy-libreoffice" || return 1
+    if ! in_guest 'export DEBIAN_FRONTEND=noninteractive
+      dpkg -i --force-confold /tmp/kxxy-libreoffice/*.deb >/tmp/kp-libreoffice.log 2>&1'; then
+      echo "libreoffice: dpkg 返回非 0（postinst 警告？），日志尾巴——" >&2
+      in_guest 'tail -8 /tmp/kp-libreoffice.log' >&2 || true
+    fi
+    lo_ok || { echo "libreoffice: 装完仍调不动 $LO_BIN" >&2; return 1; }
+    in_guest "$LO_BIN --version" >&2 || true
+    : > "$STAMP/libreoffice"
+    rm -rf "$ROOTFS/tmp/kxxy-libreoffice"
+    drop_bundle "$BUNDLES/libreoffice-noble-arm64-debs.tar.gz"
+    return 0
+  fi
+  [ "$OFFLINE" = "1" ] && { offline_fail " LibreOffice（离线包已缺失）"; return 1; }
+  prov_base || return 1
+  prov_apt "libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui" libreoffice || return 1
+  lo_ok || { echo "libreoffice: apt 装完仍调不动 $LO_BIN" >&2; return 1; }
+  : > "$STAMP/libreoffice"
 }
 
 # 数据栈：pandas（约 12 MiB）
@@ -264,8 +333,21 @@ prov_torch() {
 }
 
 rc=0
+
+# 五个离线包各自「装成功」时就被 drop 掉了。但**重装扩展会把它们原样放回来**，
+# 而此时所有目标都已经有戳、`offline-all` 一条都不用装 ⇒ 580 MiB 白占设备空间
+# （真机 0.9.97 上复现：重装后 provision/ 又满了）。所以全部齐了就顺手清掉。
+prune_bundles_if_done() {
+  [ "${KXXY_PROVISION_KEEP:-0}" = "1" ] && return 0
+  for t in julia dotnet wkhtmltopdf python-ml libreoffice; do
+    [ -f "$STAMP/$t" ] || return 0
+  done
+  rm -f "$BUNDLES"/*.tar.gz 2>/dev/null || true
+  return 0
+}
+
 if [ "$#" -eq 0 ]; then
-  echo "用法：kxxy-glibc-provision <base|julia|dotnet|wkhtmltopdf|python-ml|python-data|python-torch|python-full|all>" >&2
+  echo "用法：kxxy-glibc-provision <base|julia|dotnet|wkhtmltopdf|python-ml|libreoffice|offline-all|python-data|python-torch|python-full|all>" >&2
   exit 2
 fi
 for want in "$@"; do
@@ -275,6 +357,15 @@ for want in "$@"; do
     dotnet) prov_dotnet ;;
     wkhtmltopdf) prov_wkhtmltopdf ;;
     python-ml) prov_python ;;
+    libreoffice|soffice) prov_libreoffice ;;
+    offline-all)
+      OFFLINE=1
+      prov_julia || rc=1
+      prov_dotnet || rc=1
+      prov_wkhtmltopdf || rc=1
+      prov_python || rc=1
+      prov_libreoffice || rc=1
+      ;;
     python-data|pandas) prov_pandas ;;
     python-torch|torch) prov_torch ;;
     python-full|python)
@@ -285,15 +376,19 @@ for want in "$@"; do
         in_guest 'python3 -c "import numpy,scipy,sklearn,cv2,pandas,torch as t;print(\"numpy\",numpy.__version__,\"scipy\",scipy.__version__,\"sklearn\",sklearn.__version__,\"cv2\",cv2.__version__,\"pandas\",pandas.__version__,\"torch\",t.__version__)"'
       fi ;;
     all)
-      prov_julia
-      prov_dotnet
-      prov_wkhtmltopdf
-      prov_python
-      prov_pandas
-      prov_torch
+      # 每一个都要记 rc：原来只有最后一条（torch）的状态会被 `[ "$?" -eq 0 ]` 看到，
+      # 前面 julia/dotnet 装失败也照样退 0。
+      prov_julia || rc=1
+      prov_dotnet || rc=1
+      prov_wkhtmltopdf || rc=1
+      prov_python || rc=1
+      prov_libreoffice || rc=1
+      prov_pandas || rc=1
+      prov_torch || rc=1
       ;;
     *) echo "kxxy-glibc-provision: 未知目标 $want" >&2; rc=2 ;;
   esac
   [ "$?" -eq 0 ] || rc=1
+  [ "$rc" -eq 0 ] && prune_bundles_if_done
 done
 exit "$rc"

@@ -16,7 +16,7 @@ const generated = [...pythonDefaultWrappers(), ...hardlinkWrappers(), ...rsyncWr
 
 await test('runtime and native installer share the new patchset contract', () => {
   const marker = (text) => /(?:const|val) PATCHSET_MARKER\s*=\s*"([^"]+)"/.exec(text)?.[1];
-  assert.equal(marker(build), 'kxxy-patchset@42');
+  assert.equal(marker(build), 'kxxy-patchset@46');
   assert.equal(marker(installer), marker(build));
 });
 await test('all independent Python routes have native completeness anchors', () => {

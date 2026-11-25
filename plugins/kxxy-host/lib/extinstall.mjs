@@ -47,6 +47,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
+import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -311,6 +312,23 @@ async function runInstall(job, root, id, item) {
       `${JSON.stringify({ phase: 'done', percent: 100, message: job.message, updatedAt: Date.now() }, null, 2)}\n`,
     )
   } catch { /* 非致命 */ }
+
+  // glibc 扩展装好后，在 Android 设备上后台静默执行一次离线预置（julia / dotnet /
+  // wkhtmltopdf / python-ml / libreoffice），使四个工具与原生 soffice 装完扩展即就绪，
+  // 不必等用户首次敲命令再解包，全程 KXXY_GLIBC_OFFLINE=1 零联网。
+  if (id === 'glibc' && process.platform === 'android' && process.env.KXXY_SKIP_AUTO_PROVISION !== '1') {
+    const prov = join(extDir, 'bin', 'kxxy-glibc-provision')
+    if (existsSync(prov)) {
+      try {
+        const child = spawn(prov, ['offline-all'], {
+          env: { ...process.env, KXXY_GLIBC_OFFLINE: '1' },
+          detached: true,
+          stdio: 'ignore',
+        })
+        child.unref()
+      } catch { /* 非致命：首次调用工具垫片时仍会触发离线预置 */ }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

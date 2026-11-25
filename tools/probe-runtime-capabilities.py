@@ -89,12 +89,20 @@ def process_info():
     }
 
 
-def run_command(argv, scratch, timeout=45):
-    """Do not inject PATH/PYTHONPATH or substitute an explicit alternative Python."""
+def run_command(argv, scratch, timeout=45, extra_env=None):
+    """Do not inject PATH/PYTHONPATH or substitute an explicit alternative Python.
+
+    ``extra_env`` exists for the one case where the *host* contract, not a guess, is
+    required: `EngineConfig` always exports `KXXY_ENGINE_ROOT` to the engine process,
+    and `libreoffice-kit` uses it to find the glibc userland. A probe that omits it
+    would report the WASM backend on a device that actually converts natively.
+    """
     started = time.monotonic()
+    env = None if not extra_env else {**os.environ, **extra_env}
     try:
         result = subprocess.run(argv, cwd=str(scratch), capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=timeout)
+                                encoding="utf-8", errors="replace", timeout=timeout,
+                                env=env)
         return {"status": "pass" if result.returncode == 0 else "fail", "argv": argv,
                 "code": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
                 "elapsed_seconds": round(time.monotonic() - started, 3)}
@@ -307,11 +315,12 @@ def office_probe(root, scratch):
     """Informational: which document engine office_convert/office_render actually uses.
 
     Runs the Kit's own `capabilities --json`, so the answer comes from the package that
-    performs the conversion instead of a second opinion. Android ships the WASM engine
-    only (no soffice, and the native engine package needs a glibc userland), so
-    `backend: wasm` is the declared configuration, not a silent degradation — that is
-    what keeps "render differs from desktop Word" from being re-filed as a defect.
-    Never fails the report: office is optional.
+    performs the conversion instead of a second opinion. Kit 的原生引擎包在 Android 上
+    架构不可达（平台矩阵里没有 android，且依赖私有 dsoffice 助手），所以随包默认是
+    WASM；装了 glibc 扩展并预置了 LibreOffice 之后，Kit 会优先走容器里的
+    `program/soffice.bin`（KXXY_LIBREOFFICE_GLIBC_NATIVE 桥接），此时报 `backend: native`。
+    两种情况下转换都能用，区别只是版式是否与桌面 Word 逐像素一致，所以这个检查
+    永远是 informational，绝不进 required。
     """
     node = root / "bin/node"
     cli = root / "lib/node_modules/@deepseek-ai/libreoffice-kit/lib/cli.js"
@@ -319,7 +328,8 @@ def office_probe(root, scratch):
         return {"status": "skip", "reason": "runtime node not installed", "node": str(node)}
     if not cli.is_file():
         return {"status": "skip", "reason": "libreoffice-kit not installed", "kit": str(cli)}
-    run = run_command([str(node), str(cli), "capabilities", "--json"], scratch, timeout=120)
+    run = run_command([str(node), str(cli), "capabilities", "--json"], scratch, timeout=120,
+                      extra_env={"KXXY_ENGINE_ROOT": str(root), "KXXY_FILES_DIR": str(root.parent)})
     result = {"status": "pass", "argv": run.get("argv"), "code": run.get("code"),
               "elapsed_seconds": run.get("elapsed_seconds")}
     payload = None
@@ -340,8 +350,9 @@ def office_probe(root, scratch):
                   nativePreview=runtime.get("nativePreview"), cliPath=runtime.get("cliPath"),
                   conversions=payload.get("conversions"), pdfBackend=(payload.get("imageRendering") or {}).get("pdfBackend"))
     result["native"] = result["backend"] == "native"
-    result["note"] = ("native LibreOffice engine is in use" if result["native"]
-                      else "WASM engine: conversion works, desktop-exact layout is not guaranteed")
+    result["note"] = ("native LibreOffice engine is in use (glibc container)" if result["native"]
+                      else "WASM engine: conversion works, desktop-exact layout is not guaranteed"
+                           + " (install the glibc extension + provision libreoffice for native)")
     return result
 
 
@@ -372,7 +383,7 @@ def probe(root, scratch_parent):
               "notes": ["Manual probe only; no root/su, policy changes, provisioning, or secret reads.",
                         "Inherited PATH/environment are unchanged; wrappers may apply their normal runtime environment.",
                         "A zero-sample true run is not proof of a denied counter; inspect load and syscall diagnostics.",
-                        "office_engine is informational and never required: Android ships the WASM document engine."]}
+                        "office_engine is informational and never required: it reports wasm unless the glibc extension has native LibreOffice provisioned."]}
     scratch = None
     try:
         scratch = Path(tempfile.mkdtemp(prefix="kxxy-capabilities-", dir=str(scratch_parent)))

@@ -81,6 +81,7 @@ function parseArgs(argv) {
     assets: join(PROJECT, 'android', 'app', 'src', 'main', 'assets', 'python-repair'),
     alias: null,
     checkOnly: false,
+    replace: [],
   }
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]
@@ -89,9 +90,15 @@ function parseArgs(argv) {
     else if (a === '--meta') opts.meta = resolve(argv[++i])
     else if (a === '--assets') opts.assets = resolve(argv[++i])
     else if (a === '--alias') opts.alias = resolve(argv[++i])
+    else if (a === '--replace') {
+      const spec = argv[++i] ?? ''
+      const eq = spec.indexOf('=')
+      if (eq <= 0) throw new Error(`--replace 需要 <运行时内路径>=<本机文件>：${spec}`)
+      opts.replace.push([spec.slice(0, eq), resolve(spec.slice(eq + 1))])
+    }
     else if (a === '--check-only') opts.checkOnly = true
     else if (a === '--help' || a === '-h') {
-      console.log('用法：node tools/restamp-host-plugin.mjs --in <runtime.zip> --out <new.zip> [--meta <build.json>] [--assets <python-repair>] [--check-only]')
+      console.log('用法：node tools/restamp-host-plugin.mjs --in <runtime.zip> --out <new.zip> [--meta <build.json>] [--assets <python-repair>] [--replace <entry>=<file>]... [--check-only]')
       process.exit(0)
     } else throw new Error(`未知参数：${a}`)
   }
@@ -325,6 +332,23 @@ async function main() {
   files.set(`${HOST_PLUGIN_BASE}lib/index.js`, tree.get(`${HOST_PLUGIN_BASE}lib/index.js`))
   files.set(`${HOST_PLUGIN_BASE}lib/.fingerprint`, tree.get(`${HOST_PLUGIN_BASE}lib/.fingerprint`))
   console.log(`指纹 ${fingerprint}（${marker}）`)
+
+  /*
+   * 额外替换：运行时里**不属于 kxxy-host** 的上游文件（例如修 pi-ai 的
+   * `defaultInput` 空数组回归只需换掉一个 `lib/index.js`，没必要重打 1.9 GiB）。
+   *
+   * 必须晚于树指纹计算再进 `files`：`stampHostPluginFingerprint` 只对
+   * `kxxy-host/` 树求值，把上游文件混进去会让指纹与全量构建不一致，
+   * 设备侧锚点 8 会判「插件指纹不符」而无限重装。
+   */
+  for (const [entryName, srcPath] of opts.replace) {
+    if (!existsSync(srcPath)) throw new Error(`--replace 源文件不存在：${srcPath}`)
+    if (!cd.entries.some((e) => e.name === entryName)) {
+      throw new Error(`--replace 目标不在运行时里：${entryName}（新增条目请走全量构建）`)
+    }
+    files.set(entryName, { data: readFileSync(srcPath), mode: 0o644 })
+    console.log(`替换运行时条目 ${entryName}（${statSync(srcPath).size} 字节）`)
+  }
 
   const manifestEntry = cd.entries.find((e) => e.name === 'kxxy-runtime.json')
   if (!manifestEntry) throw new Error('运行时缺少 kxxy-runtime.json')

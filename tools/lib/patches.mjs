@@ -760,6 +760,191 @@ export function patchLibreOfficeKitPlatform(ctx) {
 }
 
 /**
+ * libreoffice-kit 的 glibc 原生后端接入：在 Android 上检测到 glibc 容器已预置
+ * `/usr/lib/libreoffice/program/soffice.bin` 时，优先通过
+ * `kxxy-glibc -- …/soffice.bin --headless --convert-to` 执行原生文档转换，并在
+ * `discoverRuntime()` 报告 `backend: "native"`；未装或失败时自动无缝回退到内置
+ * WASM 后端（`KXXY_OFFICE_BACKEND=wasm` 可强制走 WASM）。
+ *
+ * **不要换成 `/usr/bin/soffice`**：那是 oosplash 启动器，proot 里自检 `/proc`
+ * 失败会直接退 1（真机实测 `ERROR: /proc not mounted`，连 `--version` 都不回）。
+ *
+ * 刻意不修改 `engine.js` 区段（保留 `patchLibreOfficeKitPlatform` 与 `office-assets.mjs`
+ * 的既有锚点/指纹契约），只注入在 `discoverRuntime` 与 `execute` 两处；两个入口
+ * 文件（`lib/index.js` / `lib/cli.js`）各注一遍。
+ */
+export function patchLibreOfficeKitGlibcNative(ctx) {
+  // **两个文件都要改**：`lib/index.js` 是库入口（引擎内部转换走这条），而
+  // `lib/cli.js` 是**自带一份完整实现**的命令行入口 —— `capabilities --json`、
+  // `convert`、`render` 全走它自己的 `discoverRuntime()` / `execute()`。
+  // 只改前者时，能力探针永远报 `backend: "wasm"`，而实际问题已经修好了：
+  // 排查时看起来像「没修」，浪费一整轮。
+  const targets = [
+    "@deepseek-ai/libreoffice-kit/lib/index.js",
+    "@deepseek-ai/libreoffice-kit/lib/cli.js",
+  ];
+  if (!ctx.exists(targets[0])) return "跳过（依赖树无 libreoffice-kit）";
+  const notes = [];
+  for (const rel of targets) {
+    const name = rel.split("/").pop();
+    notes.push(ctx.exists(rel) ? `${name}: ${applyGlibcNativeTo(ctx, rel)}` : `${name}: 缺失`);
+  }
+  return `libreoffice-kit → 接入 glibc 容器原生 soffice 后端（${notes.join("；")}）`;
+}
+
+/**
+ * 同一套注入应用到单个文件。index.js 与 cli.js 的 `discoverRuntime` / `execute`
+ * 结构逐字节一致（cli.js 是打包产物，把库内联了一份），所以锚点通用。
+ */
+function applyGlibcNativeTo(ctx, rel) {
+  const src = ctx.read(rel);
+  const marker = "KXXY_LIBREOFFICE_GLIBC_NATIVE";
+  if (src.includes(marker)) return "已打过";
+
+  const DISCOVER_ANCHOR = `async function discoverRuntime(options) {
+	resolveOptions(options);
+	try {
+		const engine = await resolveEngine(options?.resolveEnginePackage);`;
+  if (!src.includes(DISCOVER_ANCHOR)) {
+    return "跳过（libreoffice-kit 结构不含 discoverRuntime 锚点）";
+  }
+
+  const HELPER = `/* ${marker}: Android 上检测到 glibc 容器内的 LibreOffice 时，优先走原生无头转换，失败或未装时回退 WASM。
+ *
+ * 为什么调 soffice.bin 而不是 /usr/bin/soffice：后者是 oosplash 启动器，它在启动时
+ * 自检 /proc，proot 里该自检通不过（真机实测：ERROR: /proc not mounted …，退出码 1，
+ * 连 --version 都不回）。而它包装的 soffice.bin 在同一容器里 --version 与
+ * --convert-to pdf 都正常（实测产出 PDF）。所以这里直接调 soffice.bin。
+ *
+ * 为什么不带 \`-env:UserInstallation=file://…\`：真机上这个参数会让 soffice.bin
+ * **无输出、退出码 81**（同一份 .odt，去掉它立刻成功；换个目录、先 rm -rf 再建、
+ * 把 HOME 指过去，四种写法全部 81）。容器里用工具默认 profile（HOME=/root）反而
+ * 稳定，连续两次转换都正常。转换本身由 Kit 的 acquire() 串行化，共享 profile 安全。 */
+function kxxyResolveGlibcSoffice() {
+	if (process.platform !== "android") return null;
+	if (String(process.env.KXXY_OFFICE_BACKEND ?? "").trim().toLowerCase() === "wasm") return null;
+	const root = process.env.KXXY_ENGINE_ROOT || resolve(dirname(fileURLToPath(import.meta.url)), "../../../../..");
+	const files = process.env.KXXY_FILES_DIR || dirname(root);
+	const glibcBin = join(root, "extensions", "glibc", "bin", "kxxy-glibc");
+	const rootfs = process.env.KXXY_GLIBC_ROOTFS || join(files, "glibc", "rootfs");
+	const guestSoffice = "/usr/lib/libreoffice/program/soffice.bin";
+	try {
+		if (!statSync(glibcBin).isFile()) return null;
+		if (!statSync(join(rootfs, guestSoffice)).isFile()) return null;
+	} catch {
+		return null;
+	}
+	const fontsDir = join(root, "lib", "node_modules", "kxxy-host", "fonts");
+	let hasFonts = false;
+	try { hasFonts = statSync(fontsDir).isDirectory(); } catch {}
+	return { glibcBin, rootfs, guestSoffice, fontsDir: hasFonts ? fontsDir : null };
+}
+async function kxxyConvertViaGlibcSoffice(ctx, sourceBytes, request, scratch, signal) {
+	signal.throwIfAborted();
+	const { extension, format } = request;
+	const inPath = join(scratch, \`source.\${extension}\`);
+	const outDir = join(scratch, "glibc-out");
+	await mkdir(outDir, { recursive: true, mode: 448 });
+	await writeFile(inPath, sourceBytes, { mode: 384, signal });
+	const args = ["-b", \`\${scratch}:\${scratch}\`];
+	if (ctx.fontsDir) args.push("-b", \`\${ctx.fontsDir}:/usr/local/share/fonts/kxxy\`);
+	args.push(
+		"--",
+		ctx.guestSoffice,
+		"--headless",
+		"--nologo",
+		"--nodefault",
+		"--norestore",
+		"--nolockcheck",
+		"--convert-to",
+		format,
+		"--outdir",
+		outDir,
+		inPath
+	);
+	const child = spawn(ctx.glibcBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+	let stderr = "";
+	child.stderr?.setEncoding("utf8");
+	child.stderr?.on("data", (c) => { stderr = (stderr + c).slice(-16384); });
+	const abort = () => { try { child.kill("SIGKILL"); } catch {} };
+	signal.addEventListener("abort", abort, { once: true });
+	try {
+		const code = await new Promise((res, rej) => {
+			child.once("error", rej);
+			child.once("close", (c) => res(c));
+		});
+		signal.throwIfAborted();
+		if (code !== 0) throw new Error(\`glibc soffice exited \${code}: \${stderr.trim()}\`);
+		/* soffice.bin 对不认识的输入会以 0 退出但不产出文件（实测 .txt 无 infilter 如此），
+		 * 必须自己确认产物存在且非空，否则会把「空转换」当成成功、上层写空文件。 */
+		const expected = join(outDir, \`source.\${format}\`);
+		let bytes;
+		try {
+			bytes = await readFile(expected);
+		} catch {
+			throw new Error(\`glibc soffice produced no output (\${format}): \${stderr.trim()}\`);
+		}
+		if (bytes.length === 0) throw new Error(\`glibc soffice produced an empty \${format}\`);
+		return bytes;
+	} finally {
+		signal.removeEventListener("abort", abort);
+	}
+}
+`;
+
+  let out = replaceOnce(
+    src,
+    DISCOVER_ANCHOR,
+    HELPER + `async function discoverRuntime(options) {
+	resolveOptions(options);
+	if (options?.resolveEnginePackage === void 0 && kxxyResolveGlibcSoffice() !== null) {
+		return {
+			version: ENGINE_VERSION,
+			backend: "native",
+			nativePreview: false,
+			cliPath: fileURLToPath(new URL("./cli.js", import.meta.url)),
+			nodeApiPath: fileURLToPath(new URL("./index.js", import.meta.url))
+		};
+	}
+	try {
+		const engine = await resolveEngine(options?.resolveEnginePackage);`,
+    "libreoffice-kit 的 glibc 原生 discoverRuntime 接入",
+  );
+
+  const EXEC_ANCHOR = `			const fonts = await snapshot(stopped);
+			const result = await runWorker({
+				bytes: sourceBytes,`;
+  if (out.includes(EXEC_ANCHOR)) {
+    const EXEC_REPLACE = `			const kxxyNative = request.sheet === void 0 && !request.recalculate ? kxxyResolveGlibcSoffice() : null;
+			if (kxxyNative !== null) {
+				try {
+					const nativeBytes = await kxxyConvertViaGlibcSoffice(kxxyNative, sourceBytes, request, scratch, stopped);
+					validateOutput(nativeBytes, format);
+					const nativePageCount = format === "pdf" ? pdfPageCount(nativeBytes) : void 0;
+					stopped.throwIfAborted();
+					await output.writeFile(nativeBytes);
+					stopped.throwIfAborted();
+					succeeded = true;
+					return {
+						backend: "native",
+						missingFonts: [],
+						...nativePageCount === void 0 ? {} : { pageCount: nativePageCount }
+					};
+				} catch (nativeErr) {
+					if (stopped.aborted || String(process.env.KXXY_OFFICE_BACKEND ?? "").trim().toLowerCase() === "native") throw nativeErr;
+				}
+			}
+			const fonts = await snapshot(stopped);
+			const result = await runWorker({
+				bytes: sourceBytes,`;
+    out = replaceOnce(out, EXEC_ANCHOR, EXEC_REPLACE, "libreoffice-kit 的 glibc 原生 execute 接入");
+  }
+
+  ctx.write(rel, out);
+  return "native 接入完成";
+}
+
+/**
  * libreoffice-kit 的字体回退表：补上 Android 上真实存在的字体族。
  *
  * 为什么必须打：`systemFontDirectories()` 在 android 上走的是 XDG 分支
@@ -1546,7 +1731,8 @@ export function patchCatalogModalityFallback(ctx) {
     src.includes("majorVersionFallbackKey(") &&
     src.includes("modalityBase?.input") &&
     src.includes("unknownRouteInput(api, entry.id, request.defaultInput)") &&
-    src.includes("defaultInputDeclared,")
+    src.includes("defaultInputDeclared,") &&
+    !src.includes("defaultInput: z.array(z.union(MODALITIES)).default([...DEFAULT_INPUT]),")
   ) {
     return "已打过（自定义路由的图片模态回退），跳过";
   }
@@ -1699,8 +1885,21 @@ function catalogModalityFallback(api, id) {
     "dsh-llm-pi-ai 的目录回退注入点",
   );
 
-  // 1) profile 里是否**显式**写了 defaultInput：schema 会把缺省物化成 ["text"]，
-  //    两者必须区分，否则回退永远被默认值挡在前面。
+  // 0) Cordis schema 不得把未声明的 defaultInput 物化成 ["text"]：
+  //    原 schema 写 `defaultInput: z.array(z.union(MODALITIES)).default([...DEFAULT_INPUT])`，
+  //    导致真机经过 Cordis 解析后 `source.defaultInput` 恒为 `["text"]`，
+  //    `defaultInputDeclared` 恒为 true，整条目录回退 + 协议兜底链被短路！
+  //    去掉 `.default(...)` 后，未声明时保持 undefined，`resolveProfiles` 已有
+  //    `[...source.defaultInput ?? DEFAULT_INPUT]` 兜底；显式声明时才触发优先覆盖。
+  out = replaceOnce(
+    out,
+    `	defaultInput: z.array(z.union(MODALITIES)).default([...DEFAULT_INPUT]),`,
+    `	defaultInput: z.array(z.union(MODALITIES)),`,
+    "dsh-llm-pi-ai 的 defaultInput schema 去默认值",
+  );
+
+  // 1) profile 里是否**显式**写了 defaultInput：
+  //    上面已移除 schema 默认值，这里只认用户显式声明的数组。
   out = replaceOnce(
     out,
     `		const defaultInput = [...source.defaultInput ?? DEFAULT_INPUT];`,
@@ -1751,11 +1950,94 @@ function catalogModalityFallback(api, id) {
     out.includes("catalogModalityFallback(api, entry.id)") &&
       out.includes("modalityBase?.input") &&
       out.includes("unknownRouteInput(api, entry.id, request.defaultInput)") &&
-      out.includes("defaultInputDeclared,"),
+      out.includes("defaultInputDeclared,") &&
+      !out.includes("defaultInput: z.array(z.union(MODALITIES)).default([...DEFAULT_INPUT]),"),
     "dsh-llm-pi-ai 的图片模态回退未全部生效",
   );
   ctx.write(rel, out);
-  return "dsh-llm-pi-ai → 自定义路由继承内置目录模态，目录也不知道的对话协议按可收图兜底（guge/chat/guiji 不再报「不支持图片」）";
+  return "dsh-llm-pi-ai → 移除 schema defaultInput 物化默认值，自定义路由继承内置目录模态 + 对话协议兜底";
+}
+
+/**
+ * provider 表单提交空 `defaultInput` 数组时的容错。
+ *
+ * ── 症状（用户报，2026-11-25 真机）──────────────────────────────────────
+ *
+ * 设置 → 模型 → 新建提供商，填好 Provider ID / API 地址 / 密钥 / 模型目录后
+ * 「创建提供商」必失败，红字：
+ *
+ *     llm-pi-ai: provider "guiji" defaultInput must name at least one modality
+ *
+ * 模型板块整个不可用（改不动、存不下）。
+ *
+ * ── 根因（本产物自己引入的回归）────────────────────────────────────────
+ *
+ * `patchCatalogModalityFallback` 为了让「没声明 defaultInput」与「声明了
+ * ["text"]」可区分，把 schema 里的
+ * `defaultInput: z.array(...).default([...DEFAULT_INPUT])` 去掉了默认值。
+ * 但设置页的 provider 表单是**按 JSON Schema 物化草稿**的：数组字段没有
+ * default 时草稿里就是 `[]`，提交上来也是 `[]`。而
+ * `[...source.defaultInput ?? DEFAULT_INPUT]` 只对 `undefined` / `null` 兜底，
+ * 空数组照样展开成 `[]`，紧接着的
+ * `if (defaultInput.length === 0) throw ...` 就把保存打死了。
+ *
+ * ── 为什么不能把 schema 默认值加回去 ───────────────────────────────────
+ *
+ * 加回 `.default([...DEFAULT_INPUT])` 等于又让 `source.defaultInput` 恒为
+ * `["text"]`、`defaultInputDeclared` 恒为 true，整条目录回退 + 协议兜底链
+ * 重新被短路 —— 图片问题会原样复现。
+ *
+ * ── 修法 ───────────────────────────────────────────────────────────────
+ *
+ * 语义上「空数组」不是「声明了零种模态」（那不可能成立），而是「没声明」：
+ * 只有非空数组才算显式声明，空数组一律回落到 `DEFAULT_INPUT`；
+ * `defaultInputDeclared` 仍按「非空数组」判定，回退链优先级不变。
+ */
+export function patchDefaultInputEmptyArray(ctx) {
+  const rel = "@deepseek-ai/dsh-llm-pi-ai/lib/index.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无 dsh-llm-pi-ai）";
+  const src = ctx.read(rel);
+  const MARK = "KXXY_DEFAULT_INPUT_EMPTY";
+  if (src.includes(MARK)) return "已打过（空 defaultInput 视为未声明），跳过";
+
+  const BEFORE = `		const defaultInput = [...source.defaultInput ?? DEFAULT_INPUT];`;
+  must(src.includes(BEFORE), "dsh-llm-pi-ai 的 defaultInput 物化点丢失");
+  const AFTER = `		// ${MARK}：provider 表单在没有 schema 默认值时会提交空数组，那不是
+		// 「声明了零种模态」而是「没声明」—— 按未声明处理，否则保存必失败。
+		const defaultInput = Array.isArray(source.defaultInput) && source.defaultInput.length > 0 ? [...source.defaultInput] : [...DEFAULT_INPUT];`;
+  const out = replaceOnce(src, BEFORE, AFTER, "dsh-llm-pi-ai 的空 defaultInput 容错");
+
+  must(
+    out.includes(MARK) &&
+      out.includes(`const defaultInputDeclared = Array.isArray(source.defaultInput) && source.defaultInput.length > 0;`),
+    "空 defaultInput 容错与声明探测不一致",
+  );
+  ctx.write(rel, out);
+  return "dsh-llm-pi-ai → 空 defaultInput 数组按未声明处理（修复模型设置无法保存）";
+}
+
+/**
+ * 模型设置 UI 补丁：在 pi-ai ProviderEditor 中补上 provider 级 `defaultInput` 复选框。
+ *
+ * 上游 `@deepseek-ai/dsh-client-ui-settings-models` 已在每行模型展开区提供单模型
+ * `ModelInputTypes`（编辑 `entry.input`），但缺少 provider 级 `defaultInput` 编辑入口。
+ * 这里复用同包内的 `ModelInputTypes` 组件，在 `ModelListEditor` 上方渲染 provider 级
+ * 默认输入模态，用户可直接在 UI 里为自定义路由开启/关闭默认图片模态。
+ */
+export function patchModelSettingsDefaultInput(ctx) {
+  const rel = "@deepseek-ai/dsh-client-ui-settings-models/lib/client.js";
+  if (!ctx.exists(rel)) return "跳过（依赖树无 dsh-client-ui-settings-models）";
+  const src = ctx.read(rel);
+  const marker = "/* KXXY_PROVIDER_DEFAULT_INPUT */";
+  if (src.includes(marker)) return "已打过（模型设置 provider 级 defaultInput 控件），跳过";
+  const anchor = `:(0,react_jsx_runtime.jsx)(ModelListEditor,{...catalogProps,catalogProvider:props.declared===true?void 0:props.provider,reasoningLevels:reasoning.levels,reasoningLevelsOnly:reasoning.levelsOnly,defaultInput:Array.isArray(defaultInput)?defaultInput:void 0,probe,probeBlocked:keyRemoval!==void 0?\`keyRemovePending\`:shownKeyFailure,operations,onBusyChange:setListBusy})`;
+  if (!src.includes(anchor)) {
+    return "跳过（dsh-client-ui-settings-models 结构不同，未注入 defaultInput 控件）";
+  }
+  const replacement = `:${marker}(0,react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment,{children:[(0,react_jsx_runtime.jsx)(\`div\`,{className:ModelsSection_module_css_default[\`field\`],children:(0,react_jsx_runtime.jsx)(ModelInputTypes,{model:{defaultInput:Array.isArray(schema.getPath(draft,[\`defaultInput\`]))?schema.getPath(draft,[\`defaultInput\`]):void 0},field:\`defaultInput\`,position:0,fallback:Array.isArray(defaultInput)?defaultInput:[\`text\`,\`image\`],disabled,t,onChange:next=>{setDraft(current=>Array.isArray(next.defaultInput)&&next.defaultInput.length>0?schema.setPath(current,[\`defaultInput\`],next.defaultInput):schema.deletePath(current,[\`defaultInput\`]))}})}),(0,react_jsx_runtime.jsx)(ModelListEditor,{...catalogProps,catalogProvider:props.declared===true?void 0:props.provider,reasoningLevels:reasoning.levels,reasoningLevelsOnly:reasoning.levelsOnly,defaultInput:Array.isArray(defaultInput)?defaultInput:void 0,probe,probeBlocked:keyRemoval!==void 0?\`keyRemovePending\`:shownKeyFailure,operations,onBusyChange:setListBusy})]})`;
+  const out = replaceOnce(src, anchor, replacement, "dsh-client-ui-settings-models 的 provider defaultInput 控件");
+  ctx.write(rel, out);
+  return "dsh-client-ui-settings-models → ProviderEditor 增加 provider 级 defaultInput 复选框";
 }
 
 /**
@@ -1975,9 +2257,9 @@ export function applyAllPatches(root, termuxRead) {
     patchKoffi, patchSharp, patchNodePty, patchSherpaOnnx, patchSubprocessInspector, patchFlock,
     patchRequireBuiltin, patchSandboxLocal, patchSessionJsonl, patchSessionJsonlWorker,
     patchRipgrep, patchFsLocal, patchAttachmentLocal, patchNativeCommandAndroid,
-    patchDocumentPreviewUnicodeSets, patchLibreOfficeKitPlatform, patchLibreOfficeKitFontFallbacks,
+    patchDocumentPreviewUnicodeSets, patchLibreOfficeKitPlatform, patchLibreOfficeKitGlibcNative, patchLibreOfficeKitFontFallbacks,
     patchOfficeDefaultFonts, patchOfficeToPdfFormats, patchDocumentPreviewOfficeExtensions, patchDocumentPreviewArchiveProviders,
-    patchDocumentPreviewMediaProviders, patchDeveloperRoleCompat, patchCatalogModalityFallback, patchClientRuntimeAlias,
+    patchDocumentPreviewMediaProviders, patchDeveloperRoleCompat, patchCatalogModalityFallback, patchDefaultInputEmptyArray, patchModelSettingsDefaultInput, patchClientRuntimeAlias,
     patchFrontendLenientBoot, patchDshManifest,
   ];
   const results = [], errors = [];

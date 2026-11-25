@@ -18,7 +18,7 @@
  * `/var/lib/dpkg/status` 跳过已满足的依赖，最后在设备容器里 `dpkg -i` 一次装齐。
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -268,15 +268,17 @@ function pickAlternative(group, installed, byName, providers) {
   return inIndex ?? group[0];
 }
 
-function resolveClosure(rootName, index, installed) {
+function resolveClosure(rootNames, index, installed) {
+  const roots = Array.isArray(rootNames) ? rootNames : [rootNames];
+  const rootSet = new Set(roots);
   const { byName, providers } = index;
   const picked = new Map();
-  const queue = [{ name: rootName, constraint: null }];
+  const queue = roots.map((name) => ({ name, constraint: null }));
   while (queue.length) {
     const { name, constraint } = queue.shift();
     const installedVersion = installed.get(name);
     // 已装且满足约束 ⇒ 不用带（base rootfs 里的 libc6 / libstdc++6 就该这样跳过）。
-    if (name !== rootName && installedVersion !== undefined && satisfies(installedVersion, constraint)) continue;
+    if (!rootSet.has(name) && installedVersion !== undefined && satisfies(installedVersion, constraint)) continue;
     const entry = byName.get(name) ?? providers.get(name)?.[0];
     if (!entry) {
       log(`  警告：索引里找不到依赖 ${name}（若 rootfs 已装可忽略）`);
@@ -292,14 +294,14 @@ function resolveClosure(rootName, index, installed) {
   return picked;
 }
 
-async function buildWkhtmltopdf() {
-  log('解析 wkhtmltopdf 依赖闭包…');
-  const index = await loadIndexes();
-  const installed = installedPackages();
-  log(`base rootfs 已装 ${installed.size} 个包`);
-  const closure = resolveClosure('wkhtmltopdf', index, installed);
+async function buildDebBundle(name, roots, bundleFile, { index, installed } = {}) {
+  log(`解析 ${name} 依赖闭包…`);
+  const idx = index ?? await loadIndexes();
+  const inst = installed ?? installedPackages();
+  log(`base rootfs 已装 ${inst.size} 个包`);
+  const closure = resolveClosure(roots, idx, inst);
   const sorted = [...closure.values()].sort((a, b) => a.name.localeCompare(b.name));
-  log(`闭包 ${sorted.length} 个包，共 ${(sorted.reduce((n, e) => n + (e.size ?? 0), 0) / 1048576).toFixed(1)} MiB`);
+  log(`${name} 闭包 ${sorted.length} 个包，共 ${(sorted.reduce((n, e) => n + (e.size ?? 0), 0) / 1048576).toFixed(1)} MiB`);
   const debDir = join(CACHE, 'debs');
   mkdirSync(debDir, { recursive: true });
   for (const entry of sorted) {
@@ -310,8 +312,8 @@ async function buildWkhtmltopdf() {
     if (entry.sha256 && got !== entry.sha256) throw new Error(`${entry.name} 摘要不符`);
   }
   const list = sorted.map((entry) => `${entry.name}=${entry.version}`).join('\n') + '\n';
-  writeFileSync(join(debDir, 'debs.list'), list, 'utf8');
-  const bundle = join(CACHE, 'wkhtmltopdf-noble-arm64-debs.tar.gz');
+  writeFileSync(join(debDir, `${name}.list`), list, 'utf8');
+  const bundle = join(CACHE, bundleFile);
   // 用仓库自带的 tar 写入器：Windows 的 `tar` 会把 `E:` 当成远端主机。
   const files = sorted.map((entry) => ({
     name: `${entry.name}_${entry.version.replace(/:/g, '%3a')}_arm64.deb`,
@@ -321,8 +323,97 @@ async function buildWkhtmltopdf() {
   }));
   files.push({ name: 'debs.list', data: Buffer.from(list, 'utf8'), mode: 0o644, mtimeSec: 0 });
   writeFileSync(bundle, tarGzSync(files));
-  log(`wkhtmltopdf 闭包 → ${bundle}（${(statSync(bundle).size / 1048576).toFixed(1)} MiB，${files.length} 条）`);
-  return { name: 'wkhtmltopdf', file: 'wkhtmltopdf-noble-arm64-debs.tar.gz', sha256: sha256File(bundle), actualBytes: statSync(bundle).size, packages: sorted.map((entry) => entry.name) };
+  log(`${name} 闭包 → ${bundle}（${(statSync(bundle).size / 1048576).toFixed(1)} MiB，${files.length} 条）`);
+  return { name, file: bundleFile, sha256: sha256File(bundle), actualBytes: statSync(bundle).size, packages: sorted.map((entry) => entry.name) };
+}
+
+async function buildWkhtmltopdf() {
+  return buildDebBundle('wkhtmltopdf', ['wkhtmltopdf'], 'wkhtmltopdf-noble-arm64-debs.tar.gz');
+}
+
+async function buildLibreOffice() {
+  return buildDebBundle(
+    'libreoffice',
+    ['libreoffice-writer-nogui', 'libreoffice-calc-nogui', 'libreoffice-impress-nogui'],
+    'libreoffice-noble-arm64-debs.tar.gz',
+  );
+}
+
+async function buildPythonMl() {
+  log('解析 python-ml 离线套件（Ubuntu noble/arm64 python3+pip deb + cp312 aarch64 manylinux 轮子）…');
+  const index = await loadIndexes();
+  const installed = installedPackages();
+  const closure = resolveClosure(['python3', 'python3-pip'], index, installed);
+  const sorted = [...closure.values()].sort((a, b) => a.name.localeCompare(b.name));
+  log(`python-ml deb 闭包 ${sorted.length} 个包，共 ${(sorted.reduce((n, e) => n + (e.size ?? 0), 0) / 1048576).toFixed(1)} MiB`);
+  const debDir = join(CACHE, 'debs');
+  mkdirSync(debDir, { recursive: true });
+  for (const entry of sorted) {
+    const dest = join(debDir, `${entry.name}_${entry.version.replace(/:/g, '%3a')}_arm64.deb`);
+    if (existsSync(dest) && statSync(dest).size === entry.size) continue;
+    await download(`${MIRROR}/${entry.filename}`, dest, { expectBytes: entry.size });
+    const got = sha256File(dest);
+    if (entry.sha256 && got !== entry.sha256) throw new Error(`${entry.name} 摘要不符`);
+  }
+
+  const wheelDir = join(CACHE, 'py-wheels-cp312-aarch64');
+  mkdirSync(wheelDir, { recursive: true });
+  const existingWhls = readdirSync(wheelDir).filter((f) => f.endsWith('.whl'));
+  if (existingWhls.length === 0) {
+    const py = process.env.PYTHON ?? 'python';
+    const pipArgs = [
+      '-m', 'pip', 'download',
+      '--only-binary=:all:',
+      '--python-version', '3.12',
+      '--implementation', 'cp',
+      '--abi', 'cp312',
+      '--abi', 'abi3',
+      '--abi', 'none',
+      '--platform', 'manylinux_2_28_aarch64',
+      '--platform', 'manylinux_2_17_aarch64',
+      '--platform', 'manylinux2014_aarch64',
+      '--platform', 'linux_aarch64',
+      '--platform', 'any',
+      '-d', wheelDir,
+      'numpy', 'scikit-learn', 'opencv-python-headless',
+    ];
+    if (process.env.KXXY_PIP_INDEX) pipArgs.push('-i', process.env.KXXY_PIP_INDEX);
+    log(`下载 cp312 aarch64 轮子 → ${wheelDir}`);
+    execFileSync(py, pipArgs, { stdio: 'inherit' });
+  } else {
+    log(`复用已缓存轮子 ${wheelDir}（${existingWhls.length} 个 .whl）`);
+  }
+
+  const wheelNames = readdirSync(wheelDir).filter((f) => f.endsWith('.whl')).sort();
+  if (wheelNames.length < 3) throw new Error(`python-ml 轮子数量异常：${wheelNames.length}`);
+  const list = sorted.map((entry) => `${entry.name}=${entry.version}`).join('\n') + '\n';
+  const files = [
+    ...sorted.map((entry) => ({
+      name: `debs/${entry.name}_${entry.version.replace(/:/g, '%3a')}_arm64.deb`,
+      data: readFileSync(join(debDir, `${entry.name}_${entry.version.replace(/:/g, '%3a')}_arm64.deb`)),
+      mode: 0o644,
+      mtimeSec: 0,
+    })),
+    { name: 'debs/debs.list', data: Buffer.from(list, 'utf8'), mode: 0o644, mtimeSec: 0 },
+    ...wheelNames.map((w) => ({
+      name: `wheels/${w}`,
+      data: readFileSync(join(wheelDir, w)),
+      mode: 0o644,
+      mtimeSec: 0,
+    })),
+  ];
+  const bundleFile = 'python-ml-noble-arm64.tar.gz';
+  const bundle = join(CACHE, bundleFile);
+  writeFileSync(bundle, tarGzSync(files));
+  log(`python-ml 离线包 → ${bundle}（${(statSync(bundle).size / 1048576).toFixed(1)} MiB，${sorted.length} debs + ${wheelNames.length} wheels）`);
+  return {
+    name: 'python-ml',
+    file: bundleFile,
+    sha256: sha256File(bundle),
+    actualBytes: statSync(bundle).size,
+    packages: sorted.map((entry) => entry.name),
+    wheels: wheelNames,
+  };
 }
 
 const manifestPath = join(CACHE, 'manifest.json');
@@ -331,6 +422,8 @@ const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath
 if (only === 'all' || only === 'julia') manifest.bundles.julia = await downloadTarball(JULIA);
 if (only === 'all' || only === 'dotnet') manifest.bundles.dotnet = await downloadTarball(DOTNET);
 if (only === 'all' || only === 'wkhtmltopdf') manifest.bundles.wkhtmltopdf = await buildWkhtmltopdf();
+if (only === 'all' || only === 'libreoffice') manifest.bundles.libreoffice = await buildLibreOffice();
+if (only === 'all' || only === 'python-ml') manifest.bundles['python-ml'] = await buildPythonMl();
 
 manifest.generated = new Date().toISOString().slice(0, 10);
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');

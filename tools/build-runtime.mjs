@@ -1023,8 +1023,24 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * **`host.css` 与 `lib/localinstall.mjs` 都不在 Python 增量修复的受管名单里**
  * （`PythonRuntimeRepair.HOST_WEB_FILES` 只有 index.html 与 host.js），
  * 不涨编号就是「新页面 + 旧样式 + 旧后端」—— 弹层依旧看不见任何报错。
+ *
+ * 43 → 44（v0.9.98）：`@deepseek-ai/libreoffice-kit/lib/index.js` 的**内容**又变了
+ * —— v0.9.97 的 glibc 原生后端桥接调的是 `/usr/bin/soffice`（oosplash 启动器），
+ * 而它在 proot 里自检 `/proc` 失败直接退 1，所以 `office_engine.backend` 仍是
+ * `wasm`。这一版改为调 `program/soffice.bin`，并补上「产物必须存在且非空」的校验。
+ * 文件路径没变、锚点全过 ⇒ 不涨编号，已装 0.9.97 的设备会跳过解压、继续跑旧桥接。
+ *
+ * 44 → 45：同一个桥接**还要打进 cli.js**。`lib/cli.js` 是打包产物，把
+ * `discoverRuntime` / `execute` 内联了一份，`capabilities --json`、`convert`、
+ * `render` 三条命令全走它 —— 只改 `lib/index.js` 时，能力探针永远报 `backend: wasm`，
+ * 而库路径其实已经是 native 了。「看起来没修好」的坑就在这里。
+ *
+ * 45 → 46：桥接去掉 `-env:UserInstallation=file://…`。真机上这个参数让
+ * `soffice.bin` 无输出退出 81（同一份 .odt，去掉它立刻成功；换目录、先 rm -rf
+ * 再建、把 HOME 指过去，四种写法全 81）。容器里用默认 profile（HOME=/root）
+ * 反而稳定，连跑两次都正常 —— 转换本身由 Kit 的 acquire() 串行化。
  */
-const PATCHSET_MARKER = "kxxy-patchset@42";
+const PATCHSET_MARKER = "kxxy-patchset@46";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

@@ -609,22 +609,21 @@ export const POOL_ITEMS = [
   // 而这份 rootfs 有 194 条软链 —— 详见 `tools/lib/asset-pack.mjs` 顶部注释。
   {
     id: "glibc", source: "asset", category: "toolchain",
-    version: "24.04.3-r5",
+    version: "24.04.3-r6",
     name: "glibc 用户态（Ubuntu 24.04 + proot）",
     description:
       "在 proot 里跑一份**未改动的 Ubuntu 24.04 base**：`kxxy-glibc` 进容器，" +
       "`kxxy-glibc -c 'apt-get update'` 直接装包。所有只有 glibc 构件的工具都能用了 —— " +
-      "julia、dotnet-sdk、wkhtmltopdf、PyPI 的 manylinux 轮子（sklearn/cv2）都在这一类。" +
-      "装完扩展还多出四条**普通命令**：`julia`、`dotnet`、`wkhtmltopdf`、`kxxy-py`，" +
-      "首次运行时各自在容器里预置 —— julia / dotnet / wkhtmltopdf 随扩展携带离线包，" +
-      "**断网也能装**（kxxy-py 仍要联网拉 manylinux 轮子，裸 python3 已原生可用）；" +
+      "julia、dotnet-sdk、wkhtmltopdf、PyPI 的 manylinux 轮子（sklearn/cv2）以及原生无头 LibreOffice 都在这一类。" +
+      "装完扩展即多出六条**普通命令**：`julia`、`dotnet`、`wkhtmltopdf`、`kxxy-py`、`soffice`、`libreoffice`，" +
+      "全部随扩展携带离线包并在安装后后台自动离线预置，**全程断网可用**；" +
       "KXXY_GLIBC_OFFLINE=1 禁止一切联网，缺本地包直接报错、不静默下载。" +
       "无需 root、不改系统，代价是每条系统调用多一层 ptrace 转发（比原生慢 2–5 倍）。" +
-      "首次运行解包 rootfs 约 1 分钟；之后 apt 装的东西都留在 <files>/glibc/rootfs，" +
+      "首次运行解包 rootfs 约 1 分钟；之后装好的工具都留在 <files>/glibc/rootfs，" +
       "重装扩展或升级 APK 都不会丢。",
-    // 用户能看到/点到的命令。`kxxy-glibc` 是入口，四条工具命令是垫片（首次自动预置），
+    // 用户能看到/点到的命令。`kxxy-glibc` 是入口，工具命令是垫片（安装后自动离线预置），
     // `kxxy-glibc-provision` 用于手动补/重做预置。
-    bins: ["kxxy-glibc", "kxxy-glibc-provision", "julia", "dotnet", "wkhtmltopdf", "kxxy-py"],
+    bins: ["kxxy-glibc", "kxxy-glibc-provision", "julia", "dotnet", "wkhtmltopdf", "kxxy-py", "soffice", "libreoffice"],
     assets: [
       {
         // Ubuntu Base 24.04.3（arm64）：29 865 086 字节，与 sha256 一起钉死。
@@ -668,6 +667,20 @@ export const POOL_ITEMS = [
         sha256: "1b159c948cd82237c67d20e2232aeb04f1c0b56a62ca96fd0eb5ef0840e81f52",
         to: "provision/wkhtmltopdf-noble-arm64-debs.tar.gz",
       },
+      {
+        // 容器内 Python 3.12 + pip deb 闭包 + numpy/scipy/scikit-learn/opencv-python-headless cp312 aarch64 轮子。
+        // 由 `node tools/fetch-provision-bundles.mjs --only python-ml` 生成。
+        from: ".cache/glibc/provision/python-ml-noble-arm64.tar.gz",
+        sha256: "f93a8d84c042f1547c3a23ee6ccd6959e005c919b0ed41bd3c3a88231b42f8fc",
+        to: "provision/python-ml-noble-arm64.tar.gz",
+      },
+      {
+        // Ubuntu noble/arm64 原生无头 LibreOffice（writer/calc/impress-nogui + 完整依赖闭包）。
+        // 由 `node tools/fetch-provision-bundles.mjs --only libreoffice` 生成。
+        from: ".cache/glibc/provision/libreoffice-noble-arm64-debs.tar.gz",
+        sha256: "85a91a554488b648939614817988cc2b240e3cfe1532b1ac34b2613ba2b71efd",
+        to: "provision/libreoffice-noble-arm64-debs.tar.gz",
+      },
     ],
     wrappers: ["kxxy-glibc", "kxxy-glibc-provision"],
     // 垫片：模板 `glibc-tool.sh` 渲染，`exe` 是容器内的绝对路径。
@@ -677,19 +690,29 @@ export const POOL_ITEMS = [
     tools: [
       {
         name: "julia", exe: "/opt/julia-1.11.7/bin/julia", group: "julia",
-        label: "Julia 1.11.7", hint: "官方 aarch64 包约 285 MiB",
+        label: "Julia 1.11.7", hint: "随包离线包约 285 MiB",
       },
       {
         name: "dotnet", exe: "/usr/bin/dotnet", group: "dotnet",
-        label: ".NET SDK 8.0", hint: "apt 包约 200 MiB",
+        label: ".NET SDK 8.0", hint: "随包离线包约 199 MiB",
       },
       {
         name: "wkhtmltopdf", exe: "/usr/bin/wkhtmltopdf", group: "wkhtmltopdf",
-        label: "wkhtmltopdf 0.12.6", hint: "apt 包约 30 MiB",
+        label: "wkhtmltopdf 0.12.6", hint: "随包离线包约 91 MiB",
       },
       {
         name: "kxxy-py", exe: "/usr/bin/python3", group: "python-ml",
-        label: "容器内 Python 3.12 + numpy/scikit-learn/cv2", hint: "pip manylinux 轮子约 120 MiB",
+        label: "容器内 Python 3.12 + numpy/scikit-learn/cv2", hint: "随包离线包约 103 MiB",
+      },
+      {
+        // exe 必须是 soffice.bin：/usr/bin/soffice 是 oosplash 启动器，它在 proot 里
+        // 自检 /proc 失败会直接退 1（`ERROR: /proc not mounted`），垫片等于废的。
+        name: "soffice", exe: "/usr/lib/libreoffice/program/soffice.bin", group: "libreoffice",
+        label: "原生 LibreOffice（无头版）", hint: "随包离线包约 168 MiB",
+      },
+      {
+        name: "libreoffice", exe: "/usr/lib/libreoffice/program/soffice.bin", group: "libreoffice",
+        label: "原生 LibreOffice（无头版）", hint: "随包离线包约 168 MiB",
       },
     ],
   },

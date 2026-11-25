@@ -26,7 +26,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openAsar } from './lib/registry.mjs';
-import { createPatchContext, patchCatalogModalityFallback } from './lib/patches.mjs';
+import { createPatchContext, patchCatalogModalityFallback, patchDefaultInputEmptyArray, patchModelSettingsDefaultInput } from './lib/patches.mjs';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const KEY = 'lib/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js';
@@ -167,6 +167,24 @@ function verify(asarPath) {
   const target = path.join(scratch, 'pi-ai-adapter.mjs');
   writeFileSync(target, original);
   execFileSync(process.execPath, ['--check', target], { stdio: 'pipe' });
+
+  // ── 2.5 空 defaultInput 数组按「未声明」处理（模型设置能保存）─────────
+  const emptyFix = patchDefaultInputEmptyArray(ctx);
+  assert.match(emptyFix, /空 defaultInput/, `空数组容错未生效：${emptyFix}`);
+  const fixed = files.get(KEY).data.toString('utf8');
+  assert.ok(
+    fixed.includes('const defaultInput = Array.isArray(source.defaultInput) && source.defaultInput.length > 0 ? [...source.defaultInput] : [...DEFAULT_INPUT];'),
+    '空 defaultInput 没有回落到 DEFAULT_INPUT —— provider 表单提交 [] 时保存必失败',
+  );
+  assert.ok(
+    !fixed.includes('const defaultInput = [...source.defaultInput ?? DEFAULT_INPUT];'),
+    '旧的 defaultInput 物化点仍在（空数组绕过 ?? 兜底）',
+  );
+  const emptyFix2 = patchDefaultInputEmptyArray(ctx);
+  assert.match(emptyFix2, /已打过/, `空数组容错不幂等：${emptyFix2}`);
+  assert.equal(files.get(KEY).data.toString('utf8'), fixed, '空数组容错二次应用改变了字节');
+  writeFileSync(path.join(scratch, 'pi-ai-adapter-fixed.mjs'), fixed);
+  execFileSync(process.execPath, ['--check', path.join(scratch, 'pi-ai-adapter-fixed.mjs')], { stdio: 'pipe' });
 
   // ── 3. input 回退链顺序逐字锁定 ────────────────────────────────────────
   assert.ok(original.includes(CHAIN), 'input 回退链的优先级顺序被改动');
