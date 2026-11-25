@@ -507,8 +507,14 @@ def dispatch(root, files, cwd, env, command, arguments, explicit_venv=None, exec
     if request is not None:
         return create_venvs(root, files, cwd, env, python_args, request, venv)
     if venv is None:
-        fallback = native_fallback(root, env)
-        if fallback is not None:
+        try:
+            argv, child_env = guest_command(root, files, cwd, env, python_args, venv)
+        except DispatchError as exc:
+            if "must be an absolute path" in str(exc) or "cannot safely bind" in str(exc):
+                raise
+            fallback = native_fallback(root, env)
+            if fallback is None:
+                raise
             argv = [str(fallback)] + python_args
             child_env = fallback_environment(env)
             if fallback_notice(env):
@@ -517,7 +523,8 @@ def dispatch(root, files, cwd, env, command, arguments, explicit_venv=None, exec
             if execute:
                 os.execve(argv[0], argv, child_env)
             return argv, child_env
-    argv, child_env = guest_command(root, files, cwd, env, python_args, venv)
+    else:
+        argv, child_env = guest_command(root, files, cwd, env, python_args, venv)
     if execute:
         os.chdir(cwd)
         os.execve(argv[0], argv, child_env)

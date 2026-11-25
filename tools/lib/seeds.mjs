@@ -609,14 +609,15 @@ export const POOL_ITEMS = [
   // 而这份 rootfs 有 194 条软链 —— 详见 `tools/lib/asset-pack.mjs` 顶部注释。
   {
     id: "glibc", source: "asset", category: "toolchain",
-    version: "24.04.3-r3",
+    version: "24.04.3-r4",
     name: "glibc 用户态（Ubuntu 24.04 + proot）",
     description:
       "在 proot 里跑一份**未改动的 Ubuntu 24.04 base**：`kxxy-glibc` 进容器，" +
       "`kxxy-glibc -c 'apt-get update'` 直接装包。所有只有 glibc 构件的工具都能用了 —— " +
       "julia、dotnet-sdk、wkhtmltopdf、PyPI 的 manylinux 轮子（sklearn/cv2）都在这一类。" +
       "装完扩展还多出四条**普通命令**：`julia`、`dotnet`、`wkhtmltopdf`、`kxxy-py`，" +
-      "首次运行时各自在容器里预置（要联网，之后一直复用），所以不必记容器用法。" +
+      "首次运行时各自在容器里预置 —— julia / dotnet / wkhtmltopdf 随扩展携带离线包，" +
+      "**断网也能装**（kxxy-py 仍要联网拉 manylinux 轮子，裸 python3 已原生可用）。" +
       "无需 root、不改系统，代价是每条系统调用多一层 ptrace 转发（比原生慢 2–5 倍）。" +
       "首次运行解包 rootfs 约 1 分钟；之后 apt 装的东西都留在 <files>/glibc/rootfs，" +
       "重装扩展或升级 APK 都不会丢。",
@@ -634,6 +635,37 @@ export const POOL_ITEMS = [
         to: "rootfs/ubuntu-base.tgz",
         // 归档里有两条硬链（perl5.38.2 / uncompress），应用域建不出来 → 构建期改写
         dereference: true,
+      },
+      // ── 离线预置包（2026-11-25 起）──────────────────────────────────────
+      //
+      // 这三份是 `kxxy-glibc-provision` 的本地来源：装完扩展就**不用联网**也能
+      // 把 julia / dotnet / wkhtmltopdf 装上。没有它们时脚本回退到 apt/curl，
+      // 断网环境就只有这条路能走通。
+      //
+      // 为什么放在扩展里而不是 APK 根 assets：扩展本来就要解包一次（rootfs 1 分钟），
+      // 且它们只对「装了 glibc 扩展」的人有意义 —— 不装的人不该为 600 MiB 买单。
+      // 设备侧落在 `<root>/extensions/glibc/provision/`，由 kxxy-glibc-provision 读。
+      {
+        // Julia 官方 aarch64 tarball（顶层 julia-1.11.7/，解到容器 /opt 即用）。
+        from: ".cache/glibc/provision/julia-1.11.7-linux-aarch64.tar.gz",
+        url: "https://julialang-s3.julialang.org/bin/linux/aarch64/1.11/julia-1.11.7-linux-aarch64.tar.gz",
+        sha256: "f97f80b35c12bdaf40c26f6c55dbb7617441e49c9e6b842f65e8410a388ca6f4",
+        to: "provision/julia-1.11.7-linux-aarch64.tar.gz",
+      },
+      {
+        // 微软官方 .NET SDK 8.0.404（linux-arm64，自带宿主，不依赖 apt）。
+        from: ".cache/glibc/provision/dotnet-sdk-8.0.404-linux-arm64.tar.gz",
+        url: "https://builds.dotnet.microsoft.com/dotnet/Sdk/8.0.404/dotnet-sdk-8.0.404-linux-arm64.tar.gz",
+        sha256: "695204a6a180ae5b88f6078e1f063a148bdc87fb14e25d22eec78863e6fe1e51",
+        to: "provision/dotnet-sdk-8.0.404-linux-arm64.tar.gz",
+      },
+      {
+        // wkhtmltopdf 0.12.6 + noble/arm64 完整依赖闭包（.deb 集合）。
+        // 由 `node tools/fetch-provision-bundles.mjs --only wkhtmltopdf` 生成；
+        // 闭包按 base rootfs 的 dpkg status 跳过已装依赖，所以不含 libc6 之类。
+        from: ".cache/glibc/provision/wkhtmltopdf-noble-arm64-debs.tar.gz",
+        sha256: "1b159c948cd82237c67d20e2232aeb04f1c0b56a62ca96fd0eb5ef0840e81f52",
+        to: "provision/wkhtmltopdf-noble-arm64-debs.tar.gz",
       },
     ],
     wrappers: ["kxxy-glibc", "kxxy-glibc-provision"],

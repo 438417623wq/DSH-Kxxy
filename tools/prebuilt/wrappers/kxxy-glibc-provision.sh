@@ -23,7 +23,12 @@ set -u
 ROOT=@DSH_ROOT@
 FILES=@DSH_FILES@
 GC="$ROOT/extensions/glibc/bin/kxxy-glibc"
+EXT="$ROOT/extensions/glibc"
 STAMP="$FILES/glibc/.provisioned"
+# 随扩展一起装下来的离线包（构建期 `tools/fetch-provision-bundles.mjs` 产出）。
+# 有本地包就不联网；没有才回退 apt / curl。
+BUNDLES="$EXT/provision"
+ROOTFS="${KXXY_GLIBC_ROOTFS:-$FILES/glibc/rootfs}"
 
 [ -x "$GC" ] || { echo "kxxy-glibc-provision: 缺 $GC（glibc 扩展没装全？）" >&2; exit 127; }
 mkdir -p "$STAMP" || { echo "kxxy-glibc-provision: 无法创建 $STAMP" >&2; exit 1; }
@@ -44,6 +49,24 @@ fi
 # 容器里跑一段脚本；失败时把日志尾巴打出来（否则用户只看到 exit 1）
 in_guest() {
   "$GC" -c "$1"
+}
+
+# 装成功后删掉用过的离线包：它们已经在扩展目录里占了 ~580 MiB，而装好的东西
+# 落在 <files>/glibc/rootfs（扩展重装/APK 升级都不会丢）。想留着复用就
+# KXXY_PROVISION_KEEP=1。删了也能恢复 —— 重装扩展会重新释放。
+drop_bundle() {
+  [ "${KXXY_PROVISION_KEEP:-0}" = "1" ] && return 0
+  rm -f "$1" 2>/dev/null || true
+  return 0
+}
+
+# 解开 rootfs（首次调用会解 base seed 约 1 分钟）。离线包要直接写进 rootfs，
+# 所以必须先确保它已经解出来。
+ensure_rootfs() {
+  [ -x "$ROOTFS/bin/sh" ] && return 0
+  in_guest 'true' >/dev/null 2>&1 || return 1
+  [ -d "$ROOTFS/usr/bin" ] || { echo "kxxy-glibc-provision: rootfs 还没解出来（$ROOTFS）" >&2; return 1; }
+  return 0
 }
 
 prov_base() {
@@ -82,25 +105,81 @@ prov_apt() {
 }
 
 prov_julia() {
-  in_guest 'test -x /opt/julia-1.11.7/bin/julia' && return 0
+  [ -f "$STAMP/julia" ] && return 0
+  if [ -f "$BUNDLES/julia-1.11.7-linux-aarch64.tar.gz" ]; then
+    echo "== 安装 Julia 1.11.7（离线包，约 285 MiB）==" >&2
+    ensure_rootfs || return 1
+    mkdir -p "$ROOTFS/opt" || return 1
+    tar -xzf "$BUNDLES/julia-1.11.7-linux-aarch64.tar.gz" -C "$ROOTFS/opt" || return 1
+    in_guest '/opt/julia-1.11.7/bin/julia -e "println(\"julia \", VERSION)"' || return 1
+    : > "$STAMP/julia"
+    drop_bundle "$BUNDLES/julia-1.11.7-linux-aarch64.tar.gz"
+    return 0
+  fi
+  in_guest 'test -x /opt/julia-1.11.7/bin/julia' && { : > "$STAMP/julia"; return 0; }
   prov_base || return 1
-  echo "== 下载 Julia 1.11.7（约 285 MiB，单线程）==" >&2
+  echo "== 下载 Julia 1.11.7（约 285 MiB，单线程；离线包缺失才走这条路）==" >&2
   in_guest 'cd /tmp && rm -f julia.tgz \
     && curl -fL --retry 3 -o julia.tgz https://julialang-s3.julialang.org/bin/linux/aarch64/1.11/julia-1.11.7-linux-aarch64.tar.gz \
     && mkdir -p /opt && tar -xzf julia.tgz -C /opt && rm -f julia.tgz \
     && /opt/julia-1.11.7/bin/julia -e "println(\"julia \", VERSION)"' || return 1
+  : > "$STAMP/julia"
 }
 
+# dotnet：离线包是微软官方 linux-arm64 SDK tarball（自带宿主，不依赖 apt）。
+# 容器里没有 libicu，所以包装器固定 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+# —— 否则 `dotnet --info` 会以 "Couldn't find a valid ICU package" 退出。
 prov_dotnet() {
+  [ -f "$STAMP/dotnet" ] && return 0
+  if [ -f "$BUNDLES/dotnet-sdk-8.0.404-linux-arm64.tar.gz" ]; then
+    echo "== 安装 .NET SDK 8.0.404（离线包，约 200 MiB）==" >&2
+    ensure_rootfs || return 1
+    mkdir -p "$ROOTFS/opt/dotnet" "$ROOTFS/usr/bin" || return 1
+    tar -xzf "$BUNDLES/dotnet-sdk-8.0.404-linux-arm64.tar.gz" -C "$ROOTFS/opt/dotnet" || return 1
+    cat > "$ROOTFS/usr/bin/dotnet" <<'DOTNET_WRAPPER'
+#!/bin/sh
+# [kxxy] .NET SDK 包装器：rootfs 里没有 libicu，固定 invariant 全球化模式。
+export DOTNET_ROOT=/opt/dotnet
+export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+export DOTNET_CLI_TELEMETRY_OPTOUT=1
+export DOTNET_NOLOGO=1
+exec /opt/dotnet/dotnet "$@"
+DOTNET_WRAPPER
+    chmod 0755 "$ROOTFS/usr/bin/dotnet" || return 1
+    in_guest 'dotnet --version' || return 1
+    : > "$STAMP/dotnet"
+    drop_bundle "$BUNDLES/dotnet-sdk-8.0.404-linux-arm64.tar.gz"
+    return 0
+  fi
   prov_base || return 1
   prov_apt dotnet-sdk-8.0 dotnet || return 1
   in_guest 'dotnet --version' || return 1
+  : > "$STAMP/dotnet"
 }
 
+# wkhtmltopdf：离线包是「noble/arm64 全依赖闭包」的 .deb，一次 dpkg -i 装齐。
+# 之所以不用 apt 装本地 deb：apt 解本地文件仍会去索引里找依赖，断网直接失败。
 prov_wkhtmltopdf() {
+  [ -f "$STAMP/wkhtmltopdf" ] && return 0
+  if [ -f "$BUNDLES/wkhtmltopdf-noble-arm64-debs.tar.gz" ]; then
+    echo "== 安装 wkhtmltopdf 0.12.6 + 依赖（离线包）==" >&2
+    ensure_rootfs || return 1
+    rm -rf "$ROOTFS/tmp/kxxy-wkhtmltopdf"
+    mkdir -p "$ROOTFS/tmp/kxxy-wkhtmltopdf" || return 1
+    tar -xzf "$BUNDLES/wkhtmltopdf-noble-arm64-debs.tar.gz" -C "$ROOTFS/tmp/kxxy-wkhtmltopdf" || return 1
+    in_guest 'export DEBIAN_FRONTEND=noninteractive
+      dpkg -i --force-confold /tmp/kxxy-wkhtmltopdf/*.deb >/tmp/kp-wkhtmltopdf.log 2>&1 \
+        || { tail -8 /tmp/kp-wkhtmltopdf.log >&2; exit 1; }' || return 1
+    in_guest 'wkhtmltopdf --version' || return 1
+    : > "$STAMP/wkhtmltopdf"
+    rm -rf "$ROOTFS/tmp/kxxy-wkhtmltopdf"
+    drop_bundle "$BUNDLES/wkhtmltopdf-noble-arm64-debs.tar.gz"
+    return 0
+  fi
   prov_base || return 1
   prov_apt wkhtmltopdf wkhtmltopdf || return 1
   in_guest 'wkhtmltopdf --version' || return 1
+  : > "$STAMP/wkhtmltopdf"
 }
 
 prov_python() {

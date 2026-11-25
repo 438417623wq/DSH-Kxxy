@@ -16,7 +16,7 @@
  *      「协议映射 → 精确 id → 规范化 id → 全局多模态」四步回退；
  *   3. 纯文本模型（embedding 等）不会被当成多模态基线；
  *   4. `input` 回退链的优先级顺序逐字锁定（entry → 显式 defaultInput →
- *      base → fallback → ["text"]）。
+ *      base → fallback → 未知路由按协议兜底），并验证 `strict` 策略能退回纯文本。
  *
  * 不验证：真实网络请求、上游 `containsImage` 抛错路径、Android 设备行为。
  */
@@ -32,18 +32,24 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const KEY = 'lib/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js';
 const IN_ASAR = 'dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js';
 const CHAIN =
-  'input: declaredInput(entry.input) ?? (request.defaultInputDeclared === true ? declaredInput(request.defaultInput) : void 0) ?? base?.input ?? modalityBase?.input ?? [...request.defaultInput],';
+  'input: declaredInput(entry.input) ?? (request.defaultInputDeclared === true ? declaredInput(request.defaultInput) : void 0) ?? base?.input ?? modalityBase?.input ?? unknownRouteInput(api, entry.id, request.defaultInput),';
 
 const CATALOG = {
   google: [
-    { id: 'gemini-2.5-pro', api: 'google-generative-ai', input: ['text', 'image'], contextWindow: 1048576, maxTokens: 65536 },
-    { id: 'gemini-embedding-001', api: 'google-generative-ai', input: ['text'], contextWindow: 2048, maxTokens: 1 },
+    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', api: 'google-generative-ai', input: ['text', 'image'], contextWindow: 1048576, maxTokens: 65536 },
+    { id: 'gemini-embedding-001', name: 'Gemini Embedding 001', api: 'google-generative-ai', input: ['text'], contextWindow: 2048, maxTokens: 1 },
   ],
   openai: [
-    { id: 'gpt-4o', api: 'openai-responses', input: ['text', 'image'], contextWindow: 128000, maxTokens: 16384 },
-    { id: 'text-embedding-3-large', api: 'openai-embeddings', input: ['text'], contextWindow: 8191, maxTokens: 1 },
+    { id: 'gpt-4o', name: 'GPT-4o', api: 'openai-responses', input: ['text', 'image'], contextWindow: 128000, maxTokens: 16384 },
+    { id: 'gpt-6-astra', name: 'GPT-6 Astra', api: 'openai-responses', input: ['text', 'image'], contextWindow: 400000, maxTokens: 128000 },
+    { id: 'o3-mini', name: 'o3-mini', api: 'openai-responses', input: ['text'], contextWindow: 200000, maxTokens: 100000 },
+    { id: 'text-embedding-3-large', name: 'Text Embedding 3 Large', api: 'openai-embeddings', input: ['text'], contextWindow: 8191, maxTokens: 1 },
   ],
-  anthropic: [{ id: 'claude-sonnet-4-5', api: 'anthropic-messages', input: ['text', 'image'], contextWindow: 1000000, maxTokens: 64000 }],
+  anthropic: [{ id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5', api: 'anthropic-messages', input: ['text', 'image'], contextWindow: 1000000, maxTokens: 64000 }],
+  deepseek: [
+    { id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash', api: 'openai-completions', input: ['text', 'image'], contextWindow: 1000000, maxTokens: 384000 },
+    { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', api: 'openai-completions', input: ['text'], contextWindow: 1000000, maxTokens: 384000 },
+  ],
 };
 
 function sliceFunction(source, name) {
@@ -72,7 +78,7 @@ function exerciseFallback(patched) {
     'catalogProviderIds',
     'getAllBuiltinModels',
     `${helperBlock}
-return { catalogModalityFallback, multimodalFallbackModels, normalizedFallbackId };`,
+return { catalogModalityFallback, multimodalFallbackModels, normalizedFallbackId, unknownRouteInput };`,
   );
   const api = factory(
     () => providerIds,
@@ -92,13 +98,55 @@ return { catalogModalityFallback, multimodalFallbackModels, normalizedFallbackId
   assert.equal(pick('anthropic-messages', 'claude-sonnet-4-5')?.id, 'claude-sonnet-4-5', 'anthropic 映射失败');
   // 未知协议也能按规范化 id 全局找到已知多模态模型。
   assert.equal(pick('openai-completions', 'claude-sonnet-4-5')?.id, 'claude-sonnet-4-5', '全局多模态回退失败');
-  // 纯文本模型不得被当成多模态基线。
+  // 第三方中转按模型显示名写 id（如硅基流动 deepseek-ai/DeepSeek-V4.1-Flash）命中内置 name（DeepSeek V4.1 Flash）。
+  assert.equal(pick('openai-completions', 'deepseek-ai/DeepSeek-V4.1-Flash')?.id, 'deepseek-flash', '按内置 name 匹配 DeepSeek-V4.1-Flash 失败');
+  assert.deepEqual(pick('openai-completions', 'Pro/deepseek-ai/DeepSeek-V4.1-Flash')?.input, ['text', 'image'], '多段前缀 + name 匹配失败');
+  // 小版本演进（如 gpt-6.2-astra / deepseek-v4.2-flash）保守回退到同家族多模态基线。
+  assert.equal(pick('openai-responses', 'gpt-6.2-astra')?.id, 'gpt-6-astra', 'gpt-6.2-astra 主版本回退失败');
+  assert.deepEqual(pick('openai-responses', 'gpt-6.2-astra')?.input, ['text', 'image']);
+  assert.equal(pick('openai-completions', 'deepseek-ai/DeepSeek-V4.2-Flash')?.id, 'deepseek-flash', 'DeepSeek-V4.2-Flash 主版本回退失败');
+  // 纯文本模型不得被当成多模态基线（即使 name 或主版本接近也不放行）。
+  assert.equal(pick('openai-completions', 'deepseek-ai/DeepSeek-V4-Pro'), undefined, '纯文本 DeepSeek V4 Pro 被误判为多模态');
+  assert.equal(pick('openai-completions', 'deepseek-ai/DeepSeek-V4.2-Pro'), undefined, '纯文本 DeepSeek V4.2 Pro 被误判为多模态');
+  assert.equal(pick('openai-responses', 'o3-mini'), undefined, '纯文本 o3-mini 被误判为多模态');
   assert.equal(pick('openai-completions', 'text-embedding-3-large'), undefined, 'embedding 模型被误判为多模态');
   assert.equal(pick('google-generative-ai', 'gemini-embedding-001'), undefined, '纯文本 gemini 模型被误判为多模态');
   // 完全未知的 id 保持原判定（仍然只收文本）。
   assert.equal(pick('google-generative-ai', 'no-such-model-xyz'), undefined, '未知模型不应产生回退');
   // 索引缓存：第二次调用返回同一对象。
   assert.equal(api.multimodalFallbackModels().get('gpt-4o'), CATALOG.openai[0], '全局索引未缓存同一实体');
+
+  // ── 目录与回退都落空时的最后一格 ──────────────────────────────────────
+  // 中转 route 的模型名可能完全不在内置目录（guiji/chat/guge 这类），此时按协议兜底：
+  // 对话协议视为可收图，非对话协议维持纯文本。
+  assert.deepEqual(api.unknownRouteInput('openai-completions', 'guiji-v4-flash', ['text']), ['text', 'image'], '未知中转模型（openai-completions）未按可收图兜底');
+  assert.deepEqual(api.unknownRouteInput('openai-responses', 'chat/astra-x', ['text']), ['text', 'image'], '未知中转模型（openai-responses，带网关前缀）未按可收图兜底');
+  assert.deepEqual(api.unknownRouteInput('anthropic-messages', 'guge-sonnet', ['text']), ['text', 'image'], '未知中转模型（anthropic-messages）未按可收图兜底');
+  assert.deepEqual(api.unknownRouteInput('google-generative-ai', 'guge-gemini', ['text']), ['text', 'image'], '未知中转模型（google-generative-ai）未按可收图兜底');
+  assert.deepEqual(api.unknownRouteInput('openai-embeddings', 'embed-x', ['text']), ['text'], '非对话协议被放宽为可收图');
+  assert.deepEqual(api.unknownRouteInput(undefined, 'embed-x', ['text']), ['text'], '协议未知时不得放宽');
+  assert.deepEqual(api.unknownRouteInput('openai-completions', 'chat-x', ['text', 'image']), ['text', 'image'], '已声明 image 时不得重复追加');
+  // 目录**明确**说是纯文本的，兜底也不得放行 —— 否则「纯文本模型仍然拒绝图片」这条契约就破了。
+  assert.deepEqual(api.unknownRouteInput('openai-completions', 'deepseek-ai/DeepSeek-V4-Pro', ['text']), ['text'], '已知纯文本 DeepSeek V4 Pro 被协议兜底放行');
+  assert.deepEqual(api.unknownRouteInput('openai-responses', 'o3-mini', ['text']), ['text'], '已知纯文本 o3-mini 被协议兜底放行');
+  assert.deepEqual(api.unknownRouteInput('openai-completions', 'text-embedding-3-large', ['text']), ['text'], 'embedding 被协议兜底放行');
+
+  // KXXY_MODALITY_UNKNOWN=strict 恢复「未知即纯文本」。
+  const previous = process.env.KXXY_MODALITY_UNKNOWN;
+  process.env.KXXY_MODALITY_UNKNOWN = 'strict';
+  try {
+    const strictFactory = new Function(
+      'catalogProviderIds',
+      'getAllBuiltinModels',
+      `${helperBlock}
+return { unknownRouteInput };`,
+    );
+    const strict = strictFactory(() => providerIds, (id) => CATALOG[id]);
+    assert.deepEqual(strict.unknownRouteInput('openai-completions', 'chat-x', ['text']), ['text'], 'strict 策略未关闭兜底');
+  } finally {
+    if (previous === undefined) delete process.env.KXXY_MODALITY_UNKNOWN;
+    else process.env.KXXY_MODALITY_UNKNOWN = previous;
+  }
 }
 
 function verify(asarPath) {
@@ -108,7 +156,7 @@ function verify(asarPath) {
 
   // ── 1. 真实文件上落地 + 幂等 ───────────────────────────────────────────
   const first = patchCatalogModalityFallback(ctx);
-  assert.match(first, /继承图片模态/, `补丁未生效：${first}`);
+  assert.match(first, /继承内置目录模态/, `补丁未生效：${first}`);
   const original = files.get(KEY).data.toString('utf8');
   const second = patchCatalogModalityFallback(ctx);
   assert.match(second, /已打过/, `二次应用不幂等：${second}`);
@@ -124,6 +172,7 @@ function verify(asarPath) {
   assert.ok(original.includes(CHAIN), 'input 回退链的优先级顺序被改动');
   assert.ok(original.includes('const modalityBase = base ?? catalogModalityFallback(api, entry.id);'), '回退条目选择点被改动');
   assert.ok(!original.includes('const modalityBase = catalogModalityFallback'), '回退不得越过 base（目录命中的路由保持原判定）');
+  assert.ok(!original.includes('?? [...request.defaultInput],'), 'input 仍直接落到 schema 默认值（未知中转永远发不了图）');
 
   // ── 4. 用受控目录跑真实抽取出来的回退函数 ──────────────────────────────
   exerciseFallback(original);

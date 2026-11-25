@@ -1024,7 +1024,7 @@ const OFFICE_FONTS_MARKER_FILE = "office-assets.version";
  * （`PythonRuntimeRepair.HOST_WEB_FILES` 只有 index.html 与 host.js），
  * 不涨编号就是「新页面 + 旧样式 + 旧后端」—— 弹层依旧看不见任何报错。
  */
-const PATCHSET_MARKER = "kxxy-patchset@40";
+const PATCHSET_MARKER = "kxxy-patchset@42";
 const PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version";
 
 /**

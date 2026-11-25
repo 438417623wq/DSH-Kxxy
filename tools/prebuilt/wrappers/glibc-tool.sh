@@ -22,7 +22,7 @@ if ! "$GC" -c "test -x $EXE" >/dev/null 2>&1; then
     echo "__NAME__: 容器里还没有 __LABEL__，先执行：kxxy-glibc-provision __GROUP__" >&2
     exit 127
   fi
-  echo "__NAME__: 首次使用，正在预置 __LABEL__（__HINT__，需要联网）…" >&2
+  echo "__NAME__: 首次使用，正在预置 __LABEL__（__HINT__；有随包离线包时不联网）…" >&2
   if ! "$PROV" __GROUP__; then
     echo "__NAME__: 预置失败。可重试：kxxy-glibc-provision __GROUP__" >&2
     exit 1

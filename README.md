@@ -110,6 +110,8 @@ dsh-kxxy/
 > **运行时能力修复（2026-11-21）**：默认 Python 独立 glibc 路由、真实硬链接/rsync 语义、perf 失败诊断与设备验收边界，见 [修复与验收说明](docs/runtime-capabilities-2026-11-21.md)。源码/本地测试通过不等于设备内核权限已解除。
 >
 > **v0.9.78 收口**：`perf list` 区分 PMU/fallback，`perf stat` 不再用回退数据冒充硬件事件，`perf record` 保留目标退出码；rsync 新增 `KXXY_RSYNC_LINK_REQUIRED=1`，软链去重改为原子替换。见 [变更说明](docs/2026-11-22-v0.9.78-perf降级收口与快照严格模式.md)。
+>
+> **v0.9.93**：自定义路由（`guiji` / `chat` / `guge` 这类 pi-ai 不认识的 key）**发图片不再被本地拒** —— `input` 回退链最后一格从「查内置目录」改成「看协议」，已知纯文本模型仍拦截（`KXXY_MODALITY_UNKNOWN=strict` 可关）；`julia` / `dotnet` / `wkhtmltopdf` 三份离线包随 glibc 扩展进池，**断网也能首次装好**；LibreOffice 明确维持 WASM（原生路径是跨 ABI `dlopen`，不做）。补丁集 `@42`，glibc 扩展 `r4`。见 [变更说明](docs/2026-11-25-v0.9.93-图片模态兜底与离线预置.md)。
 
 > **Python 依赖修复（0.9.42）**：默认装配 `tools/prebuilt/python-android-cp314/` 中已验证的 CFFI 2.0.0 与 pycparser 2.23，核对目标 Python/原生库摘要后才能出包。不再依赖 deb 的联网 postinst。新解释器/库版本须重建匹配构件，不能直接复用。维护区“一键验收（含 Python）”可做实际功能检查；NumPy/psutil 的旧平台标签仍如实报告。详见 [Python 修复与验证边界](docs/python-runtime-repair-0.9.42.md)。
 

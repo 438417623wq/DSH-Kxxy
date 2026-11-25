@@ -27,15 +27,16 @@ import { spawn } from 'node:child_process'
 import {
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
   readSync,
-  realpathSync,
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { delimiter, join, resolve, sep } from 'node:path'
+import { delimiter, dirname, join, resolve, sep } from 'node:path'
 
 /**
  * 清单版本：加/换包时改这个数字，标记文件不匹配就会重跑一次。
@@ -225,20 +226,63 @@ function isElf(path) {
 }
 
 /**
+ * 在 guest rootfs 坐标系内解析路径与软链（同 python-default.py 的 guest_file）。
+ * 避免对容器内绝对软链（如 `/usr/bin/python3 -> /usr/bin/python3.12`）调用宿主机
+ * realpathSync 时穿透到宿主机 `/usr/bin/...`。
+ */
+function resolveGuestPath(rootfs, guestPath) {
+  const todo = String(guestPath).split('/').filter(Boolean)
+  const parts = []
+  let links = 0
+  while (todo.length > 0) {
+    const part = todo.shift()
+    if (!part || part === '.') continue
+    if (part === '..') {
+      if (parts.length > 0) parts.pop()
+      continue
+    }
+    const current = join(rootfs, ...parts, part)
+    let st
+    try {
+      st = lstatSync(current)
+    } catch {
+      return null
+    }
+    if (st.isSymbolicLink()) {
+      links += 1
+      if (links > 40) return null
+      let target
+      try {
+        target = readlinkSync(current)
+      } catch {
+        return null
+      }
+      const norm = target.replace(/\\/g, '/')
+      if (norm.startsWith('/')) parts.length = 0
+      const next = norm.split('/').filter(Boolean)
+      todo.unshift(...next)
+    } else {
+      parts.push(part)
+    }
+  }
+  return join(rootfs, ...parts)
+}
+
+/**
  * glibc 容器是否真的能跑 Python（与 python-default.py 的 `require_ready` 同判据）。
  *
  * 只看 `.kxxy-seed` 不够：装了 glibc 扩展但没 `kxxy-glibc-provision python-ml`
  * 时，种子在、`/usr/bin/python3` 不在 —— 此时裸 `python3` 会落到运行时的原生
  * bionic 解释器（见 tools/prebuilt/kxxy-tools/python-default.py 的回退）。
+ *
+ * 目录布局：`root` 是 `<filesDir>/engine`，glibc 容器数据在同级的 `<filesDir>/glibc/rootfs`
+ * （与 kxxy-glibc.sh 的 `DATA="$FILES/glibc"`、python-default.py 的 `files / "glibc/rootfs"` 对齐）。
  */
 function glibcPythonReady(root) {
-  const rootfs = process.env.KXXY_GLIBC_ROOTFS || join(root, 'glibc', 'rootfs')
+  const rootfs = process.env.KXXY_GLIBC_ROOTFS || join(dirname(resolve(root)), 'glibc', 'rootfs')
   if (!existsSync(join(rootfs, '.kxxy-seed'))) return false
-  try {
-    return isElf(realpathSync(join(rootfs, 'usr', 'bin', 'python3')))
-  } catch {
-    return false
-  }
+  const py = resolveGuestPath(rootfs, '/usr/bin/python3')
+  return py !== null && isElf(py)
 }
 
 /**

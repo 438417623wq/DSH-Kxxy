@@ -1522,10 +1522,14 @@ function patchDeveloperRoleCompat(ctx) {
  *     只接受「声明了 `image` 且 api 是对话协议」的条目，纯文本模型不会被用来
  *     放宽判定；继承的只有 `input` / `contextWindow` / `maxTokens`，`baseUrl`、
  *     `cost`、`name` 一概不继承 —— 中转域的计费与端点与官方不同。
+ *   · 目录与回退**都**没命中（连模型名都不在内置目录里的中转）—— 对话协议按
+ *     「可收图」放行（`unknownRouteInput`），非对话协议（embedding 等）维持
+ *     `["text"]`；`KXXY_MODALITY_UNKNOWN=strict` 可恢复旧判定。
  *
  * 优先级保持不变、且用户显式配置始终优先：
  *
- *     entry.input ?? (显式写的) defaultInput ?? base.input ?? fallback.input ?? ["text"]
+ *     entry.input ?? (显式写的) defaultInput ?? base.input ?? fallback.input
+ *                 ?? 未知路由兜底(api, defaultInput)
  *
  * 之所以要区分「显式 defaultInput」与「schema 默认值」：后者是 `["text"]`，
  * 若把它排在回退之前，回退永远没有机会生效（这正是原实现的死结）。
@@ -1536,7 +1540,14 @@ export function patchCatalogModalityFallback(ctx) {
   const rel = "@deepseek-ai/dsh-llm-pi-ai/lib/index.js";
   if (!ctx.exists(rel)) return "跳过（依赖树无 dsh-llm-pi-ai）";
   const src = ctx.read(rel);
-  if (src.includes("KXXY_CATALOG_MODALITY_FALLBACK")) {
+  if (
+    src.includes("KXXY_CATALOG_MODALITY_FALLBACK") &&
+    src.includes("normalizedFallbackId(base.name)") &&
+    src.includes("majorVersionFallbackKey(") &&
+    src.includes("modalityBase?.input") &&
+    src.includes("unknownRouteInput(api, entry.id, request.defaultInput)") &&
+    src.includes("defaultInputDeclared,")
+  ) {
     return "已打过（自定义路由的图片模态回退），跳过";
   }
 
@@ -1560,36 +1571,109 @@ const MODALITY_FALLBACK_PROTOCOLS = new Map([
 ]);
 const MODALITY_FALLBACK_APIS = new Set(MODALITY_FALLBACK_PROTOCOLS.keys());
 const MODALITY_FALLBACK_PREFIX = /^(?:[A-Za-z0-9_.-]+\\/)+/;
-/** 模型 id 去掉网关前缀（\`Pro/\`、\`openai/\`、\`models/\` …）并小写。 */
+/** 模型 id / 显示名去掉网关前缀（\`Pro/\`、\`deepseek-ai/\`、\`openai/\` …）、小写并把空白/下划线/连字符统一为 \`-\`。 */
 function normalizedFallbackId(id) {
-	return String(id).replace(MODALITY_FALLBACK_PREFIX, "").toLowerCase();
+	return String(id).replace(MODALITY_FALLBACK_PREFIX, "").trim().toLowerCase().replace(/[\\s_-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+/** 折叠小版本号（如 \`gpt-6.2-astra\` → \`gpt-6-astra\`、\`deepseek-v4.2-flash\` → \`deepseek-v4-flash\`），仅用于已知多模态家族的保守回退。 */
+function majorVersionFallbackKey(key) {
+	return String(key).replace(/(\\d+)\\.\\d+(?=[^0-9]|$)/g, "$1");
 }
 /** 只接受「对话协议 + 明确声明图片输入」的目录条目，纯文本模型不得放宽判定。 */
 function multimodalCatalogBase(model) {
 	return model !== void 0 && Array.isArray(model.input) && model.input.includes("image") && MODALITY_FALLBACK_APIS.has(model.api) ? model : void 0;
 }
 let multimodalFallbackIndex;
-/** 规范化 id → 已知多模态模型（首次访问时建立，顺序取目录首条）。 */
-function multimodalFallbackModels() {
-	if (multimodalFallbackIndex !== void 0) return multimodalFallbackIndex;
+let multimodalMajorFallbackIndex;
+let textOnlyFallbackKeys;
+function ensureFallbackIndexes() {
+	if (multimodalFallbackIndex !== void 0) return;
 	const byId = /* @__PURE__ */ new Map();
+	const byMajor = /* @__PURE__ */ new Map();
+	const textOnly = /* @__PURE__ */ new Set();
 	for (const id of catalogProviderIds()) for (const model of getAllBuiltinModels(id)) {
+		const idKey = normalizedFallbackId(model.id);
+		const nameKey = typeof model.name === "string" && model.name.trim() !== "" ? normalizedFallbackId(model.name) : "";
 		const base = multimodalCatalogBase(model);
-		if (base !== void 0 && !byId.has(normalizedFallbackId(base.id))) byId.set(normalizedFallbackId(base.id), base);
+		if (base === void 0) {
+			if (idKey) textOnly.add(idKey);
+			if (nameKey) textOnly.add(nameKey);
+			continue;
+		}
+		if (idKey && !byId.has(idKey)) byId.set(idKey, base);
+		if (nameKey && !byId.has(nameKey)) byId.set(nameKey, base);
+		const idMajor = idKey ? majorVersionFallbackKey(idKey) : "";
+		const nameMajor = nameKey ? majorVersionFallbackKey(nameKey) : "";
+		if (idMajor && !byMajor.has(idMajor)) byMajor.set(idMajor, base);
+		if (nameMajor && !byMajor.has(nameMajor)) byMajor.set(nameMajor, base);
 	}
 	multimodalFallbackIndex = byId;
-	return byId;
+	multimodalMajorFallbackIndex = byMajor;
+	textOnlyFallbackKeys = textOnly;
+}
+/** 规范化 id / 显示名 → 已知多模态模型（首次访问时建立，顺序取目录首条）。 */
+function multimodalFallbackModels() {
+	ensureFallbackIndexes();
+	return multimodalFallbackIndex;
 }
 /**
-* 自定义 route 的目录回退：先按协议映射的 provider 找精确 id，再按规范化 id，
-* 最后全局按规范化 id 找已知多模态模型。
+* 目录是否**明确判定**这个模型只收文本。
+*
+* catalogModalityFallback 对「已知纯文本」与「完全不认识」都返回 undefined，
+* 两者混为一谈会让协议兜底把已知纯文本模型（deepseek-v4-pro、o3-mini）也放行 ——
+* 那就把「纯文本模型仍然拒绝图片」这条契约破坏了。这里把前者单独识别出来。
+* @param api - route 的 wire 协议。
+* @param id - 配置里写的模型 id。
+* @returns 目录明确声明为纯文本时为 true。
+*/
+function knownTextOnlyModel(api, id) {
+	ensureFallbackIndexes();
+	const key = normalizedFallbackId(id);
+	if (!textOnlyFallbackKeys.has(key)) return false;
+	// 同名条目里有多模态的就以多模态为准（例如中转把显示名写成通用名）。
+	if (multimodalFallbackIndex.has(key)) return false;
+	const own = MODALITY_FALLBACK_PROTOCOLS.get(api);
+	if (own !== void 0 && multimodalMajorFallbackIndex.has(majorVersionFallbackKey(key))) return false;
+	return true;
+}
+/**
+* 目录（base）与回退（modalityBase）都查不到时的最后一格。
+*
+* 自定义中转 route（guge / chat / guiji 这类 pi-ai 不认识的 key）常常连模型名都不在
+* 内置目录里，于是 base 与 modalityBase 同时落空，input 只能取 schema 默认的
+* [\"text\"] —— 结论是「这类路由永远发不了图」，与模型本身有没有视觉能力无关。
+* 这里按**协议**兜底：对话协议（openai-completions / openai-responses /
+* anthropic-messages / google-generative-ai）默认视为可收图，上游不认图时由它自己
+* 返回 400，比本地武断拒绝更接近事实。
+*
+* 两条边界：目录明确说是纯文本的不放行（knownTextOnlyModel）；非对话协议不放行。
+* 想恢复「未知即纯文本」的旧判定：环境变量 KXXY_MODALITY_UNKNOWN=strict。
+* @param api - route 的 wire 协议。
+* @param id - 配置里写的模型 id（用于识别「目录已知的纯文本模型」）。
+* @param defaultInput - profile 的 defaultInput（未声明时 schema 物化为 [\"text\"]）。
+* @returns 该模型最终采用的 input 模态数组。
+*/
+const MODALITY_UNKNOWN_POLICY = String(globalThis.process?.env?.KXXY_MODALITY_UNKNOWN ?? \"assume-image\").trim().toLowerCase();
+function unknownRouteInput(api, id, defaultInput) {
+	if (MODALITY_UNKNOWN_POLICY === \"strict\") return [...defaultInput];
+	if (!MODALITY_FALLBACK_APIS.has(api)) return [...defaultInput];
+	if (knownTextOnlyModel(api, id)) return [...defaultInput];
+	return defaultInput.includes(\"image\") ? [...defaultInput] : [...defaultInput, \"image\"];
+}
+/**
+* 自定义 route 的目录回退：先按协议映射的 provider 找精确 id，再按规范化 id / name，
+* 再全局按规范化 id / name 找已知多模态模型（如 \`deepseek-ai/DeepSeek-V4.1-Flash\`
+* 命中内置 \`deepseek-flash\` / \`DeepSeek V4.1 Flash\`），最后按主版本折叠键回退
+* （如 \`gpt-6.2-astra\` 命中 \`gpt-6-astra\`）；已知纯文本模型绝不放宽。
 * @param api - route 的 wire 协议；未知或非对话协议时只走全局回退。
 * @param id - 配置里写的模型 id（可能带网关前缀）。
 * @returns 可继承的目录条目，或 \`undefined\`（保持原判定，仍然只收文本）。
 */
 function catalogModalityFallback(api, id) {
+	ensureFallbackIndexes();
 	const own = MODALITY_FALLBACK_PROTOCOLS.get(api);
 	const key = normalizedFallbackId(id);
+	if (textOnlyFallbackKeys.has(key) && !multimodalFallbackIndex.has(key)) return void 0;
 	if (own !== void 0) {
 		const models = getAllBuiltinModels(own);
 		for (const model of models) {
@@ -1598,10 +1682,14 @@ function catalogModalityFallback(api, id) {
 		}
 		for (const model of models) {
 			const base = multimodalCatalogBase(model);
-			if (base !== void 0 && normalizedFallbackId(base.id) === key) return base;
+			if (base !== void 0 && (normalizedFallbackId(base.id) === key || (typeof base.name === "string" && normalizedFallbackId(base.name) === key))) return base;
 		}
 	}
-	return multimodalFallbackModels().get(key);
+	const exact = multimodalFallbackModels().get(key);
+	if (exact !== void 0) return exact;
+	const majorKey = majorVersionFallbackKey(key);
+	if (majorKey && majorKey !== key) return multimodalMajorFallbackIndex.get(majorKey);
+	return void 0;
 }`;
 
   let out = replaceOnce(
@@ -1655,18 +1743,19 @@ function catalogModalityFallback(api, id) {
   out = replaceOnce(
     out,
     `			input: declaredInput(entry.input) ?? base?.input ?? [...request.defaultInput],`,
-    `			input: declaredInput(entry.input) ?? (request.defaultInputDeclared === true ? declaredInput(request.defaultInput) : void 0) ?? base?.input ?? modalityBase?.input ?? [...request.defaultInput],`,
+    `			input: declaredInput(entry.input) ?? (request.defaultInputDeclared === true ? declaredInput(request.defaultInput) : void 0) ?? base?.input ?? modalityBase?.input ?? unknownRouteInput(api, entry.id, request.defaultInput),`,
     "dsh-llm-pi-ai 的 input 回退链",
   );
 
   must(
     out.includes("catalogModalityFallback(api, entry.id)") &&
       out.includes("modalityBase?.input") &&
+      out.includes("unknownRouteInput(api, entry.id, request.defaultInput)") &&
       out.includes("defaultInputDeclared,"),
     "dsh-llm-pi-ai 的图片模态回退未全部生效",
   );
   ctx.write(rel, out);
-  return "dsh-llm-pi-ai → 自定义路由从内置目录继承图片模态（guge/chat 等中转不再报「不支持图片」）";
+  return "dsh-llm-pi-ai → 自定义路由继承内置目录模态，目录也不知道的对话协议按可收图兜底（guge/chat/guiji 不再报「不支持图片」）";
 }
 
 /**

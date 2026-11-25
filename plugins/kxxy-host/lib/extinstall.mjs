@@ -1580,6 +1580,8 @@ function perlLauncher() {
 
 /** 把 `target` 写成 perl launcher（覆盖已有条目；失败向上抛，由调用方决定是否忽略）。 */
 function installPerlLauncher(target) {
+  // 先解除可能存在的软链，避免 writeFileSync 沿软链覆盖真实的 perl 二进制。
+  if (isPresent(target)) unlinkSync(target)
   writeFileSync(target, perlLauncher(), { mode: 0o755 })
   try { chmodSync(target, 0o755) } catch { /* Android 上 FAT 之外都能设，失败不致命 */ }
 }

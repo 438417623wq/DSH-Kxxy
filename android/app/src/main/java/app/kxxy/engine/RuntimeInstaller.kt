@@ -3665,7 +3665,7 @@ class RuntimeInstaller(private val ctx: Context) {
         // 38 → 39（v0.9.87）：本地插件安装修复。`host.css` 的安装弹层遮罩降到 190
         // （原先与 toast 同为 200，失败提示被遮罩盖住）、`lib/localinstall.mjs`
         // 放宽包根布局 —— 这两个都不在 HOST_WEB_FILES 里，只能靠本编号重解。
-        private const val PATCHSET_MARKER = "kxxy-patchset@40"
+        private const val PATCHSET_MARKER = "kxxy-patchset@42"
         private const val PATCHSET_MARKER_FILE = "lib/node_modules/kxxy-host/patchset.version"
         private val PYTHON_DEFAULT_FILES = listOf(
             "libexec/python-default/python-default.py",

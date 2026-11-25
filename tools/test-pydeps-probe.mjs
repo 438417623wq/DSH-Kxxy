@@ -89,32 +89,38 @@ try {
   check('不足 4 字节不误判', P.isElf(short) === false)
   check('文件不存在返回 false（不抛）', P.isElf(path.join(work, 'elf', 'nope')) === false)
 
-  // ── 4. glibcPythonReady ─────────────────────────────────────────────────
-  const ready = path.join(work, 'ready')
-  touchElf(path.join(ready, 'glibc', 'rootfs', 'usr', 'bin', 'python3'))
-  mkdirSync(path.join(ready, 'glibc', 'rootfs'), { recursive: true })
+  // ── 4. glibcPythonReady（真实布局：<files>/engine 与 <files>/glibc/rootfs 同级）──
+  const readyFiles = path.join(work, 'ready')
+  const ready = path.join(readyFiles, 'engine')
+  mkdirSync(ready, { recursive: true })
+  touchElf(path.join(readyFiles, 'glibc', 'rootfs', 'usr', 'bin', 'python3'))
+  mkdirSync(path.join(readyFiles, 'glibc', 'rootfs'), { recursive: true })
   check('没有 .kxxy-seed 就不算就绪', P.glibcPythonReady(ready) === false)
-  writeFileSync(path.join(ready, 'glibc', 'rootfs', '.kxxy-seed'), '')
+  writeFileSync(path.join(readyFiles, 'glibc', 'rootfs', '.kxxy-seed'), '')
   check('种子 + 真 ELF 才就绪', P.glibcPythonReady(ready) === true)
 
-  const seedOnly = path.join(work, 'seed-only')
-  mkdirSync(path.join(seedOnly, 'glibc', 'rootfs'), { recursive: true })
-  writeFileSync(path.join(seedOnly, 'glibc', 'rootfs', '.kxxy-seed'), '')
+  const seedOnlyFiles = path.join(work, 'seed-only')
+  const seedOnly = path.join(seedOnlyFiles, 'engine')
+  mkdirSync(seedOnly, { recursive: true })
+  mkdirSync(path.join(seedOnlyFiles, 'glibc', 'rootfs'), { recursive: true })
+  writeFileSync(path.join(seedOnlyFiles, 'glibc', 'rootfs', '.kxxy-seed'), '')
   check('只有种子、没有 /usr/bin/python3 不算就绪', P.glibcPythonReady(seedOnly) === false)
 
-  const linked = path.join(work, 'linked')
-  mkdirSync(path.join(linked, 'glibc', 'rootfs'), { recursive: true })
-  writeFileSync(path.join(linked, 'glibc', 'rootfs', '.kxxy-seed'), '')
-  const linkedElf = touchElf(path.join(linked, 'glibc', 'rootfs', 'usr', 'lib', 'python3.12'))
+  const linkedFiles = path.join(work, 'linked')
+  const linked = path.join(linkedFiles, 'engine')
+  mkdirSync(linked, { recursive: true })
+  mkdirSync(path.join(linkedFiles, 'glibc', 'rootfs'), { recursive: true })
+  writeFileSync(path.join(linkedFiles, 'glibc', 'rootfs', '.kxxy-seed'), '')
+  touchElf(path.join(linkedFiles, 'glibc', 'rootfs', 'usr', 'lib', 'python3.12'))
   try {
-    symlinkSync(linkedElf, path.join(linked, 'glibc', 'rootfs', 'usr', 'bin', 'python3'), 'file')
-    check('软链到 ELF 也算就绪（先 realpath 再判）', P.glibcPythonReady(linked) === true)
+    symlinkSync('../lib/python3.12', path.join(linkedFiles, 'glibc', 'rootfs', 'usr', 'bin', 'python3'), 'file')
+    check('容器内软链到 ELF 也算就绪（在 rootfs 坐标系内解析）', P.glibcPythonReady(linked) === true)
   } catch {
-    console.log('SKIP 宿主不允许建软链，跳过 realpath 断言')
+    console.log('SKIP 宿主不允许建软链，跳过 guest 软链断言')
   }
 
   // ── 5. effectivePython ──────────────────────────────────────────────────
-  const engine = path.join(work, 'engine')
+  const engine = path.join(work, 'plain-files', 'engine')
   const enginePy = touchElf(path.join(engine, 'bin', 'python3'))
   const dispatcherDir = path.join(engine, 'libexec', 'python-default', 'bin')
   const dispatcherPy = path.join(dispatcherDir, 'python3')
@@ -131,9 +137,10 @@ try {
   check('容器没就绪时判 dispatcher（不是 glibc）', stillDispatcher?.mode === 'dispatcher', JSON.stringify(stillDispatcher))
 
   // 容器就绪（种子 + 真 ELF）之后，同一个 dispatcher 落点要翻成 glibc 模式。
-  const engineReady = path.join(work, 'engine-ready')
-  touchElf(path.join(engineReady, 'glibc', 'rootfs', 'usr', 'bin', 'python3'))
-  writeFileSync(path.join(engineReady, 'glibc', 'rootfs', '.kxxy-seed'), '')
+  const engineReadyFiles = path.join(work, 'engine-ready')
+  const engineReady = path.join(engineReadyFiles, 'engine')
+  touchElf(path.join(engineReadyFiles, 'glibc', 'rootfs', 'usr', 'bin', 'python3'))
+  writeFileSync(path.join(engineReadyFiles, 'glibc', 'rootfs', '.kxxy-seed'), '')
   const readyDispatcher = path.join(engineReady, 'libexec', 'python-default', 'bin')
   mkdirSync(readyDispatcher, { recursive: true })
   writeFileSync(path.join(readyDispatcher, 'python3'), '#!/system/bin/sh\nexec kxxy-glibc python3 "$@"\n')

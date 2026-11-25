@@ -17,7 +17,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { buildViews, relinkAll } from '../plugins/kxxy-host/lib/extinstall.mjs'
@@ -62,6 +62,20 @@ try {
   unlinkSync(target)
   relinkAll(root)
   check('wrapper 被删后 relinkAll 能重建', existsSync(target) && readFileSync(target, 'utf8').includes(MARKER))
+
+  // 旧设备升级场景：target 原先是指向真 perl 二进制的软链，relinkAll 替换成 wrapper 时不得沿软链覆写真身。
+  const realPerl = path.join(perlExt, 'bin', 'perl')
+  const originalRealPerl = readFileSync(realPerl, 'utf8')
+  try {
+    unlinkSync(target)
+    symlinkSync(realPerl, target, 'file')
+    writeFileSync(path.join(root, 'extensions', '.relink'), '1')
+    relinkAll(root)
+    check('旧软链被 relinkAll 替换成普通 wrapper', existsSync(target) && !lstatSync(target).isSymbolicLink() && readFileSync(target, 'utf8').includes(MARKER))
+    check('旧软链被替换时不覆写真 perl 二进制', readFileSync(realPerl, 'utf8') === originalRealPerl)
+  } catch {
+    console.log('SKIP 宿主不允许建软链，跳过旧软链防穿透覆写断言')
+  }
 
   // ── 运行期：按磁盘现状重算 PERL5LIB ────────────────────────────────────
   const cut = text.slice(0, text.indexOf('# 真身'))

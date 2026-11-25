@@ -43,11 +43,17 @@ import { dirname, join } from 'node:path'
 /** 等 provider 注册完成的上限（插件是并发加载的，llm 目录可能还没填满）。 */
 const PROVIDER_WAIT_MS = 30000
 
+/** 首个 provider 出现后，若当前选择的路由尚未注册，再额外等待的上限（避免并发加载竞态）。 */
+const PREFERRED_PROVIDER_WAIT_MS = 5000
+
 /** 单条路由的模型目录探测上限。 */
 const PROBE_TIMEOUT_MS = 8000
 
 /** 轮询 provider 目录的间隔。 */
 const POLL_MS = 500
+
+/** 上游 base 写死的出厂默认路由：只有它（或空选择）才允许在缺凭据时自动改写。 */
+const UPSTREAM_DEFAULT_PROVIDER = 'deepseek-official'
 
 /**
  * 懒取一个引擎服务。
@@ -99,14 +105,18 @@ function withTimeout(factory, ms) {
 }
 
 /**
- * 等到 llm 目录里有 provider 为止。
+ * 等到 llm 目录里有 provider 为止；若指定了 `preferredProvider`，在首个 provider 出现后
+ * 还会再多等一小段（`preferredWaitMs`），避免并发加载时其它路由刚注册就提前返回。
  * @param {import('@deepseek-ai/cordis').Context} ctx 插件上下文。
  * @param {object} llm `llm` 服务。
  * @param {number} limitMs 最长等待毫秒数。
+ * @param {string | null} [preferredProvider] 当前选择期待出现的路由 id。
+ * @param {number} [preferredWaitMs] 首个 provider 出现后为期待路由预留的宽限期。
  * @returns {Promise<Array<{ id: string, name?: string }>>} 已注册路由。
  */
-async function waitForProviders(ctx, llm, limitMs) {
+async function waitForProviders(ctx, llm, limitMs, preferredProvider = null, preferredWaitMs = PREFERRED_PROVIDER_WAIT_MS) {
   const startedAt = Date.now()
+  let firstSeenAt = null
   for (;;) {
     let providers = []
     try {
@@ -114,8 +124,15 @@ async function waitForProviders(ctx, llm, limitMs) {
     } catch {
       providers = []
     }
-    if (providers.length > 0) return providers
-    if (Date.now() - startedAt >= limitMs) return providers
+    const now = Date.now()
+    if (providers.length > 0) {
+      if (!preferredProvider || providers.some((p) => p?.id === preferredProvider)) {
+        return providers
+      }
+      if (firstSeenAt === null) firstSeenAt = now
+      if (now - firstSeenAt >= preferredWaitMs) return providers
+    }
+    if (now - startedAt >= limitMs) return providers
     await new Promise((resolve) => {
       const timer = setTimeout(resolve, POLL_MS)
       if (typeof timer.unref === 'function') timer.unref()
@@ -376,15 +393,37 @@ async function run(ctx, options) {
     return { changed: false, skipped: 'missing-service' }
   }
 
-  const providers = await waitForProviders(ctx, llm, options.providerWaitMs ?? PROVIDER_WAIT_MS)
-  if (providers.length === 0) return { changed: false, skipped: 'no-providers' }
-
   let selection = null
   try {
     selection = defaultModel.currentSelection()
   } catch {
     selection = null
   }
+
+  const preferredProvider = typeof selection?.provider === 'string' && selection.provider.length > 0
+    ? selection.provider
+    : null
+  const providers = await waitForProviders(
+    ctx,
+    llm,
+    options.providerWaitMs ?? PROVIDER_WAIT_MS,
+    preferredProvider,
+    options.preferredWaitMs ?? PREFERRED_PROVIDER_WAIT_MS,
+  )
+  if (providers.length === 0) return { changed: false, skipped: 'no-providers' }
+
+  // 重读一次当前选择：等待 provider 注册期间，loader 可能完成了补丁应用。
+  try {
+    selection = defaultModel.currentSelection()
+  } catch {
+    selection = null
+  }
+
+  await trace({
+    phase: 'start',
+    selection,
+    providers: providers.map((provider) => provider?.id),
+  })
 
   // 当前选择还能用就什么都不做 —— 用户选过的模型必须原样保留。
   //
@@ -393,10 +432,41 @@ async function run(ctx, options) {
   // 声明的静态 `models`，没有密钥照样返回 `deepseek-flash` —— 只看列表会把
   // 「写死的默认值 + 从没配过的路由」误判成可用，自愈当场失效（实测过）。
   if (selection?.provider) {
+    const registered = providers.some((provider) => provider?.id === selection.provider)
     const configured = await routeLooksConfigured(ctx, selection.provider)
-    const currentModels = configured ? await usableModels(llm, selection.provider) : null
+    const currentModels = configured && registered ? await probeModels(llm, selection.provider) : null
+    if (!registered) {
+      await trace({ phase: 'probe', provider: selection.provider, error: 'provider-not-registered' })
+    } else if (!configured) {
+      await trace({ phase: 'probe', provider: selection.provider, error: 'credential-missing' })
+    }
     if (currentModels !== null && (!selection.model || currentModels.some((model) => model.id === selection.model))) {
       return { changed: false, from: selection, to: selection, skipped: 'current-usable' }
+    }
+    // 非出厂默认路由（用户或先前一次自愈已明确选定过，如 chat/gpt-6.2-astra）：
+    // 绝不静默覆盖回别的路由！否则每轮启动都会重写 cordis.patch.yml 并把用户在
+    // 「模型」页选好的路由重置掉。探测原因已记入 default-model.log 供排查。
+    if (selection.provider !== UPSTREAM_DEFAULT_PROVIDER) {
+      const reason = !registered
+        ? 'provider-not-registered'
+        : !configured
+          ? 'credential-missing'
+          : currentModels === null
+            ? 'probe-failed'
+            : 'model-not-in-catalog'
+      await trace({
+        phase: 'preserve',
+        provider: selection.provider,
+        model: selection.model ?? null,
+        reason,
+      })
+      return {
+        changed: false,
+        from: selection,
+        to: selection,
+        skipped: 'user-selection-preserved',
+        reason,
+      }
     }
   }
 
@@ -409,6 +479,9 @@ async function run(ctx, options) {
     if (models === null) continue
     const pick = models.find((model) => model.id === selection?.model) ?? models[0]
     if (typeof pick?.id !== 'string' || pick.id.length === 0) continue
+    if (selection?.provider === provider.id && selection?.model === pick.id) {
+      return { changed: false, from: selection, to: selection, skipped: 'already-selected' }
+    }
     let applied = true
     try {
       await defaultModel.saveSelection({ provider: provider.id, model: pick.id })

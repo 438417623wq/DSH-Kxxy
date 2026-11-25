@@ -109,6 +109,12 @@ class DefaultPython(unittest.TestCase):
         native.chmod(0o755)
         return native
 
+    def test_ready_glibc_takes_precedence_over_native_python(self):
+        self.make_native()
+        argv, _ = self.call("python3", ["-c", "print(1)"])
+        self.assertEqual(argv[0], str(self.root / "libexec/python-default/kxxy-glibc"))
+        self.assertEqual(argv[-3:], ["/usr/bin/python3", "-c", "print(1)"])
+
     def test_missing_rootfs_falls_back_to_native_python(self):
         native = self.make_native()
         (self.rootfs / ".kxxy-seed").unlink()
