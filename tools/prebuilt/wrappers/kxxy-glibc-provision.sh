@@ -167,9 +167,14 @@ prov_wkhtmltopdf() {
     rm -rf "$ROOTFS/tmp/kxxy-wkhtmltopdf"
     mkdir -p "$ROOTFS/tmp/kxxy-wkhtmltopdf" || return 1
     tar -xzf "$BUNDLES/wkhtmltopdf-noble-arm64-debs.tar.gz" -C "$ROOTFS/tmp/kxxy-wkhtmltopdf" || return 1
-    in_guest 'export DEBIAN_FRONTEND=noninteractive
-      dpkg -i --force-confold /tmp/kxxy-wkhtmltopdf/*.deb >/tmp/kp-wkhtmltopdf.log 2>&1 \
-        || { tail -8 /tmp/kp-wkhtmltopdf.log >&2; exit 1; }' || return 1
+    # dpkg -i 的退出码不可全信：proot 里 postinst 会碰到取不到的 /proc、/dev
+    # 或 locale 设置而返回非 0，但文件已经落盘、程序照样能跑。所以这里把
+    # dpkg 的失败降级成警告，真正的判据交给下一行的 `wkhtmltopdf --version`。
+    if ! in_guest 'export DEBIAN_FRONTEND=noninteractive
+      dpkg -i --force-confold /tmp/kxxy-wkhtmltopdf/*.deb >/tmp/kp-wkhtmltopdf.log 2>&1'; then
+      echo "wkhtmltopdf: dpkg 返回非 0（postinst 警告？），日志尾巴——" >&2
+      in_guest 'tail -8 /tmp/kp-wkhtmltopdf.log' >&2 || true
+    fi
     in_guest 'wkhtmltopdf --version' || return 1
     : > "$STAMP/wkhtmltopdf"
     rm -rf "$ROOTFS/tmp/kxxy-wkhtmltopdf"

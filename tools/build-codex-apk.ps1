@@ -28,8 +28,17 @@ $hold = Join-Path $project '.cache\apk-assets-hold'
 # 收尾再写 `codex-apk-result.json` 时相对路径就解析到 android\ 下面。v0.9.89 实际踩到一次 ——
 # 包、签名、两段终验全过，最后一步抛 DirectoryNotFoundException，构建结果没落盘。
 # 这里一次性锚成绝对路径，后面的 Copy-Item / Get-FileHash 也一并受益。
-$Backup = [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $Backup))
-$Runtime = [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $Runtime))
+# 再存一份到 $script:BackupRoot：build-apk.ps1 是点源引入的，它内部对同名变量
+# 的重新赋值会覆盖本脚本作用域里的 $Backup（v0.9.93 就是这样又把路径弄丢、
+# 最后一步 WriteAllText 报 DirectoryNotFoundException）。收尾写结果文件只认
+# $script:BackupRoot，且写之前先把目录建出来。
+function Resolve-InputPath([string]$value) {
+    if ([IO.Path]::IsPathRooted($value)) { return [IO.Path]::GetFullPath($value) }
+    return [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $value))
+}
+$Backup = Resolve-InputPath $Backup
+$Runtime = Resolve-InputPath $Runtime
+$script:BackupRoot = $Backup
 foreach ($path in @($Runtime, $env:KXXY_NODE, $python, $env:KXXY_JAVA, $gradle, (Join-Path $Backup '.cache\apk-assets-hold\runtime.zip'))) {
     if (-not (Test-Path -LiteralPath $path)) { throw "Missing build input/backup: $path" }
 }
@@ -85,8 +94,9 @@ if (($meta.PSObject.Properties.Name -contains 'dshUpgradeManifestSha256') -or ($
 $sha = (Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText("$apk.sha256", "$sha`n", [Text.Encoding]::ASCII)
 # 构建结果必须落盘：这是交付记录，缺了就得靠人回忆「这一版到底哪份 runtime 打的」。
-New-Item -ItemType Directory -Force -Path $Backup | Out-Null
-[IO.File]::WriteAllText((Join-Path $Backup 'codex-apk-result.json'), ((@{ apk = $apk; report = $report; version = $Version; versionCode = $VersionCode; sha256 = $sha; runtime = $Runtime; runtimeSha256 = $runtimeHash; nativeCodexIncluded = [bool]$meta.codexRuntimeIncluded; nativeExecutionMode = $meta.codexRuntimeExecutionMode; deviceInstalled = $false } | ConvertTo-Json) + "`n"), [Text.UTF8Encoding]::new($false))
+$resultFile = Join-Path $script:BackupRoot 'codex-apk-result.json'
+New-Item -ItemType Directory -Force -Path $script:BackupRoot | Out-Null
+[IO.File]::WriteAllText($resultFile, ((@{ apk = $apk; report = $report; version = $Version; versionCode = $VersionCode; sha256 = $sha; runtime = $Runtime; runtimeSha256 = $runtimeHash; nativeCodexIncluded = [bool]$meta.codexRuntimeIncluded; nativeExecutionMode = $meta.codexRuntimeExecutionMode; deviceInstalled = $false } | ConvertTo-Json) + "`n"), [Text.UTF8Encoding]::new($false))
 Write-Output "FINAL_APK=$apk"
 Write-Output "SHA256=$sha"
 Write-Output "VERIFICATION=$report"
