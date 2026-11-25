@@ -35,6 +35,7 @@ import {
 	healExtensions,
 	placeholderMap,
 	poolSignature,
+	readCatalog,
 	relinkAll,
 	removeExtension,
 	staleExtensions,
@@ -593,6 +594,47 @@ try {
 		check('池变大后判为需要重装', stale2.includes('grown'), `stale=${JSON.stringify(stale2)}`);
 		check('池变小后判为需要重装', stale2.includes('shrunk'), `stale=${JSON.stringify(stale2)}`);
 		check('池体积一致时不动', !stale2.includes('fresh'), `stale=${JSON.stringify(stale2)}`);
+
+		// 版本判据（v0.9.94 真机事故）：池体积**判不出来**的落后必须靠目录版本。
+		//
+		// 现场：glibc 扩展装配时读到的是旧池（8 个条目，没有 provision），收尾
+		// `buildViews` 却按路径 stat 到了刚换上去的新池 ⇒ 记下 628,888,438。
+		// layout 与 poolBytes 两条判据都判「最新」，这台设备再也不会重装 glibc，
+		// 三份离线预置包一个都落不下来；而此后池体积再也不变，光靠体积永远发现
+		// 不了。所以拿**真实目录里**的版本号做第三条判据。
+		const catalogItem = readCatalog()?.items?.find((i) => i.id === 'glibc');
+		if (catalogItem?.version) {
+			const declared = catalogItem.version;
+			writeFileSync(join(root, 'ext-pool', 'glibc.pool'), 'POOL2');
+			makeExt(root, 'glibc', { 'bin/g': 'G' });
+			const versionedLinks = JSON.stringify({
+				extId: 'glibc', bins: [], libs: [], views: [],
+				layout: LAYOUT_VERSION, poolBytes: poolSignature(root, 'glibc'),
+			});
+			const stamp = join(root, 'extensions', 'glibc', '.ext-version');
+			writeFileSync(join(root, 'extensions', 'glibc', '.links.json'), versionedLinks);
+
+			writeFileSync(stamp, `${declared}-old\n`);
+			check('池体积一致但版本落后 → 仍需重装', staleExtensions(root).includes('glibc'),
+				`stale=${JSON.stringify(staleExtensions(root))}`);
+
+			writeFileSync(stamp, `${declared}\n`);
+			check('版本一致且池未变 → 不重装', !staleExtensions(root).includes('glibc'),
+				`stale=${JSON.stringify(staleExtensions(root))}`);
+
+			// 老扩展根本没写过 .ext-version，或写了 unknown：不能当成「版本不同」
+			// 而每轮都重装（那会把 60~250 MiB 的解包变成每次启动的固定成本）
+			writeFileSync(stamp, 'unknown\n');
+			check('版本 unknown 时不判落后', !staleExtensions(root).includes('glibc'),
+				`stale=${JSON.stringify(staleExtensions(root))}`);
+			rmSync(stamp, { force: true });
+			check('没有 .ext-version 时不判落后', !staleExtensions(root).includes('glibc'),
+				`stale=${JSON.stringify(staleExtensions(root))}`);
+
+			// 收拾干净，别影响后面块里的 /kxxy/extensions 断言
+			rmSync(join(root, 'ext-pool', 'glibc.pool'), { force: true });
+			rmSync(join(root, 'extensions', 'glibc'), { recursive: true, force: true });
+		}
 
 		// 空 root / 不存在的 extensions 目录都要安全返回
 		equal('root 为空时返回空数组', staleExtensions('').length, 0);

@@ -218,26 +218,61 @@ async function runInstall(job, root, id, item) {
     poolFile = legacy
   }
 
-  rmSync(tmpDir, { recursive: true, force: true })
-  mkdirSync(tmpDir, { recursive: true })
-  updateJob(job, { phase: 'extract', percent: 1, message: '开始解包' }, tmpDir)
-
   const totalBytes = Number(item.sizeBytes) || 0
   let lastReported = 0
-  const result = await extractTarGz(poolFile, tmpDir, {
-    totalBytes,
-    onProgress: (info) => {
-      // 解包阶段占 0..85%；按累计字节算，没有总量估计时按条目数凑合
-      const frac = totalBytes > 0
-        ? info.written / totalBytes
-        : Math.min(1, info.written / (info.written + 8 * 1024 * 1024))
-      const percent = 1 + Math.floor(frac * 84)
-      if (percent !== lastReported) {
-        lastReported = percent
-        updateJob(job, { phase: 'extract', percent, message: `解包 ${id}` }, tmpDir)
-      }
-    },
-  })
+  let result
+  /*
+   * 池在解包**期间**被换掉的竞态（v0.9.94 真机踩到，代价是 glibc 扩展永远停在旧版）。
+   *
+   * `RuntimeInstaller.ensureExtensionPool()` 把 APK 里的新池落到 `ext-pool/`，用的是
+   * `.part` + rename 原子替换；而扩展重装是引擎启动后由 kxxy-host 自己发起的 ——
+   * 两边都在启动窗口里跑。谁先谁后不确定，实测过一次这样的顺序：
+   *
+   *   1. 扩展重装先拿到**旧池**的文件描述符，开始解包（8 个条目，没有 provision）；
+   *   2. 原生层把新池 rename 到位（628 MiB，含三份离线预置包）；
+   *   3. buildViews 收尾时 `poolSignature()` 按**路径**重新 stat ⇒ 记下的是新池体积。
+   *
+   * 结果：目录里是旧内容，`.links.json` 却声称用的是新池 —— `staleExtensions()`
+   * 从此判它「最新」，这台设备再也不会重装 glibc 扩展，离线预置包一个都落不下来。
+   *
+   * 修法两道：解包前后各 stat 一次（变了就重来，最多两次）；`buildViews` 用
+   * **解包前**记下的体积落 `poolBytes`，这样即使重试也记的是真正消费过的那个池。
+   */
+  let poolBytesUsed = 0
+  for (let attempt = 0; ; attempt += 1) {
+    rmSync(tmpDir, { recursive: true, force: true })
+    mkdirSync(tmpDir, { recursive: true })
+    updateJob(job, { phase: 'extract', percent: 1, message: '开始解包' }, tmpDir)
+    poolBytesUsed = statSync(poolFile).size
+    lastReported = 0
+    result = await extractTarGz(poolFile, tmpDir, {
+      totalBytes,
+      onProgress: (info) => {
+        // 解包阶段占 0..85%；按累计字节算，没有总量估计时按条目数凑合
+        const frac = totalBytes > 0
+          ? info.written / totalBytes
+          : Math.min(1, info.written / (info.written + 8 * 1024 * 1024))
+        const percent = 1 + Math.floor(frac * 84)
+        if (percent !== lastReported) {
+          lastReported = percent
+          updateJob(job, { phase: 'extract', percent, message: `解包 ${id}` }, tmpDir)
+        }
+      },
+    })
+    if (statSync(poolFile).size === poolBytesUsed) break
+    if (attempt >= 1) {
+      rmSync(tmpDir, { recursive: true, force: true })
+      updateJob(job, {
+        phase: 'error',
+        percent: 0,
+        message: '包池在解包过程中被替换，请重新安装',
+        error: 'pool replaced during extract',
+        finishedAt: Date.now(),
+      })
+      return
+    }
+    updateJob(job, { phase: 'extract', percent: 1, message: '包池已更新，重新解包' }, tmpDir)
+  }
 
   updateJob(job, { phase: 'link', percent: 88, message: '接入 PATH 与链接库' }, tmpDir)
 
@@ -256,7 +291,7 @@ async function runInstall(job, root, id, item) {
   const applied = applyPlaceholders(root, extDir, join(extDir, POOL_MANIFEST))
 
   // layout 戳由 buildViews 一并返回（见那里的注释）
-  const links = buildViews(root, id, extDir)
+  const links = buildViews(root, id, extDir, { poolBytes: poolBytesUsed })
   writeFileSync(join(extDir, '.links.json'), `${JSON.stringify(links, null, 2)}\n`)
 
   const rewritten = applied.skipped ? '' : `，回填路径 ${applied.rewritten} 个`
@@ -521,7 +556,16 @@ export function ensureFortranToolchain(root, extDir) {
   }
 }
 
-export function buildViews(root, id, extDir) {
+/**
+ * 装配视图并产出 `.links.json` 的内容。
+ *
+ * @param {object} [opts]
+ * @param {number} [opts.poolBytes] 本次装配**实际消费**的池体积。装配路径（runInstall）
+ *   会把它在解包前就量好传进来 —— 收尾时再按路径 stat 会拿到「解包途中被换上去的
+ *   新池」体积，那正是「links.json 声称最新、目录里却是旧内容」的来源。
+ *   缺省（未来的重装配工具）才回退到按路径取。
+ */
+export function buildViews(root, id, extDir, opts = {}) {
   const engineBin = join(root, 'bin')
   const engineLib = join(root, 'lib')
   mkdirSync(engineBin, { recursive: true })
@@ -634,6 +678,7 @@ export function buildViews(root, id, extDir) {
   //
   // `poolBytes` 同理必须在这里打：它记录「这次装配用的是多大的池」，池被
   // 新 APK 换掉之后（见 poolSignature 的注释）staleExtensions 靠它发现。
+  const declared = Number(opts.poolBytes)
   return {
     extId: id,
     bins,
@@ -641,7 +686,7 @@ export function buildViews(root, id, extDir) {
     views,
     linkedAt: Date.now(),
     layout: LAYOUT_VERSION,
-    poolBytes: poolSignature(root, id),
+    poolBytes: Number.isFinite(declared) && declared > 0 ? declared : poolSignature(root, id),
   }
 }
 
@@ -1941,6 +1986,25 @@ export function staleExtensions(root) {
   if (!existsSync(extRoot)) return []
   // listPool 返回的是 Map（id → 包文件路径），不是数组
   const pool = new Set(listPool(root).keys())
+  /*
+   * 目录版本：体积判据的补充，不是替代。
+   *
+   * `poolBytes` 只在「池体积变了」时有效。真机踩到的反例是 v0.9.94 的 glibc 扩展：
+   * 装配时读到旧池（8 个条目），收尾却按路径记下了刚换上去的新池体积，于是两条
+   * 老判据（layout / poolBytes）都判「最新」，离线预置包一个都落不下来。此后池
+   * 体积再没变过，光靠体积永远发现不了 —— 必须有一条「目录里写的版本 vs 随包
+   * 目录的版本」的判据。
+   *
+   * 只比**两边都非空且非 unknown** 的情况：老扩展（runInstall 还没写 `.ext-version`
+   * 时留下 `unknown`）交给 layout / poolBytes 判，避免把「读不到版本」当成「版本不同」
+   * 而无限重装。
+   */
+  const catalogVersion = new Map()
+  for (const item of readCatalog()?.items ?? []) {
+    if (item?.id && typeof item.version === 'string' && item.version !== '') {
+      catalogVersion.set(item.id, item.version)
+    }
+  }
   const stale = []
   try {
     for (const entry of readdirSync(extRoot, { withFileTypes: true })) {
@@ -1961,6 +2025,12 @@ export function staleExtensions(root) {
         stale.push(entry.name)
         continue
       }
+      const expected = catalogVersion.get(entry.name)
+      const installed = readVersionStamp(join(extRoot, entry.name))
+      if (expected !== undefined && installed !== '' && installed !== 'unknown' && installed !== expected) {
+        stale.push(entry.name)
+        continue
+      }
       // 池内容变了（新 APK 换了包）→ 装配出来的目录已经和池对不上。
       // `recordedBytes === 0` 是「这份 .links.json 由还没记 poolBytes 的旧代码
       // 写的」，一律当落后处理；否则比对当前池体积。
@@ -1973,6 +2043,15 @@ export function staleExtensions(root) {
     return []
   }
   return stale
+}
+
+/** 读扩展目录里的 `.ext-version`（runInstall 写的整行版本号）；读不到返回空串。 */
+function readVersionStamp(extDir) {
+  try {
+    return readFileSync(join(extDir, '.ext-version'), 'utf8').trim()
+  } catch {
+    return ''
+  }
 }
 
 /**

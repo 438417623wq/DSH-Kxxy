@@ -111,6 +111,8 @@ dsh-kxxy/
 >
 > **v0.9.78 收口**：`perf list` 区分 PMU/fallback，`perf stat` 不再用回退数据冒充硬件事件，`perf record` 保留目标退出码；rsync 新增 `KXXY_RSYNC_LINK_REQUIRED=1`，软链去重改为原子替换。见 [变更说明](docs/2026-11-22-v0.9.78-perf降级收口与快照严格模式.md)。
 >
+> **v0.9.95**：真机收尾。① 设备上装的一直是 0.9.80，三个修复从未上机；装上 0.9.94 后 ①② 生效、③ 仍坏——根因是**扩展重装判据被骗**：`ensureExtensionPool()` 把新池 rename 到位的同时，glibc 扩展正拿旧池解包，收尾 `buildViews()` 按路径 stat 记下了**新池体积**，`.links.json` 于是声称「最新」，这台设备再也不会重装 glibc（离线包一个没落下来）。修法：解包前后各 stat 一次（池被换掉就重来）、`poolBytes` 取解包前量到的值、`staleExtensions()` 增加「`.ext-version` vs 随包目录版本」判据；并把 0.9.94 遗留的「池已 r5、随包目录仍写 r4」用重封修正。② 能力探针补 `os.link` 的 `ctypes` 兜底（bionic 的 CPython 没有 `os.link`，原来整份报告直接崩）。真机实测：四条路由 + 未知中转都放行图片、`o3-mini` 仍拒；`office_engine.backend=wasm`；严格离线从零装 julia/dotnet/wkhtmltopdf 用时 2 分 06 秒。见 [变更说明](docs/2026-11-25-v0.9.95-真机三问题收尾与扩展重装判据.md)。
+>
 > **v0.9.94**：三条修复方案对齐。① 图片模态保留「按协议补 `image`」而不采用「只置空 `inputModalities`」——本产物在准入之后还有第二道请求期判定（`pi-ai/lib/index.js:2244` 的 `containsImage && !model.input.includes("image")`），只置空会从「本地拒绝」变成「请求期 UNSUPPORTED_CONTENT」，且 ACP/CUA 的能力上报会变假；回归里已把这道门钉住。② Office 后端显式化只做了可查这一半：能力探针新增 `office_engine`，直接跑 Kit 自己的 `capabilities --json`（`backend: wasm` 是声明值，不是静默降级）；原生 soffice 仍不做。③ glibc 预置新增 `KXXY_GLIBC_OFFLINE=1` 严格离线（缺包直接报错，不静默下载），三个工具加「已装即走」快路径；扩展 `r5`。顺带修 `build-codex-apk.ps1` 缺 UTF-8 BOM 导致 PS 5.1 解析失败（中文注释被按 GBK 读、吞掉 `}`）。见 [变更说明](docs/2026-11-25-v0.9.94-三方案对齐与离线开关.md)。
 >
 > **v0.9.93**：自定义路由（`guiji` / `chat` / `guge` 这类 pi-ai 不认识的 key）**发图片不再被本地拒** —— `input` 回退链最后一格从「查内置目录」改成「看协议」，已知纯文本模型仍拦截（`KXXY_MODALITY_UNKNOWN=strict` 可关）；`julia` / `dotnet` / `wkhtmltopdf` 三份离线包随 glibc 扩展进池，**断网也能首次装好**；LibreOffice 明确维持 WASM（原生路径是跨 ABI `dlopen`，不做）。补丁集 `@42`，glibc 扩展 `r4`。见 [变更说明](docs/2026-11-25-v0.9.93-图片模态兜底与离线预置.md)。

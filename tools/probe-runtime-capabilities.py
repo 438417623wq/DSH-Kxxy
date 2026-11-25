@@ -6,6 +6,7 @@ PATH and runtime environment are inherited unchanged. All probe-created files li
 one private scratch directory and are removed, including on failed checks.
 """
 import argparse
+import ctypes
 import errno
 import json
 import os
@@ -124,6 +125,22 @@ def file_info(path):
             "is_symlink": stat.S_ISLNK(value.st_mode), "is_regular": stat.S_ISREG(value.st_mode)}
 
 
+def os_link(source, destination):
+    """`os.link` with a libc fallback for Android's CPython.
+
+    Android 的 CPython 构建没有 `os.link`（真机实测 `AttributeError: module 'os'
+    has no attribute 'link'`），`link(2)` 在 libc 里却是有的 —— 直接 ctypes 调，
+    否则探针在**唯一需要它的平台**上不是「报告没有硬链接」，而是整份报告崩掉。
+    """
+    if hasattr(os, "link"):
+        return os.link(source, destination)
+    libc = ctypes.CDLL(None, use_errno=True)
+    rc = libc.link(os.fsencode(str(source)), os.fsencode(str(destination)))
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), str(source), None, str(destination))
+
+
 def verify_link(source, destination, payload):
     """Reject link2symlink/copy emulation; prove unlink survival and restoration."""
     original, linked = file_info(source), file_info(destination)
@@ -141,7 +158,7 @@ def verify_link(source, destination, payload):
     source.unlink()
     result["unlink_source_survives"] = destination.read_bytes() == payload
     result["after_unlink"] = file_info(destination)
-    os.link(destination, source)
+    os_link(destination, source)
     result["restored_source"] = file_info(source)
     result["restored_destination"] = file_info(destination)
     result["source_restored"] = (source.read_bytes() == payload and
@@ -194,7 +211,7 @@ def link_probe(root, scratch, kind):
             source, destination = work / "source", work / "destination"
             source.write_bytes(payload)
             if kind == "os.link":
-                os.link(source, destination)
+                os_link(source, destination)
             else:
                 command = run_command([str(tool), "--coreutils-prog=ln", str(source), str(destination)], scratch)
                 result["command"] = command
@@ -202,6 +219,11 @@ def link_probe(root, scratch, kind):
                     return result
             result.update(verify_link(source, destination, payload))
     except (OSError, ValueError) as ex:
+        result.update(failure(ex))
+        result["status"] = "fail"
+    except AttributeError as ex:
+        # 解释器缺某个 API（如 bionic 的 os.link 且 ctypes 也调不通）时，
+        # 一句 capability 说明比整份报告崩掉有用得多
         result.update(failure(ex))
         result["status"] = "fail"
     return result
