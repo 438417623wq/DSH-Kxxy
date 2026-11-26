@@ -1,0 +1,16 @@
+{
+  "apk": "Kxxy-0.9.103.apk",
+  "apkBytes": 3973249557,
+  "sha256": "bc2a40c341439cf8cba43f65067b91fa6ac487fdd0963d877aaae68f161effc6",
+  "runtimeSha256": "a853c8ae90500b9c284d9164133b1e50d759c86fde9ee24518b87a190af5468f",
+  "codexPluginVersion": "0.1.0",
+  "codexPluginFingerprint": "fe25a505035b46fbd80445f3f835b9efcd6b12c38b6f8a6b623608e98b8c5e68",
+  "nativeCodexIncluded": false,
+  "extensionPools": 33,
+  "checksPassed": true,
+  "limitations": [
+    "Codex CLI is not included; native Codex sandbox execution remains blocked",
+    "Custom agents require providers with compatible function calling; commands use app process permissions with per-operation approval",
+    "No installation or on-device UI acceptance performed"
+  ]
+}

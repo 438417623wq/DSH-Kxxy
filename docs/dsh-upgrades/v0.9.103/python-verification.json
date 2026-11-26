@@ -1,0 +1,18 @@
+{
+  "apk": "Kxxy-0.9.103.apk",
+  "schema": 1,
+  "pythonRevision": "python-cffi-2.0.0-cp314-android24-arm64-v1",
+  "runtimeSha256": "a853c8ae90500b9c284d9164133b1e50d759c86fde9ee24518b87a190af5468f",
+  "repairManifestSha256": "ea81091d4734f8dcef55f5980b98ed427abafda6a6fafb101bcba8ae3b6574ba",
+  "repairPayloadSha256": "59ad829a490b19e05ae57c4d58dab06ec241273052df11af98caac7bcb7853c0",
+  "repairPayloadBytes": 2435310,
+  "repairFiles": 679,
+  "androidHelperIncluded": true,
+  "pythonSelftestSourceMatches": true,
+  "checksPassed": true,
+  "deviceInstalled": false,
+  "deviceVerified": false,
+  "remainingWarnings": [
+    "NumPy/psutil legacy Android wheel tags retained; use in-app functional selftest"
+  ]
+}

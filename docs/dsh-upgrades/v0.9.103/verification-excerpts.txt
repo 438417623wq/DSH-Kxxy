@@ -1,0 +1,39 @@
+[final-verify-runtime.log]
+Office 资产合同通过：kit/wasm 0.2.3，48 项完整引擎资源及随包字体/许可证，kxxy-office@5
+宿主插件内容指纹：✓ 72ff3acef0a9…，55 个文件（与 build-meta.json 一致）
+jansi native 剥离：✓ 扫描 457 个 jar，命中 0
+默认 Python：6 个独立路由条目通过；原生 ln/rsync/perf 脚本与源码一致
+Host fontconfig: fc-list / fc-match 2.18.4, 8 bundled ELF dependencies verified
+结论：全部关键条目齐备
+
+[final-proof.log]
+Verified 7 runtime changes; 679 managed paths, 2435310 payload bytes.
+
+[final-jvm.log]
+TOTAL PASS 135
+PASS real 0.9.102 managed bytes -> 72ff3acef0a96451466c25092b24ec0245dfeae67bd0a9e57924559887cf947f: 6 atomic replacements, zero-write conflict, all anchors current, user sentinels retained, second repair idempotent
+
+[contracts.log]
+ℹ tests 20
+ℹ pass 20
+ℹ fail 0
+ℹ skipped 0
+
+[final-compile-kotlin.log]
+BUILD SUCCESSFUL in 4m 55s
+
+[office-asar.log]
+Office 默认字体真实双版本回归：0 通过 / 0 失败（用例数）
+
+[final-installed-routes.log: JSON fields]
+{
+  "result": "PASS",
+  "mode": "focused-installed-routes",
+  "routes": 6,
+  "modeVerified": false,
+  "sourceSha256": "a853c8ae90500b9c284d9164133b1e50d759c86fde9ee24518b87a190af5468f",
+  "androidExecutionRun": false
+}
+
+[office-asar.log: path redacted]
+回归前置条件或夹具失败：Error: ENOENT: no such file or directory, open '<CACHE>/dsh-upstream-0.2.2-rc.2-dedup.asar'
